@@ -11,8 +11,10 @@
 //! client addresses are treated).
 
 mod client_ip;
+mod setup;
 
 pub use client_ip::ClientIp;
+pub use setup::SetupService;
 
 use std::{sync::Arc, time::Duration};
 
@@ -22,7 +24,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use craftcloud_core::Capabilities;
 use ipnet::IpNet;
@@ -68,15 +70,38 @@ pub fn router() -> Router {
     router_with(Capabilities::development_defaults(), &ApiConfig::default())
 }
 
-/// Builds the router with explicit capabilities and limits.
+/// Builds the router with explicit capabilities and limits, without
+/// database-backed services (the setup routes answer 503 `SETUP_UNAVAILABLE`).
 pub fn router_with(capabilities: Capabilities, config: &ApiConfig) -> Router {
+    router_with_setup(capabilities, config, None)
+}
+
+/// Builds the router with the optional instance-setup service.
+pub fn router_with_setup(
+    capabilities: Capabilities,
+    config: &ApiConfig,
+    setup: Option<SetupService>,
+) -> Router {
+    let state = ApiState {
+        capabilities,
+        setup: setup.map(Arc::new),
+    };
     let routes = Router::new()
         .route("/health/live", get(health_live))
         .route("/api/v1/info", get(info))
+        .route("/api/v1/setup/status", get(setup::status))
+        .route("/api/v1/setup/complete", post(setup::complete))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(capabilities);
+        .with_state(state);
     with_middleware(routes, config)
+}
+
+/// Shared handler state.
+#[derive(Clone)]
+pub(crate) struct ApiState {
+    pub(crate) capabilities: Capabilities,
+    pub(crate) setup: Option<Arc<SetupService>>,
 }
 
 /// Applies the centralized middleware stack. The last layer added is the
@@ -197,8 +222,8 @@ async fn health_live() -> Json<serde_json::Value> {
     Json(json!({ "status": "live" }))
 }
 
-async fn info(State(capabilities): State<Capabilities>) -> Json<Capabilities> {
-    Json(capabilities)
+async fn info(State(state): State<ApiState>) -> Json<Capabilities> {
+    Json(state.capabilities)
 }
 
 async fn not_found(headers: HeaderMap) -> Response {
@@ -220,19 +245,32 @@ async fn method_not_allowed(headers: HeaderMap) -> Response {
 }
 
 /// Builds the error body described in `docs/02-architecture/api-conventions.md`.
-fn error_response(
+pub(crate) fn error_response(
     status: StatusCode,
     code: &str,
     message: &str,
     request_headers: &HeaderMap,
 ) -> Response {
+    error_response_with_details(status, code, message, request_headers, None)
+}
+
+/// Like [`error_response`] with an optional `details` object. Details must
+/// never contain request values.
+pub(crate) fn error_response_with_details(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    request_headers: &HeaderMap,
+    details: Option<serde_json::Value>,
+) -> Response {
     let request_id = request_headers
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok());
-    let body = json!({
-        "error": { "code": code, "message": message, "request_id": request_id }
-    });
-    (status, Json(body)).into_response()
+    let mut error = json!({ "code": code, "message": message, "request_id": request_id });
+    if let (Some(details), Some(object)) = (details, error.as_object_mut()) {
+        object.insert("details".to_owned(), details);
+    }
+    (status, Json(json!({ "error": error }))).into_response()
 }
 
 #[cfg(test)]

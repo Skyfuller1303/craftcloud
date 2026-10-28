@@ -18,6 +18,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures",
+ "password-hash",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,6 +120,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -170,14 +191,29 @@ name = "craftcloud-api"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "craftcloud-auth",
  "craftcloud-core",
+ "craftcloud-db",
  "ipnet",
+ "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "craftcloud-auth"
+version = "0.0.0"
+dependencies = [
+ "argon2",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]
@@ -204,9 +240,11 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "craftcloud-api",
+ "craftcloud-auth",
  "craftcloud-core",
  "craftcloud-db",
  "ipnet",
+ "libc",
  "sqlx",
  "tokio",
  "tracing",
@@ -968,6 +1006,17 @@ dependencies = [
  "redox_syscall 0.5.18",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core",
+ "subtle",
 ]
 
 [[package]]

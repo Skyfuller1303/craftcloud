@@ -21,6 +21,7 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_REQUEST_TIMEOUT_SECS` | `10` | 1 bis 300 |
 | `CRAFTCLOUD_SHUTDOWN_GRACE_SECS` | `10` | 1 bis 120 |
 | `CRAFTCLOUD_LOG_FORMAT` | `text` | `text` oder `json` |
+| `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE` | nicht gesetzt (Setup deaktiviert) | absoluter Pfad einer Secret-Datei mit dem Bootstrap-Token (mindestens 32 Zeichen nach dem Trimmen); erfordert `CRAFTCLOUD_DATABASE_URL_FILE` |
 | `CRAFTCLOUD_DATABASE_URL_FILE` | nicht gesetzt (Prototypmodus ohne Datenbank) | absoluter Pfad einer Secret-Datei mit der PostgreSQL-URL |
 | `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` | `10` | 1 bis 100 |
 | `CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS` | `5` | 1 bis 60 |
@@ -29,7 +30,7 @@ Die Datenbank-URL enthält ein Passwort und steht deshalb **nur** in der Secret-
 
 Schema-Migrationen werden **nie implizit** angewendet: vor dem ersten Start und nach jedem Upgrade zuerst ein Backup erstellen, dann `craftcloud-server migrate` ausführen (wendet ausstehende Migrationen unter einem Advisory Lock an, nur vorwärts). Der normale Start prüft nur, ob das Schema vollständig und unverändert migriert ist, und endet sonst mit Exit-Code 1.
 
-Reserviert und derzeit **abgelehnt** („not supported in this build yet“): `CRAFTCLOUD_DATABASE_URL`, `CRAFTCLOUD_STORAGE_BACKEND`, `CRAFTCLOUD_STORAGE_ROOT`, `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`, `CRAFTCLOUD_SESSION_SECRET_FILE`. Sie werden mit späteren Meilensteinen eingeführt (Secret-Dateien: absoluter Pfad, reguläre Datei, höchstens 4 KiB, unter Unix nicht für Gruppe/andere lesbar).
+Reserviert und derzeit **abgelehnt** („not supported in this build yet“): `CRAFTCLOUD_DATABASE_URL`, `CRAFTCLOUD_STORAGE_BACKEND`, `CRAFTCLOUD_STORAGE_ROOT`, `CRAFTCLOUD_SESSION_SECRET_FILE`. Sie werden mit späteren Meilensteinen eingeführt (Secret-Dateien: absoluter Pfad, reguläre Datei, höchstens 4 KiB, unter Unix nicht für Gruppe/andere lesbar).
 
 ```dotenv
 # EXAMPLE — NEVER commit real values
@@ -42,6 +43,33 @@ CRAFTCLOUD_LOG_FORMAT=json
 Absolute URLs entstehen ausschließlich aus `CRAFTCLOUD_PUBLIC_URL`, nie aus `Host` oder `X-Forwarded-*`. `X-Forwarded-For` wird nur von konfigurierten Proxys ausgewertet.
 
 **Bewusst kein `docker-compose.yml` als scheinbar lauffertiges Ergebnis:** erst erstellen, wenn Server-Image, Migrationspfad, Healthcheck, Secret Ownership und Volume-Permissions real implementiert sind.
+
+## Erstes Setup (Bootstrap des Instanz-Operators)
+
+Der Server erzeugt und druckt nie einen Token (ADR-0013). Der Operator legt ihn selbst als Datei an:
+
+```sh
+umask 077
+openssl rand -base64 48 > /run/secrets/craftcloud_bootstrap   # Rechte 0600, nur der Serverbenutzer darf lesen
+```
+
+1. Datenbank-URL-Datei bereitstellen, `craftcloud-server migrate` ausführen (erzeugt auch die Tabelle `instance_setup`).
+2. Server mit `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE=/run/secrets/craftcloud_bootstrap` starten; `GET /api/v1/setup/status` liefert `{"setup_required":true}`.
+3. `POST /api/v1/setup/complete` mit `bootstrap_token`, `email`, `display_name`, `password` (12 bis 128 Zeichen), `organization.name` und `organization.slug` aufrufen (nur über TLS am vertrauenswürdigen Proxy, nie über unverschlüsseltes Netz). Erfolg: 201 mit `user_id` und `organization_id`; es wird noch keine Sitzung erzeugt (Login folgt mit PR-005).
+4. **Danach die Bootstrap-Secret-Datei löschen und die Variable entfernen.** Der Server warnt bei jedem Start, solange die Datei konfiguriert ist, obwohl das Setup abgeschlossen ist. Ein gültiger Token liefert nach Abschluss nur noch 409, ein falscher immer 403. Ist keine Bootstrap-Datei konfiguriert, antwortet `POST /api/v1/setup/complete` ebenfalls 403 `INVALID_BOOTSTRAP_TOKEN` (anonyme Aufrufer sollen nicht erkennen, ob ein Secret existiert); der eigentliche Grund steht als Warnung im Server-Log. Läuft die Anfrage in den Timeout (503 `TIMEOUT`) oder bricht die Verbindung während des Commits ab, kann das Setup trotzdem erfolgreich gewesen sein: vor einem erneuten Versuch `GET /api/v1/setup/status` prüfen. Das Setup ist vom allgemeinen Timeout nicht ausgenommen.
+
+Das Setup hat keine eigene Ratenbegrenzung: Der Token hat mindestens 32 Zeichen, Raten ist praktisch aussichtslos; ein allgemeiner Limiter folgt mit den Sitzungen (PR-005). Der Passwort-Hash (Argon2id, 19 MiB, 2 Iterationen) wird nur nach gültigem Token berechnet, höchstens vier gleichzeitig.
+
+### Offline-Wiederherstellung (nur per Datenbankzugriff)
+
+Es gibt bewusst **keinen** HTTP-Endpunkt zum Zurücksetzen. Ist der Operator ausgesperrt, bevor die CLI-Wiederherstellung (PR-005, ADR-0013 Punkt 6) existiert, kann ein Betreiber mit Datenbankzugriff das Setup nach einem **Backup** wieder öffnen:
+
+1. Server stoppen, Datenbank sichern.
+2. `DELETE FROM instance_setup;` ausführen. Das bestehende Operator-Konto und die Organisation bleiben unverändert erhalten (alle Fremdschlüssel sind `ON DELETE RESTRICT`).
+3. Bootstrap-Secret-Datei mit einem **neuen** Token anlegen und den Server starten. Das erneute Setup braucht eine andere E-Mail-Adresse und einen anderen Org-Slug als die bestehenden Datensätze; sonst antwortet es mit 422.
+4. Danach wie oben die Secret-Datei entfernen. Alte Konten sind anschließend durch den Betreiber zu bereinigen.
+
+Dieser Ablauf ist getestet (`deleting_the_marker_row_reopens_setup_without_touching_existing_data`), aber eine Notfallmaßnahme, kein Produktmerkmal.
 
 ## Setup-Runbook
 

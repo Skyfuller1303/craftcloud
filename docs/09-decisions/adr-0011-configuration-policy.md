@@ -30,3 +30,7 @@ Konfigurationsdatei (TOML) zusätzlich zur Umgebung (mehr Oberfläche, später m
 ## Review und Revision
 
 Zusammen mit ADR-0010 vor Übergabe an Maintainer prüfen. Reservierte Schlüssel werden mit dem jeweiligen Meilenstein (DB, Storage, Bootstrap, Sessions) freigeschaltet.
+
+## Nachtrag 2026-10-28
+
+Mit PR-003 und PR-004 sind `CRAFTCLOUD_DATABASE_URL_FILE` und `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE` keine reservierten Schlüssel mehr, sondern unterstützt. `CRAFTCLOUD_DATABASE_URL` bleibt abgelehnt (nur über Datei). Maßgeblich für die aktuelle Schlüsselliste ist `docs/06-operations/deployment.md`.

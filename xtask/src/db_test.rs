@@ -120,7 +120,7 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
 
     let url = format!("postgres://postgres:{password}@127.0.0.1:{port}/postgres");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    println!("==> cargo test -p craftcloud-db -p craftcloud-server -- --ignored");
+    println!("==> cargo test -p craftcloud-db -p craftcloud-api -p craftcloud-server -- --ignored");
     let status = Command::new(&cargo)
         .args([
             "test",
@@ -128,6 +128,8 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
             "craftcloud-db",
             "-p",
             "craftcloud-server",
+            "-p",
+            "craftcloud-api",
             "--",
             "--ignored",
         ])

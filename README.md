@@ -20,6 +20,8 @@ cargo xtask db-test   # PostgreSQL integration tests in a throwaway Docker conta
 craftcloud-server migrate   # apply pending DB migrations (needs CRAFTCLOUD_DATABASE_URL_FILE); never run implicitly
 ```
 
+First-time setup (operator account and organization) is a one-shot `POST /api/v1/setup/complete` guarded by a bootstrap token file you create yourself; see [docs/06-operations/deployment.md](docs/06-operations/deployment.md). There is no login yet.
+
 Invalid configuration prints every problem and exits with code 2 without binding a socket (runtime failures exit with 1); keys and rules are in [docs/06-operations/deployment.md](docs/06-operations/deployment.md) and [ADR-0011](docs/09-decisions/adr-0011-configuration-policy.md).
 
 The workspace declares `rust-version = "1.99"`, the locally installed toolchain, so every local build exercises the declared MSRV (ADR-0010). Roadmap: [ROADMAP.md](ROADMAP.md) and [docs/07-roadmap/phases.md](docs/07-roadmap/phases.md).

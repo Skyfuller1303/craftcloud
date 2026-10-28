@@ -33,15 +33,14 @@ const DB_CONNECT_TIMEOUT_SECS_RANGE: (u64, u64) = (1, 60);
 
 /// Keys reserved for later milestones. They are rejected explicitly instead
 /// of being silently ignored.
-const RESERVED_KEYS: [&str; 5] = [
+const RESERVED_KEYS: [&str; 4] = [
     "DATABASE_URL",
     "STORAGE_BACKEND",
     "STORAGE_ROOT",
-    "BOOTSTRAP_SECRET_FILE",
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 10] = [
+const SUPPORTED_KEYS: [&str; 11] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -49,6 +48,7 @@ const SUPPORTED_KEYS: [&str; 10] = [
     "REQUEST_TIMEOUT_SECS",
     "SHUTDOWN_GRACE_SECS",
     "LOG_FORMAT",
+    "BOOTSTRAP_SECRET_FILE",
     "DATABASE_URL_FILE",
     "DATABASE_MAX_CONNECTIONS",
     "DATABASE_CONNECT_TIMEOUT_SECS",
@@ -120,6 +120,9 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Database settings.
     pub database: DatabaseSettings,
+    /// Absolute path of the bootstrap token secret file. `None` disables the
+    /// one-time instance setup. Requires a configured database.
+    pub bootstrap_secret_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -242,6 +245,19 @@ impl Config {
         )
         .unwrap_or(DEFAULT_DB_CONNECT_TIMEOUT_SECS);
 
+        let bootstrap_secret_file = field(
+            &mut errors,
+            env,
+            "BOOTSTRAP_SECRET_FILE",
+            parse_absolute_path,
+        );
+        if bootstrap_secret_file.is_some() && db_url_file.is_none() {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}BOOTSTRAP_SECRET_FILE"),
+                "requires CRAFTCLOUD_DATABASE_URL_FILE: instance setup needs a database",
+            ));
+        }
+
         // Range-checked above, so the conversion cannot fail; the fallback
         // keeps the code free of panics regardless.
         let max_body_bytes = usize::try_from(max_body_bytes).unwrap_or(usize::MAX);
@@ -260,10 +276,23 @@ impl Config {
                     max_connections: u32::try_from(db_max_connections).unwrap_or(u32::MAX),
                     connect_timeout: Duration::from_secs(db_connect_timeout_secs),
                 },
+                bootstrap_secret_file,
             })
         } else {
             Err(errors)
         }
+    }
+}
+
+fn parse_absolute_path(key: &str, raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(raw.trim());
+    if raw.trim().is_empty() || !path.is_absolute() {
+        Err(ConfigError::new(
+            key,
+            "must be an absolute path to a secret file",
+        ))
+    } else {
+        Ok(path)
     }
 }
 
@@ -456,6 +485,43 @@ mod tests {
             ("CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS", "x"),
         ] {
             assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_secret_file_requires_database_and_absolute_path() {
+        let abs = if cfg!(windows) {
+            r"C:\run\secrets\x"
+        } else {
+            "/run/secrets/x"
+        };
+        let ok = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE", abs),
+            ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+        ]))
+        .unwrap();
+        assert_eq!(ok.bootstrap_secret_file, Some(PathBuf::from(abs)));
+        assert_eq!(
+            Config::from_env_map(&BTreeMap::new())
+                .unwrap()
+                .bootstrap_secret_file,
+            None
+        );
+
+        let no_db = errors_of(&[("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE", abs)]);
+        assert_eq!(keys(&no_db), ["CRAFTCLOUD_BOOTSTRAP_SECRET_FILE"]);
+        assert!(no_db[0].message.contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+
+        for bad in ["relative/x", ""] {
+            let errors = errors_of(&[
+                ("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE", bad),
+                ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+            ]);
+            assert_eq!(
+                keys(&errors),
+                ["CRAFTCLOUD_BOOTSTRAP_SECRET_FILE"],
+                "{bad:?}"
+            );
         }
     }
 

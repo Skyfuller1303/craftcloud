@@ -11,6 +11,7 @@ mod tests {
 
     use craftcloud_db::migrate::{self, migrator_up_to};
     use craftcloud_db::organizations::{self, MemberStatus, NewOrganization, OrgRole};
+    use craftcloud_db::setup::{self, NewInstance, SetupError};
     use craftcloud_db::users::{self, NewUser, User};
     use craftcloud_db::workspaces::{self, MAX_LIST_LIMIT, NewWorkspace, WorkspaceRole};
     use craftcloud_db::{DbError, OrgScope, PgPool, SchemaProblem};
@@ -144,7 +145,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![1, 2, 3]
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -167,14 +168,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            2,
+            3,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -188,7 +189,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(
             migrate::verify(&db.pool).await,
-            Err(DbError::Schema(SchemaProblem::Pending(vec![2])))
+            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3])))
         );
 
         let (scope, owner) = org(&db.pool, "acme").await;
@@ -196,7 +197,7 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2]
+            vec![2, 3]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -564,5 +565,281 @@ mod tests {
             .unwrap_err();
         assert!(!err.to_string().contains("hunter2"));
         assert!(!format!("{err:?}").contains("hunter2"));
+    }
+
+    fn new_instance(slug: &str) -> NewInstance {
+        NewInstance {
+            operator_email: "operator@example.test".to_owned(),
+            operator_display_name: "Operator".to_owned(),
+            operator_password_hash: "$argon2id$placeholder".to_owned(),
+            organization_name: "First Org".to_owned(),
+            organization_slug: slug.to_owned(),
+        }
+    }
+
+    async fn count(pool: &PgPool, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn setup_creates_operator_org_and_membership_once() {
+        let db = migrated().await;
+        assert!(!setup::is_completed(&db.pool).await.unwrap());
+        let created = setup::complete(&db.pool, &new_instance("acme"))
+            .await
+            .unwrap();
+        assert!(setup::is_completed(&db.pool).await.unwrap());
+
+        let row = sqlx::query("SELECT instance_role, password_hash FROM users WHERE id = $1")
+            .bind(created.user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("instance_role").as_deref(),
+            Some("operator")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("password_hash").as_deref(),
+            Some("$argon2id$placeholder")
+        );
+        let member = sqlx::query(
+            "SELECT role, status FROM organization_members WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(created.organization_id)
+        .bind(created.user_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(member.get::<String, _>("role"), "owner");
+        assert_eq!(member.get::<String, _>("status"), "active");
+        let owner: Uuid =
+            sqlx::query_scalar("SELECT owner_user_id FROM organizations WHERE id = $1")
+                .bind(created.organization_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, created.user_id);
+        let marker: Uuid = sqlx::query_scalar("SELECT operator_user_id FROM instance_setup")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(marker, created.user_id);
+
+        let again = setup::complete(
+            &db.pool,
+            &NewInstance {
+                operator_email: "other@example.test".to_owned(),
+                ..new_instance("other")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(again, SetupError::AlreadyCompleted);
+        assert_eq!(count(&db.pool, "users").await, 1);
+        assert_eq!(count(&db.pool, "organizations").await, 1);
+        assert_eq!(count(&db.pool, "instance_setup").await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn setup_failure_rolls_back_everything() {
+        let db = migrated().await;
+        // A pre-existing organization makes the slug insert fail after the
+        // singleton row and the operator user were already written.
+        org(&db.pool, "acme").await;
+        let before_users = count(&db.pool, "users").await;
+
+        let err = setup::complete(&db.pool, &new_instance("acme"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SetupError::Db(DbError::UniqueViolation { .. })),
+            "{err:?}"
+        );
+        assert_eq!(count(&db.pool, "users").await, before_users);
+        assert_eq!(count(&db.pool, "instance_setup").await, 0);
+        assert!(!setup::is_completed(&db.pool).await.unwrap());
+        let operators: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE instance_role = 'operator'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(operators, 0);
+
+        // The failed attempt did not close setup.
+        setup::complete(&db.pool, &new_instance("fresh"))
+            .await
+            .unwrap();
+        assert!(setup::is_completed(&db.pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn concurrent_setups_produce_exactly_one_winner() {
+        let db = migrated().await;
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let pool = db.pool.clone();
+            handles.push(tokio::spawn(async move {
+                let new = NewInstance {
+                    operator_email: format!("op{i}@example.test"),
+                    ..new_instance(&format!("org-{i}"))
+                };
+                setup::complete(&pool, &new).await
+            }));
+        }
+        let mut ok = 0;
+        let mut already = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(SetupError::AlreadyCompleted) => already += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!((ok, already), (1, 9));
+        assert_eq!(count(&db.pool, "users").await, 1);
+        assert_eq!(count(&db.pool, "organizations").await, 1);
+        assert_eq!(count(&db.pool, "organization_members").await, 1);
+        assert_eq!(count(&db.pool, "instance_setup").await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn upgrade_from_0002_keeps_data_and_leaves_setup_open() {
+        let db = TestDb::new().await;
+        migrate::run_with(&db.pool, &migrator_up_to(2))
+            .await
+            .unwrap();
+        let (scope, _) = org(&db.pool, "acme").await;
+        let ws = workspaces::create(&db.pool, &scope, &new_ws("main"))
+            .await
+            .unwrap();
+
+        let applied = migrate::run(&db.pool).await.unwrap();
+        assert_eq!(
+            applied.iter().map(|a| a.version).collect::<Vec<_>>(),
+            vec![3]
+        );
+        migrate::verify(&db.pool).await.unwrap();
+        assert!(
+            workspaces::get(&db.pool, &scope, ws.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!setup::is_completed(&db.pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn instance_setup_is_a_singleton() {
+        let db = migrated().await;
+        let created = setup::complete(&db.pool, &new_instance("acme"))
+            .await
+            .unwrap();
+        // A second row cannot be inserted, and id=false is rejected.
+        let dup = sqlx::query("INSERT INTO instance_setup (operator_user_id) VALUES ($1)")
+            .bind(created.user_id)
+            .execute(&db.pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(db_err(dup), DbError::UniqueViolation { .. }));
+        let falsy =
+            sqlx::query("INSERT INTO instance_setup (id, operator_user_id) VALUES (false, $1)")
+                .bind(created.user_id)
+                .execute(&db.pool)
+                .await
+                .unwrap_err();
+        assert!(matches!(db_err(falsy), DbError::CheckViolation { .. }));
+        // The operator cannot be deleted while referenced.
+        let del = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(created.user_id)
+            .execute(&db.pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(db_err(del), DbError::ForeignKeyViolation { .. }));
+    }
+
+    /// Documents the offline recovery path of docs/06-operations/deployment.md:
+    /// deleting the marker row reopens setup, existing rows stay.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn deleting_the_marker_row_reopens_setup_without_touching_existing_data() {
+        let db = migrated().await;
+        setup::complete(&db.pool, &new_instance("acme"))
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM instance_setup")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(!setup::is_completed(&db.pool).await.unwrap());
+
+        // The old operator still owns its e-mail address and the old slug.
+        let same_email = setup::complete(&db.pool, &new_instance("second"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            same_email,
+            SetupError::Db(DbError::UniqueViolation { .. })
+        ));
+        let fresh = NewInstance {
+            operator_email: "second@example.test".to_owned(),
+            ..new_instance("second")
+        };
+        setup::complete(&db.pool, &fresh).await.unwrap();
+        assert_eq!(count(&db.pool, "users").await, 2);
+        assert_eq!(count(&db.pool, "organizations").await, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn setup_race_is_correct_under_a_serializable_server_default() {
+        let db = migrated().await;
+        // New sessions of this database default to SERIALIZABLE; the setup
+        // transaction must still behave as under READ COMMITTED.
+        let mut admin = PgConnection::connect_with(&db.admin).await.unwrap();
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{}\" SET default_transaction_isolation = 'serializable'",
+            db.name
+        ))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        let fresh = db.extra_pool().await;
+        let level: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+            .fetch_one(&fresh)
+            .await
+            .unwrap();
+        assert_eq!(level, "serializable");
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let pool = fresh.clone();
+            handles.push(tokio::spawn(async move {
+                let new = NewInstance {
+                    operator_email: format!("op{i}@example.test"),
+                    ..new_instance(&format!("org-{i}"))
+                };
+                setup::complete(&pool, &new).await
+            }));
+        }
+        let (mut ok, mut already) = (0, 0);
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(_) => ok += 1,
+                Err(SetupError::AlreadyCompleted) => already += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!((ok, already), (1, 9));
+        assert_eq!(count(&fresh, "users").await, 1);
+        assert_eq!(count(&fresh, "instance_setup").await, 1);
     }
 }

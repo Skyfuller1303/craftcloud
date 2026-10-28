@@ -13,7 +13,8 @@ mod server;
 use std::process::ExitCode;
 
 use config::{Config, DatabaseSettings, LogFormat};
-use craftcloud_api::ApiConfig;
+use craftcloud_api::{ApiConfig, SetupService};
+use craftcloud_auth::BootstrapToken;
 use craftcloud_core::Capabilities;
 use craftcloud_db::PgPool;
 use tracing_subscriber::EnvFilter;
@@ -119,7 +120,8 @@ async fn main() -> ExitCode {
 }
 
 /// Reads the database URL from its secret file and connects. The URL is held
-/// only in the zeroizing `Secret` and never logged.
+/// only in the `Secret` wrapper (zeroed on drop) and never logged; the
+/// connection library keeps its own copy while connecting.
 async fn connect_database(settings: &DatabaseSettings) -> Result<Option<PgPool>, Failure> {
     let Some(path) = &settings.url_file else {
         return Ok(None);
@@ -160,7 +162,23 @@ async fn migrate(settings: &DatabaseSettings) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Loads and validates the bootstrap token (at least 32 characters). Errors
+/// never contain the token.
+fn load_bootstrap_token(config: &Config) -> Result<Option<BootstrapToken>, Failure> {
+    let Some(path) = &config.bootstrap_secret_file else {
+        return Ok(None);
+    };
+    let secret = secret::load_secret_file(path)
+        .map_err(|err| Failure::config(format!("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE: {err}")))?;
+    BootstrapToken::new(secret.expose())
+        .map(Some)
+        .map_err(|err| Failure::config(format!("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE: {err}")))
+}
+
 async fn run(config: Config) -> Result<(), Failure> {
+    // Validate the bootstrap secret first: a bad file is a configuration
+    // error (exit 2) and must stop startup before anything is bound.
+    let bootstrap = load_bootstrap_token(&config)?;
     // Migrations are never applied implicitly: only verify the schema.
     let pool = connect_database(&config.database).await?;
     if let Some(pool) = &pool {
@@ -170,6 +188,16 @@ async fn run(config: Config) -> Result<(), Failure> {
             ))
         })?;
         tracing::info!("database schema verified");
+        if bootstrap.is_some()
+            && craftcloud_db::setup::is_completed(pool)
+                .await
+                .map_err(|err| Failure::runtime(err.to_string()))?
+        {
+            tracing::warn!(
+                "instance setup is already completed; remove the bootstrap secret file \
+                 (CRAFTCLOUD_BOOTSTRAP_SECRET_FILE) from this deployment"
+            );
+        }
     } else {
         tracing::warn!(
             "no database configured (CRAFTCLOUD_DATABASE_URL_FILE unset); running in prototype mode"
@@ -183,13 +211,17 @@ async fn run(config: Config) -> Result<(), Failure> {
         address = %config.bind,
         "starting CraftCloud development prototype (not production-ready; no authentication)"
     );
-    let router = craftcloud_api::router_with(
+    let setup = pool
+        .as_ref()
+        .map(|pool| SetupService::new(pool.clone(), bootstrap));
+    let router = craftcloud_api::router_with_setup(
         Capabilities::development_defaults(),
         &ApiConfig {
             max_body_bytes: config.max_body_bytes,
             request_timeout: config.request_timeout,
             trusted_proxies: config.trusted_proxies.clone(),
         },
+        setup,
     );
     let outcome = server::serve(listener, router, shutdown_signal(), config.shutdown_grace)
         .await

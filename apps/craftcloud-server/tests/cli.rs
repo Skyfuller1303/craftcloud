@@ -166,10 +166,14 @@ mod tests {
         }
     }
 
-    fn nanos() -> u128 {
-        std::time::SystemTime::now()
+    /// Unique per call within the process (the clock alone can repeat).
+    fn nanos() -> String {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
+            .map_or(0, |d| d.as_nanos());
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{time}_{n}")
     }
 
     fn free_port() -> u16 {
@@ -224,7 +228,8 @@ mod tests {
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         assert!(text(&out).contains("applied migration 1"));
         assert!(text(&out).contains("applied migration 2"));
-        assert!(text(&out).contains("applied 2 migration(s)"));
+        assert!(text(&out).contains("applied migration 3"));
+        assert!(text(&out).contains("applied 3 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));
@@ -270,5 +275,173 @@ mod tests {
         assert_eq!(out.status.code(), Some(1), "{}", text(&out));
         assert!(!text(&out).contains("wrong-secret-xyz"));
         fx.assert_no_password(&out);
+    }
+
+    // ---- bootstrap secret --------------------------------------------
+
+    const BOOTSTRAP_TOKEN: &str = "cli-test-bootstrap-token-0123456789abcdef";
+
+    /// Temp secret file removed on drop.
+    struct TempSecret(PathBuf);
+
+    impl TempSecret {
+        fn new(tag: &str, content: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "craftcloud-cli-{tag}-{}-{}",
+                std::process::id(),
+                nanos()
+            ));
+            std::fs::write(&path, content).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Self(path)
+        }
+
+        fn path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempSecret {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn bootstrap_secret_without_database_exits_2() {
+        let secret = TempSecret::new("boot", BOOTSTRAP_TOKEN);
+        let out = run(&[], &[("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE", &secret.path())]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+        assert!(!text(&out).contains(BOOTSTRAP_TOKEN));
+    }
+
+    #[test]
+    fn short_or_missing_bootstrap_token_exits_2_before_binding() {
+        let db_file = TempSecret::new("dburl", "postgres://u:p@127.0.0.1:1/none");
+        let short = TempSecret::new("short", "too-short-token");
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_DATABASE_URL_FILE", &db_file.path()),
+                ("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE", &short.path()),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(
+            text(&out).contains("at least 32 characters"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("too-short-token"));
+
+        let missing = std::env::temp_dir().join("craftcloud-cli-no-such-bootstrap");
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_DATABASE_URL_FILE", &db_file.path()),
+                (
+                    "CRAFTCLOUD_BOOTSTRAP_SECRET_FILE",
+                    &missing.to_string_lossy(),
+                ),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2));
+        assert!(text(&out).contains("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE"));
+    }
+
+    fn http_post(port: u16, path: &str, body: &str) -> Option<String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ok()?;
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).ok()?;
+        Some(response)
+    }
+
+    fn wait_for_server(port: u16) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if http_get(port, "/health/live").is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn setup_over_http_then_restart_warns_to_remove_the_secret() {
+        let fx = Fixture::new();
+        let db_secret = fx.secret();
+        let bootstrap = TempSecret::new("bootstrap", &format!("{BOOTSTRAP_TOKEN}\n"));
+        let boot_path = bootstrap.path();
+        let port = free_port();
+        let bind = format!("127.0.0.1:{port}");
+        let env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", db_secret.as_str()),
+            ("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE", boot_path.as_str()),
+            ("CRAFTCLOUD_BIND", bind.as_str()),
+            ("CRAFTCLOUD_LOG_FORMAT", "json"),
+        ];
+        assert_eq!(run(&["migrate"], &env).status.code(), Some(0));
+
+        let password = "cli-test-operator-password-123";
+        let request = format!(
+            r#"{{"bootstrap_token":"{BOOTSTRAP_TOKEN}","email":"op@example.test","display_name":"Op","password":"{password}","organization":{{"name":"Org","slug":"org"}}}}"#
+        );
+
+        // First run: status required, wrong token 403, right token 201.
+        let mut child = command(&[], &env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(wait_for_server(port), "server did not start");
+        let status = http_get(port, "/api/v1/setup/status").unwrap();
+        assert!(status.contains(r#""setup_required":true"#), "{status}");
+        let wrong = request.replace(BOOTSTRAP_TOKEN, "wrong-token-wrong-token-wrong-token-xxxx");
+        let denied = http_post(port, "/api/v1/setup/complete", &wrong).unwrap();
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        let created = http_post(port, "/api/v1/setup/complete", &request).unwrap();
+        assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+        let again = http_post(port, "/api/v1/setup/complete", &request).unwrap();
+        assert!(again.starts_with("HTTP/1.1 409"), "{again}");
+        child.kill().unwrap();
+        let first = child.wait_with_output().unwrap();
+        for secret in [BOOTSTRAP_TOKEN, password, "wrong-token-wrong"] {
+            assert!(!text(&first).contains(secret), "{secret} leaked into logs");
+        }
+        fx.assert_no_password(&first);
+
+        // Restart with the secret file still configured: warns, never prints it.
+        let mut child = command(&[], &env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(wait_for_server(port), "server did not restart");
+        let status = http_get(port, "/api/v1/setup/status").unwrap();
+        assert!(status.contains(r#""setup_required":false"#), "{status}");
+        child.kill().unwrap();
+        let second = child.wait_with_output().unwrap();
+        assert!(
+            text(&second).contains("remove the bootstrap secret file"),
+            "{}",
+            text(&second)
+        );
+        assert!(!text(&second).contains(BOOTSTRAP_TOKEN));
     }
 }

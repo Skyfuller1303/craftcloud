@@ -16,6 +16,7 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 - [ ] **CC-P01-03** — PostgreSQL-Migrationssystem, UUID und tenant-scoped query layer
   - Status: Umsetzung lokal vorhanden (Schema 0001/0002, `migrate`-Befehl, `OrgScope`-Repositories, Docker-Integrationstests), Review offen; siehe ADR-0012.
 - [ ] **CC-P01-04** — one-shot Admin-Bootstrap mit Recovery-Runbook (CC-F01)
+  - Status: Umsetzung lokal vorhanden (Setup-Routen, Singleton-Transaktion, Argon2id, Offline-Wiederherstellung dokumentiert), Review offen; kein Login (PR-005).
 - [ ] **CC-P01-05** — Auth, Sessions, Logout/Revocation, CSRF/Rate-Limiting (CC-F02)
 - [ ] **CC-P01-06** — Organizations, Workspaces und Membership CRUD (CC-F04)
 - [ ] **CC-P01-07** — zentrale Policy Engine + negative Tenant-Tests (CC-F05)

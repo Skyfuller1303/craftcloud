@@ -113,6 +113,14 @@ Die `docs/`-Schreibweise ist bewusst **lowercase**, entsprechend den sichtbaren 
 - [Adr 0007 Collaboration](09-decisions/adr-0007-collaboration.md)
 - [Adr 0008 Licensing](09-decisions/adr-0008-licensing.md)
 - [Adr 0009 Conflict Status And Auth Schemes](09-decisions/adr-0009-conflict-status-and-auth-schemes.md)
+- [Adr 0010 Http Framework And Toolchain](09-decisions/adr-0010-http-framework-and-toolchain.md)
+- [Adr 0011 Configuration Policy](09-decisions/adr-0011-configuration-policy.md)
+- [Adr 0012 Database And Migrations](09-decisions/adr-0012-database-and-migrations.md)
+- [Adr 0013 P1 Identity Product Decisions](09-decisions/adr-0013-p1-identity-product-decisions.md)
+- [Adr 0014 P2 Storage Defaults](09-decisions/adr-0014-p2-storage-defaults.md)
+- [Adr 0015 Admin Ui Language And Design](09-decisions/adr-0015-admin-ui-language-and-design.md)
+- [Adr 0016 P3 P4 Operations And Pilot](09-decisions/adr-0016-p3-p4-operations-and-pilot.md)
+- [Decision Log](09-decisions/decision-log.md)
 
 ### 10-community
 

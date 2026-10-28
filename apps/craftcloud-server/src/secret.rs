@@ -1,10 +1,12 @@
 //! Secret values and a strict loader for secret files.
 //!
-//! Used for the database URL (`CRAFTCLOUD_DATABASE_URL_FILE`); later
-//! milestones add bootstrap and session secrets. Rules for a secret file:
-//! absolute path, regular file (not a symlink, not a directory), at most 4 KiB, valid UTF-8, not empty
-//! after removing one trailing newline, and on unix not readable by group or
-//! others. On non-unix platforms the permission check is not performed.
+//! Used for the database URL (`CRAFTCLOUD_DATABASE_URL_FILE`) and the
+//! bootstrap token (`CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`); later milestones add
+//! session secrets. Rules for a secret file: absolute path, regular file (not
+//! a symlink, not a directory; on unix the open itself refuses symlinks), at
+//! most 4 KiB, valid UTF-8, not empty after removing one trailing newline, and
+//! on unix not readable by group or others. On non-unix platforms the
+//! permission check is not performed.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -16,7 +18,9 @@ use zeroize::Zeroizing;
 /// Maximum accepted size of a secret file in bytes.
 pub const SECRET_FILE_MAX_BYTES: u64 = 4096;
 
-/// A secret string. Never printed, never serialized; memory is zeroed on drop.
+/// A secret string. Never printed, never serialized. The stored string and
+/// the read buffer are zeroed on drop; copies made by callers (for example
+/// when parsing the value) are the callers' responsibility.
 pub struct Secret(Zeroizing<String>);
 
 impl Secret {
@@ -100,7 +104,7 @@ pub fn load_secret_file(path: &Path) -> Result<Secret, SecretError> {
         return Err(SecretError::TooLarge(owned()));
     }
 
-    let file = File::open(path).map_err(|e| SecretError::Io(owned(), e))?;
+    let file = open_no_follow(path).map_err(|e| SecretError::Io(owned(), e))?;
     // Re-check on the opened handle to narrow the window for file swaps.
     let meta = file.metadata().map_err(|e| SecretError::Io(owned(), e))?;
     if !meta.is_file() {
@@ -125,6 +129,24 @@ pub fn load_secret_file(path: &Path) -> Result<Secret, SecretError> {
         return Err(SecretError::Empty(owned()));
     }
     Ok(Secret(Zeroizing::new(trimmed.to_owned())))
+}
+
+/// Opens the file read-only. On unix the open itself refuses to follow a
+/// symlink (`O_NOFOLLOW`), which closes the window between the
+/// `symlink_metadata` check and the open. On other platforms only the earlier
+/// check and the handle re-check apply (documented limitation).
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(unix)]

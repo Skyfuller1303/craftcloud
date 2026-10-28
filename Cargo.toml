@@ -4,6 +4,7 @@ members = [
     "apps/craftcloud-server",
     "crates/craftcloud-core",
     "crates/craftcloud-api",
+    "crates/craftcloud-auth",
     "crates/craftcloud-db",
     "xtask",
 ]
@@ -19,6 +20,11 @@ publish = false
 craftcloud-core = { path = "crates/craftcloud-core" }
 craftcloud-api = { path = "crates/craftcloud-api" }
 craftcloud-db = { path = "crates/craftcloud-db" }
+craftcloud-auth = { path = "crates/craftcloud-auth" }
+argon2 = { version = "0.5", features = ["std"] }
+sha2 = { version = "0.10", default-features = false }
+subtle = "2"
+libc = "0.2"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid", "time"] }
 time = { version = "0.3", default-features = false, features = ["std"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
@@ -48,3 +54,10 @@ dbg_macro = "deny"
 
 [profile.dev]
 debug = "line-tables-only"
+
+# Password hashing is memory-hard; unoptimized builds make tests very slow.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

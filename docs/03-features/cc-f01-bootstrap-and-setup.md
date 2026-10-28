@@ -1,6 +1,6 @@
 # CC-F01 — Erstinstallation und sicherer Bootstrap
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
+> **Status:** Umsetzung lokal vorhanden (PR-004, Review offen): Token nur per Secret-Datei (ADR-0013), `GET /api/v1/setup/status`, `POST /api/v1/setup/complete`, Singleton-Transaktion, Argon2id; noch ohne Sitzung/Login (PR-005) und ohne CLI-Wiederherstellung. Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

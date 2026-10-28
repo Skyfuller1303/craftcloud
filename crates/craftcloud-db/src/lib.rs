@@ -18,6 +18,7 @@ pub mod migrate;
 pub mod organizations;
 mod pool;
 mod scope;
+pub mod setup;
 pub mod users;
 pub mod workspaces;
 

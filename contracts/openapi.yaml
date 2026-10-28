@@ -32,6 +32,7 @@ paths:
       tags: [Setup]
       security: []
       summary: Generic setup state without secrets (CC-F01)
+      description: Reveals only whether setup is still required. Answers 503 SETUP_UNAVAILABLE when no database is configured or reachable.
       responses:
         '200':
           description: Setup state
@@ -42,16 +43,92 @@ paths:
                 required: [setup_required]
                 properties:
                   setup_required: {type: boolean}
+        '500':
+          description: Internal error (INTERNAL)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503':
+          description: SETUP_UNAVAILABLE (no database configured or reachable) or TIMEOUT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
   /setup/complete:
     post:
       tags: [Setup]
       security: []
       summary: One-shot creation of the initial instance operator (CC-F01)
-      description: Request schema (bootstrap token, credentials, organization name) is deliberately not yet specified.
+      description: >-
+        Creates exactly one instance operator, one organization and the operator's owner membership in a
+        single transaction. The bootstrap token comes from the file configured by the operator
+        (CRAFTCLOUD_BOOTSTRAP_SECRET_FILE); the server never generates or prints one. No session is created.
+        Order of checks: (1) 503 SETUP_UNAVAILABLE if no database is configured or reachable; (2) an
+        unparsable body, unknown field or missing field (including a missing bootstrap_token) answers 422
+        VALIDATION_ERROR without details, 415 or 413, before the token is looked at and independent of any
+        state; (3) 403 INVALID_BOOTSTRAP_TOKEN for a wrong token and, identically, when no bootstrap secret
+        is configured on the server (callers cannot tell the two apart; the reason is only logged), also
+        independent of whether setup was completed; (4) 409 SETUP_ALREADY_COMPLETED, only for a valid
+        token; (5) 422 VALIDATION_ERROR with details.fields for semantic field validation only. There is
+        no rate limit on this route (tokens have at least 32 characters); a generic limiter follows with
+        the session work.
+
+        The request is subject to the global handler timeout (503 TIMEOUT) without exemption. If a request
+        times out or the connection drops while the server was committing, setup may nevertheless have
+        succeeded: the client must re-check GET /setup/status (setup_required false) before retrying.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SetupCompleteRequest'}
       responses:
-        '201': {description: Initial operator created; setup routes are closed afterwards}
-        '409': {$ref: '#/components/responses/Conflict'}
-        '422': {description: Validation error}
+        '201':
+          description: Initial operator and organization created; setup routes are closed afterwards
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, organization_id]
+                properties:
+                  user_id: {type: string, format: uuid}
+                  organization_id: {type: string, format: uuid}
+        '403':
+          description: >-
+            Wrong bootstrap token or no bootstrap secret configured (both INVALID_BOOTSTRAP_TOKEN, indistinguishable)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Setup already completed (SETUP_ALREADY_COMPLETED), only for a valid token
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415':
+          description: Content-Type is not application/json (UNSUPPORTED_MEDIA_TYPE)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: >-
+            VALIDATION_ERROR. Without details when the body cannot be parsed (invalid JSON, unknown or missing
+            field). With details.fields (invalid field names only, e.g. email, display_name, password,
+            organization.name, organization.slug) for semantic field validation, which is only reached with a
+            valid token. Values are never echoed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500':
+          description: Internal error (INTERNAL), for example a failed database operation or password hashing
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503':
+          description: >-
+            SETUP_UNAVAILABLE (no database configured or reachable) or TIMEOUT (handler timeout; setup may
+            have been committed, re-check GET /setup/status)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
   /info:
     get:
       tags: [Discovery]
@@ -139,6 +216,34 @@ components:
             message: {type: string}
             request_id: {type: [string, 'null']}
             details: {type: object}
+    SetupCompleteRequest:
+      type: object
+      additionalProperties: false
+      required: [bootstrap_token, email, display_name, password, organization]
+      properties:
+        bootstrap_token:
+          type: string
+          writeOnly: true
+          minLength: 32
+          description: Token from the operator-provided secret file.
+        email:
+          type: string
+          maxLength: 320
+          description: Trimmed and lowercased by the server; exactly one @, no whitespace or control characters.
+        display_name: {type: string, minLength: 1, maxLength: 100}
+        password:
+          type: string
+          writeOnly: true
+          minLength: 12
+          maxLength: 128
+          description: Counted in characters. Must not equal the e-mail local part. Stored as an Argon2id hash.
+        organization:
+          type: object
+          additionalProperties: false
+          required: [name, slug]
+          properties:
+            name: {type: string, minLength: 1, maxLength: 100}
+            slug: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
     Workspace:
       type: object
       required: [id, name, organization_id]
