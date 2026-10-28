@@ -22,7 +22,7 @@
 }
 ```
 
-Codes: `UNAUTHENTICATED` (401), `FORBIDDEN` (403; public existence leaks may require indistinguishable 404), `NOT_FOUND` (404), `VALIDATION_ERROR` (422/400 by documented convention), `VERSION_CONFLICT` (412 when an `If-Match` precondition fails, see ADR-0009; 409 only for idempotency-key reuse with a different payload), `QUOTA_EXCEEDED` (413/409 per design), `RATE_LIMITED` (429), `STORAGE_UNAVAILABLE` (503), `INTERNAL` (500). Maintain stable machine codes independent of translated UI copy.
+Codes: `UNAUTHENTICATED` (401), `FORBIDDEN` (403; public existence leaks may require indistinguishable 404), `NOT_FOUND` (404), `METHOD_NOT_ALLOWED` (405), `PAYLOAD_TOO_LARGE` (413; Request-Body über dem konfigurierten Limit), `TIMEOUT` (503; Handler überschreitet das Zeitlimit — 408 bleibt langsamen Clients vorbehalten), `VALIDATION_ERROR` (422/400 by documented convention), `VERSION_CONFLICT` (412 when an `If-Match` precondition fails, see ADR-0009; 409 only for idempotency-key reuse with a different payload), `QUOTA_EXCEEDED` (413/409 per design), `RATE_LIMITED` (429), `STORAGE_UNAVAILABLE` (503), `INTERNAL` (500). Maintain stable machine codes independent of translated UI copy.
 
 ## Pagination
 

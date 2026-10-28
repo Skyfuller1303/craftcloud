@@ -10,7 +10,9 @@ publish.workspace = true
 craftcloud-core.workspace = true
 axum.workspace = true
 serde_json.workspace = true
-tower-http = { workspace = true, features = ["request-id", "limit", "timeout", "trace", "set-header"] }
+ipnet.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tower-http = { workspace = true, features = ["request-id", "limit", "trace", "set-header"] }
 tracing.workspace = true
 uuid.workspace = true
 

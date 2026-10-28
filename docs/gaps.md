@@ -9,7 +9,7 @@
 
 ## Implementation gaps (in recommended order)
 
-5. Secure bootstrap and HTTP skeleton. *PR-001 skeleton: health + info only* (no bootstrap, auth, DB or storage; 413/408 responses from the limit/timeout layers do not yet use the JSON error shape).
+5. Secure bootstrap and HTTP skeleton. *PR-001 skeleton: health + info only* (no bootstrap, auth, DB or storage). PR-002 added typed env configuration, secret-file loader, trusted-proxy handling and JSON errors for 413/503.
 6. Tenant database, policy, Auth/session and invitations.
 7. Project/file metadata and streaming storage with checksums.
 8. Version commit with CAS, soft delete, retention, quotas.

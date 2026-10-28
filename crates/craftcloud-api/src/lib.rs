@@ -5,8 +5,16 @@
 //!
 //! Scope of the PR-001 skeleton: `GET /health/live` and `GET /api/v1/info`.
 //! There is no authentication, database, storage, session or upload code.
+//!
+//! Absolute URLs must come from the operator-configured public URL only, never
+//! from `Host` or `X-Forwarded-*` headers (see [`ClientIp`] for how forwarded
+//! client addresses are treated).
 
-use std::time::Duration;
+mod client_ip;
+
+pub use client_ip::ClientIp;
+
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -17,12 +25,12 @@ use axum::{
     routing::get,
 };
 use craftcloud_core::Capabilities;
+use ipnet::IpNet;
 use serde_json::json;
 use tower_http::{
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     set_header::SetResponseHeaderLayer,
-    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use uuid::Uuid;
@@ -38,8 +46,11 @@ const REQUEST_ID_MAX_LEN: usize = 64;
 pub struct ApiConfig {
     /// Maximum accepted request body size in bytes.
     pub max_body_bytes: usize,
-    /// Maximum time to produce a response before answering 408.
+    /// Maximum time for a handler to produce a response before answering
+    /// 503 `TIMEOUT`.
     pub request_timeout: Duration,
+    /// Reverse proxies whose `X-Forwarded-For` is trusted. Empty trusts nobody.
+    pub trusted_proxies: Vec<IpNet>,
 }
 
 impl Default for ApiConfig {
@@ -47,6 +58,7 @@ impl Default for ApiConfig {
         Self {
             max_body_bytes: 64 * 1024,
             request_timeout: Duration::from_secs(10),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -72,9 +84,14 @@ pub fn router_with(capabilities: Capabilities, config: &ApiConfig) -> Router {
 fn with_middleware(router: Router, config: &ApiConfig) -> Router {
     router
         .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
+        // Maps limit and timeout failures to the JSON error shape.
+        .layer(middleware::from_fn_with_state(
             config.request_timeout,
+            limits_to_json_errors,
+        ))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(config.trusted_proxies.clone()),
+            client_ip::resolve_client_ip,
         ))
         // Only method, path (no query string) and request id are logged;
         // never headers, cookies or authorization data.
@@ -105,6 +122,38 @@ fn with_middleware(router: Router, config: &ApiConfig) -> Router {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ))
+}
+
+/// Enforces the handler timeout and turns bare 413 responses (from the body
+/// limit layer or from body extractors) into the JSON error shape. Runs after
+/// the request id has been set, so the error carries it.
+async fn limits_to_json_errors(
+    State(timeout): State<Duration>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers().clone();
+    let Ok(response) = tokio::time::timeout(timeout, next.run(request)).await else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TIMEOUT",
+            "The server did not produce a response in time.",
+            &headers,
+        );
+    };
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE && !is_json {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PAYLOAD_TOO_LARGE",
+            "The request body exceeds the maximum allowed size.",
+            &headers,
+        );
+    }
+    response
 }
 
 /// Generates a random UUID v4 request id.
@@ -378,9 +427,103 @@ mod tests {
             .uri("/echo-len")
             .body(Body::from(vec![0u8; 17]))
             .unwrap();
-        let (status, headers, _) = send(test_app(&config), big).await;
+        let (status, headers, body) = send(test_app(&config), big).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let value = json_body(&body);
+        assert_eq!(value["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert_eq!(
+            value["error"]["request_id"].as_str(),
+            headers[REQUEST_ID_HEADER].to_str().ok()
+        );
+    }
+
+    fn ip_app(trusted: &[&str]) -> Router {
+        let config = ApiConfig {
+            trusted_proxies: trusted.iter().map(|s| s.parse().unwrap()).collect(),
+            ..ApiConfig::default()
+        };
+        let routes = Router::new().route(
+            "/ip",
+            get(|request: Request| async move {
+                request
+                    .extensions()
+                    .get::<ClientIp>()
+                    .map_or_else(|| "none".to_owned(), |ip| ip.0.to_string())
+            }),
+        );
+        with_middleware(routes, &config)
+    }
+
+    async fn client_ip_for(app: Router, peer: Option<&str>, xff: Option<&str>) -> String {
+        let mut builder = Request::builder().uri("/ip");
+        if let Some(xff) = xff {
+            builder = builder.header("x-forwarded-for", xff);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            let addr: std::net::SocketAddr = peer.parse().unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(addr));
+        }
+        let (status, _, body) = send(app, request).await;
+        assert_eq!(status, StatusCode::OK);
+        String::from_utf8(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn client_ip_ignores_spoofed_header_from_untrusted_peer() {
+        let ip = client_ip_for(
+            ip_app(&["10.0.0.0/8"]),
+            Some("203.0.113.9:5555"),
+            Some("1.2.3.4"),
+        )
+        .await;
+        assert_eq!(ip, "203.0.113.9");
+        let ip = client_ip_for(ip_app(&[]), Some("10.0.0.1:1"), Some("1.2.3.4")).await;
+        assert_eq!(ip, "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn client_ip_follows_trusted_chain() {
+        let app = ip_app(&["10.0.0.0/8"]);
+        let ip = client_ip_for(
+            app,
+            Some("10.0.0.1:1"),
+            Some("6.6.6.6, 198.51.100.7, 10.0.0.5"),
+        )
+        .await;
+        assert_eq!(ip, "198.51.100.7");
+        let ip = client_ip_for(
+            ip_app(&["10.0.0.0/8"]),
+            Some("10.0.0.1:1"),
+            Some("10.0.0.9, 10.0.0.8"),
+        )
+        .await;
+        assert_eq!(ip, "10.0.0.9");
+    }
+
+    #[tokio::test]
+    async fn client_ip_falls_back_on_garbage_and_supports_ipv6() {
+        let ip = client_ip_for(ip_app(&["10.0.0.0/8"]), Some("10.0.0.1:1"), Some("garbage")).await;
+        assert_eq!(ip, "10.0.0.1");
+        let ip = client_ip_for(
+            ip_app(&["fd00::/8"]),
+            Some("[fd00::1]:1"),
+            Some("2001:db8::5"),
+        )
+        .await;
+        assert_eq!(ip, "2001:db8::5");
+    }
+
+    #[tokio::test]
+    async fn client_ip_absent_without_connect_info() {
+        let ip = client_ip_for(ip_app(&[]), None, Some("1.2.3.4")).await;
+        assert_eq!(ip, "none");
+        // Public routes still work without connection info.
+        let (status, _, _) = send(router(), get_req("/health/live")).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -389,12 +532,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_handler_times_out_with_408() {
+    async fn slow_handler_times_out_with_503_json() {
         let config = ApiConfig {
             request_timeout: Duration::from_millis(20),
             ..ApiConfig::default()
         };
-        let (status, _, _) = send(test_app(&config), get_req("/slow")).await;
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        let (status, headers, body) = send(test_app(&config), get_req("/slow")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        let value = json_body(&body);
+        assert_eq!(value["error"]["code"], "TIMEOUT");
+        assert_eq!(
+            value["error"]["request_id"].as_str(),
+            headers[REQUEST_ID_HEADER].to_str().ok()
+        );
     }
 }

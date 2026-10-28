@@ -1,43 +1,48 @@
 //! CraftCloud server binary: reads configuration, composes the router and
 //! serves it until a shutdown signal arrives.
+//!
+//! Exit codes: 0 clean shutdown, 1 runtime failure, 2 invalid configuration.
 
-use std::net::SocketAddr;
+mod config;
+mod secret;
+mod server;
+
 use std::process::ExitCode;
 
+use config::{Config, LogFormat};
+use craftcloud_api::ApiConfig;
+use craftcloud_core::Capabilities;
 use tracing_subscriber::EnvFilter;
 
-const BIND_ENV: &str = "CRAFTCLOUD_BIND";
-const DEFAULT_BIND: &str = "127.0.0.1:8080";
+const EXIT_CONFIG: u8 = 2;
 
-/// Reads the bind address from `CRAFTCLOUD_BIND` (default `127.0.0.1:8080`).
-fn bind_address() -> Result<SocketAddr, String> {
-    let raw = match std::env::var(BIND_ENV) {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => DEFAULT_BIND.to_owned(),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(format!("{BIND_ENV} is not valid unicode"));
-        }
-    };
-    parse_bind(&raw)
-}
-
-fn parse_bind(raw: &str) -> Result<SocketAddr, String> {
-    raw.parse().map_err(|err| {
-        format!(
-            "invalid {BIND_ENV} value {raw:?}: {err}; expected <ip>:<port>, e.g. {DEFAULT_BIND}"
-        )
-    })
+fn init_tracing(format: LogFormat) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match format {
+        LogFormat::Text => builder.init(),
+        LogFormat::Json => builder.json().init(),
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let config = match Config::from_process_env() {
+        Ok(config) => config,
+        Err(errors) => {
+            eprintln!(
+                "craftcloud-server: invalid configuration ({} problem(s)):",
+                errors.len()
+            );
+            for error in &errors {
+                eprintln!("  - {error}");
+            }
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
+    init_tracing(config.log_format);
 
-    match run().await {
+    match run(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");
@@ -47,20 +52,29 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), String> {
-    let address = bind_address()?;
-    let listener = tokio::net::TcpListener::bind(address)
+async fn run(config: Config) -> Result<(), String> {
+    let listener = tokio::net::TcpListener::bind(config.bind)
         .await
-        .map_err(|err| format!("cannot bind {address}: {err}"))?;
+        .map_err(|err| format!("cannot bind {}: {err}", config.bind))?;
     tracing::warn!(
-        %address,
+        address = %config.bind,
         "starting CraftCloud development prototype (not production-ready; no authentication)"
     );
-    axum::serve(listener, craftcloud_api::router())
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|err| format!("server error: {err}"))?;
-    tracing::info!("shut down cleanly");
+    let router = craftcloud_api::router_with(
+        Capabilities::development_defaults(),
+        &ApiConfig {
+            max_body_bytes: config.max_body_bytes,
+            request_timeout: config.request_timeout,
+            trusted_proxies: config.trusted_proxies.clone(),
+        },
+    );
+    let outcome = server::serve(listener, router, shutdown_signal(), config.shutdown_grace).await?;
+    match outcome {
+        server::Shutdown::Graceful => tracing::info!("shut down cleanly"),
+        server::Shutdown::Forced => {
+            tracing::warn!("shut down after grace period; some connections were cut")
+        }
+    }
     Ok(())
 }
 
@@ -94,24 +108,4 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     tracing::info!("shutdown signal received");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_bind_is_loopback() {
-        let addr = parse_bind(DEFAULT_BIND).unwrap();
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 8080);
-    }
-
-    #[test]
-    fn invalid_bind_values_are_errors() {
-        for bad in ["garbage", "", "127.0.0.1", "127.0.0.1:99999", ":8080"] {
-            let err = parse_bind(bad).unwrap_err();
-            assert!(err.contains(BIND_ENV), "{err}");
-        }
-    }
 }

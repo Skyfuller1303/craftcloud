@@ -26,6 +26,7 @@ paths:
         - url: https://craftcloud.example.invalid
       responses:
         '200': {description: Process is alive}
+        '503': {$ref: '#/components/responses/Timeout'}
   /setup/status:
     get:
       tags: [Setup]
@@ -79,6 +80,7 @@ paths:
                     description: >-
                       Additive field (PR-001). `development-prototype` marks a local, non-production
                       server. Clients must treat unknown values as a controlled fallback, not an error.
+        '503': {$ref: '#/components/responses/Timeout'}
   /workspaces:
     get:
       tags: [Workspaces]
@@ -125,6 +127,18 @@ components:
       scheme: bearer
       description: PLACEHOLDER — not used until the desktop authorization flow (D13) has its own ADR.
   schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code: {type: string, example: NOT_FOUND}
+            message: {type: string}
+            request_id: {type: [string, 'null']}
+            details: {type: object}
     Workspace:
       type: object
       required: [id, name, organization_id]
@@ -141,6 +155,16 @@ components:
         name: {type: string}
         head_version_id: {type: [string, 'null'], format: uuid}
   responses:
+    PayloadTooLarge:
+      description: Request body exceeds the configured limit (code PAYLOAD_TOO_LARGE)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Timeout:
+      description: Handler exceeded the time limit (code TIMEOUT)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     Unauthorized:
       description: Missing or invalid credentials
     NotFound:

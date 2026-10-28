@@ -2,25 +2,37 @@
 
 ## Minimaler MVP-Stack
 
-- `craftcloud-server`: Rust service (HTTP framework not yet decided, see ADR-0009 open points), listens only in private network/loopback; runs as non-root.
+- `craftcloud-server`: Rust service (axum, siehe ADR-0010), listens only in private network/loopback; runs as non-root.
 - `postgres`: single supported primary production database; persistent volume, backups.
 - `craftcloud-data`: persistent local blob volume, securely mounted.
 - Reverse proxy: Caddy/nginx with valid TLS. `PUBLIC_URL=https://cloud.example.org`, known trusted proxy IPs, explicit headers.
 - `craftcloud-admin`: static React build served by proxy/same-origin where feasible; CORS/CSRF simple.
 
-## Proposed env template (illustrative only)
+## Umgebungsvariablen (Konfiguration nur über Env, siehe ADR-0011)
+
+Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Variablen (Tippfehler) und noch nicht unterstützte Schlüssel führen zu einem Startfehler mit Exit-Code 2; es wird nichts gebunden.
+
+| Schlüssel | Standard | Regel |
+| --- | --- | --- |
+| `CRAFTCLOUD_BIND` | `127.0.0.1:8080` | `<ip>:<port>` |
+| `CRAFTCLOUD_PUBLIC_URL` | nicht gesetzt | absolute URL, `https`; `http` nur für Loopback (`localhost`, `127.0.0.0/8`, `::1`); keine Userinfo, kein Query, kein Fragment; abschließender `/` wird entfernt |
+| `CRAFTCLOUD_TRUSTED_PROXIES` | leer (niemandem wird vertraut) | kommagetrennte IPs/CIDRs, höchstens 64; `0.0.0.0/0` und `::/0` werden abgelehnt |
+| `CRAFTCLOUD_MAX_BODY_BYTES` | `65536` | 1024 bis 16777216 |
+| `CRAFTCLOUD_REQUEST_TIMEOUT_SECS` | `10` | 1 bis 300 |
+| `CRAFTCLOUD_SHUTDOWN_GRACE_SECS` | `10` | 1 bis 120 |
+| `CRAFTCLOUD_LOG_FORMAT` | `text` | `text` oder `json` |
+
+Reserviert und derzeit **abgelehnt** („not supported in this build yet“): `CRAFTCLOUD_DATABASE_URL`, `CRAFTCLOUD_STORAGE_BACKEND`, `CRAFTCLOUD_STORAGE_ROOT`, `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`, `CRAFTCLOUD_SESSION_SECRET_FILE`. Sie werden mit späteren Meilensteinen eingeführt (Secret-Dateien: absoluter Pfad, reguläre Datei, höchstens 4 KiB, unter Unix nicht für Gruppe/andere lesbar).
 
 ```dotenv
 # EXAMPLE — NEVER commit real values
 CRAFTCLOUD_PUBLIC_URL=https://cloud.example.org
 CRAFTCLOUD_BIND=127.0.0.1:8080
-CRAFTCLOUD_DATABASE_URL=postgresql://craftcloud:<secret>@db:5432/craftcloud
-CRAFTCLOUD_STORAGE_BACKEND=filesystem
-CRAFTCLOUD_STORAGE_ROOT=/data/blobs
 CRAFTCLOUD_TRUSTED_PROXIES=127.0.0.1/32
-CRAFTCLOUD_BOOTSTRAP_SECRET_FILE=/run/secrets/bootstrap_token
-CRAFTCLOUD_SESSION_SECRET_FILE=/run/secrets/session_secret
+CRAFTCLOUD_LOG_FORMAT=json
 ```
+
+Absolute URLs entstehen ausschließlich aus `CRAFTCLOUD_PUBLIC_URL`, nie aus `Host` oder `X-Forwarded-*`. `X-Forwarded-For` wird nur von konfigurierten Proxys ausgewertet.
 
 **Bewusst kein `docker-compose.yml` als scheinbar lauffertiges Ergebnis:** erst erstellen, wenn Server-Image, Migrationspfad, Healthcheck, Secret Ownership und Volume-Permissions real implementiert sind.
 
