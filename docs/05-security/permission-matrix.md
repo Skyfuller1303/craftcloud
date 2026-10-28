@@ -1,6 +1,6 @@
 # Berechtigungsmatrix (Vorschlag – per Endpoint erzwingen)
 
-Roles: **Operator** (Instanzbetrieb, keine automatische Einsicht in Kundendateien per API), **Owner** (Org), **OrgAdmin**, **WorkspaceAdmin**, **Editor**, **Viewer**, **Guest** (später). `Operator` ist nicht einfach eine Org-Rolle. Es muss eine streng definierte Break-glass-Policy geben, falls Supportzugriff erforderlich wird.
+Roles: **Operator** (Instanzbetrieb, keine automatische Einsicht in Kundendateien per API), **Owner** (Org), **OrgAdmin**, **WorkspaceAdmin**, **Editor**, **Viewer**, **Guest** (später). `Operator` ist nicht einfach eine Org-Rolle und hat deshalb keine Spalte in dieser Tabelle; der in CC-F01/E2E-01 genannte „initiale Instanzadministrator“ ist diese Operator-Rolle. Es muss eine streng definierte Break-glass-Policy geben, falls Supportzugriff erforderlich wird.
 
 | Aktion | Owner | OrgAdmin | WorkspaceAdmin | Editor | Viewer | Guest (later) |
 |---|---|---|---|---|---|---|

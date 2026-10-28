@@ -22,7 +22,7 @@
 }
 ```
 
-Codes: `UNAUTHENTICATED` (401), `FORBIDDEN` (403; public existence leaks may require indistinguishable 404), `NOT_FOUND` (404), `VALIDATION_ERROR` (422/400 by documented convention), `VERSION_CONFLICT` (409/412 depending precondition), `QUOTA_EXCEEDED` (413/409 per design), `RATE_LIMITED` (429), `STORAGE_UNAVAILABLE` (503), `INTERNAL` (500). Maintain stable machine codes independent of translated UI copy.
+Codes: `UNAUTHENTICATED` (401), `FORBIDDEN` (403; public existence leaks may require indistinguishable 404), `NOT_FOUND` (404), `VALIDATION_ERROR` (422/400 by documented convention), `VERSION_CONFLICT` (412 when an `If-Match` precondition fails, see ADR-0009; 409 only for idempotency-key reuse with a different payload), `QUOTA_EXCEEDED` (413/409 per design), `RATE_LIMITED` (429), `STORAGE_UNAVAILABLE` (503), `INTERNAL` (500). Maintain stable machine codes independent of translated UI copy.
 
 ## Pagination
 
@@ -32,7 +32,8 @@ Cursor-based, bounded page limit (default 50, hard cap chosen in implementation)
 
 ```http
 POST /api/v1/files/{file_id}/versions
-Authorization: Bearer <device-token>
+Cookie: <browser-session>   # desktop token scheme pending D13/ADR
+X-CSRF-Token: <token>
 Idempotency-Key: f8e...
 If-Match: "version:UUID"
 Content-Type: application/json

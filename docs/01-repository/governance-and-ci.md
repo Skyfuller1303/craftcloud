@@ -24,7 +24,9 @@ Branches: `main` protected; topic branches `feat/cc-fNN-...`, `fix/...`, `docs/.
 | P2 | Chunk-/Streaming-Upload + Versioning + Restore | E2E & Storage-Fault Test |
 | P3 | Admin-Flows, ARIA/A11y, CSRF/role Tests | Screenshots + CI |
 | P4 | Real app integration with opt-in/offline/error flow | App-Maintainer-Test |
-| P5 | Pilot mit gesichertem Restore | Operative Checkliste |
+| P5 | FigCraft-Adapter/Launcher ohne Regression bestehender Links | Maintainer-Abnahme beider Repos |
+| P6 | OIDC/S3 bestehen identische Integritäts-/Security-Tests | CI-Log, Testbericht |
+| P7 | Pilot mit gesichertem Restore | Operative Checkliste |
 
 ## Unterschiede der Upstream-Workflows
 

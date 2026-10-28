@@ -1,7 +1,7 @@
 # Phase 00 — RFC, Projektfreigabe und Architekturentscheidungen
 
 > **Code:** P0. **Goal:** Maintainer approval, scope and governance.  
-> **Status:** geplant / offen, keine abgeschlossenen Arbeiten behauptet.
+> **Status:** in Arbeit seit 2026-10-28 als lokaler Prototyp ohne öffentliche Kommunikation; Nachweise in [phase-00-log.md](phase-00-log.md).
 
 ## Eintrittsvoraussetzungen
 
@@ -9,7 +9,7 @@ Projektvorschlag und öffentlich zugängliche Repository-/Issue-Quellen genügen
 
 ## Umsetzungstickets
 
-- [ ] **CC-P00-01** — Abgleich der bestehenden CraftCloud-/DriveCraft-/Nextcloud-Issues, Overlap-Landkarte finalisieren
+- [ ] **CC-P00-01** — Abgleich der bestehenden CraftCloud-/DriveCraft-/Nextcloud-Issues, Overlap-Landkarte finalisieren — Entwurf: [overlap-map.md](../00-product/overlap-map.md), Bestätigung offen
 - [ ] **CC-P00-02** — Maintainer-RFC unter org-übergreifendem ArtCraft-Issue einreichen; keine Repo im Namen von storytold ohne Zustimmung
 - [ ] **CC-P00-03** — Zugriff/Standards aus craftrules erfragen und Upstream-Compliance-Check aktualisieren
 - [ ] **CC-P00-04** — Lizenz-/Markenfreigabe und Clean-room-Grenzen definieren

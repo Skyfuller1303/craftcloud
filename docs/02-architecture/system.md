@@ -41,7 +41,7 @@ flowchart TB
 - Storage down: DB metadata and content lifecycle cannot claim ready without committed blob; pending uploads expire.
 - Proxy down: no cloud access, but native local project unaffected.
 - Backup incomplete: restore is rejected unless DB snapshot and blob manifest have compatible restore point.
-- Every `document_version` references exactly one durable, verified blob (except explicit pending/failed state excluded from ready listings).
+- Every `file_version` references exactly one durable, verified blob (except explicit pending/failed state excluded from ready listings).
 
 ## Deployment shape
 

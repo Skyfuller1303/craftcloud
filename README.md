@@ -19,7 +19,7 @@ This package is a **proposed future repository structure** consistent with docum
 7. [Phase 0 acceptance checklist](docs/07-roadmap/phase-00-rfc.md)
 8. [Maintainer RFC](docs/10-community/github-rfc-en.md)
 
-## Proposed long-term monorepo (not implemented in this ZIP)
+## Proposed long-term monorepo (not implemented in this package)
 
 ```text
 craftcloud/
@@ -46,7 +46,7 @@ craftcloud/
 └── README.md
 ```
 
-> **Do not treat omitted files as finished implementation.** This ZIP deliberately does not contain a fake Cargo workspace, fake CI tests, executable deployment stack, unapproved logos, or copied upstream license texts.
+> **Do not treat omitted files as finished implementation.** This package deliberately does not contain a fake Cargo workspace, fake CI tests, executable deployment stack, unapproved logos, or copied upstream license texts.
 
 ## Sequencing
 

@@ -10,7 +10,7 @@
 
 **Sind Dateien Ende-zu-Ende verschlüsselt?** Im MVP ausdrücklich nein. TLS transit; Betreiber kann im Regelfall ruhende Daten lesen. E2EE wäre ein separates Design mit Tradeoffs.
 
-**Ist die ZIP eine fertige GitHub-Repo?** Nein. Es ist eine referenzierbare **Dokumentations-/Projektstruktur**, die eine spätere echte Repo vorbereitet. Weder Backend noch Frontend noch CI-Workflows wurden implementiert oder getestet.
+**Ist dieses Paket eine fertige GitHub-Repo?** Nein. Es ist eine referenzierbare **Dokumentations-/Projektstruktur**, die eine spätere echte Repo vorbereitet. Weder Backend noch Frontend noch CI-Workflows wurden implementiert oder getestet.
 
 **Wieso React/TS, wenn der Launcher Rust-only ist?** CraftCloud-Admin ist unabhängige Browser-App. Der Launcher selbst bleibt Rust-only und erhält später höchstens eine optionale Rust-seitige Verbindungskonfiguration.
 

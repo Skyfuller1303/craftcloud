@@ -8,12 +8,49 @@ info:
 servers:
   - url: https://craftcloud.example.invalid/api/v1
 security:
-  - bearerAuth: []
+  - cookieAuth: []
 tags:
+  - name: Health
+  - name: Setup
   - name: Discovery
   - name: Workspaces
   - name: Files
 paths:
+  /health/live:
+    get:
+      tags: [Health]
+      security: []
+      summary: Liveness only; no dependency details
+      description: Path is relative to the server root, not /api/v1 (see CC-F15).
+      servers:
+        - url: https://craftcloud.example.invalid
+      responses:
+        '200': {description: Process is alive}
+  /setup/status:
+    get:
+      tags: [Setup]
+      security: []
+      summary: Generic setup state without secrets (CC-F01)
+      responses:
+        '200':
+          description: Setup state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [setup_required]
+                properties:
+                  setup_required: {type: boolean}
+  /setup/complete:
+    post:
+      tags: [Setup]
+      security: []
+      summary: One-shot creation of the initial instance operator (CC-F01)
+      description: Request schema (bootstrap token, credentials, organization name) is deliberately not yet specified.
+      responses:
+        '201': {description: Initial operator created; setup routes are closed afterwards}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {description: Validation error}
   /info:
     get:
       tags: [Discovery]
@@ -68,9 +105,15 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
 components:
   securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: craftcloud_session
+      description: Browser session (HttpOnly, Secure, SameSite). Mutating requests also require a CSRF header; final names pending (ADR-0009).
     bearerAuth:
       type: http
       scheme: bearer
+      description: PLACEHOLDER — not used until the desktop authorization flow (D13) has its own ADR.
   schemas:
     Workspace:
       type: object
@@ -92,3 +135,5 @@ components:
       description: Missing or invalid credentials
     NotFound:
       description: Resource not visible to requester
+    Conflict:
+      description: State conflict without precondition (e.g. setup already completed, idempotency key reused with a different payload)

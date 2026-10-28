@@ -10,7 +10,7 @@
 
 ## Persona C – Designer im Team
 
-**Aktionen:** Projekt finden, Datei herunterladen, lokal bearbeiten, mit bekannter Basisversion neue Revision hochladen, ältere Revision ansehen/wiederherstellen. **Erwartung:** Kein stilles Überschreiben paralleler Änderungen. **Test:** Zwei Clients speichern von derselben Version; einer erhält 409 und einen Konfliktdialog.
+**Aktionen:** Projekt finden, Datei herunterladen, lokal bearbeiten, mit bekannter Basisversion neue Revision hochladen, ältere Revision ansehen/wiederherstellen. **Erwartung:** Kein stilles Überschreiben paralleler Änderungen. **Test:** Zwei Clients speichern von derselben Version; einer erhält 412 `VERSION_CONFLICT` (siehe ADR-0009) und einen Konfliktdialog.
 
 ## Persona D – Externer Reviewer
 

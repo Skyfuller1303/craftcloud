@@ -20,6 +20,7 @@ Die `docs/`-Schreibweise ist bewusst **lowercase**, entsprechend den sichtbaren 
 - [Open Questions](00-product/open-questions.md)
 - [Use Cases And Personas](00-product/use-cases-and-personas.md)
 - [Vision And Boundaries](00-product/vision-and-boundaries.md)
+- [Overlap Map](00-product/overlap-map.md)
 
 ### 01-repository
 
@@ -85,6 +86,7 @@ Die `docs/`-Schreibweise ist bewusst **lowercase**, entsprechend den sichtbaren 
 - [Backlog And Pr Sequence](07-roadmap/backlog-and-pr-sequence.md)
 - [Effort And Risk Register](07-roadmap/effort-and-risk-register.md)
 - [Phase 00 Rfc](07-roadmap/phase-00-rfc.md)
+- [Phase 00 Log](07-roadmap/phase-00-log.md)
 - [Phase 01 Backend](07-roadmap/phase-01-backend.md)
 - [Phase 02 Files](07-roadmap/phase-02-files.md)
 - [Phase 03 Dashboard](07-roadmap/phase-03-dashboard.md)
@@ -110,6 +112,7 @@ Die `docs/`-Schreibweise ist bewusst **lowercase**, entsprechend den sichtbaren 
 - [Adr 0006 Auth](09-decisions/adr-0006-auth.md)
 - [Adr 0007 Collaboration](09-decisions/adr-0007-collaboration.md)
 - [Adr 0008 Licensing](09-decisions/adr-0008-licensing.md)
+- [Adr 0009 Conflict Status And Auth Schemes](09-decisions/adr-0009-conflict-status-and-auth-schemes.md)
 
 ### 10-community
 

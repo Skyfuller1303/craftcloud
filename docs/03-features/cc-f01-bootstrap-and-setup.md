@@ -9,7 +9,7 @@ Ein Administrator installiert den Dienst als Self-Hosted-Stack. Vor dem ersten B
 
 ## Detaillierter Funktionsumfang und technische Umsetzung
 
-`GET /api/v1/setup/status` darf nur generische Information ohne Secrets liefern; `POST /api/v1/setup/complete` prüft Token, Datenbank-Transaktion, Mindestpasswortanforderungen, Organisationsname und erstellt genau einen initialen Instanzadministrator. Danach Setup-Routen sperren. Bei unterbrochener Transaktion keine halb angelegten Admins. Konfiguration: `PUBLIC_URL`, `TRUSTED_PROXIES`, `DATABASE_URL`, `STORAGE_ROOT`, `BOOTSTRAP_SECRET_FILE`; No auto-admin through default credentials.
+`GET /api/v1/setup/status` darf nur generische Information ohne Secrets liefern; `POST /api/v1/setup/complete` prüft Token, Datenbank-Transaktion, Mindestpasswortanforderungen, Organisationsname und erstellt genau einen initialen Instanzadministrator. Danach Setup-Routen sperren. Bei unterbrochener Transaktion keine halb angelegten Admins. Konfiguration: `CRAFTCLOUD_PUBLIC_URL`, `CRAFTCLOUD_TRUSTED_PROXIES`, `CRAFTCLOUD_DATABASE_URL`, `CRAFTCLOUD_STORAGE_ROOT`, `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE` (Namensschema wie `06-operations/deployment.md`); No auto-admin through default credentials.
 
 ## User Journey und gewünschtes Verhalten
 

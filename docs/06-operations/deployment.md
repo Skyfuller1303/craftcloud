@@ -2,7 +2,7 @@
 
 ## Minimaler MVP-Stack
 
-- `craftcloud-server`: Rust/Actix service, listens only in private network/loopback; runs as non-root.
+- `craftcloud-server`: Rust service (HTTP framework not yet decided, see ADR-0009 open points), listens only in private network/loopback; runs as non-root.
 - `postgres`: single supported primary production database; persistent volume, backups.
 - `craftcloud-data`: persistent local blob volume, securely mounted.
 - Reverse proxy: Caddy/nginx with valid TLS. `PUBLIC_URL=https://cloud.example.org`, known trusted proxy IPs, explicit headers.
