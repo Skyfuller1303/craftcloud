@@ -116,10 +116,130 @@ mod tests {
         )
         .await
         .unwrap();
-        let scope = OrgScope::caller_has_authorized(created.id);
-        organizations::add_member(pool, &scope, owner.id, OrgRole::Owner, MemberStatus::Active)
+        let scope = scope_for(created.id);
+        organizations::add_member(
+            pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            owner.id,
+            OrgRole::Owner,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        (scope, owner)
+    }
+
+    /// A scope can only come from a policy `Allow`; tests ask the policy as an
+    /// owner of the organization.
+    fn scope_for(org_id: Uuid) -> OrgScope {
+        use craftcloud_core::policy::{Action, Actor, OrgMembership, Resource, can};
+        let actor = Actor {
+            user_id: Uuid::new_v4(),
+            instance_operator: false,
+            membership: Some(OrgMembership {
+                org_id,
+                role: OrgRole::Owner,
+            }),
+            workspace: None,
+        };
+        let permit = can(
+            &actor,
+            Action::OrganizationUpdate,
+            &Resource::Organization { org_id },
+        )
+        .permit()
+        .unwrap();
+        OrgScope::from_permit(&permit).unwrap()
+    }
+
+    /// The scope for exactly one action (every writing repository function
+    /// requires the scope of its own action).
+    fn sc(scope: &OrgScope, action: craftcloud_core::policy::Action) -> OrgScope {
+        use craftcloud_core::policy::{Actor, OrgMembership, Resource, can};
+        let org_id = scope.org_id();
+        let actor = Actor {
+            user_id: Uuid::new_v4(),
+            instance_operator: false,
+            membership: Some(OrgMembership {
+                org_id,
+                role: OrgRole::Owner,
+            }),
+            workspace: None,
+        };
+        let resource = match action {
+            craftcloud_core::policy::Action::MemberAdd => Resource::Member {
+                org_id,
+                target: None,
+                role: Some(OrgRole::Member),
+            },
+            craftcloud_core::policy::Action::MemberChangeRole
+            | craftcloud_core::policy::Action::MemberRemove => Resource::Member {
+                org_id,
+                target: Some(craftcloud_core::policy::MemberTarget {
+                    user_id: Uuid::new_v4(),
+                    role: OrgRole::Member,
+                }),
+                role: Some(OrgRole::Admin),
+            },
+            craftcloud_core::policy::Action::WorkspaceManage
+            | craftcloud_core::policy::Action::WorkspaceRead => Resource::Workspace {
+                org_id,
+                workspace_id: Uuid::new_v4(),
+            },
+            _ => Resource::Organization { org_id },
+        };
+        let permit = can(&actor, action, &resource).permit().unwrap();
+        OrgScope::from_permit(&permit).unwrap()
+    }
+
+    /// A scope stemming from a read-only action.
+    fn read_scope_for(org_id: Uuid) -> OrgScope {
+        use craftcloud_core::policy::{Action, Actor, OrgMembership, Resource, can};
+        let actor = Actor {
+            user_id: Uuid::new_v4(),
+            instance_operator: false,
+            membership: Some(OrgMembership {
+                org_id,
+                role: OrgRole::Owner,
+            }),
+            workspace: None,
+        };
+        let permit = can(
+            &actor,
+            Action::MemberList,
+            &Resource::Member {
+                org_id,
+                target: None,
+                role: None,
+            },
+        )
+        .permit()
+        .unwrap();
+        OrgScope::from_permit(&permit).unwrap()
+    }
+
+    /// Like `org`, but for databases migrated only to an older schema (before
+    /// migration 0005 added `organizations.version`).
+    async fn legacy_org(pool: &PgPool, slug: &str) -> (OrgScope, User) {
+        let owner = user(pool, &format!("owner-{slug}@example.test")).await;
+        let org_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO organizations (id, slug, name, owner_user_id) VALUES ($1, $2, 'Legacy', $3)")
+            .bind(org_id)
+            .bind(slug)
+            .bind(owner.id)
+            .execute(pool)
             .await
             .unwrap();
+        let scope = scope_for(org_id);
+        organizations::add_member(
+            pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            owner.id,
+            OrgRole::Owner,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
         (scope, owner)
     }
 
@@ -146,7 +266,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![1, 2, 3, 4, 5]
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -169,14 +289,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            4,
+            5,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -190,15 +310,15 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(
             migrate::verify(&db.pool).await,
-            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3, 4])))
+            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3, 4, 5])))
         );
 
-        let (scope, owner) = org(&db.pool, "acme").await;
+        let (scope, owner) = legacy_org(&db.pool, "acme").await;
 
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3, 4]
+            vec![2, 3, 4, 5]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -219,9 +339,13 @@ mod tests {
         assert_eq!(row.get::<String, _>("slug"), "acme");
         assert_eq!(row.get::<String, _>("role"), "owner");
         // New tables are usable after the upgrade.
-        workspaces::create(&db.pool, &scope, &new_ws("main"))
-            .await
-            .unwrap();
+        workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -276,34 +400,54 @@ mod tests {
     async fn workspace_member_requires_org_membership() {
         let db = migrated().await;
         let (scope, _) = org(&db.pool, "acme").await;
-        let ws = workspaces::create(&db.pool, &scope, &new_ws("main"))
-            .await
-            .unwrap();
+        let ws = workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
         let outsider = user(&db.pool, "outsider@example.test").await;
-        let err =
-            workspaces::add_member(&db.pool, &scope, ws.id, outsider.id, WorkspaceRole::Viewer)
-                .await
-                .unwrap_err();
+        let err = workspaces::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            ws.id,
+            outsider.id,
+            WorkspaceRole::Viewer,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.constraint(), Some("workspace_members_org_member_fk"));
         assert!(matches!(err, DbError::ForeignKeyViolation { .. }));
 
         // Becomes possible once the user is an organization member.
         organizations::add_member(
             &db.pool,
-            &scope,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
             outsider.id,
             OrgRole::Member,
             MemberStatus::Active,
         )
         .await
         .unwrap();
-        workspaces::add_member(&db.pool, &scope, ws.id, outsider.id, WorkspaceRole::Viewer)
-            .await
-            .unwrap();
-        let again =
-            workspaces::add_member(&db.pool, &scope, ws.id, outsider.id, WorkspaceRole::Editor)
-                .await
-                .unwrap_err();
+        workspaces::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            ws.id,
+            outsider.id,
+            WorkspaceRole::Viewer,
+        )
+        .await
+        .unwrap();
+        let again = workspaces::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            ws.id,
+            outsider.id,
+            WorkspaceRole::Editor,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(again, DbError::UniqueViolation { .. }));
     }
 
@@ -313,13 +457,17 @@ mod tests {
         let db = migrated().await;
         let (scope_a, _) = org(&db.pool, "org-a").await;
         let (scope_b, owner_b) = org(&db.pool, "org-b").await;
-        let ws_a = workspaces::create(&db.pool, &scope_a, &new_ws("main"))
-            .await
-            .unwrap();
+        let ws_a = workspaces::create(
+            &db.pool,
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
         // owner_b is an org-b member, but ws_a belongs to org-a.
         let err = workspaces::add_member(
             &db.pool,
-            &scope_b,
+            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceManage),
             ws_a.id,
             owner_b.id,
             WorkspaceRole::Admin,
@@ -346,17 +494,29 @@ mod tests {
         let db = migrated().await;
         let (scope_a, _) = org(&db.pool, "org-a").await;
         let (scope_b, _) = org(&db.pool, "org-b").await;
-        workspaces::create(&db.pool, &scope_a, &new_ws("main"))
-            .await
-            .unwrap();
-        let dup = workspaces::create(&db.pool, &scope_a, &new_ws("main"))
-            .await
-            .unwrap_err();
+        workspaces::create(
+            &db.pool,
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
+        let dup = workspaces::create(
+            &db.pool,
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(dup, DbError::UniqueViolation { .. }));
         assert_eq!(dup.constraint(), Some("workspaces_org_slug_unique"));
-        workspaces::create(&db.pool, &scope_b, &new_ws("main"))
-            .await
-            .unwrap();
+        workspaces::create(
+            &db.pool,
+            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -400,7 +560,7 @@ mod tests {
         let (scope, _) = org(&db.pool, "acme").await;
         let negative = workspaces::create(
             &db.pool,
-            &scope,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
             &NewWorkspace {
                 quota_bytes: Some(-1),
                 ..new_ws("neg")
@@ -411,7 +571,7 @@ mod tests {
         assert_eq!(negative.constraint(), Some("workspaces_quota_non_negative"));
         workspaces::create(
             &db.pool,
-            &scope,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
             &NewWorkspace {
                 quota_bytes: Some(0),
                 ..new_ws("zero")
@@ -421,9 +581,13 @@ mod tests {
         .unwrap();
 
         for bad_slug in ["Upper", "-lead", "has space", "", &"a".repeat(64)] {
-            let err = workspaces::create(&db.pool, &scope, &new_ws(bad_slug))
-                .await
-                .unwrap_err();
+            let err = workspaces::create(
+                &db.pool,
+                &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+                &new_ws(bad_slug),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 matches!(err, DbError::CheckViolation { .. }),
                 "{bad_slug:?}"
@@ -449,12 +613,20 @@ mod tests {
         let db = migrated().await;
         let (scope_a, _) = org(&db.pool, "org-a").await;
         let (scope_b, _) = org(&db.pool, "org-b").await;
-        let ws_a = workspaces::create(&db.pool, &scope_a, &new_ws("a-one"))
-            .await
-            .unwrap();
-        let ws_b = workspaces::create(&db.pool, &scope_b, &new_ws("b-one"))
-            .await
-            .unwrap();
+        let ws_a = workspaces::create(
+            &db.pool,
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("a-one"),
+        )
+        .await
+        .unwrap();
+        let ws_b = workspaces::create(
+            &db.pool,
+            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("b-one"),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             workspaces::get(&db.pool, &scope_a, ws_a.id)
@@ -516,12 +688,22 @@ mod tests {
     async fn deletes_are_restricted() {
         let db = migrated().await;
         let (scope, owner) = org(&db.pool, "acme").await;
-        let ws = workspaces::create(&db.pool, &scope, &new_ws("main"))
-            .await
-            .unwrap();
-        workspaces::add_member(&db.pool, &scope, ws.id, owner.id, WorkspaceRole::Admin)
-            .await
-            .unwrap();
+        let ws = workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
+        workspaces::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            ws.id,
+            owner.id,
+            WorkspaceRole::Admin,
+        )
+        .await
+        .unwrap();
 
         let e1 = sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind(ws.id)
@@ -717,15 +899,19 @@ mod tests {
         migrate::run_with(&db.pool, &migrator_up_to(2))
             .await
             .unwrap();
-        let (scope, _) = org(&db.pool, "acme").await;
-        let ws = workspaces::create(&db.pool, &scope, &new_ws("main"))
-            .await
-            .unwrap();
+        let (scope, _) = legacy_org(&db.pool, "acme").await;
+        let ws = workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
 
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3, 4]
+            vec![3, 4, 5]
         );
         migrate::verify(&db.pool).await.unwrap();
         assert!(
@@ -734,6 +920,9 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // Existing organizations start at version 1 after migration 0005.
+        let upgraded = organizations::get(&db.pool, &scope).await.unwrap().unwrap();
+        assert_eq!(upgraded.version, 1);
         assert!(!setup::is_completed(&db.pool).await.unwrap());
     }
 
@@ -1223,5 +1412,685 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn removing_a_member_removes_their_workspace_grants_and_scopes_are_checked() {
+        use craftcloud_db::members::{OrgTx, RemoveOutcome, RoleOutcome};
+        let db = migrated().await;
+        let (scope, owner) = org(&db.pool, "acme").await;
+        let (other_scope, _) = org(&db.pool, "other").await;
+        let member = user(&db.pool, "m@example.test").await;
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            member.id,
+            OrgRole::Member,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        let ws = workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &new_ws("main"),
+        )
+        .await
+        .unwrap();
+        workspaces::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            ws.id,
+            member.id,
+            WorkspaceRole::Editor,
+        )
+        .await
+        .unwrap();
+
+        // A scope of another organization is refused by the transaction.
+        let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tx.remove(&other_scope, member.id).await.is_err());
+        // A role change keeps the workspace grants; removal drops them.
+        assert!(matches!(
+            tx.set_role(
+                &sc(&scope, craftcloud_core::policy::Action::MemberChangeRole),
+                member.id,
+                OrgRole::Admin
+            )
+            .await
+            .unwrap(),
+            RoleOutcome::Changed(_)
+        ));
+        assert_eq!(count(&db.pool, "workspace_members").await, 1);
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                member.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::Removed
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(count(&db.pool, "workspace_members").await, 0);
+        assert_eq!(count(&db.pool, "organization_members").await, 2);
+        // The sole owner is protected, a missing member is reported.
+        let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                owner.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::LastOwner
+        );
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                member.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::NotMember
+        );
+        // Unknown organizations have no transaction.
+        assert!(
+            OrgTx::begin(&db.pool, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn organization_creation_with_owner_is_atomic_and_account_state_changes_are_guarded() {
+        use craftcloud_db::accounts::{self, DisableOutcome};
+        use craftcloud_db::organizations::CreateOutcome;
+        let db = migrated().await;
+        let owner = user(&db.pool, "own@example.test").await;
+        let new = |slug: &str, owner_user_id: Uuid| NewOrganization {
+            slug: slug.to_owned(),
+            name: "N".to_owned(),
+            owner_user_id,
+        };
+        let created = organizations::create_with_owner(&db.pool, &new("one", owner.id))
+            .await
+            .unwrap();
+        let CreateOutcome::Created(org) = created else {
+            panic!("not created")
+        };
+        assert_eq!(org.version, 1);
+        assert_eq!(count(&db.pool, "organization_members").await, 1);
+        // Duplicate slug: nothing is stored (no orphan membership).
+        let dup = organizations::create_with_owner(&db.pool, &new("one", owner.id))
+            .await
+            .unwrap_err();
+        assert!(matches!(dup, DbError::UniqueViolation { .. }));
+        assert_eq!(count(&db.pool, "organizations").await, 1);
+        assert_eq!(count(&db.pool, "organization_members").await, 1);
+        assert!(matches!(
+            organizations::create_with_owner(&db.pool, &new("two", Uuid::new_v4()))
+                .await
+                .unwrap(),
+            CreateOutcome::OwnerNotFound
+        ));
+
+        // Disabling is idempotent and never applies to the setup operator.
+        let now = time::OffsetDateTime::now_utc();
+        assert_eq!(
+            accounts::set_disabled(&db.pool, owner.id, true, now)
+                .await
+                .unwrap(),
+            DisableOutcome::Changed {
+                orphaned_organizations: vec![org.id]
+            }
+        );
+        assert_eq!(
+            accounts::set_disabled(&db.pool, owner.id, true, now)
+                .await
+                .unwrap(),
+            DisableOutcome::Unchanged {
+                orphaned_organizations: vec![org.id]
+            }
+        );
+        assert!(matches!(
+            organizations::create_with_owner(&db.pool, &new("three", owner.id))
+                .await
+                .unwrap(),
+            CreateOutcome::OwnerDisabled
+        ));
+        assert_eq!(
+            accounts::set_disabled(&db.pool, owner.id, false, now)
+                .await
+                .unwrap(),
+            DisableOutcome::Changed {
+                orphaned_organizations: vec![]
+            }
+        );
+        assert_eq!(
+            accounts::set_disabled(&db.pool, Uuid::new_v4(), true, now)
+                .await
+                .unwrap(),
+            DisableOutcome::NoSuchUser
+        );
+        let operator = setup::complete(&db.pool, &new_instance("operator-org"))
+            .await
+            .unwrap()
+            .user_id;
+        assert_eq!(
+            accounts::set_disabled(&db.pool, operator, true, now)
+                .await
+                .unwrap(),
+            DisableOutcome::IsOperator
+        );
+        assert_eq!(
+            accounts::set_disabled(&db.pool, operator, false, now)
+                .await
+                .unwrap(),
+            DisableOutcome::Unchanged {
+                orphaned_organizations: vec![]
+            }
+        );
+    }
+
+    async fn disable(db: &TestDb, user: Uuid) {
+        use craftcloud_db::accounts;
+        accounts::set_disabled(&db.pool, user, true, time::OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn disabled_owners_do_not_count_for_the_last_owner_rule() {
+        use craftcloud_db::members::{OrgTx, RemoveOutcome, RoleOutcome};
+        let db = migrated().await;
+        let (scope, x) = org(&db.pool, "acme").await;
+        let y = user(&db.pool, "y@example.test").await;
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            y.id,
+            OrgRole::Owner,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        disable(&db, y.id).await;
+
+        // Only a disabled owner would remain: the enabled owner can neither leave nor be demoted.
+        let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tx.set_role(
+                &sc(&scope, craftcloud_core::policy::Action::MemberChangeRole),
+                x.id,
+                OrgRole::Admin
+            )
+            .await
+            .unwrap(),
+            RoleOutcome::LastOwner
+        ));
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                x.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::LastOwner
+        );
+        // The disabled owner itself can be demoted or removed (it does not count).
+        assert!(matches!(
+            tx.set_role(
+                &sc(&scope, craftcloud_core::policy::Action::MemberChangeRole),
+                y.id,
+                OrgRole::Member
+            )
+            .await
+            .unwrap(),
+            RoleOutcome::Changed(_)
+        ));
+        tx.commit().await.unwrap();
+
+        // With a second enabled owner the first may leave.
+        let z = user(&db.pool, "z@example.test").await;
+        let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tx.add(
+                &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+                z.id,
+                OrgRole::Owner
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::members::AddOutcome::Added(_)
+        ));
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                x.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::Removed
+        );
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn disabling_the_last_enabled_owner_is_allowed_and_reports_the_orphans() {
+        use craftcloud_db::accounts::{self, DisableOutcome};
+        let db = migrated().await;
+        let (scope_a, a) = org(&db.pool, "org-a").await;
+        let (scope_b, _) = org(&db.pool, "org-b").await;
+        // `a` also co-owns org-b together with its own owner, so org-b is not orphaned.
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope_b, craftcloud_core::policy::Action::MemberAdd),
+            a.id,
+            OrgRole::Owner,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let outcome = accounts::set_disabled(&db.pool, a.id, true, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DisableOutcome::Changed {
+                orphaned_organizations: vec![scope_a.org_id()]
+            }
+        );
+        // Idempotent, and the orphan list reflects the current state.
+        let again = accounts::set_disabled(&db.pool, a.id, true, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            DisableOutcome::Unchanged {
+                orphaned_organizations: vec![scope_a.org_id()]
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn break_glass_recovery_makes_an_enabled_user_owner() {
+        use craftcloud_db::recovery::{SetOwnerOutcome, set_org_owner};
+        let db = migrated().await;
+        let (scope, owner) = org(&db.pool, "acme").await;
+        let org_id = scope.org_id();
+        disable(&db, owner.id).await;
+        let newcomer = user(&db.pool, "new@example.test").await;
+        let member = user(&db.pool, "member@example.test").await;
+        let invited = user(&db.pool, "invited@example.test").await;
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            member.id,
+            OrgRole::Member,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            invited.id,
+            OrgRole::Admin,
+            MemberStatus::Invited,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            set_org_owner(&db.pool, "acme", "new@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::Added {
+                org_id,
+                user_id: newcomer.id
+            }
+        );
+        assert_eq!(
+            set_org_owner(&db.pool, "acme", "new@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::AlreadyOwner {
+                org_id,
+                user_id: newcomer.id
+            }
+        );
+        assert_eq!(
+            set_org_owner(&db.pool, "acme", "member@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::Promoted {
+                org_id,
+                user_id: member.id
+            }
+        );
+        assert_eq!(
+            set_org_owner(&db.pool, "acme", "invited@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::Promoted {
+                org_id,
+                user_id: invited.id
+            }
+        );
+        assert_eq!(
+            set_org_owner(&db.pool, "acme", "nobody@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::UserNotFound
+        );
+        assert_eq!(
+            set_org_owner(&db.pool, "no-such-org", "new@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::OrgNotFound
+        );
+        // A disabled account cannot be made owner.
+        disable(&db, newcomer.id).await;
+        let gone = user(&db.pool, "gone@example.test").await;
+        disable(&db, gone.id).await;
+        assert_eq!(
+            set_org_owner(&db.pool, "acme", "gone@example.test")
+                .await
+                .unwrap(),
+            SetOwnerOutcome::UserDisabled
+        );
+        let owners: i64 = sqlx::query_scalar("SELECT count(*) FROM organization_members m JOIN users u ON u.id = m.user_id WHERE m.org_id = $1 AND m.role = 'owner' AND m.status = 'active' AND u.disabled_at IS NULL").bind(org_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(owners, 2, "member and invited users are now enabled owners");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn non_active_membership_rows_are_handled_explicitly() {
+        use craftcloud_db::members::{self, AddOutcome, OrgTx, RemoveOutcome, RoleOutcome};
+        let db = migrated().await;
+        let (scope, _owner) = org(&db.pool, "acme").await;
+        let (invited, disabled, old_owner) = (
+            user(&db.pool, "inv@example.test").await,
+            user(&db.pool, "dis@example.test").await,
+            user(&db.pool, "oldowner@example.test").await,
+        );
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            invited.id,
+            OrgRole::Admin,
+            MemberStatus::Invited,
+        )
+        .await
+        .unwrap();
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            disabled.id,
+            OrgRole::Member,
+            MemberStatus::Disabled,
+        )
+        .await
+        .unwrap();
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            old_owner.id,
+            OrgRole::Owner,
+            MemberStatus::Disabled,
+        )
+        .await
+        .unwrap();
+
+        // Non-active rows are invisible as members ...
+        assert_eq!(
+            organizations::active_role(&db.pool, scope.org_id(), invited.id)
+                .await
+                .unwrap(),
+            None
+        );
+        let listed = members::list(&db.pool, &scope, 50, None).await.unwrap();
+        assert_eq!(listed.len(), 1, "only the active owner is listed");
+        let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tx.role_of(invited.id).await.unwrap(), None);
+        // ... but cleanup tools see the stored role.
+        assert_eq!(
+            tx.stored_role_of(invited.id).await.unwrap(),
+            Some(OrgRole::Admin)
+        );
+        // Changing the role of a non-active row is "not a member".
+        assert!(matches!(
+            tx.set_role(
+                &sc(&scope, craftcloud_core::policy::Action::MemberChangeRole),
+                invited.id,
+                OrgRole::Member
+            )
+            .await
+            .unwrap(),
+            RoleOutcome::NotMember
+        ));
+
+        // Adding reactivates a non-owner row with the given role ...
+        let AddOutcome::Added(m) = tx
+            .add(
+                &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+                invited.id,
+                OrgRole::Member,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("not added")
+        };
+        assert_eq!(m.role, "member");
+        assert!(matches!(
+            tx.add(
+                &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+                disabled.id,
+                OrgRole::Admin
+            )
+            .await
+            .unwrap(),
+            AddOutcome::Added(_)
+        ));
+        assert_eq!(tx.role_of(disabled.id).await.unwrap(), Some(OrgRole::Admin));
+        // ... an active member stays "already a member" ...
+        assert!(matches!(
+            tx.add(
+                &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+                invited.id,
+                OrgRole::Member
+            )
+            .await
+            .unwrap(),
+            AddOutcome::AlreadyMember
+        ));
+        // ... and a non-active owner row is never reactivated through add.
+        assert!(matches!(
+            tx.add(
+                &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+                old_owner.id,
+                OrgRole::Member
+            )
+            .await
+            .unwrap(),
+            AddOutcome::AlreadyMember
+        ));
+        assert_eq!(tx.role_of(old_owner.id).await.unwrap(), None);
+        // Remove deletes a row of any status.
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                old_owner.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert_eq!(
+            tx.remove(
+                &sc(&scope, craftcloud_core::policy::Action::MemberRemove),
+                old_owner.id
+            )
+            .await
+            .unwrap(),
+            RemoveOutcome::NotMember
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(count(&db.pool, "organization_members").await, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn a_scope_only_drives_the_repository_function_of_its_own_action() {
+        use craftcloud_core::policy::Action;
+        use craftcloud_db::members::OrgTx;
+        let db = migrated().await;
+        let (base, _) = org(&db.pool, "acme").await;
+        let org_id = base.org_id();
+        let (read, remove_scope, add_scope) = (
+            read_scope_for(org_id),
+            sc(&base, Action::MemberRemove),
+            sc(&base, Action::MemberAdd),
+        );
+        let stranger = user(&db.pool, "s@example.test").await;
+
+        let mut tx = OrgTx::begin(&db.pool, org_id).await.unwrap().unwrap();
+        // A read permit drives no write ...
+        assert!(tx.add(&read, stranger.id, OrgRole::Member).await.is_err());
+        assert!(tx.update_name(&read, "Renamed", 1).await.is_err());
+        // ... and neither does the permit of another write action.
+        assert!(
+            tx.add(&remove_scope, stranger.id, OrgRole::Member)
+                .await
+                .is_err()
+        );
+        assert!(
+            tx.set_role(&remove_scope, stranger.id, OrgRole::Admin)
+                .await
+                .is_err()
+        );
+        assert!(tx.update_name(&add_scope, "Renamed", 1).await.is_err());
+        assert!(tx.remove(&add_scope, stranger.id).await.is_err());
+        drop(tx);
+        assert!(
+            workspaces::create(&db.pool, &add_scope, &new_ws("main"))
+                .await
+                .is_err()
+        );
+        assert!(
+            workspaces::create(&db.pool, &read, &new_ws("main"))
+                .await
+                .is_err()
+        );
+        assert!(
+            organizations::add_member(
+                &db.pool,
+                &remove_scope,
+                stranger.id,
+                OrgRole::Member,
+                MemberStatus::Active
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(count(&db.pool, "organization_members").await, 1);
+        assert_eq!(count(&db.pool, "workspaces").await, 0);
+        // The matching scope works; reads work with any scope.
+        let mut tx = OrgTx::begin(&db.pool, org_id).await.unwrap().unwrap();
+        assert!(
+            tx.add(&add_scope, stranger.id, OrgRole::Member)
+                .await
+                .is_ok()
+        );
+        assert!(tx.remove(&remove_scope, stranger.id).await.is_ok());
+        assert!(
+            tx.update_name(&sc(&base, Action::OrganizationUpdate), "Renamed", 1)
+                .await
+                .is_ok()
+        );
+        tx.commit().await.unwrap();
+        assert!(organizations::get(&db.pool, &read).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn the_last_owner_check_waits_for_a_concurrent_account_disable() {
+        use craftcloud_core::policy::Action;
+        use craftcloud_db::members::{OrgTx, RoleOutcome};
+        let db = migrated().await;
+        let (base, x) = org(&db.pool, "acme").await;
+        let y = user(&db.pool, "y@example.test").await;
+        organizations::add_member(
+            &db.pool,
+            &sc(&base, Action::MemberAdd),
+            y.id,
+            OrgRole::Owner,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+
+        // The other owner's account is being disabled: the transaction holds the
+        // user row and has changed it, but has not committed yet.
+        let mut disabling = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+            .bind(y.id)
+            .execute(&mut *disabling)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+            .bind(y.id)
+            .execute(&mut *disabling)
+            .await
+            .unwrap();
+
+        // x demotes themselves; with two owners (one about to be disabled) that looks allowed
+        // unless the check waits for the disable and re-reads it.
+        let pool = db.pool.clone();
+        let scope = sc(&base, Action::MemberChangeRole);
+        let org_id = base.org_id();
+        let demote = tokio::spawn(async move {
+            let mut tx = OrgTx::begin(&pool, org_id).await.unwrap().unwrap();
+            tx.set_role(&scope, x.id, OrgRole::Admin).await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !demote.is_finished(),
+            "the owner count must wait for the in-flight disable"
+        );
+
+        disabling.commit().await.unwrap();
+        let outcome = demote.await.unwrap().unwrap();
+        assert!(matches!(outcome, RoleOutcome::LastOwner), "{outcome:?}");
+        assert_eq!(
+            organizations::active_role(&db.pool, org_id, x.id)
+                .await
+                .unwrap(),
+            Some(OrgRole::Owner)
+        );
     }
 }

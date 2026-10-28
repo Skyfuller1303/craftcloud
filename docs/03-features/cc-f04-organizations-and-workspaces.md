@@ -1,6 +1,6 @@
 # CC-F04 — Organisationen und Workspaces
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
+> **Status:** Organisationen und Mitgliedschaften lokal umgesetzt (PR-006, Review offen): Anlegen nur durch den Operator, Lesen/Umbenennen mit ETag, Mitglieder verwalten, Konten (de)aktivieren, Pagination. Workspace-Routen (`POST/GET /organizations/{id}/workspaces`, `PATCH /workspaces/{id}`) und Löschen/Soft-Delete von Organisationen sind offen (PR-007, Lücke dokumentiert). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

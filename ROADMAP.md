@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-28 — PR-006 (CC-P01-06) implemented locally: pure policy engine (`craftcloud_core::policy`), organizations (operator-created), membership management with last-owner protection, account disable/enable, ETag/If-Match, keyset pagination, structured audit log events, migration 0005. Not reviewed or merged.
+
 2026-10-28 — PR-005 (CC-P01-05) implemented locally: login, cookie sessions (hashed at rest), CSRF header + Origin check, in-memory rate limiting, logout/logout-all, password change, operator-issued and offline password reset links, migration 0004. Not reviewed or merged.
 
 2026-10-28 — PR-004 (CC-P01-04) implemented locally: one-shot instance setup (`/api/v1/setup/*`), Argon2id password hashing, bootstrap token via `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`, migration 0003, `craftcloud-auth` crate. No login yet. Not reviewed or merged.

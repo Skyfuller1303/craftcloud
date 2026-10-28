@@ -556,34 +556,20 @@ pub(crate) async fn change_password(
 
 // ---- /admin/users/{user_id}/password-reset --------------------------------
 
-/// Common checks for the operator-only reset routes. Authorization for now is
-/// the instance operator recorded by the setup; PR-006 routes this through
-/// the policy engine. Returns the target account id.
+/// Common checks for the operator-only reset routes: the policy engine decides
+/// whether the actor may manage reset links (operator action), then the target
+/// account must exist. Returns the target account id.
 async fn operator_target(
     services: &Services,
     session: &AuthenticatedSession,
+    action: craftcloud_core::policy::Action,
+    action_name: &str,
     target: &str,
     headers: &HeaderMap,
 ) -> Result<Uuid, Box<Response>> {
-    match accounts::is_setup_operator(&services.pool, session.user_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(Box::new(error_response(
-                StatusCode::FORBIDDEN,
-                "FORBIDDEN",
-                "Only the instance operator may manage password reset links.",
-                headers,
-            )));
-        }
-        Err(error) => {
-            return Err(Box::new(db_failure(
-                &error,
-                headers,
-                "operator check failed",
-            )));
-        }
-    }
-    let Ok(user_id) = Uuid::parse_str(target) else {
+    let target_id = Uuid::parse_str(target).ok();
+    crate::orgs::operator_only(services, session, action, action_name, target_id, headers).await?;
+    let Some(user_id) = target_id else {
         return Err(Box::new(not_found(headers)));
     };
     match accounts::get(&services.pool, user_id).await {
@@ -606,7 +592,16 @@ pub(crate) async fn issue_password_reset(
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
     };
-    let user_id = match operator_target(&services, &session, &target, &headers).await {
+    let user_id = match operator_target(
+        &services,
+        &session,
+        craftcloud_core::policy::Action::PasswordResetIssue,
+        "password_reset.issue",
+        &target,
+        &headers,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(response) => return *response,
     };
@@ -669,7 +664,16 @@ pub(crate) async fn void_password_reset(
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
     };
-    let user_id = match operator_target(&services, &session, &target, &headers).await {
+    let user_id = match operator_target(
+        &services,
+        &session,
+        craftcloud_core::policy::Action::PasswordResetVoid,
+        "password_reset.void",
+        &target,
+        &headers,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(response) => return *response,
     };

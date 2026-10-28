@@ -1,6 +1,6 @@
 # CC-F05 — RBAC und Objektberechtigungen
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
+> **Status:** Policy-Engine und Org-Rollen lokal umgesetzt (PR-006, Review offen): reine Funktion `can(actor, action, resource)`, Actor pro Request frisch aus der Datenbank, Tabellentests, Scope nur aus `Allow`-Permit. Letzter-Owner-Regel zählt nur aktivierte Owner (Break-glass-CLI `admin set-org-owner`). Workspace-Aktionen sind in der Policy hinterlegt, ihre Routen kommen mit PR-007; Audit-Speicher folgt mit CC-F11 (bis dahin strukturierte `audit`-Logereignisse). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

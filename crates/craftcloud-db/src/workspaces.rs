@@ -73,6 +73,7 @@ pub async fn create(
     scope: &OrgScope,
     new: &NewWorkspace,
 ) -> Result<Workspace, DbError> {
+    scope.require(craftcloud_core::policy::Action::WorkspaceManage)?;
     Ok(sqlx::query_as::<_, Workspace>(&format!(
         "INSERT INTO workspaces (id, org_id, slug, name, quota_bytes) \
          VALUES ($1, $2, $3, $4, $5) RETURNING {COLUMNS}"
@@ -136,6 +137,7 @@ pub async fn add_member(
     user_id: Uuid,
     role: WorkspaceRole,
 ) -> Result<(), DbError> {
+    scope.require(craftcloud_core::policy::Action::WorkspaceManage)?;
     sqlx::query(
         "INSERT INTO workspace_members (org_id, workspace_id, user_id, role) \
          VALUES ($1, $2, $3, $4)",

@@ -205,3 +205,119 @@ pub async fn change_password(
     tx.commit().await?;
     Ok(Some(revoked))
 }
+
+/// Result of [`set_disabled`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisableOutcome {
+    /// The state changed. `orphaned_organizations` lists the organizations the
+    /// account was an owner of that now have no enabled owner (only when
+    /// disabling).
+    Changed {
+        /// Organizations left without an enabled owner.
+        orphaned_organizations: Vec<Uuid>,
+    },
+    /// The account already was in the requested state (the orphan list is
+    /// computed for the current state when disabling).
+    Unchanged {
+        /// Organizations without an enabled owner among the account's own.
+        orphaned_organizations: Vec<Uuid>,
+    },
+    /// No such account.
+    NoSuchUser,
+    /// The instance operator cannot be disabled.
+    IsOperator,
+}
+
+/// Upper bound of the orphan list in a disable result.
+const MAX_ORPHANS: i64 = 1000;
+
+/// Disables or enables an account. Disabling revokes every session of the
+/// account and voids its pending reset links in the same transaction (lock
+/// order: users row first). The instance operator is never disabled.
+///
+/// Disabling is **not** blocked when the account is the last enabled owner of
+/// organizations (a security response must not be blocked); those
+/// organizations are returned so the caller can report them and the operator
+/// can recover them with the offline `set-org-owner` tool.
+///
+/// # Errors
+///
+/// Database failures only; nothing changes on failure.
+pub async fn set_disabled(
+    pool: &PgPool,
+    user_id: Uuid,
+    disabled: bool,
+    now: OffsetDateTime,
+) -> Result<DisableOutcome, DbError> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(bool, bool)> = sqlx::query_as(
+        "SELECT disabled_at IS NOT NULL, \
+                EXISTS (SELECT 1 FROM instance_setup s WHERE s.operator_user_id = users.id) \
+         FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((currently_disabled, is_operator)) = row else {
+        return Ok(DisableOutcome::NoSuchUser);
+    };
+    if disabled && is_operator {
+        return Ok(DisableOutcome::IsOperator);
+    }
+    let changed = currently_disabled != disabled;
+    if changed {
+        sqlx::query(
+            "UPDATE users SET disabled_at = CASE WHEN $2 THEN $3::timestamptz ELSE NULL END WHERE id = $1",
+        )
+        .bind(user_id)
+        .bind(disabled)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if disabled {
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    let orphaned_organizations: Vec<Uuid> = if disabled {
+        // Organizations this account owns that have no enabled active owner
+        // (this account counts as disabled: its row is updated above).
+        sqlx::query_scalar(
+            "SELECT m.org_id FROM organization_members m \
+             WHERE m.user_id = $1 AND m.role = 'owner' AND m.status = 'active' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM organization_members o JOIN users u ON u.id = o.user_id \
+                   WHERE o.org_id = m.org_id AND o.role = 'owner' AND o.status = 'active' \
+                     AND u.disabled_at IS NULL) \
+             ORDER BY m.org_id LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(MAX_ORPHANS)
+        .fetch_all(&mut *tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    tx.commit().await?;
+    Ok(if changed {
+        DisableOutcome::Changed {
+            orphaned_organizations,
+        }
+    } else {
+        DisableOutcome::Unchanged {
+            orphaned_organizations,
+        }
+    })
+}

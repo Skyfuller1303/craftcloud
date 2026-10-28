@@ -14,6 +14,8 @@ tags:
   - name: Setup
   - name: Auth
   - name: Admin
+  - name: Organizations
+  - name: Members
   - name: Discovery
   - name: Workspaces
   - name: Files
@@ -366,6 +368,331 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations:
+    get:
+      tags: [Organizations]
+      summary: List the organizations the caller is a member of (CC-F04)
+      description: >-
+        Active memberships of the authenticated user, ordered by (created_at, id), keyset paginated. Cursors are
+        opaque, bound to the listing and the user, and not signed (see api-conventions).
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MyOrganizationPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Organizations, Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Create an organization (instance operator only)
+      description: >-
+        Creates the organization and the owner membership of owner_user_id (an existing, enabled user; may be the
+        operator) in one transaction. Self-service creation does not exist (ADR-0013). Other callers: 403
+        FORBIDDEN. Invalid name/slug, unknown or disabled owner and a taken slug answer 422 VALIDATION_ERROR with
+        details.fields.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateOrganizationRequest'}
+      responses:
+        '201':
+          description: Created
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "org-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreatedOrganization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: CSRF_FAILED or FORBIDDEN (not the instance operator)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Organizations]
+      summary: Read an organization (members only)
+      description: >-
+        Non-members, the instance operator without membership and unknown ids all answer an identical 404
+        NOT_FOUND (no existence leak). The ETag is the version for PATCH.
+      responses:
+        '200':
+          description: The organization with the caller's role
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Organization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Organizations]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Rename an organization (owner and admin)
+      description: >-
+        Order of checks: authentication and CSRF, 404 (not a member), 403 FORBIDDEN (plain member), 422 invalid
+        name, 428 PRECONDITION_REQUIRED without If-Match, 412 VERSION_CONFLICT if the If-Match ETag is not the
+        current version (the current ETag is returned in the response header).
+      parameters:
+        - in: header
+          name: If-Match
+          required: true
+          schema: {type: string, example: '"org-v1"'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateOrganizationRequest'}
+      responses:
+        '200':
+          description: Updated; the new ETag is in the header
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Organization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '412':
+          description: VERSION_CONFLICT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '428':
+          description: PRECONDITION_REQUIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/members:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Members]
+      summary: List the members of an organization (any member)
+      description: >-
+        Ordered by join time and user id (stable, keyset paginated); cursors contain only a timestamp and ids, never
+        names or e-mail addresses. Only active members are listed. Non-members and unknown organizations answer 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Members]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Add an existing user as member (owner and admin)
+      description: >-
+        Owners may assign any role; admins only member and admin, never owner (403). Plain members: 403,
+        non-members: 404. An unknown user id answers 404 only after the permission check passed (no user
+        enumeration for others); an already active membership answers 409 ALREADY_MEMBER, a disabled account
+        409 ACCOUNT_DISABLED. An invited or disabled membership row is reactivated with the given role. Real onboarding by invitation follows with PR-007.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AddMemberRequest'}
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Member'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: ALREADY_MEMBER or ACCOUNT_DISABLED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/members/{user_id}:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+      - in: path
+        name: user_id
+        required: true
+        schema: {type: string, format: uuid}
+    patch:
+      tags: [Members]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Change a member's role (owner and admin)
+      description: >-
+        Owners may set any role. Admins may set member/admin on members and admins (including themselves) and never
+        touch owners (403). The last *enabled* owner cannot be demoted (409 LAST_OWNER; owners whose account is
+        disabled do not count); membership changes and renames of one organization are serialized so concurrent
+        requests cannot leave it without an owner. Only active members can be changed. An unknown target is
+        404 for owners and admins and 403 for plain members.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChangeRoleRequest'}
+      responses:
+        '200':
+          description: Role changed (or already set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Member'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: LAST_OWNER
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Members]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Remove a member or leave the organization
+      description: >-
+        Owners may remove anybody, admins members and admins (not owners), and every member may remove themselves
+        (leave). The user's workspace grants in the organization are removed with the membership. The last owner
+        cannot be removed (409 LAST_OWNER). A membership row of any status (also invited or disabled) can be removed.
+      responses:
+        '204': {description: Removed}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: LAST_OWNER
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/organizations:
+    get:
+      tags: [Admin, Organizations]
+      summary: Organization metadata of the whole instance (operator only)
+      description: >-
+        Id, slug, name, creation time and member count only: no member lists, no user data, no files. The operator
+        has no access to organization contents through this route.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrganizationSummaryPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users/{user_id}/disable:
+    post:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Disable an account (operator only)
+      description: >-
+        Revokes every session of the account, voids its pending reset links and refuses further logins. Idempotent.
+        The instance operator cannot be disabled (409 CANNOT_DISABLE_OPERATOR). Memberships stay, so enabling the
+        account restores access. Disabling is never blocked by the last-owner rule (a security response must not be
+        blocked): the 200 response lists the organizations that are left without an enabled owner
+        (orphaned_organization_ids, empty if none); the server logs a warning and the host operator can recover them
+        with `craftcloud-server admin set-org-owner --org <slug> --email <address>`.
+      parameters:
+        - {in: path, name: user_id, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Disabled (or already disabled); lists organizations without an enabled owner
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orphaned_organization_ids]
+                properties:
+                  orphaned_organization_ids:
+                    type: array
+                    maxItems: 1000
+                    items: {type: string, format: uuid}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: CANNOT_DISABLE_OPERATOR
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users/{user_id}/enable:
+    post:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Enable an account (operator only)
+      description: Idempotent. Earlier sessions stay revoked.
+      parameters:
+        - {in: path, name: user_id, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '204': {description: Enabled (or already enabled)}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /info:
     get:
       tags: [Discovery]
@@ -430,6 +757,24 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '404': {$ref: '#/components/responses/NotFound'}
 components:
+  parameters:
+    OrgId:
+      in: path
+      name: org_id
+      required: true
+      schema: {type: string, format: uuid}
+    Limit:
+      in: query
+      name: limit
+      required: false
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+      description: Page size; values above 100 are clamped, 0 or non-numeric values answer 422.
+    Cursor:
+      in: query
+      name: cursor
+      required: false
+      schema: {type: string}
+      description: Opaque cursor from next_cursor of the previous page; bound to the listing and scope (400 INVALID_CURSOR otherwise).
   securitySchemes:
     cookieAuth:
       type: apiKey
@@ -519,6 +864,97 @@ components:
         csrf_token: {type: string}
         created_at: {type: string, format: date-time}
         expires_at: {type: string, format: date-time}
+    Organization:
+      type: object
+      required: [id, slug, name, role, version, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        slug: {type: string}
+        name: {type: string}
+        role: {type: string, enum: [owner, admin, member], description: The caller's role}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+    CreatedOrganization:
+      type: object
+      required: [id, slug, name, owner_user_id, version, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        slug: {type: string}
+        name: {type: string}
+        owner_user_id: {type: string, format: uuid}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+    MyOrganizationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/Organization'}
+        next_cursor: {type: [string, 'null']}
+    OrganizationSummaryPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [id, slug, name, member_count, created_at]
+            properties:
+              id: {type: string, format: uuid}
+              slug: {type: string}
+              name: {type: string}
+              member_count: {type: integer}
+              created_at: {type: string, format: date-time}
+        next_cursor: {type: [string, 'null']}
+    Member:
+      type: object
+      required: [user_id, display_name, email, role, joined_at]
+      properties:
+        user_id: {type: string, format: uuid}
+        display_name: {type: string}
+        email: {type: string}
+        role: {type: string, enum: [owner, admin, member]}
+        joined_at: {type: string, format: date-time}
+    MemberPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/Member'}
+        next_cursor: {type: [string, 'null']}
+    CreateOrganizationRequest:
+      type: object
+      additionalProperties: false
+      required: [name, slug, owner_user_id]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        slug: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
+        owner_user_id: {type: string, format: uuid}
+    UpdateOrganizationRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+    AddMemberRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, role]
+      properties:
+        user_id: {type: string, format: uuid}
+        role: {type: string, enum: [owner, admin, member]}
+    ChangeRoleRequest:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: {type: string, enum: [owner, admin, member]}
     SessionList:
       type: object
       required: [sessions]

@@ -22,6 +22,8 @@ craftcloud-server migrate   # apply pending DB migrations (needs CRAFTCLOUD_DATA
 
 Authentication is cookie-session based (`/api/v1/auth/*`) with CSRF protection and rate limiting; configure `CRAFTCLOUD_PUBLIC_URL` for browser use. Offline password recovery: `craftcloud-server admin issue-password-reset --email <address>`.
 
+Organizations are created by the instance operator; members, roles (owner, admin, member) and access are enforced by a central policy engine (see [permission matrix](docs/05-security/permission-matrix.md)).
+
 First-time setup (operator account and organization) is a one-shot `POST /api/v1/setup/complete` guarded by a bootstrap token file you create yourself; see [docs/06-operations/deployment.md](docs/06-operations/deployment.md). There is no login yet.
 
 Invalid configuration prints every problem and exits with code 2 without binding a socket (runtime failures exit with 1); keys and rules are in [docs/06-operations/deployment.md](docs/06-operations/deployment.md) and [ADR-0011](docs/09-decisions/adr-0011-configuration-policy.md).

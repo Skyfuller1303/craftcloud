@@ -22,11 +22,13 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
 
-const USAGE: &str = "usage: craftcloud-server [migrate | admin issue-password-reset --email <address>]\n\
+const USAGE: &str = "usage: craftcloud-server [migrate | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address>]\n\
     \n\
     (no argument)                          start the HTTP server\n\
     migrate                                apply pending database migrations and exit\n\
-    admin issue-password-reset --email E   print a one-hour password reset link for account E\n";
+    admin issue-password-reset --email E   print a one-hour password reset link for account E\n\
+    admin set-org-owner --org SLUG --email E\n\
+                                           break glass: make the enabled account E an owner of organization SLUG\n";
 
 /// A failure with the exit code it maps to.
 struct Failure {
@@ -54,6 +56,7 @@ enum Command {
     Serve,
     Migrate,
     IssuePasswordReset { email: String },
+    SetOrgOwner { org: String, email: String },
     Help,
 }
 
@@ -66,6 +69,17 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             if admin == "admin" && action == "issue-password-reset" && flag == "--email" =>
         {
             Ok(Command::IssuePasswordReset {
+                email: email.clone(),
+            })
+        }
+        [admin, action, f1, org, f2, email]
+            if admin == "admin"
+                && action == "set-org-owner"
+                && f1 == "--org"
+                && f2 == "--email" =>
+        {
+            Ok(Command::SetOrgOwner {
+                org: org.clone(),
                 email: email.clone(),
             })
         }
@@ -118,6 +132,7 @@ async fn main() -> ExitCode {
         Command::Migrate => migrate(&config.database).await,
         Command::Serve => run(config).await,
         Command::IssuePasswordReset { email } => issue_password_reset(&config, &email).await,
+        Command::SetOrgOwner { org, email } => set_org_owner(&config, &org, &email).await,
         Command::Help => Ok(()),
     };
     match result {
@@ -248,6 +263,62 @@ async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failur
     );
     println!("Password reset link (valid for 1 hour, usable once):");
     println!("{public_url}/reset-password#token={}", token.expose());
+    pool.close().await;
+    Ok(())
+}
+
+/// Break-glass recovery: makes an existing, enabled account an owner of an
+/// organization that lost its enabled owners. Runs on the host with access to
+/// the database secret; it is not reachable through the HTTP API. Writes an
+/// audit log line (identifiers only) and prints the result to stdout.
+async fn set_org_owner(config: &Config, org_slug: &str, email: &str) -> Result<(), Failure> {
+    use craftcloud_db::recovery::{SetOwnerOutcome, set_org_owner};
+
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "set-org-owner requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let Ok(email) = NormalizedEmail::parse(email) else {
+        return Err(Failure::runtime("no account with that e-mail address"));
+    };
+    let outcome = set_org_owner(&pool, org_slug, email.as_str())
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?;
+    let (message, org, user) = match outcome {
+        SetOwnerOutcome::Added { org_id, user_id } => {
+            ("added as owner", Some(org_id), Some(user_id))
+        }
+        SetOwnerOutcome::Promoted { org_id, user_id } => {
+            ("promoted to owner", Some(org_id), Some(user_id))
+        }
+        SetOwnerOutcome::AlreadyOwner { org_id, user_id } => {
+            ("already an owner", Some(org_id), Some(user_id))
+        }
+        SetOwnerOutcome::OrgNotFound => {
+            return Err(Failure::runtime("no organization with that slug"));
+        }
+        SetOwnerOutcome::UserNotFound => {
+            return Err(Failure::runtime("no account with that e-mail address"));
+        }
+        SetOwnerOutcome::UserDisabled => {
+            return Err(Failure::runtime("the account is disabled; enable it first"));
+        }
+    };
+    // Identifiers only: no e-mail address, no name.
+    tracing::info!(
+        target: "craftcloud::audit",
+        actor = "cli",
+        action = "org.break_glass_set_owner",
+        org = %org.map(|o| o.to_string()).unwrap_or_default(),
+        target_id = %user.map(|u| u.to_string()).unwrap_or_default(),
+        result = message,
+        "audit"
+    );
+    println!("{message}");
     pool.close().await;
     Ok(())
 }

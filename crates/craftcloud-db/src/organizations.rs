@@ -1,4 +1,10 @@
-//! Organizations (tenants) and organization membership. Minimal helpers.
+//! Organizations (tenants): creation, reads, updates and listings.
+//!
+//! Membership changes live in [`crate::members`]. Reads and writes of one
+//! organization take an [`OrgScope`], which only a policy `Allow` can produce.
+//! Listings that are not tied to one organization (the actor's own
+//! memberships, the operator's metadata list) take plain parameters because
+//! they filter by the actor / are operator-only by policy.
 
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
@@ -6,26 +12,7 @@ use uuid::Uuid;
 
 use crate::{DbError, OrgScope};
 
-/// Role inside an organization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrgRole {
-    /// Organization owner.
-    Owner,
-    /// Administrator.
-    Admin,
-    /// Regular member.
-    Member,
-}
-
-impl OrgRole {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Owner => "owner",
-            Self::Admin => "admin",
-            Self::Member => "member",
-        }
-    }
-}
+pub use craftcloud_core::policy::OrgRole;
 
 /// Membership status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +35,22 @@ impl MemberStatus {
     }
 }
 
+/// Maximum page size of all listings.
+pub const MAX_PAGE: u32 = 100;
+/// Default page size of all listings.
+pub const DEFAULT_PAGE: u32 = 50;
+
+/// Keyset position after which a listing continues: creation time and id of
+/// the last item of the previous page.
+pub type AfterKey = (OffsetDateTime, Uuid);
+
+/// Clamps a requested page size to `1..=`[`MAX_PAGE`] + 1 (the API asks for
+/// one extra row to know whether another page follows).
+#[must_use]
+pub fn clamp_page(limit: u32) -> i64 {
+    i64::from(limit.clamp(1, MAX_PAGE + 1))
+}
+
 /// Input for [`create`].
 #[derive(Debug, Clone)]
 pub struct NewOrganization {
@@ -68,14 +71,19 @@ pub struct Organization {
     pub slug: String,
     /// Display name.
     pub name: String,
-    /// Owning user.
+    /// The user the organization was created for. Authoritative ownership is
+    /// the `owner` membership role, not this column.
     pub owner_user_id: Uuid,
+    /// Optimistic concurrency version, incremented on every update.
+    pub version: i64,
     /// Creation time (UTC).
     pub created_at: OffsetDateTime,
 }
 
-/// Creates an organization. This creates the tenant itself, so it is not
-/// scoped; the caller must be authorized to create organizations.
+const COLUMNS: &str = "id, slug, name, owner_user_id, version, created_at";
+
+/// Creates an organization without membership (low-level helper for tests
+/// and tooling; the API uses [`create_with_owner`]).
 ///
 /// # Errors
 ///
@@ -83,10 +91,10 @@ pub struct Organization {
 /// [`DbError::ForeignKeyViolation`] for an unknown owner,
 /// [`DbError::CheckViolation`] for invalid values.
 pub async fn create(pool: &PgPool, new: &NewOrganization) -> Result<Organization, DbError> {
-    Ok(sqlx::query_as::<_, Organization>(
+    Ok(sqlx::query_as::<_, Organization>(&format!(
         "INSERT INTO organizations (id, slug, name, owner_user_id) VALUES ($1, $2, $3, $4) \
-         RETURNING id, slug, name, owner_user_id, created_at",
-    )
+         RETURNING {COLUMNS}"
+    ))
     .bind(Uuid::new_v4())
     .bind(&new.slug)
     .bind(&new.name)
@@ -95,7 +103,63 @@ pub async fn create(pool: &PgPool, new: &NewOrganization) -> Result<Organization
     .await?)
 }
 
-/// Adds a member to the scoped organization.
+/// Result of [`create_with_owner`].
+#[derive(Debug, Clone)]
+pub enum CreateOutcome {
+    /// Organization and owner membership were created.
+    Created(Organization),
+    /// The owner account does not exist.
+    OwnerNotFound,
+    /// The owner account is disabled.
+    OwnerDisabled,
+}
+
+/// Creates an organization and the `owner` membership of `owner_user_id` in
+/// one transaction. The operator-only creation path; the caller authorizes.
+///
+/// # Errors
+///
+/// [`DbError::UniqueViolation`] for a duplicate slug, [`DbError::CheckViolation`]
+/// for invalid values; nothing is stored on failure.
+pub async fn create_with_owner(
+    pool: &PgPool,
+    new: &NewOrganization,
+) -> Result<CreateOutcome, DbError> {
+    let mut tx = pool.begin().await?;
+    let disabled: Option<bool> =
+        sqlx::query_scalar("SELECT disabled_at IS NOT NULL FROM users WHERE id = $1 FOR SHARE")
+            .bind(new.owner_user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match disabled {
+        None => return Ok(CreateOutcome::OwnerNotFound),
+        Some(true) => return Ok(CreateOutcome::OwnerDisabled),
+        Some(false) => {}
+    }
+    let org = sqlx::query_as::<_, Organization>(&format!(
+        "INSERT INTO organizations (id, slug, name, owner_user_id) VALUES ($1, $2, $3, $4) \
+         RETURNING {COLUMNS}"
+    ))
+    .bind(Uuid::new_v4())
+    .bind(&new.slug)
+    .bind(&new.name)
+    .bind(new.owner_user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO organization_members (org_id, user_id, role, status) \
+         VALUES ($1, $2, 'owner', 'active')",
+    )
+    .bind(org.id)
+    .bind(new.owner_user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(CreateOutcome::Created(org))
+}
+
+/// Adds a member to the scoped organization (low-level helper for tests and
+/// tooling; the API uses [`crate::members::OrgTx`]).
 ///
 /// # Errors
 ///
@@ -108,6 +172,7 @@ pub async fn add_member(
     role: OrgRole,
     status: MemberStatus,
 ) -> Result<(), DbError> {
+    scope.require(craftcloud_core::policy::Action::MemberAdd)?;
     sqlx::query(
         "INSERT INTO organization_members (org_id, user_id, role, status) VALUES ($1, $2, $3, $4)",
     )
@@ -118,4 +183,139 @@ pub async fn add_member(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// The actor's role in an organization if they are an **active** member.
+/// Used to build the policy actor; it carries no data about the organization.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn active_role(
+    pool: &PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<OrgRole>, DbError> {
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM organization_members WHERE org_id = $1 AND user_id = $2 AND status = 'active'",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(role.as_deref().and_then(OrgRole::parse))
+}
+
+/// Reads the scoped organization.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn get(pool: &PgPool, scope: &OrgScope) -> Result<Option<Organization>, DbError> {
+    Ok(sqlx::query_as::<_, Organization>(&format!(
+        "SELECT {COLUMNS} FROM organizations WHERE id = $1"
+    ))
+    .bind(scope.org_id())
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Result of `OrgTx::update_name`.
+#[derive(Debug, Clone)]
+pub enum UpdateOutcome {
+    /// Updated; carries the new state (version incremented).
+    Updated(Organization),
+    /// The stored version differs from the expected one.
+    VersionMismatch {
+        /// The current version.
+        current_version: i64,
+    },
+    /// The organization does not exist (any more).
+    Gone,
+}
+
+/// An organization as seen by one of its members.
+#[derive(Debug, Clone, FromRow)]
+pub struct MyOrganization {
+    /// Identifier.
+    pub id: Uuid,
+    /// Slug.
+    pub slug: String,
+    /// Display name.
+    pub name: String,
+    /// Version (ETag basis).
+    pub version: i64,
+    /// Creation time.
+    pub created_at: OffsetDateTime,
+    /// The member's role (`owner`, `admin`, `member`).
+    pub role: String,
+}
+
+/// Lists the organizations the user is an active member of, ordered by
+/// `(created_at, id)`, one page after `after`.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn list_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    limit: u32,
+    after: Option<AfterKey>,
+) -> Result<Vec<MyOrganization>, DbError> {
+    Ok(sqlx::query_as::<_, MyOrganization>(
+        "SELECT o.id, o.slug, o.name, o.version, o.created_at, m.role \
+         FROM organization_members m JOIN organizations o ON o.id = m.org_id \
+         WHERE m.user_id = $1 AND m.status = 'active' \
+           AND ($2::timestamptz IS NULL OR (o.created_at, o.id) > ($2::timestamptz, $3::uuid)) \
+         ORDER BY o.created_at, o.id LIMIT $4",
+    )
+    .bind(user_id)
+    .bind(after.map(|(at, _)| at))
+    .bind(after.map(|(_, id)| id))
+    .bind(clamp_page(limit))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Organization metadata for the operator's instance overview. Deliberately
+/// contains no member or user data besides a count.
+#[derive(Debug, Clone, FromRow)]
+pub struct OrganizationSummary {
+    /// Identifier.
+    pub id: Uuid,
+    /// Slug.
+    pub slug: String,
+    /// Display name.
+    pub name: String,
+    /// Creation time.
+    pub created_at: OffsetDateTime,
+    /// Number of active members.
+    pub member_count: i64,
+}
+
+/// Lists all organizations (metadata only) ordered by `(created_at, id)`,
+/// one page after `after`. Operator-only by policy.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn list_all(
+    pool: &PgPool,
+    limit: u32,
+    after: Option<AfterKey>,
+) -> Result<Vec<OrganizationSummary>, DbError> {
+    Ok(sqlx::query_as::<_, OrganizationSummary>(
+        "SELECT o.id, o.slug, o.name, o.created_at, \
+                (SELECT count(*) FROM organization_members m \
+                 WHERE m.org_id = o.id AND m.status = 'active') AS member_count \
+         FROM organizations o \
+         WHERE ($1::timestamptz IS NULL OR (o.created_at, o.id) > ($1::timestamptz, $2::uuid)) \
+         ORDER BY o.created_at, o.id LIMIT $3",
+    )
+    .bind(after.map(|(at, _)| at))
+    .bind(after.map(|(_, id)| id))
+    .bind(clamp_page(limit))
+    .fetch_all(pool)
+    .await?)
 }

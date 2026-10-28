@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod identity;
+pub mod policy;
 
 pub use capabilities::{
     API_VERSION, Capabilities, FEATURE_ID_MAX_LEN, FeatureId, FeatureIdError, ServerMode,

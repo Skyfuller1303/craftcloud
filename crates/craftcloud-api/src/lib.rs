@@ -13,6 +13,8 @@
 mod auth;
 mod client_ip;
 mod clock;
+mod orgs;
+mod pagination;
 mod ratelimit;
 mod responses;
 mod services;
@@ -32,7 +34,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use craftcloud_core::Capabilities;
 use ipnet::IpNet;
@@ -100,6 +102,31 @@ pub fn router_with_services(
         .route("/api/v1/info", get(info))
         .route("/api/v1/setup/status", get(setup::status))
         .route("/api/v1/setup/complete", post(setup::complete))
+        .route(
+            "/api/v1/organizations",
+            get(orgs::list_mine).post(orgs::create_org),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}",
+            get(orgs::get_org).patch(orgs::update_org),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/members",
+            get(orgs::list_members).post(orgs::add_member),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/members/{user_id}",
+            patch(orgs::change_role).delete(orgs::remove_member),
+        )
+        .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
+        .route(
+            "/api/v1/admin/users/{user_id}/disable",
+            post(orgs::disable_user),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/enable",
+            post(orgs::enable_user),
+        )
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/session", get(auth::session))
         .route("/api/v1/auth/sessions", get(auth::list_sessions))

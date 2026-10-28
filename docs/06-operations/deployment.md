@@ -83,6 +83,16 @@ Ist der Operator (oder ein anderes Konto) ausgesperrt, genügt in der Regel `cra
 
 Dieser Ablauf ist getestet (`deleting_the_marker_row_reopens_setup_without_touching_existing_data`), aber eine Notfallmaßnahme, kein Produktmerkmal.
 
+### Organisation ohne aktivierten Owner (Break-glass)
+
+Wird das Konto des letzten aktivierten Owners deaktiviert (das ist nie blockiert), meldet `POST /api/v1/admin/users/{id}/disable` die betroffenen Organisationen in `orphaned_organization_ids`, und der Server schreibt eine Warnung und ein Audit-Ereignis `organization.orphaned`. Der Operator hat bewusst keinen API-Zugriff auf Organisationsdaten. Wiederherstellung durch den Hostbetreiber, ohne HTTP-Endpunkt:
+
+```sh
+craftcloud-server admin set-org-owner --org <slug> --email <adresse>
+```
+
+Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt oder befördert (eine vorhandene Zeile mit Status `invited`/`disabled` wird aktiviert). Der Befehl braucht `CRAFTCLOUD_DATABASE_URL_FILE` (Hostzugriff), prüft das Schema, schreibt ein Audit-Ereignis `org.break_glass_set_owner` mit Kennungen (keine E-Mail-Adresse) und gibt das Ergebnis auf stdout aus. Alternativ kann der ausgesperrte Owner mit `POST /api/v1/admin/users/{id}/enable` wieder aktiviert werden.
+
 ## Setup-Runbook
 
 1. Host patchen, Docker/Podman gemäß Betreiberregel, DNS und TLS einrichten.

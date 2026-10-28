@@ -230,7 +230,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 2"));
         assert!(text(&out).contains("applied migration 3"));
         assert!(text(&out).contains("applied migration 4"));
-        assert!(text(&out).contains("applied 4 migration(s)"));
+        assert!(text(&out).contains("applied migration 5"));
+        assert!(text(&out).contains("applied 5 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));
@@ -634,5 +635,89 @@ mod tests {
             fx.scalar("SELECT count(*)::text FROM password_reset_tokens"),
             "2"
         );
+    }
+
+    #[test]
+    fn set_org_owner_needs_exact_arguments_and_a_database() {
+        for args in [
+            &["admin", "set-org-owner"][..],
+            &["admin", "set-org-owner", "--org", "acme"][..],
+            &[
+                "admin",
+                "set-org-owner",
+                "--email",
+                "a@b.test",
+                "--org",
+                "acme",
+            ][..],
+            &["admin", "set-org-owner", "--org", "acme", "--email"][..],
+        ] {
+            let out = run(args, &[]);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(text(&out).contains("usage: craftcloud-server"));
+        }
+        let out = run(
+            &[
+                "admin",
+                "set-org-owner",
+                "--org",
+                "acme",
+                "--email",
+                "a@b.test",
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn set_org_owner_recovers_an_organization_without_an_enabled_owner() {
+        let fx = Fixture::new();
+        let db_secret = fx.secret();
+        let env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", db_secret.as_str()),
+            ("CRAFTCLOUD_LOG_FORMAT", "json"),
+        ];
+        assert_eq!(run(&["migrate"], &env).status.code(), Some(0));
+        fx.exec("INSERT INTO users (id, normalized_email, display_name, disabled_at) VALUES ('11111111-1111-1111-1111-111111111111', 'gone@example.test', 'Gone', now())");
+        fx.exec("INSERT INTO users (id, normalized_email, display_name) VALUES ('22222222-2222-2222-2222-222222222222', 'rescue@example.test', 'Rescue')");
+        fx.exec("INSERT INTO organizations (id, slug, name, owner_user_id) VALUES ('33333333-3333-3333-3333-333333333333', 'acme', 'Acme', '11111111-1111-1111-1111-111111111111')");
+        fx.exec("INSERT INTO organization_members (org_id, user_id, role, status) VALUES ('33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 'owner', 'active')");
+
+        let cmd = |org: &str, email: &str| {
+            run(
+                &["admin", "set-org-owner", "--org", org, "--email", email],
+                &env,
+            )
+        };
+        // Wrong inputs fail without changing anything.
+        assert_eq!(cmd("nope", "rescue@example.test").status.code(), Some(1));
+        assert_eq!(cmd("acme", "nobody@example.test").status.code(), Some(1));
+        let disabled = cmd("acme", "gone@example.test");
+        assert_eq!(disabled.status.code(), Some(1));
+        assert!(text(&disabled).contains("disabled"));
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM organization_members"),
+            "1"
+        );
+
+        let ok = cmd("acme", "Rescue@Example.test");
+        assert_eq!(ok.status.code(), Some(0), "{}", text(&ok));
+        let stdout = String::from_utf8_lossy(&ok.stdout);
+        assert!(stdout.contains("added as owner"), "{stdout}");
+        assert_eq!(fx.scalar("SELECT role FROM organization_members WHERE user_id = '22222222-2222-2222-2222-222222222222'"), "owner");
+        // Audit line with identifiers only: no e-mail address.
+        assert!(stdout.contains("org.break_glass_set_owner"), "{stdout}");
+        assert!(
+            stdout.contains("33333333-3333-3333-3333-333333333333")
+                && stdout.contains("22222222-2222-2222-2222-222222222222")
+        );
+        assert!(!text(&ok).contains("rescue@example.test") && !text(&ok).contains("Rescue"));
+        // Repeating is harmless.
+        let again = cmd("acme", "rescue@example.test");
+        assert_eq!(again.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&again.stdout).contains("already an owner"));
     }
 }

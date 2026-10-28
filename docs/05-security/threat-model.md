@@ -30,7 +30,7 @@ Benutzeridentitäten, Session-/Device-Tokens, Org-/Workspace-Metadaten, private 
 ## High-priority abuse cases
 
 1. `/setup/complete` race creates two owners. *Mitigation (PR-004):* the setup transaction claims the singleton row `instance_setup` first, so concurrent attempts serialize on its primary key; tests `twenty_concurrent_requests_create_exactly_one_operator` (HTTP, 20 requests, exactly one 201) and `concurrent_setups_produce_exactly_one_winner` (DB), rollback in `failure_inside_the_transaction_leaves_nothing_behind` and `setup_failure_rolls_back_everything`; wrong token and token-free probing in `setup_flow_status_wrong_token_success_and_repeat` and `wrong_token_is_forbidden_and_never_logged`.
-2. User A manipulates `workspace_id` of User B and obtains same-name file.
+2. User A manipulates `workspace_id` of User B and obtains same-name file. *Mitigation (PR-006, organizations level):* repository scopes only come from policy permits, non-members get an identical 404; tests `a_member_of_one_organization_sees_nothing_of_another` (all org routes, unknown-id comparison, operator, swapped ids), `plain_members_cannot_write_and_non_members_do_not_exist_for_them`, `admins_manage_members_and_admins_but_never_touch_owners`, `concurrent_demotions_and_departures_never_leave_an_organization_without_an_owner`, `every_unsafe_route_needs_a_session_the_csrf_header_and_the_origin`.
 3. A Viewer starts upload then role revoked before commit.
 4. A stale signed URL continues working after explicit revoke.
 5. Storage key constructed from `../../etc/passwd`.
