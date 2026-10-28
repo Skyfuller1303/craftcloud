@@ -16,11 +16,13 @@ The repository now contains a minimal Rust workspace skeleton (PR-001 / CC-P01-0
 cargo build --locked -p craftcloud-server   # build the server
 CRAFTCLOUD_BIND=127.0.0.1:8080 cargo run -p craftcloud-server   # default bind is 127.0.0.1:8080
 cargo xtask ci   # fmt check, clippy -D warnings, tests, relative-link check of all Markdown files
+cargo xtask db-test   # PostgreSQL integration tests in a throwaway Docker container (needs Docker; pinned postgres:18.6)
+craftcloud-server migrate   # apply pending DB migrations (needs CRAFTCLOUD_DATABASE_URL_FILE); never run implicitly
 ```
 
 Invalid configuration prints every problem and exits with code 2 without binding a socket (runtime failures exit with 1); keys and rules are in [docs/06-operations/deployment.md](docs/06-operations/deployment.md) and [ADR-0011](docs/09-decisions/adr-0011-configuration-policy.md).
 
-The workspace declares `rust-version = "1.95"`; this is not verified locally yet (ADR-0010). Roadmap: [ROADMAP.md](ROADMAP.md) and [docs/07-roadmap/phases.md](docs/07-roadmap/phases.md).
+The workspace declares `rust-version = "1.99"`, the locally installed toolchain, so every local build exercises the declared MSRV (ADR-0010). Roadmap: [ROADMAP.md](ROADMAP.md) and [docs/07-roadmap/phases.md](docs/07-roadmap/phases.md).
 
 ## Start here
 

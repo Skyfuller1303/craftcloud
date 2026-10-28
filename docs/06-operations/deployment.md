@@ -21,6 +21,13 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_REQUEST_TIMEOUT_SECS` | `10` | 1 bis 300 |
 | `CRAFTCLOUD_SHUTDOWN_GRACE_SECS` | `10` | 1 bis 120 |
 | `CRAFTCLOUD_LOG_FORMAT` | `text` | `text` oder `json` |
+| `CRAFTCLOUD_DATABASE_URL_FILE` | nicht gesetzt (Prototypmodus ohne Datenbank) | absoluter Pfad einer Secret-Datei mit der PostgreSQL-URL |
+| `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` | `10` | 1 bis 100 |
+| `CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS` | `5` | 1 bis 60 |
+
+Die Datenbank-URL enthält ein Passwort und steht deshalb **nur** in der Secret-Datei (siehe ADR-0012); `CRAFTCLOUD_DATABASE_URL` selbst wird abgelehnt und verweist auf `CRAFTCLOUD_DATABASE_URL_FILE`. Für entfernte Datenbanken in der URL `sslmode=verify-full` verwenden (bei privater CA zusätzlich `sslrootcert`). Die URL wird nie geloggt.
+
+Schema-Migrationen werden **nie implizit** angewendet: vor dem ersten Start und nach jedem Upgrade zuerst ein Backup erstellen, dann `craftcloud-server migrate` ausführen (wendet ausstehende Migrationen unter einem Advisory Lock an, nur vorwärts). Der normale Start prüft nur, ob das Schema vollständig und unverändert migriert ist, und endet sonst mit Exit-Code 1.
 
 Reserviert und derzeit **abgelehnt** („not supported in this build yet“): `CRAFTCLOUD_DATABASE_URL`, `CRAFTCLOUD_STORAGE_BACKEND`, `CRAFTCLOUD_STORAGE_ROOT`, `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`, `CRAFTCLOUD_SESSION_SECRET_FILE`. Sie werden mit späteren Meilensteinen eingeführt (Secret-Dateien: absoluter Pfad, reguläre Datei, höchstens 4 KiB, unter Unix nicht für Gruppe/andere lesbar).
 

@@ -1,6 +1,7 @@
 //! Local developer tasks. `cargo xtask ci` runs the same checks a CI job
 //! would run, sequentially and failing fast.
 
+mod db_test;
 mod docs_check;
 
 use std::path::{Path, PathBuf};
@@ -10,8 +11,9 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("ci") if args.next().is_none() => ci(),
+        Some("db-test") if args.next().is_none() => db_test::run(&repo_root()),
         _ => {
-            eprintln!("usage: cargo xtask ci");
+            eprintln!("usage: cargo xtask <ci|db-test>");
             ExitCode::from(2)
         }
     }

@@ -10,7 +10,7 @@
 ## Implementation gaps (in recommended order)
 
 5. Secure bootstrap and HTTP skeleton. *PR-001 skeleton: health + info only* (no bootstrap, auth, DB or storage). PR-002 added typed env configuration, secret-file loader, trusted-proxy handling and JSON errors for 413/503.
-6. Tenant database, policy, Auth/session and invitations.
+6. Tenant database, policy, Auth/session and invitations. *PR-003: PostgreSQL schema (users, organizations, workspaces and memberships), forward-only migrations, tenant-scoped workspace repository; no policy engine, auth, sessions or invitations yet.*
 7. Project/file metadata and streaming storage with checksums.
 8. Version commit with CAS, soft delete, retention, quotas.
 9. Browser admin interface with usable auth/workspace flows.

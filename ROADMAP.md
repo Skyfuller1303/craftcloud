@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-28 — PR-003 (CC-P01-03) implemented locally: `craftcloud-db` (sqlx, runtime queries), migrations 0001/0002, explicit `craftcloud-server migrate`, startup schema verification, `CRAFTCLOUD_DATABASE_URL_FILE`, `cargo xtask db-test` (Docker). ADR-0012 proposed. Not reviewed or merged. MSRV is 1.99 (installed toolchain; 1.95 dropped by user decision, ADR-0010).
+
 2026-10-28 — PR-002 (CC-P01-02) implemented locally: typed env config (exit code 2 on invalid config), secret-file loader (not wired), trusted-proxy client IP, JSON errors for 413/503 (`TIMEOUT`), bounded graceful shutdown. ADR-0011 proposed. Not reviewed or merged.
 
 2026-10-28 — PR-001 (CC-P01-01) skeleton implemented locally: Rust workspace, `/health/live` + `/api/v1/info` only, `cargo xtask ci`. Not reviewed or merged; MSRV 1.95 not verified.

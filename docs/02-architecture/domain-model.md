@@ -36,6 +36,10 @@ erDiagram
   USERS ||--o{ SESSIONS : authenticates
 ```
 
+## Umsetzungsstand (PR-003)
+
+Implementiert und migriert (`crates/craftcloud-db/migrations/`): `users`, `organizations`, `organization_members`, `workspaces`, `workspace_members`. Die Tenant-Grenze wird per **zusammengesetzten Fremdschlüsseln** erzwungen: `workspaces` hat `UNIQUE (org_id, id)`; `workspace_members` verweist mit `(org_id, workspace_id)` auf `workspaces (org_id, id)` und mit `(org_id, user_id)` auf `organization_members (org_id, user_id)`. Damit kann ein Workspace-Mitglied weder zu einem Workspace einer anderen Organisation gehören noch ohne Org-Mitgliedschaft existieren. Alle Fremdschlüssel sind `ON DELETE RESTRICT`. Sessions, Einladungen, Audit, Projekte und Dateien folgen in späteren PRs.
+
 ## Wichtige Designregeln
 
 - Alle tenant-gebundenen Datensätze tragen `org_id`, obwohl sie über FKs indirekt zuordenbar wären; verhindert versehentliche Cross-Org-Abfragen und erleichtert Policy/Partitionierung. FK-/Constraint-Design muss das tatsächlich erzwingen.

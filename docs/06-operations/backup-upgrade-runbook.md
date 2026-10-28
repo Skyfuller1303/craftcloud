@@ -25,6 +25,8 @@ PostgreSQL-Metadaten (Users, orgs, ACL, file versions, blob map, audit according
 
 ## Upgrade-Check
 
+Schema-Migrationen sind nur vorwärts gerichtet (kein Down-Skript): vor jedem `craftcloud-server migrate` ein Datenbank-Backup erstellen; das Zurückspielen dieses Backups ist der Rollback-Pfad (ADR-0012).
+
 Vorher Vollbackup und Restore-Drill, Release Notes/DB migration compatibility, Client/API matrix. Währenddessen Health/Readiness und Upload-Drain. Nachher Smoke Tests für Login, Project list, Upload/Download, version conflict, backup age. Keine stillen Downgrades über nicht rückwärtskompatible Migrationen.
 
 ## RPO/RTO

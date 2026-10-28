@@ -4,19 +4,23 @@ members = [
     "apps/craftcloud-server",
     "crates/craftcloud-core",
     "crates/craftcloud-api",
+    "crates/craftcloud-db",
     "xtask",
 ]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 publish = false
 # No `license` field on purpose: the license is undecided (ADR-0008).
 
 [workspace.dependencies]
 craftcloud-core = { path = "crates/craftcloud-core" }
 craftcloud-api = { path = "crates/craftcloud-api" }
+craftcloud-db = { path = "crates/craftcloud-db" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid", "time"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

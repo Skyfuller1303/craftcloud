@@ -1,13 +1,10 @@
 //! Secret values and a strict loader for secret files.
 //!
-//! Not wired to any configuration key yet; later milestones (bootstrap,
-//! sessions) consume it. Rules for a secret file: absolute path, regular file
-//! (not a symlink, not a directory), at most 4 KiB, valid UTF-8, not empty
+//! Used for the database URL (`CRAFTCLOUD_DATABASE_URL_FILE`); later
+//! milestones add bootstrap and session secrets. Rules for a secret file:
+//! absolute path, regular file (not a symlink, not a directory), at most 4 KiB, valid UTF-8, not empty
 //! after removing one trailing newline, and on unix not readable by group or
 //! others. On non-unix platforms the permission check is not performed.
-
-// Consumed by later milestones (PR-004/005); unused in this build.
-#![allow(dead_code)]
 
 use std::fmt;
 use std::fs::{self, File};
@@ -57,6 +54,7 @@ pub enum SecretError {
     /// The file is not valid UTF-8.
     NotUtf8(PathBuf),
     /// Group or others can read the file (unix only).
+    #[cfg_attr(not(unix), allow(dead_code))]
     InsecurePermissions(PathBuf),
 }
 

@@ -10,10 +10,11 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 ## Umsetzungstickets
 
 - [ ] **CC-P01-01** — Rust Cargo workspace und Leerlauf-Service mit strikter Lint-Policy aufsetzen
-  - Status: Umsetzung lokal vorhanden (Workspace, `/health/live`, `/api/v1/info`, `cargo xtask ci`), Review und Freigabe offen; MSRV 1.95 nicht lokal geprüft.
+  - Status: Umsetzung lokal vorhanden (Workspace, `/health/live`, `/api/v1/info`, `cargo xtask ci`), Review und Freigabe offen; MSRV 1.99 entspricht der lokalen Toolchain (ADR-0010).
 - [ ] **CC-P01-02** — Konfigurationsvalidator und Secret-Dateien, Startup-/Shutdown-Lifecycle
   - Status: Umsetzung lokal vorhanden (Env-Konfiguration, Secret-Datei-Loader noch nicht verdrahtet, Trusted-Proxy, begrenzter Shutdown), Review offen; siehe ADR-0011.
 - [ ] **CC-P01-03** — PostgreSQL-Migrationssystem, UUID und tenant-scoped query layer
+  - Status: Umsetzung lokal vorhanden (Schema 0001/0002, `migrate`-Befehl, `OrgScope`-Repositories, Docker-Integrationstests), Review offen; siehe ADR-0012.
 - [ ] **CC-P01-04** — one-shot Admin-Bootstrap mit Recovery-Runbook (CC-F01)
 - [ ] **CC-P01-05** — Auth, Sessions, Logout/Revocation, CSRF/Rate-Limiting (CC-F02)
 - [ ] **CC-P01-06** — Organizations, Workspaces und Membership CRUD (CC-F04)

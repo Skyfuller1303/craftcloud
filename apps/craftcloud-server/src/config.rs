@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -25,6 +26,10 @@ const REQUEST_TIMEOUT_SECS_RANGE: (u64, u64) = (1, 300);
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 10;
 const SHUTDOWN_GRACE_SECS_RANGE: (u64, u64) = (1, 120);
 const MAX_TRUSTED_PROXY_ENTRIES: usize = 64;
+const DEFAULT_DB_MAX_CONNECTIONS: u64 = 10;
+const DB_MAX_CONNECTIONS_RANGE: (u64, u64) = (1, 100);
+const DEFAULT_DB_CONNECT_TIMEOUT_SECS: u64 = 5;
+const DB_CONNECT_TIMEOUT_SECS_RANGE: (u64, u64) = (1, 60);
 
 /// Keys reserved for later milestones. They are rejected explicitly instead
 /// of being silently ignored.
@@ -36,7 +41,7 @@ const RESERVED_KEYS: [&str; 5] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 7] = [
+const SUPPORTED_KEYS: [&str; 10] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -44,6 +49,9 @@ const SUPPORTED_KEYS: [&str; 7] = [
     "REQUEST_TIMEOUT_SECS",
     "SHUTDOWN_GRACE_SECS",
     "LOG_FORMAT",
+    "DATABASE_URL_FILE",
+    "DATABASE_MAX_CONNECTIONS",
+    "DATABASE_CONNECT_TIMEOUT_SECS",
 ];
 
 /// Log output format.
@@ -53,6 +61,19 @@ pub enum LogFormat {
     Text,
     /// One JSON object per line.
     Json,
+}
+
+/// Database settings. The URL itself is never configured directly because it
+/// carries a password; it is read from a secret file at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseSettings {
+    /// Absolute path of the secret file holding the PostgreSQL URL. `None`
+    /// means no database is configured (prototype mode).
+    pub url_file: Option<PathBuf>,
+    /// Maximum pool size.
+    pub max_connections: u32,
+    /// Time allowed to establish a connection.
+    pub connect_timeout: Duration,
 }
 
 /// One configuration problem, tied to a key name.
@@ -97,6 +118,8 @@ pub struct Config {
     pub shutdown_grace: Duration,
     /// Log output format.
     pub log_format: LogFormat,
+    /// Database settings.
+    pub database: DatabaseSettings,
 }
 
 impl Config {
@@ -137,10 +160,12 @@ impl Config {
         for key in env.keys().filter(|k| has_prefix(k)) {
             let suffix = key.get(PREFIX.len()..).unwrap_or("");
             if RESERVED_KEYS.contains(&suffix) {
-                errors.push(ConfigError::new(
-                    key,
-                    "not supported in this build yet (reserved for a later milestone)",
-                ));
+                let message = if suffix == "DATABASE_URL" {
+                    "not supported in this build yet: database URLs contain passwords; put the URL in a secret file and set CRAFTCLOUD_DATABASE_URL_FILE to its absolute path"
+                } else {
+                    "not supported in this build yet (reserved for a later milestone)"
+                };
+                errors.push(ConfigError::new(key, message));
             } else if !SUPPORTED_KEYS.contains(&suffix) || key.get(..PREFIX.len()) != Some(PREFIX) {
                 errors.push(ConfigError::new(
                     key,
@@ -194,6 +219,29 @@ impl Config {
         })
         .unwrap_or(LogFormat::Text);
 
+        let db_url_file = field(&mut errors, env, "DATABASE_URL_FILE", |key, raw| {
+            let path = PathBuf::from(raw.trim());
+            if raw.trim().is_empty() || !path.is_absolute() {
+                Err(ConfigError::new(
+                    key,
+                    "must be an absolute path to a secret file",
+                ))
+            } else {
+                Ok(path)
+            }
+        });
+        let db_max_connections = field(&mut errors, env, "DATABASE_MAX_CONNECTIONS", |key, raw| {
+            parse_ranged(key, raw, DB_MAX_CONNECTIONS_RANGE)
+        })
+        .unwrap_or(DEFAULT_DB_MAX_CONNECTIONS);
+        let db_connect_timeout_secs = field(
+            &mut errors,
+            env,
+            "DATABASE_CONNECT_TIMEOUT_SECS",
+            |key, raw| parse_ranged(key, raw, DB_CONNECT_TIMEOUT_SECS_RANGE),
+        )
+        .unwrap_or(DEFAULT_DB_CONNECT_TIMEOUT_SECS);
+
         // Range-checked above, so the conversion cannot fail; the fallback
         // keeps the code free of panics regardless.
         let max_body_bytes = usize::try_from(max_body_bytes).unwrap_or(usize::MAX);
@@ -207,6 +255,11 @@ impl Config {
                 request_timeout: Duration::from_secs(request_timeout_secs),
                 shutdown_grace: Duration::from_secs(shutdown_grace_secs),
                 log_format,
+                database: DatabaseSettings {
+                    url_file: db_url_file,
+                    max_connections: u32::try_from(db_max_connections).unwrap_or(u32::MAX),
+                    connect_timeout: Duration::from_secs(db_connect_timeout_secs),
+                },
             })
         } else {
             Err(errors)
@@ -372,6 +425,45 @@ mod tests {
         assert_eq!(config.request_timeout, Duration::from_secs(10));
         assert_eq!(config.shutdown_grace, Duration::from_secs(10));
         assert_eq!(config.log_format, LogFormat::Text);
+        assert_eq!(config.database.url_file, None);
+        assert_eq!(config.database.max_connections, 10);
+        assert_eq!(config.database.connect_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn database_keys() {
+        let path = if cfg!(windows) {
+            r"C:\run\secrets\db_url"
+        } else {
+            "/run/secrets/db_url"
+        };
+        let config = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_DATABASE_URL_FILE", path),
+            ("CRAFTCLOUD_DATABASE_MAX_CONNECTIONS", "100"),
+            ("CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS", "60"),
+        ]))
+        .unwrap();
+        assert_eq!(config.database.url_file, Some(PathBuf::from(path)));
+        assert_eq!(config.database.max_connections, 100);
+        assert_eq!(config.database.connect_timeout, Duration::from_secs(60));
+        for (key, bad) in [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", "relative/path"),
+            ("CRAFTCLOUD_DATABASE_URL_FILE", ""),
+            ("CRAFTCLOUD_DATABASE_MAX_CONNECTIONS", "0"),
+            ("CRAFTCLOUD_DATABASE_MAX_CONNECTIONS", "101"),
+            ("CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS", "0"),
+            ("CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS", "61"),
+            ("CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS", "x"),
+        ] {
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+    }
+
+    #[test]
+    fn database_url_error_points_to_file_key() {
+        let errors = errors_of(&[("CRAFTCLOUD_DATABASE_URL", "postgres://u:pw0rd@h/db")]);
+        assert!(errors[0].message.contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+        assert!(!errors[0].to_string().contains("pw0rd"));
     }
 
     #[test]
