@@ -8,6 +8,18 @@ CraftCloud is an **optional, local-first, self-hostable** account, organization,
 
 This package is a **proposed future repository structure** consistent with documented patterns from `storytold/figcraft`, `storytold/wordcraft`, `storytold/gridcraft`, `storytold/filmcraft`, `storytold/photocraft`, `storytold/vectorcraft`, `storytold/craft-launcher`, `storytold/craft-libs`, `storytold/craft-ai-integrations`, and `storytold/artcraft-services`. It neither claims maintainers' endorsement nor copies their code. Before publishing, confirm brand permission, ownership, copyright and licensing.
 
+## Status: not production-ready, local prototype
+
+The repository now contains a minimal Rust workspace skeleton (PR-001 / CC-P01-01): `craftcloud-core` (typed capabilities), `craftcloud-api` (axum router with `GET /health/live` and `GET /api/v1/info` only), `craftcloud-server` (binary) and `xtask`. There is no authentication, database, storage or upload code. `/api/v1/info` reports `server_mode: "development-prototype"`. Do not deploy it.
+
+```sh
+cargo build --locked -p craftcloud-server   # build the server
+CRAFTCLOUD_BIND=127.0.0.1:8080 cargo run -p craftcloud-server   # default bind is 127.0.0.1:8080
+cargo xtask ci   # fmt check, clippy -D warnings, tests, relative-link check of all Markdown files
+```
+
+The workspace declares `rust-version = "1.95"`; this is not verified locally yet (ADR-0010). Roadmap: [ROADMAP.md](ROADMAP.md) and [docs/07-roadmap/phases.md](docs/07-roadmap/phases.md).
+
 ## Start here
 
 1. [Documentation index](docs/README.md)
@@ -46,7 +58,7 @@ craftcloud/
 └── README.md
 ```
 
-> **Do not treat omitted files as finished implementation.** This package deliberately does not contain a fake Cargo workspace, fake CI tests, executable deployment stack, unapproved logos, or copied upstream license texts.
+> **Do not treat omitted files as finished implementation.** Only the PR-001 skeleton (see Status above) exists as code; there is still no executable deployment stack, no unapproved logos, and no copied upstream license texts.
 
 ## Sequencing
 

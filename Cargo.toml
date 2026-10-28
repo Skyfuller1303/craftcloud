@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/craftcloud-server",
+    "crates/craftcloud-core",
+    "crates/craftcloud-api",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+# No `license` field on purpose: the license is undecided (ADR-0008).
+
+[workspace.dependencies]
+craftcloud-core = { path = "crates/craftcloud-core" }
+craftcloud-api = { path = "crates/craftcloud-api" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+uuid = { version = "1", default-features = false, features = ["v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.dev]
+debug = "line-tables-only"

@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-28 — PR-001 (CC-P01-01) skeleton implemented locally: Rust workspace, `/health/live` + `/api/v1/info` only, `cargo xtask ci`. Not reviewed or merged; MSRV 1.95 not verified.
+
 2026-10-28 — Phase 0 started locally: overlap map (CollabCraft, CraftHub found), craftrules still 404, consistency fixes K1–K9, ADR-0009 proposed. See docs/07-roadmap/phase-00-log.md.
 
 2026-10-28 — Initial documentation-only draft. No code, tests, service, repository creation or maintainer agreement has occurred.

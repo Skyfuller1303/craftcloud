@@ -63,12 +63,22 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [api_version, features]
+                required: [api_version, features, server_mode]
                 properties:
                   api_version: {type: string, example: '1.0'}
                   features:
                     type: array
-                    items: {type: string}
+                    items:
+                      type: string
+                      pattern: '^[a-z0-9._-]+$'
+                      minLength: 1
+                      maxLength: 64
+                  server_mode:
+                    type: string
+                    enum: [development-prototype]
+                    description: >-
+                      Additive field (PR-001). `development-prototype` marks a local, non-production
+                      server. Clients must treat unknown values as a controlled fallback, not an error.
   /workspaces:
     get:
       tags: [Workspaces]

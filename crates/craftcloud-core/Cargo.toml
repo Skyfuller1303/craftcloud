@@ -1,0 +1,16 @@
+[package]
+name = "craftcloud-core"
+description = "CraftCloud domain types and deterministic validation (no IO, no HTTP)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
