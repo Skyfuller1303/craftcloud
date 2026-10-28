@@ -1,0 +1,94 @@
+openapi: 3.1.0
+info:
+  title: CraftCloud Core API — proposal sketch
+  version: 0.0.0-rfc
+  description: >-
+    RFC EXAMPLE ONLY. Not deployed, not an upstream contract, deliberately incomplete.
+    Authorization details and full response schemas must be decided before implementation.
+servers:
+  - url: https://craftcloud.example.invalid/api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Discovery
+  - name: Workspaces
+  - name: Files
+paths:
+  /info:
+    get:
+      tags: [Discovery]
+      security: []
+      summary: Discover supported server/API capabilities
+      responses:
+        '200':
+          description: Server capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, features]
+                properties:
+                  api_version: {type: string, example: '1.0'}
+                  features:
+                    type: array
+                    items: {type: string}
+  /workspaces:
+    get:
+      tags: [Workspaces]
+      summary: List only authorized workspaces
+      responses:
+        '200':
+          description: Authorized workspaces only
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Workspace'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /files/{file_id}:
+    get:
+      tags: [Files]
+      summary: Get authorized file metadata, not binary content
+      parameters:
+        - in: path
+          name: file_id
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: File metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/File'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Workspace:
+      type: object
+      required: [id, name, organization_id]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        organization_id: {type: string, format: uuid}
+    File:
+      type: object
+      required: [id, project_id, name]
+      properties:
+        id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        name: {type: string}
+        head_version_id: {type: [string, 'null'], format: uuid}
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+    NotFound:
+      description: Resource not visible to requester

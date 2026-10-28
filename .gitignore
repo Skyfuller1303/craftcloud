@@ -1,0 +1,15 @@
+# Proposal repository: private notes and implementation artifacts
+.env
+.env.*
+!.env.example
+plan/
+*.log
+*.sqlite
+*.sqlite3
+secrets/
+target/
+node_modules/
+dist/
+.coverage/
+.DS_Store
+__pycache__/
