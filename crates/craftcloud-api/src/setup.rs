@@ -24,47 +24,22 @@
 //! have at least 32 characters, so guessing is infeasible; a generic limiter
 //! arrives with the session work (PR-005).
 
-use std::sync::Arc;
-
 use axum::{
-    Json,
+    Extension, Json,
     extract::{State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use craftcloud_auth::{BootstrapToken, HashError, hash_password, validate_password};
+use craftcloud_auth::{hash_password, validate_password};
 use craftcloud_core::{DisplayName, NormalizedEmail, Slug};
-use craftcloud_db::{DbError, PgPool, setup as db_setup};
+use craftcloud_db::{DbError, setup as db_setup};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroize;
 
-use crate::{ApiState, error_response, error_response_with_details};
-
-/// Maximum number of concurrent password hashes (each uses about 19 MiB).
-const MAX_CONCURRENT_HASHES: usize = 4;
-
-/// Database-backed services for the setup routes.
-pub struct SetupService {
-    pool: PgPool,
-    bootstrap: Option<BootstrapToken>,
-    hash_permits: Arc<Semaphore>,
-}
-
-impl SetupService {
-    /// Creates the service. `bootstrap` is `None` when no bootstrap secret
-    /// file is configured; setup then answers 403 `INVALID_BOOTSTRAP_TOKEN`
-    /// exactly like a wrong token (the reason is only logged).
-    #[must_use]
-    pub fn new(pool: PgPool, bootstrap: Option<BootstrapToken>) -> Self {
-        Self {
-            pool,
-            bootstrap,
-            hash_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HASHES)),
-        }
-    }
-}
+use crate::responses::{internal, rejection_response, unavailable, validation_failed};
+use crate::services::IpClass;
+use crate::{ApiState, ClientIp, error_response};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,36 +65,18 @@ impl Drop for SetupRequest {
     }
 }
 
-fn unavailable(headers: &HeaderMap) -> Response {
-    error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "SETUP_UNAVAILABLE",
-        "Instance setup is not available because no database is configured or reachable.",
-        headers,
-    )
-}
-
-fn internal(headers: &HeaderMap) -> Response {
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "INTERNAL",
-        "An internal error occurred.",
-        headers,
-    )
-}
-
 fn db_failure(error: &DbError, headers: &HeaderMap) -> Response {
     // DbError text is generic and free of request data.
     tracing::error!(%error, "setup database operation failed");
     match error {
-        DbError::Connection(_) => unavailable(headers),
+        DbError::Connection(_) => unavailable(headers, "SETUP_UNAVAILABLE"),
         _ => internal(headers),
     }
 }
 
 pub(crate) async fn status(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    let Some(service) = &state.setup else {
-        return unavailable(&headers);
+    let Some(service) = &state.services else {
+        return unavailable(&headers, "SETUP_UNAVAILABLE");
     };
     match db_setup::is_completed(&service.pool).await {
         Ok(completed) => Json(json!({ "setup_required": !completed })).into_response(),
@@ -129,12 +86,21 @@ pub(crate) async fn status(State(state): State<ApiState>, headers: HeaderMap) ->
 
 pub(crate) async fn complete(
     State(state): State<ApiState>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
     body: Result<Json<SetupRequest>, JsonRejection>,
 ) -> Response {
-    let Some(service) = state.setup.clone() else {
-        return unavailable(&headers);
+    let Some(service) = state.services.clone() else {
+        return unavailable(&headers, "SETUP_UNAVAILABLE");
     };
+    // Rate limit before any body handling or hashing.
+    if let Err(response) = service.rate_limit_ip(
+        IpClass::Setup,
+        client_ip.map(|Extension(ip)| ip.0),
+        &headers,
+    ) {
+        return *response;
+    }
     let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => return rejection_response(&rejection, &headers),
@@ -169,12 +135,14 @@ pub(crate) async fn complete(
     };
 
     let mut password_copy = request.password.clone();
-    let hashed = run_hash_job(service.hash_permits.clone(), move || {
-        let hash = hash_password(&password_copy);
-        password_copy.zeroize();
-        hash
-    })
-    .await;
+    let hashed = service
+        .run_blocking(move || {
+            let hash = hash_password(&password_copy);
+            password_copy.zeroize();
+            hash
+        })
+        .await
+        .and_then(Result::ok);
     let Some(password_hash) = hashed else {
         tracing::error!("password hashing failed");
         return internal(&headers);
@@ -214,41 +182,6 @@ fn already_completed(headers: &HeaderMap) -> Response {
         "Instance setup has already been completed.",
         headers,
     )
-}
-
-fn validation_failed(fields: &[&str], headers: &HeaderMap) -> Response {
-    error_response_with_details(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "VALIDATION_ERROR",
-        "One or more fields are invalid.",
-        headers,
-        Some(json!({ "fields": fields })),
-    )
-}
-
-/// Maps a body rejection to an error without echoing parser messages, which
-/// may quote request values.
-fn rejection_response(rejection: &JsonRejection, headers: &HeaderMap) -> Response {
-    match rejection.status() {
-        StatusCode::PAYLOAD_TOO_LARGE => error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "PAYLOAD_TOO_LARGE",
-            "The request body exceeds the maximum allowed size.",
-            headers,
-        ),
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
-            "The request must have Content-Type application/json.",
-            headers,
-        ),
-        _ => error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "VALIDATION_ERROR",
-            "The request body is not valid.",
-            headers,
-        ),
-    }
 }
 
 /// Field of a unique violation that the caller can fix.
@@ -303,76 +236,5 @@ fn validate(request: &SetupRequest) -> Result<ValidFields, Vec<&'static str>> {
             })
         }
         _ => Err(invalid),
-    }
-}
-
-/// Runs a hashing job on the blocking pool under a concurrency permit.
-///
-/// The owned permit moves into the blocking closure, so it is released only
-/// when the CPU- and memory-heavy job has really finished. If the request
-/// future is dropped (for example by the handler timeout) the job keeps
-/// running and keeps counting against the limit.
-async fn run_hash_job<F>(permits: Arc<Semaphore>, job: F) -> Option<String>
-where
-    F: FnOnce() -> Result<String, HashError> + Send + 'static,
-{
-    let permit: OwnedSemaphorePermit = permits.acquire_owned().await.ok()?;
-    let joined = tokio::task::spawn_blocking(move || {
-        let result = job();
-        drop(permit);
-        result
-    })
-    .await;
-    joined.ok()?.ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn permit_is_held_until_the_blocking_job_ends_even_if_the_caller_is_dropped() {
-        let permits = Arc::new(Semaphore::new(1));
-        let slow = || {
-            std::thread::sleep(Duration::from_millis(400));
-            Ok("hash".to_owned())
-        };
-        // The caller gives up (like the handler timeout does) while the job runs.
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(50),
-            run_hash_job(permits.clone(), slow),
-        )
-        .await;
-        assert!(
-            outcome.is_err(),
-            "the request future must have been dropped"
-        );
-        assert_eq!(
-            permits.available_permits(),
-            0,
-            "permit leaked with the dropped future"
-        );
-
-        // Released only after the blocking job completed.
-        let mut released = false;
-        for _ in 0..100 {
-            if permits.available_permits() == 1 {
-                released = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(released, "permit was never released");
-    }
-
-    #[tokio::test]
-    async fn permit_is_released_after_failure_and_success() {
-        let permits = Arc::new(Semaphore::new(1));
-        assert_eq!(run_hash_job(permits.clone(), || Err(HashError)).await, None);
-        assert_eq!(permits.available_permits(), 1);
-        let ok = run_hash_job(permits.clone(), || Ok("h".to_owned())).await;
-        assert_eq!(ok.as_deref(), Some("h"));
-        assert_eq!(permits.available_permits(), 1);
     }
 }

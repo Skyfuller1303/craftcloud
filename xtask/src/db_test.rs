@@ -133,7 +133,7 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
             "--",
             "--ignored",
         ])
-        .env("CRAFTCLOUD_TEST_DATABASE_URL", &url)
+        .env("CC_TEST_DATABASE_URL", &url)
         .current_dir(root)
         .status()
         .map_err(|e| format!("cannot start cargo: {e}"))?;

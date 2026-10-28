@@ -26,6 +26,10 @@ const REQUEST_TIMEOUT_SECS_RANGE: (u64, u64) = (1, 300);
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 10;
 const SHUTDOWN_GRACE_SECS_RANGE: (u64, u64) = (1, 120);
 const MAX_TRUSTED_PROXY_ENTRIES: usize = 64;
+const DEFAULT_SESSION_IDLE_MINUTES: u64 = 8 * 60;
+const SESSION_IDLE_MINUTES_RANGE: (u64, u64) = (5, 72 * 60);
+const DEFAULT_SESSION_ABSOLUTE_HOURS: u64 = 7 * 24;
+const SESSION_ABSOLUTE_HOURS_RANGE: (u64, u64) = (1, 30 * 24);
 const DEFAULT_DB_MAX_CONNECTIONS: u64 = 10;
 const DB_MAX_CONNECTIONS_RANGE: (u64, u64) = (1, 100);
 const DEFAULT_DB_CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -40,7 +44,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 11] = [
+const SUPPORTED_KEYS: [&str; 13] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -49,6 +53,8 @@ const SUPPORTED_KEYS: [&str; 11] = [
     "SHUTDOWN_GRACE_SECS",
     "LOG_FORMAT",
     "BOOTSTRAP_SECRET_FILE",
+    "SESSION_IDLE_TIMEOUT_MINUTES",
+    "SESSION_ABSOLUTE_TIMEOUT_HOURS",
     "DATABASE_URL_FILE",
     "DATABASE_MAX_CONNECTIONS",
     "DATABASE_CONNECT_TIMEOUT_SECS",
@@ -123,6 +129,16 @@ pub struct Config {
     /// Absolute path of the bootstrap token secret file. `None` disables the
     /// one-time instance setup. Requires a configured database.
     pub bootstrap_secret_file: Option<PathBuf>,
+    /// Origin (`scheme://host[:port]`) of the public URL, used for the CSRF
+    /// Origin check.
+    pub public_origin: Option<String>,
+    /// Whether the session cookie is `Secure` with the `__Host-` prefix.
+    /// False only for an http public URL on a loopback host.
+    pub cookie_secure: bool,
+    /// Session idle timeout.
+    pub session_idle_timeout: Duration,
+    /// Session absolute timeout.
+    pub session_absolute_timeout: Duration,
 }
 
 impl Config {
@@ -258,6 +274,36 @@ impl Config {
             ));
         }
 
+        let session_idle_minutes = field(
+            &mut errors,
+            env,
+            "SESSION_IDLE_TIMEOUT_MINUTES",
+            |key, raw| parse_ranged(key, raw, SESSION_IDLE_MINUTES_RANGE),
+        )
+        .unwrap_or(DEFAULT_SESSION_IDLE_MINUTES);
+        let session_absolute_hours = field(
+            &mut errors,
+            env,
+            "SESSION_ABSOLUTE_TIMEOUT_HOURS",
+            |key, raw| parse_ranged(key, raw, SESSION_ABSOLUTE_HOURS_RANGE),
+        )
+        .unwrap_or(DEFAULT_SESSION_ABSOLUTE_HOURS);
+        if session_idle_minutes > session_absolute_hours * 60 {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}SESSION_IDLE_TIMEOUT_MINUTES"),
+                "must not exceed CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS",
+            ));
+        }
+        let (public_origin, cookie_secure) = public_url
+            .as_deref()
+            .and_then(|raw| Url::parse(raw).ok())
+            .map_or((None, true), |url| {
+                (
+                    Some(url.origin().ascii_serialization()),
+                    url.scheme() != "http",
+                )
+            });
+
         // Range-checked above, so the conversion cannot fail; the fallback
         // keeps the code free of panics regardless.
         let max_body_bytes = usize::try_from(max_body_bytes).unwrap_or(usize::MAX);
@@ -277,6 +323,10 @@ impl Config {
                     connect_timeout: Duration::from_secs(db_connect_timeout_secs),
                 },
                 bootstrap_secret_file,
+                public_origin,
+                cookie_secure,
+                session_idle_timeout: Duration::from_secs(session_idle_minutes * 60),
+                session_absolute_timeout: Duration::from_secs(session_absolute_hours * 3600),
             })
         } else {
             Err(errors)
@@ -523,6 +573,63 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_and_cookie_settings() {
+        let defaults = Config::from_env_map(&BTreeMap::new()).unwrap();
+        assert_eq!(defaults.session_idle_timeout, Duration::from_secs(8 * 3600));
+        assert_eq!(
+            defaults.session_absolute_timeout,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+        assert_eq!(defaults.public_origin, None);
+        assert!(defaults.cookie_secure);
+
+        let https = Config::from_env_map(&env(&[(
+            "CRAFTCLOUD_PUBLIC_URL",
+            "https://cloud.example.org:8443/cc/",
+        )]))
+        .unwrap();
+        assert_eq!(
+            https.public_origin.as_deref(),
+            Some("https://cloud.example.org:8443")
+        );
+        assert!(https.cookie_secure);
+        let local =
+            Config::from_env_map(&env(&[("CRAFTCLOUD_PUBLIC_URL", "http://127.0.0.1:8080")]))
+                .unwrap();
+        assert_eq!(
+            local.public_origin.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert!(!local.cookie_secure);
+
+        let custom = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES", "30"),
+            ("CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS", "24"),
+        ]))
+        .unwrap();
+        assert_eq!(custom.session_idle_timeout, Duration::from_secs(1800));
+        assert_eq!(
+            custom.session_absolute_timeout,
+            Duration::from_secs(24 * 3600)
+        );
+
+        for (key, bad) in [
+            ("CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES", "4"),
+            ("CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES", "4321"),
+            ("CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS", "0"),
+            ("CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS", "721"),
+        ] {
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        // Idle longer than the absolute lifetime makes no sense.
+        let errors = errors_of(&[
+            ("CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES", "600"),
+            ("CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS", "5"),
+        ]);
+        assert_eq!(keys(&errors), ["CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES"]);
     }
 
     #[test]

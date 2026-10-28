@@ -95,8 +95,8 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let admin_url = std::env::var("CRAFTCLOUD_TEST_DATABASE_URL")
-                .expect("CRAFTCLOUD_TEST_DATABASE_URL must be set");
+            let admin_url =
+                std::env::var("CC_TEST_DATABASE_URL").expect("CC_TEST_DATABASE_URL must be set");
             let admin = PgConnectOptions::from_str(&admin_url).unwrap();
             let db_name = format!("cc_test_srv_{}_{}", std::process::id(), nanos());
             rt.block_on(async {
@@ -229,7 +229,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 1"));
         assert!(text(&out).contains("applied migration 2"));
         assert!(text(&out).contains("applied migration 3"));
-        assert!(text(&out).contains("applied 3 migration(s)"));
+        assert!(text(&out).contains("applied migration 4"));
+        assert!(text(&out).contains("applied 4 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));
@@ -443,5 +444,195 @@ mod tests {
             text(&second)
         );
         assert!(!text(&second).contains(BOOTSTRAP_TOKEN));
+    }
+
+    // ---- admin issue-password-reset ------------------------------------
+
+    #[test]
+    fn issue_password_reset_requires_arguments_public_url_and_database() {
+        // Missing --email / extra arguments: usage, exit 2.
+        for args in [
+            &["admin"][..],
+            &["admin", "issue-password-reset"][..],
+            &["admin", "issue-password-reset", "--email"][..],
+            &["admin", "issue-password-reset", "--password", "x"][..],
+            &["admin", "nope", "--email", "a@b.test"][..],
+        ] {
+            let out = run(args, &[]);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(text(&out).contains("usage: craftcloud-server"));
+        }
+        let args = ["admin", "issue-password-reset", "--email", "a@b.test"];
+        // No PUBLIC_URL: exit 2 before touching anything.
+        let db_file = TempSecret::new("dburl", "postgres://u:p@127.0.0.1:1/none");
+        let out = run(&args, &[("CRAFTCLOUD_DATABASE_URL_FILE", &db_file.path())]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_PUBLIC_URL"));
+        // No database: exit 2.
+        let out = run(
+            &args,
+            &[("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org")],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+    }
+
+    impl Fixture {
+        fn exec(&self, sql: &str) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let options = self.admin.clone().database(&self.db_name);
+            rt.block_on(async {
+                let mut conn = PgConnection::connect_with(&options).await.unwrap();
+                sqlx::query(sql).execute(&mut conn).await.unwrap();
+            });
+        }
+
+        fn scalar(&self, sql: &str) -> String {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let options = self.admin.clone().database(&self.db_name);
+            rt.block_on(async {
+                let mut conn = PgConnection::connect_with(&options).await.unwrap();
+                sqlx::query_scalar::<_, String>(sql)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap()
+            })
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn issue_password_reset_prints_a_single_use_link_to_stdout_only() {
+        let fx = Fixture::new();
+        let db_secret = fx.secret();
+        let env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", db_secret.as_str()),
+            ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org"),
+            ("CRAFTCLOUD_LOG_FORMAT", "json"),
+        ];
+        let args = [
+            "admin",
+            "issue-password-reset",
+            "--email",
+            "Ria@Example.test",
+        ];
+
+        // Unmigrated database: refuse and point at migrate.
+        let out = run(&args, &env);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(text(&out).contains("craftcloud-server migrate"));
+
+        assert_eq!(run(&["migrate"], &env).status.code(), Some(0));
+        fx.exec("INSERT INTO users (id, normalized_email, display_name) VALUES (gen_random_uuid(), 'ria@example.test', 'Ria')");
+
+        // Unknown account: exit 1, nothing stored.
+        let unknown = run(
+            &[
+                "admin",
+                "issue-password-reset",
+                "--email",
+                "nobody@example.test",
+            ],
+            &env,
+        );
+        assert_eq!(unknown.status.code(), Some(1), "{}", text(&unknown));
+        assert!(text(&unknown).contains("no account"));
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM password_reset_tokens"),
+            "0"
+        );
+
+        let out = run(&args, &env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let marker = "https://cloud.example.org/reset-password#token=";
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(marker))
+            .expect(&stdout);
+        let token = line.trim_start_matches(marker);
+        assert_eq!(token.len(), 43);
+        // The token appears exactly once, on stdout, and never in logs/stderr.
+        assert_eq!(text(&out).matches(token).count(), 1);
+        assert!(!stderr.contains(token));
+        fx.assert_no_password(&out);
+        // A warning next to the link says it is a secret.
+        assert!(
+            stderr.contains("WARNING") && stderr.contains("secret"),
+            "{stderr}"
+        );
+
+        // Stored: only the SHA-256 hash, no issuer, expiry one hour out.
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM password_reset_tokens"),
+            "1"
+        );
+        assert_eq!(
+            fx.scalar("SELECT (created_by_user_id IS NULL)::text FROM password_reset_tokens"),
+            "true"
+        );
+        assert_eq!(
+            fx.scalar("SELECT (expires_at - created_at = interval '1 hour')::text FROM password_reset_tokens"),
+            "true"
+        );
+        let expected = fx.scalar(&format!(
+            "SELECT encode(sha256(convert_to('{token}', 'UTF8')), 'hex')"
+        ));
+        assert_eq!(
+            fx.scalar("SELECT encode(token_hash, 'hex') FROM password_reset_tokens"),
+            expected
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn issue_password_reset_refuses_disabled_accounts_and_revokes_sessions() {
+        let fx = Fixture::new();
+        let db_secret = fx.secret();
+        let env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", db_secret.as_str()),
+            ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org"),
+        ];
+        assert_eq!(run(&["migrate"], &env).status.code(), Some(0));
+        fx.exec("INSERT INTO users (id, normalized_email, display_name) VALUES ('11111111-1111-1111-1111-111111111111', 'sal@example.test', 'Sal')");
+        fx.exec("INSERT INTO users (id, normalized_email, display_name, disabled_at) VALUES ('22222222-2222-2222-2222-222222222222', 'dis@example.test', 'Dis', now())");
+        fx.exec("INSERT INTO sessions (id, user_id, token_hash, created_at, last_seen_at, absolute_expires_at) VALUES (gen_random_uuid(), '11111111-1111-1111-1111-111111111111', decode(repeat('ab', 32), 'hex'), now(), now(), now() + interval '1 day')");
+
+        let args = ["admin", "issue-password-reset", "--email"];
+        let disabled = run(&[args[0], args[1], args[2], "dis@example.test"], &env);
+        assert_eq!(disabled.status.code(), Some(1), "{}", text(&disabled));
+        assert!(text(&disabled).contains("disabled"));
+        assert!(!String::from_utf8_lossy(&disabled.stdout).contains("reset-password#token="));
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM password_reset_tokens"),
+            "0"
+        );
+
+        let ok = run(&[args[0], args[1], args[2], "sal@example.test"], &env);
+        assert_eq!(ok.status.code(), Some(0), "{}", text(&ok));
+        // The compromise response: active sessions are revoked, the CLI says so.
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM sessions WHERE revoked_at IS NULL"),
+            "0"
+        );
+        assert!(String::from_utf8_lossy(&ok.stderr).contains("1 active session"));
+        // A second link voids the first.
+        let again = run(&[args[0], args[1], args[2], "sal@example.test"], &env);
+        assert_eq!(again.status.code(), Some(0));
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM password_reset_tokens WHERE used_at IS NULL"),
+            "1"
+        );
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM password_reset_tokens"),
+            "2"
+        );
     }
 }

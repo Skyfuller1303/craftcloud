@@ -12,6 +12,8 @@ security:
 tags:
   - name: Health
   - name: Setup
+  - name: Auth
+  - name: Admin
   - name: Discovery
   - name: Workspaces
   - name: Files
@@ -129,6 +131,241 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Log in with e-mail and password (CC-F02)
+      description: >-
+        Creates a session and sets the session cookie. Unknown e-mail, wrong password, accounts without a
+        password and disabled accounts all answer an identical 401 INVALID_CREDENTIALS after the same amount
+        of hashing work. Rate limits: requests per client address (IPv4 exact, IPv6 /64) and, counting only
+        failed logins, per account and address (5 per 15 minutes) and per account over all addresses (50 per
+        15 minutes); a successful login resets the counter of its address. Both answer 429 RATE_LIMITED with
+        Retry-After, and unknown e-mail addresses behave exactly like registered ones. A login that presents a
+        still valid session cookie revokes that old session. The session is only created if the password hash
+        is still the verified one (a reset that commits meanwhile makes the login fail with 401). The Origin
+        check applies (login CSRF); there is no CSRF token yet. No hard lockout.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200':
+          description: Logged in; Set-Cookie carries the session cookie
+          headers:
+            Set-Cookie: {schema: {type: string}, description: Session cookie (see securitySchemes.cookieAuth)}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LoginResponse'}
+        '401': {$ref: '#/components/responses/InvalidCredentials'}
+        '403': {$ref: '#/components/responses/CsrfFailed'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/session:
+    get:
+      tags: [Auth]
+      summary: Current session (CC-F02)
+      description: Returns the authenticated account and the CSRF token. 401 UNAUTHENTICATED without a valid, unexpired, unrevoked session.
+      responses:
+        '200':
+          description: Current session
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionInfo'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/sessions:
+    get:
+      tags: [Auth]
+      summary: List the own active sessions (device list)
+      description: >-
+        Active (not revoked, not expired) sessions of the current user, newest first, at most 100. Contains no
+        network or device data (no IP address, no user agent) and never a token.
+      responses:
+        '200':
+          description: Own active sessions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/sessions/{session_id}:
+    delete:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Revoke one of the own sessions
+      description: >-
+        Only own sessions can be revoked. Another user's, unknown and already revoked sessions all answer 404.
+        Revoking the current session also clears the cookie.
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '204': {description: Session revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/CsrfFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/logout:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Log out the current session
+      description: >-
+        Revokes the session and clears the cookie. A 401 answer also carries a Set-Cookie that clears the
+        stale cookie.
+      responses:
+        '204': {description: Logged out; Set-Cookie clears the session cookie}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/CsrfFailed'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/logout-all:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Log out all sessions of the account
+      description: Revokes every session of the account and clears the cookie (also on a 401 answer).
+      responses:
+        '204': {description: All sessions of the account revoked; the cookie is cleared}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/CsrfFailed'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/password/change:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Change the own password
+      description: >-
+        Requires the current password (wrong: 403 INVALID_CURRENT_PASSWORD; rate limited to 5 per minute and
+        user). Revokes all other sessions of the account and voids pending reset links; the current session
+        stays valid. Policy violations of the new password answer 422 VALIDATION_ERROR with details.fields
+        ["new_password"].
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChangePasswordRequest'}
+      responses:
+        '204': {description: Password changed}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: CSRF_FAILED or INVALID_CURRENT_PASSWORD
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/password-reset:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Complete a password reset with a reset token
+      description: >-
+        Anonymous, rate limited per client address. Unknown, malformed, expired, used, voided and
+        disabled-account tokens all answer an identical 400 INVALID_RESET_TOKEN. A valid token with a password
+        that violates the policy answers 422 and stays usable. Success sets the password, consumes the token
+        and revokes every session of the account. Tokens are single use and valid for one hour.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResetPasswordRequest'}
+      responses:
+        '204': {description: Password set; all sessions revoked}
+        '400':
+          description: INVALID_RESET_TOKEN
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users/{user_id}/password-reset:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema: {type: string, format: uuid}
+    post:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Issue a password reset link (instance operator only)
+      description: >-
+        Until the policy engine (PR-006) only the instance operator recorded by the one-time setup may call
+        this (others: 403 FORBIDDEN). Issuing a link is a compromise response (ADR-0013): it immediately
+        revokes every active session of the target account and voids older pending links of that account. The
+        link is returned once; only a hash of its token is stored. The token sits in the URL fragment so it is
+        not sent to servers or in Referer headers. Requires CRAFTCLOUD_PUBLIC_URL (otherwise 503
+        AUTH_UNAVAILABLE). Disabled accounts: 409 ACCOUNT_DISABLED. Offline alternative:
+        craftcloud-server admin issue-password-reset --email <address>.
+      responses:
+        '201':
+          description: Reset link issued
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ResetLinkResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: CSRF_FAILED or FORBIDDEN (not the instance operator)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: ACCOUNT_DISABLED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Void pending password reset links (instance operator only)
+      description: Voids every unused reset link of the account without touching its sessions. Idempotent.
+      responses:
+        '204': {description: Pending links voided (or none existed)}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: CSRF_FAILED or FORBIDDEN (not the instance operator)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /info:
     get:
       tags: [Discovery]
@@ -197,8 +434,21 @@ components:
     cookieAuth:
       type: apiKey
       in: cookie
-      name: craftcloud_session
-      description: Browser session (HttpOnly, Secure, SameSite). Mutating requests also require a CSRF header; final names pending (ADR-0009).
+      name: __Host-craftcloud_session
+      description: >-
+        Browser session cookie: HttpOnly, Secure, SameSite=Lax, Path=/, no Domain. The name is
+        __Host-craftcloud_session; only when CRAFTCLOUD_PUBLIC_URL is plain http on a loopback host
+        (local development) the cookie is named craftcloud_session and has no Secure attribute. The value is
+        a random 32-byte token (base64url); the server stores only its SHA-256 hash. Unsafe requests with a
+        session cookie also need the X-CSRF-Token header (see csrfToken) and a matching Origin.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: >-
+        Value of csrf_token from POST /auth/login or GET /auth/session. Required, together with a same-origin
+        Origin header (or no Origin and a Sec-Fetch-Site other than cross-site), on every unsafe request
+        authenticated by the session cookie. Failure: 403 CSRF_FAILED.
     bearerAuth:
       type: http
       scheme: bearer
@@ -244,6 +494,67 @@ components:
           properties:
             name: {type: string, minLength: 1, maxLength: 100}
             slug: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$'}
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: {type: string}
+        password: {type: string, writeOnly: true}
+    LoginResponse:
+      type: object
+      required: [user_id, csrf_token, expires_at]
+      properties:
+        user_id: {type: string, format: uuid}
+        csrf_token: {type: string, description: Send as X-CSRF-Token on unsafe requests}
+        expires_at: {type: string, format: date-time, description: Earliest of idle expiry from now and the absolute expiry}
+    SessionInfo:
+      type: object
+      required: [user_id, email, display_name, instance_role, csrf_token, created_at, expires_at]
+      properties:
+        user_id: {type: string, format: uuid}
+        email: {type: string}
+        display_name: {type: string}
+        instance_role: {type: [string, 'null'], enum: [operator, null]}
+        csrf_token: {type: string}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    SessionList:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [id, created_at, last_seen_at, expires_at, current]
+            properties:
+              id: {type: string, format: uuid}
+              created_at: {type: string, format: date-time}
+              last_seen_at: {type: string, format: date-time}
+              expires_at: {type: string, format: date-time, description: Earliest of idle expiry from the last recorded activity and the absolute expiry}
+              current: {type: boolean}
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [current_password, new_password]
+      properties:
+        current_password: {type: string, writeOnly: true}
+        new_password: {type: string, writeOnly: true, minLength: 12, maxLength: 128}
+    ResetPasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [token, new_password]
+      properties:
+        token: {type: string, writeOnly: true, description: The 43-character token from the reset link fragment}
+        new_password: {type: string, writeOnly: true, minLength: 12, maxLength: 128}
+    ResetLinkResponse:
+      type: object
+      required: [reset_url, expires_at]
+      properties:
+        reset_url: {type: string, description: "Shown once. Form: <public url>/reset-password#token=<token>"}
+        expires_at: {type: string, format: date-time}
     Workspace:
       type: object
       required: [id, name, organization_id]
@@ -270,8 +581,48 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
+    InternalError:
+      description: Internal error (INTERNAL)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    ServiceUnavailable:
+      description: AUTH_UNAVAILABLE (no database configured or reachable, or CRAFTCLOUD_PUBLIC_URL missing where a link must be built) or TIMEOUT (handler timeout)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    UnsupportedMediaType:
+      description: Content-Type is not application/json (UNSUPPORTED_MEDIA_TYPE)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    BodyInvalid:
+      description: >-
+        VALIDATION_ERROR. Without details when the body cannot be parsed (invalid JSON, unknown or missing
+        field); with details.fields (field names only) for semantic validation such as the password policy.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    InvalidCredentials:
+      description: E-mail address or password is incorrect (INVALID_CREDENTIALS); identical for every kind of failure
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    CsrfFailed:
+      description: CSRF header or Origin check failed (CSRF_FAILED)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    RateLimited:
+      description: Too many requests (RATE_LIMITED); Retry-After gives the seconds to wait. Counters are in memory (single instance) and cleared by a restart.
+      headers:
+        Retry-After: {schema: {type: integer, minimum: 1}}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     Unauthorized:
-      description: Missing or invalid credentials
+      description: >-
+        No valid session (UNAUTHENTICATED): missing, malformed, expired (idle 8 h or absolute 7 d by default) or revoked
     NotFound:
       description: Resource not visible to requester
     Conflict:

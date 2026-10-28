@@ -1,7 +1,7 @@
 //! Integration tests against a real PostgreSQL server.
 //!
 //! Run with `cargo xtask db-test`, which starts a throwaway container and sets
-//! `CRAFTCLOUD_TEST_DATABASE_URL`. Every test creates its own database
+//! `CC_TEST_DATABASE_URL`. Every test creates its own database
 //! `cc_test_<uuid>` and drops it afterwards.
 
 #[cfg(test)]
@@ -11,6 +11,7 @@ mod tests {
 
     use craftcloud_db::migrate::{self, migrator_up_to};
     use craftcloud_db::organizations::{self, MemberStatus, NewOrganization, OrgRole};
+    use craftcloud_db::sessions::{self, NewSession};
     use craftcloud_db::setup::{self, NewInstance, SetupError};
     use craftcloud_db::users::{self, NewUser, User};
     use craftcloud_db::workspaces::{self, MAX_LIST_LIMIT, NewWorkspace, WorkspaceRole};
@@ -19,7 +20,7 @@ mod tests {
     use sqlx::{Connection, PgConnection, Row};
     use uuid::Uuid;
 
-    const ENV: &str = "CRAFTCLOUD_TEST_DATABASE_URL";
+    const ENV: &str = "CC_TEST_DATABASE_URL";
 
     /// A throwaway database, dropped (with FORCE) when the guard is dropped.
     struct TestDb {
@@ -30,7 +31,7 @@ mod tests {
 
     impl TestDb {
         async fn new() -> Self {
-            let admin_url = std::env::var(ENV).expect("CRAFTCLOUD_TEST_DATABASE_URL must be set");
+            let admin_url = std::env::var(ENV).expect("CC_TEST_DATABASE_URL must be set");
             let admin = PgConnectOptions::from_str(&admin_url).unwrap();
             let name = format!("cc_test_{}", Uuid::new_v4().simple());
             let mut conn = PgConnection::connect_with(&admin).await.unwrap();
@@ -145,7 +146,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 3, 4]
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -168,14 +169,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            3,
+            4,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -189,7 +190,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(
             migrate::verify(&db.pool).await,
-            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3])))
+            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3, 4])))
         );
 
         let (scope, owner) = org(&db.pool, "acme").await;
@@ -197,7 +198,7 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![2, 3, 4]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -724,7 +725,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3]
+            vec![3, 4]
         );
         migrate::verify(&db.pool).await.unwrap();
         assert!(
@@ -841,5 +842,386 @@ mod tests {
         assert_eq!((ok, already), (1, 9));
         assert_eq!(count(&fresh, "users").await, 1);
         assert_eq!(count(&fresh, "instance_setup").await, 1);
+    }
+
+    async fn user_with_hash(pool: &PgPool, email: &str, hash: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, normalized_email, display_name, password_hash) VALUES ($1, $2, 'U', $3)",
+        )
+        .bind(id)
+        .bind(email)
+        .bind(hash)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    fn new_session(user_id: Uuid, marker: u8) -> NewSession {
+        let now = time::OffsetDateTime::now_utc();
+        NewSession {
+            user_id,
+            token_hash: [marker; 32],
+            now,
+            absolute_expires_at: now + time::Duration::days(7),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn verified_login_insert_requires_the_current_hash_and_an_enabled_account() {
+        let db = migrated().await;
+        let id = user_with_hash(&db.pool, "u@example.test", "h1").await;
+        assert!(
+            sessions::create_for_verified_login(&db.pool, &new_session(id, 1), "h1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // A hash that is not the stored one (for example the one that was verified
+        // before a reset committed) creates nothing.
+        assert!(
+            sessions::create_for_verified_login(&db.pool, &new_session(id, 2), "h0")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE users SET password_hash = 'h2' WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            sessions::create_for_verified_login(&db.pool, &new_session(id, 3), "h1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sessions::create_for_verified_login(&db.pool, &new_session(id, 4), "h2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            sessions::create_for_verified_login(&db.pool, &new_session(id, 5), "h2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Unknown user.
+        assert!(
+            sessions::create_for_verified_login(&db.pool, &new_session(Uuid::new_v4(), 6), "h2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count(&db.pool, "sessions").await, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn verified_login_insert_waits_for_a_password_change_in_flight_and_then_refuses() {
+        let db = migrated().await;
+        let id = user_with_hash(&db.pool, "race@example.test", "h1").await;
+
+        // A reset/password change has updated the row but not committed yet.
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("UPDATE users SET password_hash = 'h2' WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        // The login verified "h1" earlier and now tries to create its session.
+        let pool = db.pool.clone();
+        let login = tokio::spawn(async move {
+            sessions::create_for_verified_login(&pool, &new_session(id, 9), "h1").await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !login.is_finished(),
+            "the insert must wait for the row lock"
+        );
+
+        tx.commit().await.unwrap();
+        let outcome = login.await.unwrap().unwrap();
+        assert!(
+            outcome.is_none(),
+            "a session for the replaced password was created"
+        );
+        assert_eq!(count(&db.pool, "sessions").await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn password_change_requires_the_verified_hash_and_a_live_session() {
+        use craftcloud_db::accounts;
+        let db = migrated().await;
+        let id = user_with_hash(&db.pool, "chg@example.test", "h1").await;
+        let now = time::OffsetDateTime::now_utc();
+        let keep = sessions::create_for_verified_login(&db.pool, &new_session(id, 1), "h1")
+            .await
+            .unwrap()
+            .unwrap();
+        let other = sessions::create_for_verified_login(&db.pool, &new_session(id, 2), "h1")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("INSERT INTO password_reset_tokens (id, user_id, token_hash, created_at, expires_at) VALUES (gen_random_uuid(), $1, decode(repeat('cd', 32), 'hex'), now(), now() + interval '1 hour')")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A stale verified hash (a reset committed meanwhile): nothing changes.
+        assert_eq!(
+            accounts::change_password(&db.pool, id, "h0", "h3", keep, now)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            accounts::password_hash(&db.pool, id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("h1")
+        );
+        // The kept session was revoked meanwhile (link issuance, logout): nothing changes,
+        // including the password.
+        sessions::revoke(&db.pool, keep, now).await.unwrap();
+        assert_eq!(
+            accounts::change_password(&db.pool, id, "h1", "h3", keep, now)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            accounts::password_hash(&db.pool, id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("h1")
+        );
+        // A session of another user cannot be used as the kept session.
+        let stranger = user_with_hash(&db.pool, "stranger@example.test", "x").await;
+        let foreign = sessions::create_for_verified_login(&db.pool, &new_session(stranger, 3), "x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accounts::change_password(&db.pool, id, "h1", "h3", foreign, now)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // With a live session and the verified hash it works and cleans up.
+        let live = sessions::create_for_verified_login(&db.pool, &new_session(id, 4), "h1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accounts::change_password(&db.pool, id, "h1", "h3", live, now)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            accounts::password_hash(&db.pool, id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("h3")
+        );
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sessions WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 1, "only the kept session stays active");
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM password_reset_tokens WHERE used_at IS NULL")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 0);
+        let _ = other;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn password_change_racing_a_reset_link_issue_changes_nothing() {
+        use craftcloud_db::{accounts, password_reset};
+        let db = migrated().await;
+        let id = user_with_hash(&db.pool, "race2@example.test", "h1").await;
+        let now = time::OffsetDateTime::now_utc();
+        let keep = sessions::create_for_verified_login(&db.pool, &new_session(id, 1), "h1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The issuance holds the user row lock (not yet committed): it will
+        // revoke every session of the user.
+        let mut issue = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .execute(&mut *issue)
+            .await
+            .unwrap();
+
+        let pool = db.pool.clone();
+        let change = tokio::spawn(async move {
+            accounts::change_password(&pool, id, "h1", "h3", keep, now).await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !change.is_finished(),
+            "the change must wait for the issuance"
+        );
+
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *issue)
+        .await
+        .unwrap();
+        issue.commit().await.unwrap();
+
+        // The user row was locked but not changed, so the hash matches; the
+        // session was revoked meanwhile, so the change is refused and rolled back.
+        assert_eq!(change.await.unwrap().unwrap(), None);
+        assert_eq!(
+            accounts::password_hash(&db.pool, id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("h1")
+        );
+
+        // The real issuance function produces the same outcome in sequence.
+        let live = sessions::create_for_verified_login(&db.pool, &new_session(id, 2), "h1")
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = password_reset::create(
+            &db.pool,
+            &password_reset::NewResetToken {
+                user_id: id,
+                token_hash: [7; 32],
+                created_by: None,
+                now,
+                expires_at: now + time::Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            password_reset::IssueOutcome::Issued {
+                revoked_sessions: 1
+            }
+        ));
+        assert_eq!(
+            accounts::change_password(&db.pool, id, "h1", "h3", live, now)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn concurrent_consume_issue_and_change_never_deadlock() {
+        use craftcloud_db::{accounts, password_reset};
+        let db = migrated().await;
+        let id = user_with_hash(&db.pool, "dl@example.test", "h1").await;
+        let now = time::OffsetDateTime::now_utc();
+        for round in 0..40u8 {
+            let issue = |marker: u8| {
+                let pool = db.pool.clone();
+                async move {
+                    password_reset::create(
+                        &pool,
+                        &password_reset::NewResetToken {
+                            user_id: id,
+                            token_hash: [marker; 32],
+                            created_by: None,
+                            now,
+                            expires_at: now + time::Duration::hours(1),
+                        },
+                    )
+                    .await
+                }
+            };
+            issue(round.wrapping_mul(2)).await.unwrap();
+            let live = {
+                let hash = accounts::password_hash(&db.pool, id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (
+                    sessions::create_for_verified_login(
+                        &db.pool,
+                        &new_session(id, 200 + (round % 50)),
+                        &hash,
+                    )
+                    .await
+                    .unwrap(),
+                    hash,
+                )
+            };
+            let (pool_a, pool_b, pool_c) = (db.pool.clone(), db.pool.clone(), db.pool.clone());
+            let token = [round.wrapping_mul(2); 32];
+            let current = live.1.clone();
+            let keep = live.0;
+            let consume = tokio::spawn(async move {
+                password_reset::consume(&pool_a, &token, "h-consumed", now).await
+            });
+            let create = tokio::spawn(async move {
+                password_reset::create(
+                    &pool_b,
+                    &password_reset::NewResetToken {
+                        user_id: id,
+                        token_hash: [round.wrapping_mul(2).wrapping_add(1); 32],
+                        created_by: None,
+                        now,
+                        expires_at: now + time::Duration::hours(1),
+                    },
+                )
+                .await
+            });
+            let change = tokio::spawn(async move {
+                match keep {
+                    Some(keep) => {
+                        accounts::change_password(&pool_c, id, &current, "h-changed", keep, now)
+                            .await
+                            .map(|_| ())
+                    }
+                    None => Ok(()),
+                }
+            });
+            // Any deadlock would surface as an internal error here.
+            consume.await.unwrap().unwrap();
+            create.await.unwrap().unwrap();
+            change.await.unwrap().unwrap();
+            // Reset the hash so the next round starts from a known state.
+            sqlx::query("UPDATE users SET password_hash = 'h1' WHERE id = $1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
     }
 }

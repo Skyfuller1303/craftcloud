@@ -24,6 +24,10 @@ CC-F01 bis CC-F05 lassen mehrere Produkt- und Sicherheitsfragen offen, die vor P
 9. **Link-Gültigkeit:** Einladungslinks 72 h, Reset-Links 1 h; beide einmalig und widerrufbar.
 10. **Zwei-Faktor (TOTP)** kommt nach P3 als eigener PR mit Recovery-Codes; bis dahin als bekannte Lücke dokumentiert.
 
+### Umsetzungshinweis PR-005 (2026-10-28)
+
+Punkt 6 wird wörtlich umgesetzt: Schon das Ausstellen eines Reset-Links beendet alle Sitzungen des Nutzers; das Einlösen beendet sie erneut und macht weitere offene Links ungültig. Ein neuer Link ersetzt ältere, offene Links lassen sich widerrufen, und eine Passwortänderung macht offene Links ungültig. Für deaktivierte Konten wird kein Link ausgestellt. Der zugesagte Audit-Eintrag folgt mit CC-F11 (Audit und Aktivität), bis dahin protokolliert der Server nur ein Ereignis ohne Token. Bis PR-006 darf nur der Operator Links ausstellen.
+
 ## Konsequenzen und Risiken
 
 Ohne E-Mail-Verifikation kann ein abgefangener Einladungs- oder Reset-Link ein Konto übernehmen. Gegenmaßnahmen: kurze Gültigkeit, einmalige Verwendung, Widerruf, Audit-Eintrag, keine Tokens in Logs oder Referer. Self-Service-Organisationen und offene Registrierung erfordern später eigene ADRs mit Missbrauchsschutz.

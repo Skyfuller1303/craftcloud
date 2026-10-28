@@ -13,11 +13,14 @@
 //! This crate does not read environment variables or files; the server edge
 //! supplies the connection URL.
 
+pub mod accounts;
 mod error;
 pub mod migrate;
 pub mod organizations;
+pub mod password_reset;
 mod pool;
 mod scope;
+pub mod sessions;
 pub mod setup;
 pub mod users;
 pub mod workspaces;

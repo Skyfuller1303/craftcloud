@@ -18,6 +18,7 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 - [ ] **CC-P01-04** — one-shot Admin-Bootstrap mit Recovery-Runbook (CC-F01)
   - Status: Umsetzung lokal vorhanden (Setup-Routen, Singleton-Transaktion, Argon2id, Offline-Wiederherstellung dokumentiert), Review offen; kein Login (PR-005).
 - [ ] **CC-P01-05** — Auth, Sessions, Logout/Revocation, CSRF/Rate-Limiting (CC-F02)
+  - Status: Umsetzung lokal vorhanden (Login, Cookie-Sitzungen, CSRF+Origin, Rate-Limiting, Logout/Logout-all, Passwortänderung, Reset-Links inkl. Offline-CLI), Review offen.
 - [ ] **CC-P01-06** — Organizations, Workspaces und Membership CRUD (CC-F04)
 - [ ] **CC-P01-07** — zentrale Policy Engine + negative Tenant-Tests (CC-F05)
 - [ ] **CC-P01-08** — Invite-/E-Mail-Verifikation und safe invite acceptance (CC-F03)

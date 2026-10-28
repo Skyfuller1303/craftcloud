@@ -19,11 +19,13 @@ tokio = { workspace = true, features = ["time", "rt", "sync"] }
 tower-http = { workspace = true, features = ["request-id", "limit", "trace", "set-header"] }
 tracing.workspace = true
 uuid.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tower.workspace = true
 sqlx.workspace = true
+argon2.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 

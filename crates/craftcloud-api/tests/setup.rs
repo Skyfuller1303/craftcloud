@@ -14,7 +14,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use craftcloud_api::{ApiConfig, SetupService, router_with_setup};
+    use craftcloud_api::{ApiConfig, AuthSettings, Services, router_with_services};
     use craftcloud_auth::{BootstrapToken, verify_password};
     use craftcloud_core::Capabilities;
     use craftcloud_db::PgPool;
@@ -27,12 +27,23 @@ mod tests {
 
     const TOKEN: &str = "test-bootstrap-token-0123456789-abcdefghij";
     const PASSWORD: &str = "correct-horse-battery-staple";
-    const ENV: &str = "CRAFTCLOUD_TEST_DATABASE_URL";
+    const ENV: &str = "CC_TEST_DATABASE_URL";
 
     // ---- helpers ---------------------------------------------------------
 
-    fn app(setup: Option<SetupService>) -> Router {
-        router_with_setup(
+    fn svc(pool: PgPool, bootstrap: Option<BootstrapToken>) -> Services {
+        // Generous limits: the concurrency tests send many requests from one
+        // (unknown) client address; rate limiting is tested in auth.rs.
+        let settings = AuthSettings {
+            ip_limit: 10_000,
+            pwchange_limit: 10_000,
+            ..AuthSettings::default()
+        };
+        Services::new(pool, bootstrap, settings)
+    }
+
+    fn app(setup: Option<Services>) -> Router {
+        router_with_services(
             Capabilities::development_defaults(),
             &ApiConfig::default(),
             setup,
@@ -114,13 +125,21 @@ mod tests {
         }
     }
 
-    fn capture_logs() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
-        let buffer = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buffer.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        (buffer, tracing::subscriber::set_default(subscriber))
+    /// One process-wide capture buffer. A thread-local subscriber is racy when
+    /// tests run in parallel (callsite interest caching), so a global
+    /// subscriber is installed once; checks use values unique to each test.
+    fn capture_logs() -> (LogBuffer, ()) {
+        static LOGS: std::sync::OnceLock<LogBuffer> = std::sync::OnceLock::new();
+        let buffer = LOGS.get_or_init(|| {
+            let buffer = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buffer.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            buffer
+        });
+        (buffer.clone(), ())
     }
 
     // ---- no database needed ----------------------------------------------
@@ -139,12 +158,12 @@ mod tests {
     #[tokio::test]
     async fn without_bootstrap_secret_the_answer_equals_a_wrong_token() {
         let (logs, _guard) = capture_logs();
-        let disabled = app(Some(SetupService::new(lazy_pool(), None)));
+        let disabled = app(Some(svc(lazy_pool(), None)));
         let (status, disabled_body, _) = send(&disabled, post(&valid_body())).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(code(&disabled_body), "INVALID_BOOTSTRAP_TOKEN");
 
-        let configured = app(Some(SetupService::new(
+        let configured = app(Some(svc(
             lazy_pool(),
             Some(BootstrapToken::new("another-bootstrap-token-0123456789abcdef").unwrap()),
         )));
@@ -174,7 +193,7 @@ mod tests {
     async fn wrong_token_is_forbidden_and_never_logged() {
         let (logs, _guard) = capture_logs();
         let token = BootstrapToken::new(TOKEN).unwrap();
-        let app = app(Some(SetupService::new(lazy_pool(), Some(token))));
+        let app = app(Some(svc(lazy_pool(), Some(token))));
         let mut body = valid_body();
         body["bootstrap_token"] = json!("wrong-token-wrong-token-wrong-token-xx");
         body["password"] = json!("distinctive-password-do-not-log");
@@ -197,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_requests_are_rejected_without_echoing_values() {
         let token = BootstrapToken::new(TOKEN).unwrap();
-        let app = app(Some(SetupService::new(lazy_pool(), Some(token))));
+        let app = app(Some(svc(lazy_pool(), Some(token))));
 
         let not_json = Request::builder()
             .method("POST")
@@ -219,10 +238,10 @@ mod tests {
 
         // Unparsable bodies are answered before (and independent of) the
         // token check and carry no details.
-        let unconfigured = router_with_setup(
+        let unconfigured = router_with_services(
             Capabilities::development_defaults(),
             &ApiConfig::default(),
-            Some(SetupService::new(lazy_pool(), None)),
+            Some(svc(lazy_pool(), None)),
         );
         let (status, body, _) = send(&unconfigured, post(&json!({ "password": "x" }))).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -275,7 +294,7 @@ mod tests {
 
     impl TestDb {
         async fn new() -> Self {
-            let url = std::env::var(ENV).expect("CRAFTCLOUD_TEST_DATABASE_URL must be set");
+            let url = std::env::var(ENV).expect("CC_TEST_DATABASE_URL must be set");
             let admin = PgConnectOptions::from_str(&url).unwrap();
             let name = format!("cc_test_{}", Uuid::new_v4().simple());
             let mut conn = PgConnection::connect_with(&admin).await.unwrap();
@@ -295,7 +314,7 @@ mod tests {
 
         fn app(&self) -> Router {
             let token = BootstrapToken::new(TOKEN).unwrap();
-            app(Some(SetupService::new(self.pool.clone(), Some(token))))
+            app(Some(svc(self.pool.clone(), Some(token))))
         }
 
         async fn count(&self, sql: &str) -> i64 {

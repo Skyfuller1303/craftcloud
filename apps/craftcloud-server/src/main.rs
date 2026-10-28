@@ -13,18 +13,20 @@ mod server;
 use std::process::ExitCode;
 
 use config::{Config, DatabaseSettings, LogFormat};
-use craftcloud_api::{ApiConfig, SetupService};
-use craftcloud_auth::BootstrapToken;
+use craftcloud_api::{ApiConfig, AuthSettings, Services};
+use craftcloud_auth::{BootstrapToken, OpaqueToken, PASSWORD_RESET_TTL};
 use craftcloud_core::Capabilities;
+use craftcloud_core::NormalizedEmail;
 use craftcloud_db::PgPool;
 use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
 
-const USAGE: &str = "usage: craftcloud-server [migrate]\n\
+const USAGE: &str = "usage: craftcloud-server [migrate | admin issue-password-reset --email <address>]\n\
     \n\
-    (no argument)  start the HTTP server\n\
-    migrate        apply pending database migrations and exit\n";
+    (no argument)                          start the HTTP server\n\
+    migrate                                apply pending database migrations and exit\n\
+    admin issue-password-reset --email E   print a one-hour password reset link for account E\n";
 
 /// A failure with the exit code it maps to.
 struct Failure {
@@ -51,6 +53,7 @@ impl Failure {
 enum Command {
     Serve,
     Migrate,
+    IssuePasswordReset { email: String },
     Help,
 }
 
@@ -59,6 +62,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         [] => Ok(Command::Serve),
         [one] if one == "migrate" => Ok(Command::Migrate),
         [one] if one == "--help" || one == "-h" => Ok(Command::Help),
+        [admin, action, flag, email]
+            if admin == "admin" && action == "issue-password-reset" && flag == "--email" =>
+        {
+            Ok(Command::IssuePasswordReset {
+                email: email.clone(),
+            })
+        }
         [one] => Err(format!("unknown argument {one:?}")),
         _ => Err("too many arguments".to_owned()),
     }
@@ -107,6 +117,7 @@ async fn main() -> ExitCode {
     let result = match command {
         Command::Migrate => migrate(&config.database).await,
         Command::Serve => run(config).await,
+        Command::IssuePasswordReset { email } => issue_password_reset(&config, &email).await,
         Command::Help => Ok(()),
     };
     match result {
@@ -175,6 +186,72 @@ fn load_bootstrap_token(config: &Config) -> Result<Option<BootstrapToken>, Failu
         .map_err(|err| Failure::config(format!("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE: {err}")))
 }
 
+/// Offline recovery: prints a single-use reset link to stdout. The token is
+/// never logged; it only appears on stdout. The password is never an
+/// argument; the user sets it through the link.
+async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failure> {
+    let Some(public_url) = &config.public_url else {
+        return Err(Failure::config(
+            "issue-password-reset requires CRAFTCLOUD_PUBLIC_URL to build the link",
+        ));
+    };
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "issue-password-reset requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let account = match NormalizedEmail::parse(email) {
+        Ok(email) => craftcloud_db::accounts::find_by_email(&pool, email.as_str())
+            .await
+            .map_err(|err| Failure::runtime(err.to_string()))?,
+        Err(_) => None,
+    };
+    let Some(account) = account else {
+        return Err(Failure::runtime("no account with that e-mail address"));
+    };
+    let token = OpaqueToken::generate().map_err(|err| Failure::runtime(err.to_string()))?;
+    let now = time::OffsetDateTime::now_utc();
+    let outcome = craftcloud_db::password_reset::create(
+        &pool,
+        &craftcloud_db::password_reset::NewResetToken {
+            user_id: account.id,
+            token_hash: token.hash(),
+            created_by: None,
+            now,
+            expires_at: now + PASSWORD_RESET_TTL,
+        },
+    )
+    .await
+    .map_err(|err| Failure::runtime(err.to_string()))?;
+    match outcome {
+        craftcloud_db::password_reset::IssueOutcome::Issued { revoked_sessions } => {
+            eprintln!(
+                "Note: {revoked_sessions} active session(s) of this account were revoked and                  earlier unused reset links were voided."
+            );
+        }
+        craftcloud_db::password_reset::IssueOutcome::AccountDisabled => {
+            return Err(Failure::runtime(
+                "the account is disabled; no reset link was issued",
+            ));
+        }
+        craftcloud_db::password_reset::IssueOutcome::NoSuchUser => {
+            return Err(Failure::runtime("no account with that e-mail address"));
+        }
+    }
+    // The link is a credential: it goes to stdout only (never to the log),
+    // and stderr carries the warning so it is visible next to the link.
+    eprintln!(
+        "WARNING: the link below is a secret that grants access to the account.          Hand it over privately; do not paste it into tickets or chat, and run this          command interactively (for example `docker exec -it`) so that no job log          captures stdout."
+    );
+    println!("Password reset link (valid for 1 hour, usable once):");
+    println!("{public_url}/reset-password#token={}", token.expose());
+    pool.close().await;
+    Ok(())
+}
+
 async fn run(config: Config) -> Result<(), Failure> {
     // Validate the bootstrap secret first: a bad file is a configuration
     // error (exit 2) and must stop startup before anything is bound.
@@ -211,17 +288,30 @@ async fn run(config: Config) -> Result<(), Failure> {
         address = %config.bind,
         "starting CraftCloud development prototype (not production-ready; no authentication)"
     );
-    let setup = pool
+    if pool.is_some() && config.public_origin.is_none() {
+        tracing::warn!(
+            "CRAFTCLOUD_PUBLIC_URL is not set: browser requests with an Origin header will be rejected"
+        );
+    }
+    let auth_settings = AuthSettings {
+        idle_timeout: config.session_idle_timeout,
+        absolute_timeout: config.session_absolute_timeout,
+        public_url: config.public_url.clone(),
+        public_origin: config.public_origin.clone(),
+        cookie_secure: config.cookie_secure,
+        ..AuthSettings::default()
+    };
+    let services = pool
         .as_ref()
-        .map(|pool| SetupService::new(pool.clone(), bootstrap));
-    let router = craftcloud_api::router_with_setup(
+        .map(|pool| Services::new(pool.clone(), bootstrap, auth_settings));
+    let router = craftcloud_api::router_with_services(
         Capabilities::development_defaults(),
         &ApiConfig {
             max_body_bytes: config.max_body_bytes,
             request_timeout: config.request_timeout,
             trusted_proxies: config.trusted_proxies.clone(),
         },
-        setup,
+        services,
     );
     let outcome = server::serve(listener, router, shutdown_signal(), config.shutdown_grace)
         .await

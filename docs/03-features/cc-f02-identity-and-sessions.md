@@ -1,6 +1,6 @@
 # CC-F02 — Identität, Login und Sessions
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
+> **Status:** Umsetzung lokal vorhanden (PR-005, Review offen): Login/Logout, serverseitige Cookie-Sitzungen mit CSRF- und Origin-Prüfung, Rate-Limiting, Passwortänderung, Reset-Links (Operator-API und Offline-CLI). Geräteliste (`GET /auth/sessions`, `DELETE /auth/sessions/{id}`) vorhanden. Offen: Konto-Deaktivierung per API (PR-006), Einladungen (PR-007), Policy-Anbindung (PR-006). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

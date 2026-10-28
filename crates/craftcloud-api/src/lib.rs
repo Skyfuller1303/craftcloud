@@ -10,11 +10,19 @@
 //! from `Host` or `X-Forwarded-*` headers (see [`ClientIp`] for how forwarded
 //! client addresses are treated).
 
+mod auth;
 mod client_ip;
+mod clock;
+mod ratelimit;
+mod responses;
+mod services;
+mod session;
 mod setup;
 
 pub use client_ip::ClientIp;
-pub use setup::SetupService;
+pub use clock::{Clock, SystemClock};
+pub use services::{AuthSettings, Services};
+pub use session::{AuthRejection, AuthenticatedSession, CSRF_HEADER};
 
 use std::{sync::Arc, time::Duration};
 
@@ -24,7 +32,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use craftcloud_core::Capabilities;
 use ipnet::IpNet;
@@ -71,37 +79,54 @@ pub fn router() -> Router {
 }
 
 /// Builds the router with explicit capabilities and limits, without
-/// database-backed services (the setup routes answer 503 `SETUP_UNAVAILABLE`).
+/// database-backed services (setup and authentication routes answer 503).
 pub fn router_with(capabilities: Capabilities, config: &ApiConfig) -> Router {
-    router_with_setup(capabilities, config, None)
+    router_with_services(capabilities, config, None)
 }
 
-/// Builds the router with the optional instance-setup service.
-pub fn router_with_setup(
+/// Builds the router with the optional database-backed services (setup and
+/// authentication routes).
+pub fn router_with_services(
     capabilities: Capabilities,
     config: &ApiConfig,
-    setup: Option<SetupService>,
+    services: Option<Services>,
 ) -> Router {
     let state = ApiState {
         capabilities,
-        setup: setup.map(Arc::new),
+        services: services.map(Arc::new),
     };
     let routes = Router::new()
         .route("/health/live", get(health_live))
         .route("/api/v1/info", get(info))
         .route("/api/v1/setup/status", get(setup::status))
         .route("/api/v1/setup/complete", post(setup::complete))
+        .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/session", get(auth::session))
+        .route("/api/v1/auth/sessions", get(auth::list_sessions))
+        .route(
+            "/api/v1/auth/sessions/{session_id}",
+            delete(auth::revoke_session),
+        )
+        .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/logout-all", post(auth::logout_all))
+        .route("/api/v1/auth/password/change", post(auth::change_password))
+        .route("/api/v1/auth/password-reset", post(auth::reset_password))
+        .route(
+            "/api/v1/admin/users/{user_id}/password-reset",
+            post(auth::issue_password_reset).delete(auth::void_password_reset),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
     with_middleware(routes, config)
 }
 
-/// Shared handler state.
+/// Shared handler state. Opaque: only used as the state type of
+/// [`AuthenticatedSession`].
 #[derive(Clone)]
-pub(crate) struct ApiState {
+pub struct ApiState {
     pub(crate) capabilities: Capabilities,
-    pub(crate) setup: Option<Arc<SetupService>>,
+    pub(crate) services: Option<Arc<Services>>,
 }
 
 /// Applies the centralized middleware stack. The last layer added is the

@@ -1,6 +1,7 @@
 //! Password policy and Argon2id hashing.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 use argon2::{
     Algorithm, Argon2, Params, Version,
@@ -110,6 +111,52 @@ pub fn hash_password(password: &str) -> Result<String, HashError> {
         .map_err(|_| HashError)
 }
 
+/// Whether a stored hash should be replaced after a successful verification:
+/// anything that is not Argon2id v19 with exactly the current parameters
+/// (including unparsable hashes).
+#[must_use]
+pub fn needs_rehash(phc: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(phc) else {
+        return true;
+    };
+    if parsed.algorithm != Algorithm::Argon2id.ident() || parsed.version != Some(0x13) {
+        return true;
+    }
+    match Params::try_from(&parsed) {
+        Ok(params) => {
+            params.m_cost() != MEMORY_KIB
+                || params.t_cost() != ITERATIONS
+                || params.p_cost() != PARALLELISM
+        }
+        Err(_) => true,
+    }
+}
+
+static DUMMY_HASH: OnceLock<Option<String>> = OnceLock::new();
+
+/// Spends the same work as a real verification and always returns `false`.
+/// Used for unknown accounts so response time does not reveal whether an
+/// account exists. **Blocking.** The first call also computes the dummy hash.
+#[must_use]
+pub fn dummy_verify(candidate: &str) -> bool {
+    let dummy = DUMMY_HASH.get_or_init(|| hash_password("dummy password for equal timing").ok());
+    if let Some(phc) = dummy {
+        let _ = verify_password(phc, candidate);
+    }
+    false
+}
+
+/// Verifies against `stored` if there is one, otherwise performs a dummy
+/// verification of equal cost. Returns `false` for a missing hash.
+/// **Blocking.**
+#[must_use]
+pub fn verify_or_dummy(stored: Option<&str>, candidate: &str) -> bool {
+    match stored {
+        Some(phc) => verify_password(phc, candidate),
+        None => dummy_verify(candidate),
+    }
+}
+
 /// Verifies `password` against a PHC string. Any error (malformed hash,
 /// unsupported algorithm) counts as a mismatch. **Blocking**.
 #[must_use]
@@ -188,6 +235,27 @@ mod tests {
         assert!(verify_password(&hash, "correct horse battery"));
         assert!(!verify_password(&hash, "correct horse batterY"));
         assert!(!verify_password(&hash, ""));
+    }
+
+    #[test]
+    fn needs_rehash_detects_other_parameters_and_garbage() {
+        let current = hash_password("some long password 1").unwrap();
+        assert!(!needs_rehash(&current));
+        let weaker = current.replace("m=19456", "m=8192");
+        assert!(needs_rehash(&weaker));
+        assert!(needs_rehash(&current.replace("t=2", "t=3")));
+        assert!(needs_rehash(&current.replace("$argon2id$", "$argon2i$")));
+        assert!(needs_rehash("garbage"));
+        assert!(needs_rehash(""));
+    }
+
+    #[test]
+    fn dummy_verification_never_succeeds() {
+        assert!(!dummy_verify("dummy password for equal timing"));
+        assert!(!verify_or_dummy(None, "anything at all here"));
+        let hash = hash_password("right password 123").unwrap();
+        assert!(verify_or_dummy(Some(&hash), "right password 123"));
+        assert!(!verify_or_dummy(Some(&hash), "wrong password 123"));
     }
 
     #[test]

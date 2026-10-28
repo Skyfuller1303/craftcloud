@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-28 — PR-005 (CC-P01-05) implemented locally: login, cookie sessions (hashed at rest), CSRF header + Origin check, in-memory rate limiting, logout/logout-all, password change, operator-issued and offline password reset links, migration 0004. Not reviewed or merged.
+
 2026-10-28 — PR-004 (CC-P01-04) implemented locally: one-shot instance setup (`/api/v1/setup/*`), Argon2id password hashing, bootstrap token via `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`, migration 0003, `craftcloud-auth` crate. No login yet. Not reviewed or merged.
 
 2026-10-28 — PR-003 (CC-P01-03) implemented locally: `craftcloud-db` (sqlx, runtime queries), migrations 0001/0002, explicit `craftcloud-server migrate`, startup schema verification, `CRAFTCLOUD_DATABASE_URL_FILE`, `cargo xtask db-test` (Docker). ADR-0012 proposed. Not reviewed or merged. MSRV is 1.99 (installed toolchain; 1.95 dropped by user decision, ADR-0010).
