@@ -77,6 +77,63 @@ impl Default for ApiConfig {
     }
 }
 
+/// Every route the router serves: path template and the HTTP methods
+/// answered there. This is the code side of the contract; the test
+/// `tests/contract.rs` compares it with `contracts/openapi.yaml`, probes the
+/// router for exactly these routes and fails when `router_with_services` gains
+/// a `.route(` that is not listed here.
+pub const ROUTES: &[(&str, &[&str])] = &[
+    ("/health/live", &["GET"]),
+    ("/api/v1/info", &["GET"]),
+    ("/api/v1/setup/status", &["GET"]),
+    ("/api/v1/setup/complete", &["POST"]),
+    ("/api/v1/organizations", &["GET", "POST"]),
+    ("/api/v1/organizations/{org_id}", &["GET", "PATCH"]),
+    ("/api/v1/organizations/{org_id}/members", &["GET", "POST"]),
+    (
+        "/api/v1/organizations/{org_id}/members/{user_id}",
+        &["PATCH", "DELETE"],
+    ),
+    (
+        "/api/v1/organizations/{org_id}/workspaces",
+        &["GET", "POST"],
+    ),
+    ("/api/v1/workspaces/{workspace_id}", &["GET", "PATCH"]),
+    (
+        "/api/v1/workspaces/{workspace_id}/members",
+        &["GET", "POST"],
+    ),
+    (
+        "/api/v1/workspaces/{workspace_id}/members/{user_id}",
+        &["PATCH", "DELETE"],
+    ),
+    (
+        "/api/v1/organizations/{org_id}/invitations",
+        &["GET", "POST"],
+    ),
+    (
+        "/api/v1/organizations/{org_id}/invitations/{invitation_id}",
+        &["DELETE"],
+    ),
+    ("/api/v1/invitations/accept", &["POST"]),
+    ("/api/v1/admin/organizations", &["GET"]),
+    ("/api/v1/admin/users", &["GET"]),
+    ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
+    ("/api/v1/admin/users/{user_id}/enable", &["POST"]),
+    ("/api/v1/auth/login", &["POST"]),
+    ("/api/v1/auth/session", &["GET"]),
+    ("/api/v1/auth/sessions", &["GET"]),
+    ("/api/v1/auth/sessions/{session_id}", &["DELETE"]),
+    ("/api/v1/auth/logout", &["POST"]),
+    ("/api/v1/auth/logout-all", &["POST"]),
+    ("/api/v1/auth/password/change", &["POST"]),
+    ("/api/v1/auth/password-reset", &["POST"]),
+    (
+        "/api/v1/admin/users/{user_id}/password-reset",
+        &["POST", "DELETE"],
+    ),
+];
+
 /// Builds the router with development-default capabilities and default limits.
 pub fn router() -> Router {
     router_with(Capabilities::development_defaults(), &ApiConfig::default())

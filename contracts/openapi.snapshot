@@ -1,0 +1,75 @@
+# Normalized view of contracts/openapi.yaml. Regenerate with `cargo xtask openapi-snapshot --update`.
+GET /api/v1/admin/organizations auth=cookie req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
+GET /api/v1/admin/users auth=cookie req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
+POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf req=- ok=- codes=200,401,403,404,409,500,503
+POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+DELETE /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+POST /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf req=- ok=ResetLinkResponse codes=201,401,403,404,409,500,503
+POST /api/v1/auth/login auth=none req=LoginRequest ok=LoginResponse codes=200,401,403,413,415,422,429,500,503
+POST /api/v1/auth/logout auth=cookie+csrf req=- ok=- codes=204,401,403,500,503
+POST /api/v1/auth/logout-all auth=cookie+csrf req=- ok=- codes=204,401,403,500,503
+POST /api/v1/auth/password-reset auth=none req=ResetPasswordRequest ok=- codes=204,400,413,415,422,429,500,503
+POST /api/v1/auth/password/change auth=cookie+csrf req=ChangePasswordRequest ok=- codes=204,401,403,413,415,422,429,500,503
+GET /api/v1/auth/session auth=cookie req=- ok=SessionInfo codes=200,401,500,503
+GET /api/v1/auth/sessions auth=cookie req=- ok=SessionList codes=200,401,500,503
+DELETE /api/v1/auth/sessions/{session_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+GET /api/v1/info auth=none req=- ok=- codes=200,503
+POST /api/v1/invitations/accept auth=none req=AcceptInvitationRequest ok=AcceptedInvitation codes=200,400,401,403,409,413,415,422,429,500,503
+GET /api/v1/organizations auth=cookie req=- ok=MyOrganizationPage codes=200,400,401,422,500,503
+POST /api/v1/organizations auth=cookie+csrf req=CreateOrganizationRequest ok=CreatedOrganization codes=201,401,403,413,415,422,500,503
+GET /api/v1/organizations/{org_id} auth=cookie req=- ok=Organization codes=200,401,404,500,503
+PATCH /api/v1/organizations/{org_id} auth=cookie+csrf req=UpdateOrganizationRequest ok=Organization codes=200,401,403,404,412,413,415,422,428,500,503
+GET /api/v1/organizations/{org_id}/invitations auth=cookie req=- ok=InvitationPage codes=200,400,401,403,404,422,500,503
+POST /api/v1/organizations/{org_id}/invitations auth=cookie+csrf req=CreateInvitationRequest ok=CreatedInvitation codes=201,401,403,404,409,413,415,422,429,500,503
+DELETE /api/v1/organizations/{org_id}/invitations/{invitation_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+GET /api/v1/organizations/{org_id}/members auth=cookie req=- ok=MemberPage codes=200,400,401,404,422,500,503
+POST /api/v1/organizations/{org_id}/members auth=cookie+csrf req=AddMemberRequest ok=Member codes=201,401,403,404,409,413,415,422,500,503
+DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
+PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=ChangeRoleRequest ok=Member codes=200,401,403,404,409,413,415,422,500,503
+GET /api/v1/organizations/{org_id}/workspaces auth=cookie req=- ok=WorkspacePage codes=200,400,401,404,422,500,503
+POST /api/v1/organizations/{org_id}/workspaces auth=cookie+csrf req=CreateWorkspaceRequest ok=Workspace codes=201,401,403,404,413,415,422,500,503
+POST /api/v1/setup/complete auth=none req=SetupCompleteRequest ok=- codes=201,403,409,413,415,422,500,503
+GET /api/v1/setup/status auth=none req=- ok=- codes=200,500,503
+GET /api/v1/workspaces/{workspace_id} auth=cookie req=- ok=Workspace codes=200,401,404,500,503
+PATCH /api/v1/workspaces/{workspace_id} auth=cookie+csrf req=UpdateWorkspaceRequest ok=Workspace codes=200,401,403,404,412,413,415,422,428,500,503
+GET /api/v1/workspaces/{workspace_id}/members auth=cookie req=- ok=WorkspaceMemberPage codes=200,400,401,404,422,500,503
+POST /api/v1/workspaces/{workspace_id}/members auth=cookie+csrf req=AddWorkspaceMemberRequest ok=WorkspaceMember codes=201,401,403,404,409,413,415,422,500,503
+DELETE /api/v1/workspaces/{workspace_id}/members/{user_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+PATCH /api/v1/workspaces/{workspace_id}/members/{user_id} auth=cookie+csrf req=ChangeWorkspaceRoleRequest ok=WorkspaceMember codes=200,401,403,404,413,415,422,500,503
+GET /health/live auth=none req=- ok=- codes=200,503
+# component schemas
+AcceptInvitationRequest
+AcceptedInvitation
+AddMemberRequest
+AddWorkspaceMemberRequest
+AdminUser
+AdminUserPage
+ChangePasswordRequest
+ChangeRoleRequest
+ChangeWorkspaceRoleRequest
+CreateInvitationRequest
+CreateOrganizationRequest
+CreateWorkspaceRequest
+CreatedInvitation
+CreatedOrganization
+Error
+Invitation
+InvitationPage
+LoginRequest
+LoginResponse
+Member
+MemberPage
+MyOrganizationPage
+Organization
+OrganizationSummaryPage
+ResetLinkResponse
+ResetPasswordRequest
+SessionInfo
+SessionList
+SetupCompleteRequest
+UpdateOrganizationRequest
+UpdateWorkspaceRequest
+Workspace
+WorkspaceMember
+WorkspaceMemberPage
+WorkspacePage

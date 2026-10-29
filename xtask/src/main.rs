@@ -12,9 +12,57 @@ fn main() -> ExitCode {
     match args.next().as_deref() {
         Some("ci") if args.next().is_none() => ci(),
         Some("db-test") if args.next().is_none() => db_test::run(&repo_root()),
-        _ => {
-            eprintln!("usage: cargo xtask <ci|db-test>");
-            ExitCode::from(2)
+        Some("openapi-snapshot") => match (args.next().as_deref(), args.next()) {
+            (None, None) => openapi_snapshot(false),
+            (Some("--update"), None) => openapi_snapshot(true),
+            _ => usage(),
+        },
+        _ => usage(),
+    }
+}
+
+fn usage() -> ExitCode {
+    eprintln!("usage: cargo xtask <ci|db-test|openapi-snapshot [--update]>");
+    ExitCode::from(2)
+}
+
+/// Checks `contracts/openapi.snapshot` against `contracts/openapi.yaml`, or
+/// rewrites it with `--update`. The normalization lives in the contract test
+/// (`crates/craftcloud-api/tests/contract.rs`), so there is one implementation.
+fn openapi_snapshot(update: bool) -> ExitCode {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "test",
+            "-p",
+            "craftcloud-api",
+            "--test",
+            "contract",
+            "openapi_matches_the_committed_snapshot",
+        ])
+        .current_dir(repo_root());
+    if update {
+        command.env("UPDATE_OPENAPI_SNAPSHOT", "1");
+    } else {
+        command.env_remove("UPDATE_OPENAPI_SNAPSHOT");
+    }
+    match command.status() {
+        Ok(status) if status.success() => {
+            println!(
+                "{}",
+                if update {
+                    "contracts/openapi.snapshot updated; review and commit the diff"
+                } else {
+                    "contracts/openapi.snapshot matches contracts/openapi.yaml"
+                }
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(status) => exit_code_from(status.code()),
+        Err(err) => {
+            eprintln!("cannot start cargo: {err}");
+            ExitCode::FAILURE
         }
     }
 }

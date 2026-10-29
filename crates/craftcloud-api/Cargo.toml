@@ -29,6 +29,8 @@ sqlx.workspace = true
 argon2.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
+# Contract tests only (parses contracts/openapi.yaml); not part of the shipped binary.
+serde_yaml_ng = "0.10"
 
 [lints]
 workspace = true

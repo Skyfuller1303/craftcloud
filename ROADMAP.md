@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — CC-P01-09 implemented locally: contract tests (`crates/craftcloud-api/tests/contract.rs`) comparing `contracts/openapi.yaml` with the served routes, committed `contracts/openapi.snapshot` (`cargo xtask openapi-snapshot [--update]`), common error shape tests; stale `/files` placeholder removed from the OpenAPI document; phase-01 status lines and exit gates updated. Dev-dependency `serde_yaml_ng` (tests only). Not reviewed or merged.
+
 2026-10-29 — PR-007 (CC-P01-07/08 parts) implemented locally: workspaces and workspace members (admin/editor/viewer), link invitations (72 h, single use, revocable, SHA-256 only, inviter rights re-checked at acceptance), anonymous and logged-in acceptance, org setting `workspace_admin_invites_enabled`, migration 0006, 9 new policy actions. No e-mail delivery, no workspace deletion. Not reviewed or merged.
 
 2026-10-28 — PR-006 (CC-P01-06) implemented locally: pure policy engine (`craftcloud_core::policy`), organizations (operator-created), membership management with last-owner protection, account disable/enable, ETag/If-Match, keyset pagination, structured audit log events, migration 0005. Not reviewed or merged.

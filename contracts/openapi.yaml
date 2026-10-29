@@ -3,7 +3,7 @@ info:
   title: CraftCloud Core API — proposal sketch
   version: 0.0.0-rfc
   description: >-
-    RFC EXAMPLE ONLY. Not deployed, not an upstream contract, deliberately incomplete.
+    RFC EXAMPLE ONLY. Not deployed, not an upstream contract, deliberately incomplete. Contains only operations that the server implements (checked by crates/craftcloud-api/tests/contract.rs); project, file and upload endpoints are added with their features.
     Authorization details and full response schemas must be decided before implementation.
 servers:
   - url: https://craftcloud.example.invalid/api/v1
@@ -19,7 +19,6 @@ tags:
   - name: Discovery
   - name: Workspaces
   - name: Invitations
-  - name: Files
 paths:
   /health/live:
     get:
@@ -1132,23 +1131,6 @@ paths:
         '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
-  /files/{file_id}:
-    get:
-      tags: [Files]
-      summary: Get authorized file metadata, not binary content
-      parameters:
-        - in: path
-          name: file_id
-          required: true
-          schema: {type: string, format: uuid}
-      responses:
-        '200':
-          description: File metadata
-          content:
-            application/json:
-              schema: {$ref: '#/components/schemas/File'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '404': {$ref: '#/components/responses/NotFound'}
 components:
   parameters:
     OrgId:
@@ -1543,14 +1525,6 @@ components:
         workspace_role_applied: {type: boolean, description: False when an existing equal or higher workspace role was kept}
         csrf_token: {type: string, description: Only when an account was created and logged in}
         expires_at: {type: string, format: date-time, description: Session expiry, only when a session was issued}
-    File:
-      type: object
-      required: [id, project_id, name]
-      properties:
-        id: {type: string, format: uuid}
-        project_id: {type: string, format: uuid}
-        name: {type: string}
-        head_version_id: {type: [string, 'null'], format: uuid}
   responses:
     ForbiddenOrCsrf:
       description: FORBIDDEN (authenticated but not allowed) or CSRF_FAILED
@@ -1614,7 +1588,16 @@ components:
     Unauthorized:
       description: >-
         No valid session (UNAUTHENTICATED): missing, malformed, expired (idle 8 h or absolute 7 d by default) or revoked
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     NotFound:
-      description: Resource not visible to requester
+      description: Resource not visible to requester (NOT_FOUND); unknown ids and ids of other tenants are indistinguishable
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     Conflict:
       description: State conflict without precondition (e.g. setup already completed, idempotency key reused with a different payload)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
