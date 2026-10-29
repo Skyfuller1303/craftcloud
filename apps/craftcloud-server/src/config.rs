@@ -31,6 +31,8 @@ const SESSION_IDLE_MINUTES_RANGE: (u64, u64) = (5, 72 * 60);
 const DEFAULT_SESSION_ABSOLUTE_HOURS: u64 = 7 * 24;
 const SESSION_ABSOLUTE_HOURS_RANGE: (u64, u64) = (1, 30 * 24);
 const DEFAULT_TRASH_RETENTION_DAYS: u64 = 30;
+const DEFAULT_UPLOAD_TTL_HOURS: u64 = 24;
+const UPLOAD_TTL_HOURS_RANGE: (u64, u64) = (1, 168);
 const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_FILE_SIZE_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 const TRASH_RETENTION_DAYS_RANGE: (u64, u64) = (1, 3650);
@@ -48,7 +50,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 16] = [
+const SUPPORTED_KEYS: [&str; 17] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -62,6 +64,7 @@ const SUPPORTED_KEYS: [&str; 16] = [
     "TRASH_RETENTION_DAYS",
     "STORAGE_DIR",
     "MAX_FILE_SIZE_BYTES",
+    "UPLOAD_TTL_HOURS",
     "DATABASE_URL_FILE",
     "DATABASE_MAX_CONNECTIONS",
     "DATABASE_CONNECT_TIMEOUT_SECS",
@@ -153,6 +156,8 @@ pub struct Config {
     pub storage_dir: Option<PathBuf>,
     /// Largest accepted file size in bytes (ADR-0014: 5 GiB by default).
     pub max_file_size_bytes: u64,
+    /// How long an upload session stays open.
+    pub upload_ttl: Duration,
 }
 
 impl Config {
@@ -321,6 +326,10 @@ impl Config {
             parse_ranged(key, raw, MAX_FILE_SIZE_RANGE)
         })
         .unwrap_or(DEFAULT_MAX_FILE_SIZE_BYTES);
+        let upload_ttl_hours = field(&mut errors, env, "UPLOAD_TTL_HOURS", |key, raw| {
+            parse_ranged(key, raw, UPLOAD_TTL_HOURS_RANGE)
+        })
+        .unwrap_or(DEFAULT_UPLOAD_TTL_HOURS);
         if session_idle_minutes > session_absolute_hours * 60 {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}SESSION_IDLE_TIMEOUT_MINUTES"),
@@ -363,6 +372,7 @@ impl Config {
                 trash_retention: Duration::from_secs(trash_retention_days * 24 * 3600),
                 storage_dir,
                 max_file_size_bytes,
+                upload_ttl: Duration::from_secs(upload_ttl_hours * 3600),
             })
         } else {
             Err(errors)
@@ -656,6 +666,13 @@ mod tests {
             retention.trash_retention,
             Duration::from_secs(7 * 24 * 3600)
         );
+        assert_eq!(defaults.upload_ttl, Duration::from_secs(24 * 3600));
+        let ttl = Config::from_env_map(&env(&[("CRAFTCLOUD_UPLOAD_TTL_HOURS", "168")])).unwrap();
+        assert_eq!(ttl.upload_ttl, Duration::from_secs(168 * 3600));
+        for bad in ["0", "169", "x"] {
+            let key = "CRAFTCLOUD_UPLOAD_TTL_HOURS";
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
         assert_eq!(defaults.storage_dir, None);
         assert_eq!(defaults.max_file_size_bytes, 5 * 1024 * 1024 * 1024);
         let storage = Config::from_env_map(&env(&[

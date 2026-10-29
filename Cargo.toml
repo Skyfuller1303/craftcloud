@@ -42,6 +42,9 @@ url = { version = "2", default-features = false, features = ["std"] }
 ipnet = "2"
 zeroize = "1"
 unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [workspace.lints.rust]

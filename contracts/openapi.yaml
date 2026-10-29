@@ -21,6 +21,8 @@ tags:
   - name: Invitations
   - name: Projects
   - name: Files
+  - name: Uploads
+  - name: Quota
 paths:
   /health/live:
     get:
@@ -1368,6 +1370,266 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/uploads:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    post:
+      tags: [Uploads]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Create an upload session and reserve its quota (organization owner/admin, workspace admin and editor)
+      description: >-
+        Declares size and SHA-256 of the content that will follow with `PUT /uploads/{upload_id}/content`. Reserves
+        the size against the workspace and organization quota (413 QUOTA_EXCEEDED; the message never names other
+        workspaces) and checks the maximum file size of the server (413 PAYLOAD_TOO_LARGE). At most 10 open sessions per
+        user and 200 per organization (409 UPLOAD_LIMIT). The session expires after `CRAFTCLOUD_UPLOAD_TTL_HOURS` (default
+        24). The optional `Idempotency-Key` header (1 to 128 visible ASCII characters) makes a repeated request with the
+        same file, size and hash return the same session (200); the same key with another request answers 409
+        IDEMPOTENCY_KEY_REUSED. Viewers: 403; callers who cannot see the workspace: 404. A file or project in the trash
+        answers 409 FILE_DELETED / PROJECT_DELETED. 503 STORAGE_UNAVAILABLE when no storage directory is configured.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: {type: string, minLength: 1, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateUploadRequest'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Upload'}
+        '200':
+          description: Replay of an earlier request with the same Idempotency-Key
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Upload'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: UPLOAD_LIMIT, IDEMPOTENCY_KEY_REUSED, FILE_DELETED or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413':
+          description: PAYLOAD_TOO_LARGE (above the maximum file size) or QUOTA_EXCEEDED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /uploads/{upload_id}:
+    parameters:
+      - {$ref: '#/components/parameters/UploadId'}
+    get:
+      tags: [Uploads]
+      summary: Read an upload session (creator, workspace admin, organization owner/admin)
+      description: >-
+        An open session past its expiry is closed first (state `expired`). Unknown ids, ids of other tenants and
+        sessions in workspaces the caller cannot see are indistinguishable: 404. Other members of the workspace: 403.
+      responses:
+        '200':
+          description: The session
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Upload'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Uploads]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Abort an upload session (creator, workspace admin, organization owner/admin)
+      description: >-
+        Releases the reservation; a stored but uncommitted blob becomes orphaned (removed later by the cleanup job).
+        Idempotent for closed sessions. While content is being received: 409 UPLOAD_IN_PROGRESS; after a commit:
+        409 UPLOAD_CLOSED.
+      responses:
+        '204': {description: Aborted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: UPLOAD_IN_PROGRESS or UPLOAD_CLOSED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /uploads/{upload_id}/content:
+    parameters:
+      - {$ref: '#/components/parameters/UploadId'}
+    put:
+      tags: [Uploads]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Send the content of an upload (the creator, while still editor or better)
+      description: >-
+        Raw body (any content type), streamed into object storage. There is no global body limit or handler timeout on
+        this route; instead the body is capped at the declared size (413 PAYLOAD_TOO_LARGE), a read that stalls for
+        60 seconds cancels the upload (408 REQUEST_TIMEOUT), the whole transfer ends when the session expires (410
+        UPLOAD_EXPIRED), after a grace period of 5 minutes an average rate below 16 KiB/s is cancelled (408
+        REQUEST_TIMEOUT), and a short body is 422 LENGTH_MISMATCH. Verification, publishing and recording continue on
+        the server even if the client disconnects at that point. The SHA-256 is
+        computed while streaming and compared with the declared one (422 CHECKSUM_MISMATCH). Only one request can
+        send content (409 UPLOAD_IN_PROGRESS); a session that failed, was aborted or has stored its content cannot be
+        resumed (409 UPLOAD_CLOSED, expired: 410 UPLOAD_EXPIRED); create a new session instead. A full device answers
+        507 INSUFFICIENT_STORAGE, missing storage 503 STORAGE_UNAVAILABLE. Every failure releases the reservation. After
+        the bytes are stored the server checks again with fresh roles that the caller may still write and that
+        file and project still exist; otherwise the stored object is deleted again (403/404, 409 FILE_DELETED). Success
+        leaves a verified but uncommitted blob (state `stored`); making it a file version is a separate step.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '200':
+          description: Stored; the response shows state `stored`
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Upload'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '400':
+          description: UPLOAD_INTERRUPTED (the body ended with an error)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '408':
+          description: REQUEST_TIMEOUT (the body stalled)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: UPLOAD_IN_PROGRESS, UPLOAD_CLOSED, FILE_DELETED or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '410':
+          description: UPLOAD_EXPIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413':
+          description: PAYLOAD_TOO_LARGE (more bytes than declared)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: LENGTH_MISMATCH or CHECKSUM_MISMATCH
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '507':
+          description: INSUFFICIENT_STORAGE
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/usage:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Quota]
+      summary: Storage quota and usage of an organization and its workspaces (organization owner and admin)
+      description: >-
+        `reserved_bytes` are held by open uploads and stored but uncommitted blobs, `committed_bytes` by file versions.
+        `quota_bytes` null means unlimited. Workspaces are keyset paginated (creation time, id). Other members: 403;
+        non-members: 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: Usage
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsagePage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /workspaces/{workspace_id}/quota:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+    put:
+      tags: [Quota]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Set the storage quota of a workspace (organization owner and admin)
+      description: >-
+        `quota_bytes` is required: a number of bytes or null for unlimited. A value above the organization quota is
+        422. Lowering a quota never deletes data; it only blocks new reservations. Workspace admins: 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QuotaRequest'}
+      responses:
+        '200':
+          description: Set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/QuotaResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/organizations/{org_id}/quota:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    put:
+      tags: [Quota, Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Set the storage quota of an organization (instance operator only)
+      description: >-
+        `quota_bytes` is required: a number of bytes or null for unlimited. Existing data is never deleted by a lower
+        quota. Other callers: 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QuotaRequest'}
+      responses:
+        '200':
+          description: Set
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/QuotaResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /organizations/{org_id}/invitations:
     parameters:
       - {$ref: '#/components/parameters/OrgId'}
@@ -1528,6 +1790,11 @@ components:
     FileId:
       in: path
       name: file_id
+      required: true
+      schema: {type: string, format: uuid}
+    UploadId:
+      in: path
+      name: upload_id
       required: true
       schema: {type: string, format: uuid}
     Deleted:
@@ -1913,6 +2180,65 @@ components:
       required: [name]
       properties:
         name: {type: string, minLength: 1, maxLength: 255}
+    CreateUploadRequest:
+      type: object
+      additionalProperties: false
+      required: [size_bytes, sha256]
+      properties:
+        size_bytes: {type: integer, minimum: 0, description: Exact size of the content that will be sent}
+        sha256: {type: string, pattern: '^[0-9a-fA-F]{64}$', description: Hex SHA-256 of the content}
+    Upload:
+      type: object
+      required: [upload_id, file_id, project_id, workspace_id, state, size_bytes, sha256, max_bytes, created_by, created_at, expires_at]
+      properties:
+        upload_id: {type: string, format: uuid}
+        file_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        state: {type: string, enum: [created, receiving, stored, committed, aborted, expired, failed]}
+        size_bytes: {type: integer, minimum: 0}
+        sha256: {type: string}
+        max_bytes: {type: integer, minimum: 0, description: Most bytes the content route accepts (the declared size)}
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    QuotaRequest:
+      type: object
+      additionalProperties: false
+      required: [quota_bytes]
+      properties:
+        quota_bytes: {type: [integer, 'null'], minimum: 0}
+    QuotaResponse:
+      type: object
+      required: [quota_bytes]
+      properties:
+        quota_bytes: {type: [integer, 'null'], minimum: 0}
+    UsageEntry:
+      type: object
+      required: [quota_bytes, reserved_bytes, committed_bytes]
+      properties:
+        quota_bytes: {type: [integer, 'null'], minimum: 0}
+        reserved_bytes: {type: integer, minimum: 0}
+        committed_bytes: {type: integer, minimum: 0}
+    WorkspaceUsageEntry:
+      type: object
+      required: [workspace_id, effective_limit_bytes, quota_bytes, reserved_bytes, committed_bytes]
+      properties:
+        workspace_id: {type: string, format: uuid}
+        effective_limit_bytes: {type: [integer, 'null'], minimum: 0, description: The smaller of the workspace and the organization quota; null when neither is set}
+        quota_bytes: {type: [integer, 'null'], minimum: 0}
+        reserved_bytes: {type: integer, minimum: 0}
+        committed_bytes: {type: integer, minimum: 0}
+    UsagePage:
+      type: object
+      required: [organization, workspaces, next_cursor]
+      properties:
+        organization: {$ref: '#/components/schemas/UsageEntry'}
+        workspaces:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/WorkspaceUsageEntry'}
+        next_cursor: {type: [string, 'null']}
     AdminUser:
       type: object
       required: [id, email, display_name, created_at, disabled, email_verified, origin]

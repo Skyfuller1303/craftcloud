@@ -1,6 +1,6 @@
 # CC-F07 — Streaming Upload, Download und Integrität
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
+> **Status:** Upload-Sitzungen lokal umgesetzt (PR-010, Review offen): `POST /files/{id}/uploads` (Größe und SHA-256 angeben, Quota reservieren, `Idempotency-Key`), `PUT /uploads/{id}/content` (Stream in den Objektspeicher mit hartem Byte-Limit, Leerlauf-Timeout, SHA-256- und Längenprüfung, genau ein Schreiber je Sitzung, erneute Rechteprüfung vor dem Speichern), `GET`/`DELETE /uploads/{id}`, Ablauf nach 24 h. Ergebnis ist ein geprüfter, aber noch nicht eingecheckter Blob (`staged`). Nicht umgesetzt: Version-Commit (CC-P02-04), Download (CC-P02-05), fortsetzbare Uploads, Bereinigungsjob für verwaiste Blobs (CC-P02-06/07). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

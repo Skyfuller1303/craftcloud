@@ -27,6 +27,7 @@ pub mod recovery;
 mod scope;
 pub mod sessions;
 pub mod setup;
+pub mod uploads;
 pub mod users;
 pub mod workspaces;
 

@@ -1,6 +1,6 @@
 # CC-F10 — Quotas, Retention, Lösch- und Restore-Politik
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
+> **Status:** Quota-Buchhaltung lokal umgesetzt (PR-010, Review offen): Quota je Organisation (Operator) und Workspace (Organisations-Owner/Admin), NULL = unbegrenzt, Reservierung vor jedem Upload unter der Organisationssperre, Zähler `reserved_bytes`/`committed_bytes` mit Neuberechnung aus den Zeilen, `GET /organizations/{id}/usage`. Soft-Delete und Aufbewahrung von Projekten und Dateien stammen aus PR-008. Nicht umgesetzt: Freigabe von `committed_bytes` bei Löschen, endgültiges Löschen und Garbage Collection (CC-P02-06 Rest), Lease-Logik. Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

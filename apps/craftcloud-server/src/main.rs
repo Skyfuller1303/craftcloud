@@ -354,7 +354,7 @@ async fn run(config: Config) -> Result<(), Failure> {
 
     // The object store is validated at startup when configured; storage
     // features themselves arrive with the upload and download routes.
-    let _object_store = match &config.storage_dir {
+    let object_store = match &config.storage_dir {
         Some(dir) => {
             let store = craftcloud_storage::LocalStore::open(dir)
                 .await
@@ -390,11 +390,17 @@ async fn run(config: Config) -> Result<(), Failure> {
         public_origin: config.public_origin.clone(),
         cookie_secure: config.cookie_secure,
         trash_retention: config.trash_retention,
+        max_file_size_bytes: config.max_file_size_bytes,
+        upload_ttl: config.upload_ttl,
         ..AuthSettings::default()
     };
-    let services = pool
-        .as_ref()
-        .map(|pool| Services::new(pool.clone(), bootstrap, auth_settings));
+    let services = pool.as_ref().map(|pool| {
+        let services = Services::new(pool.clone(), bootstrap, auth_settings);
+        match object_store {
+            Some(store) => services.with_storage(store),
+            None => services,
+        }
+    });
     let router = craftcloud_api::router_with_services(
         Capabilities::development_defaults(),
         &ApiConfig {

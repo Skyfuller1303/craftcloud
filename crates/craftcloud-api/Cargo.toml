@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 craftcloud-core.workspace = true
 craftcloud-auth.workspace = true
+craftcloud-storage.workspace = true
+http-body-util.workspace = true
 craftcloud-db.workspace = true
 serde = { workspace = true }
 zeroize.workspace = true
@@ -23,6 +25,10 @@ uuid.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+craftcloud-storage = { workspace = true, features = ["fault-injection"] }
+http-body.workspace = true
+bytes.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tower.workspace = true
 sqlx.workspace = true

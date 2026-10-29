@@ -27,6 +27,7 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_TRASH_RETENTION_DAYS` | `30` | 1 bis 3650; so lange bleiben in den Papierkorb verschobene Projekte und Dateien wiederherstellbar (ADR-0014). Es gibt noch keine automatische endgültige Löschung (CC-P02-06): abgelaufene Einträge bleiben in der Datenbank, sind aber nicht mehr wiederherstellbar |
 | `CRAFTCLOUD_STORAGE_DIR` | nicht gesetzt (Dateispeicher nicht verfügbar) | absoluter Pfad eines Verzeichnisses für Dateiinhalte. Beim Start geprüft: vorhanden, Verzeichnis, beschreibbar, kein Symlink/Reparse-Point; `objects` und `tmp` darunter werden angelegt und müssen auf demselben Dateisystem liegen (Probe mit Anlegen und Hard-Link; das Dateisystem muss Hard-Links unterstützen, z. B. NTFS, ext4, XFS, nicht FAT/exFAT). Bei einem Fehler beendet sich der Server mit Exit 1 |
 | `CRAFTCLOUD_MAX_FILE_SIZE_BYTES` | `5368709120` (5 GiB) | 1048576 bis 1099511627776; größte erlaubte Dateigröße (ADR-0014) |
+| `CRAFTCLOUD_UPLOAD_TTL_HOURS` | `24` | 1 bis 168; so lange bleibt eine Upload-Sitzung offen. Danach wird sie beim nächsten Zugriff (oder durch den Bereinigungsjob) geschlossen und gibt ihre Quota-Reservierung frei |
 | `CRAFTCLOUD_DATABASE_URL_FILE` | nicht gesetzt (Prototypmodus ohne Datenbank) | absoluter Pfad einer Secret-Datei mit der PostgreSQL-URL |
 | `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` | `10` | 1 bis 100 |
 | `CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS` | `5` | 1 bis 60 |
@@ -111,6 +112,16 @@ Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt ode
 - Nach einem Absturz können `.part`-Dateien in `tmp` liegen bleiben; sie sind nie sichtbar und werden mit dem Abstimmungsjob (CC-P02-07) entfernt. Sie dürfen bei gestopptem Server gefahrlos gelöscht werden.
 - Backups: Datenbank und Speicherverzeichnis gemeinsam sichern (zuerst die Datenbank, danach das Verzeichnis, damit jeder Datenbankeintrag ein Objekt hat; überzählige Objekte sind harmlos). Symlinks im Baum werden vom Server abgelehnt; beim Wiederherstellen keine Links anlegen.
 - Plattenplatz: ein volles Gerät führt zu typisierten Fehlern (`Full`, später HTTP 507); der Server bleibt nutzbar. Quoten und Überwachung folgen mit CC-F10/CC-F15.
+
+## Uploads und Quota (PR-010)
+
+- Der Inhalt wird mit `PUT /api/v1/uploads/{id}/content` als roher Body gestreamt. Für diese Route gelten weder das globale Body-Limit (`CRAFTCLOUD_MAX_BODY_BYTES`) noch das Handler-Zeitlimit; stattdessen gilt die deklarierte Größe als hartes Limit, und ein Lesevorgang, der 60 Sekunden stillsteht, bricht den Upload ab. Ein Reverse-Proxy muss für diese Route große Bodys, Streaming ohne Pufferung (`proxy_request_buffering off` bei nginx) und lange Zeitlimits erlauben.
+- Ohne `CRAFTCLOUD_STORAGE_DIR` antworten Upload-Routen 503 `STORAGE_UNAVAILABLE`. Ein volles Gerät führt zu 507 `INSUFFICIENT_STORAGE`; die Sitzung wird beendet und die Reservierung freigegeben.
+- Quotas: der Operator setzt die Organisations-Quota (`PUT /api/v1/admin/organizations/{id}/quota`), Organisations-Owner/Admins die Workspace-Quota (`PUT /api/v1/workspaces/{id}/quota`, höchstens die Organisations-Quota); `null` bedeutet unbegrenzt (Standard, ADR-0014). Eine niedrigere Quota löscht nie Daten, sie verhindert nur neue Reservierungen. Nutzung: `GET /api/v1/organizations/{id}/usage`.
+- Langsame Uploads: nach einer Schonfrist von 5 Minuten wird ein Upload abgebrochen, dessen Durchschnitt unter 16 KiB/s liegt; jeder Upload endet spätestens, wenn die Sitzung abläuft (`CRAFTCLOUD_UPLOAD_TTL_HOURS`). Das Quota-Limit eines Workspaces ist das Minimum aus Workspace- und Organisations-Quota; eine niedrigere Organisations-Quota ändert Workspace-Quotas nicht.
+- Je Nutzer höchstens 10 und je Organisation höchstens 200 offene Upload-Sitzungen (409 `UPLOAD_LIMIT`).
+- Verwaiste Blobs (Sitzung abgebrochen, abgelaufen oder fehlgeschlagen) bleiben bis zum Bereinigungsjob (CC-P02-06/07) im Speicher und in der Tabelle `blobs` mit Status `orphaned`.
+- Migration 0008 muss mit `craftcloud-server migrate` eingespielt werden (nur vorwärts).
 
 ## Setup-Runbook
 

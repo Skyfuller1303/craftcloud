@@ -127,9 +127,9 @@ mod tests {
         let source = std::fs::read_to_string(repo_file("crates/craftcloud-api/src/lib.rs"))
             .expect("lib.rs readable");
         let start = source
-            .find("let routes = Router::new()")
+            .find("let state = ApiState {")
             .expect("router construction");
-        let end = source[start..].find(".fallback(").expect("fallback") + start;
+        let end = source[start..].find("with_middleware(routes").expect("end") + start;
         let registrations = source[start..end]
             .lines()
             .filter(|line| line.trim_start().starts_with(".route("))

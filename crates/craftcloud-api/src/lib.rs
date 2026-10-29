@@ -23,6 +23,7 @@ mod responses;
 mod services;
 mod session;
 mod setup;
+mod uploads;
 mod workspaces;
 
 pub use client_ip::ClientIp;
@@ -38,7 +39,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use craftcloud_core::Capabilities;
 use ipnet::IpNet;
@@ -127,6 +128,12 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/projects/{project_id}/files", &["GET", "POST"]),
     ("/api/v1/files/{file_id}", &["GET", "PATCH", "DELETE"]),
     ("/api/v1/files/{file_id}/restore", &["POST"]),
+    ("/api/v1/files/{file_id}/uploads", &["POST"]),
+    ("/api/v1/uploads/{upload_id}", &["GET", "DELETE"]),
+    ("/api/v1/uploads/{upload_id}/content", &["PUT"]),
+    ("/api/v1/organizations/{org_id}/usage", &["GET"]),
+    ("/api/v1/workspaces/{workspace_id}/quota", &["PUT"]),
+    ("/api/v1/admin/organizations/{org_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
     ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
@@ -241,6 +248,26 @@ pub fn router_with_services(
                 .delete(files::delete_file),
         )
         .route("/api/v1/files/{file_id}/restore", post(files::restore_file))
+        .route(
+            "/api/v1/files/{file_id}/uploads",
+            post(uploads::create_upload),
+        )
+        .route(
+            "/api/v1/uploads/{upload_id}",
+            get(uploads::get_upload).delete(uploads::abort_upload),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/usage",
+            get(uploads::get_usage),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/quota",
+            put(uploads::set_workspace_quota),
+        )
+        .route(
+            "/api/v1/admin/organizations/{org_id}/quota",
+            put(uploads::set_org_quota),
+        )
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
         .route("/api/v1/admin/users", get(orgs::list_all_users))
         .route(
@@ -268,8 +295,18 @@ pub fn router_with_services(
         )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        .with_state(state.clone());
+    // Upload content streams a large body: no global body limit and no
+    // handler timeout (the handler caps the body at the declared size and
+    // times out idle reads itself). Everything else is shared.
+    let streaming = Router::new()
+        .route(
+            "/api/v1/uploads/{upload_id}/content",
+            put(uploads::put_content),
+        )
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
-    with_middleware(routes, config)
+    with_middleware(routes, config, false).merge(with_middleware(streaming, config, true))
 }
 
 /// Shared handler state. Opaque: only used as the state type of
@@ -282,14 +319,19 @@ pub struct ApiState {
 
 /// Applies the centralized middleware stack. The last layer added is the
 /// outermost one, so the order below reads from the handler outwards.
-fn with_middleware(router: Router, config: &ApiConfig) -> Router {
+fn with_middleware(router: Router, config: &ApiConfig, streaming: bool) -> Router {
+    let router = if streaming {
+        router
+    } else {
+        router
+            .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
+            // Maps limit and timeout failures to the JSON error shape.
+            .layer(middleware::from_fn_with_state(
+                config.request_timeout,
+                limits_to_json_errors,
+            ))
+    };
     router
-        .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
-        // Maps limit and timeout failures to the JSON error shape.
-        .layer(middleware::from_fn_with_state(
-            config.request_timeout,
-            limits_to_json_errors,
-        ))
         .layer(middleware::from_fn_with_state(
             Arc::new(config.trusted_proxies.clone()),
             client_ip::resolve_client_ip,
@@ -618,7 +660,7 @@ mod tests {
                     "late"
                 }),
             );
-        with_middleware(routes, config)
+        with_middleware(routes, config, false)
     }
 
     #[tokio::test]
@@ -666,7 +708,7 @@ mod tests {
                     .map_or_else(|| "none".to_owned(), |ip| ip.0.to_string())
             }),
         );
-        with_middleware(routes, &config)
+        with_middleware(routes, &config, false)
     }
 
     async fn client_ip_for(app: Router, peer: Option<&str>, xff: Option<&str>) -> String {

@@ -45,6 +45,16 @@ pub struct AuthSettings {
     pub touch_interval: Duration,
     /// How long soft-deleted projects and files stay restorable.
     pub trash_retention: Duration,
+    /// Largest file an upload session may declare, in bytes.
+    pub max_file_size_bytes: u64,
+    /// How long an upload session stays open.
+    pub upload_ttl: Duration,
+    /// Open (created or receiving) upload sessions per user.
+    pub uploads_per_user: i64,
+    /// Open upload sessions per organization.
+    pub uploads_per_org: i64,
+    /// Longest wait for the next piece of an upload body.
+    pub upload_idle_timeout: Duration,
     /// Operator-configured public URL without trailing slash; the only
     /// source for absolute URLs (never derived from request headers).
     pub public_url: Option<String>,
@@ -86,6 +96,11 @@ impl Default for AuthSettings {
             absolute_timeout: Duration::from_secs(7 * 24 * 3600),
             touch_interval: Duration::from_secs(60),
             trash_retention: Duration::from_secs(30 * 24 * 3600),
+            max_file_size_bytes: 5 * 1024 * 1024 * 1024,
+            upload_ttl: Duration::from_secs(24 * 3600),
+            uploads_per_user: 10,
+            uploads_per_org: 200,
+            upload_idle_timeout: Duration::from_secs(60),
             public_url: None,
             public_origin: None,
             cookie_secure: true,
@@ -121,6 +136,7 @@ pub struct Services {
     pub(crate) bootstrap: Option<BootstrapToken>,
     pub(crate) settings: AuthSettings,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) storage: Option<craftcloud_storage::LocalStore>,
     hash_permits: Arc<Semaphore>,
     // Separate tables per class: flooding one cannot evict another.
     login_ip: WindowLimiter,
@@ -151,6 +167,7 @@ impl Services {
             bootstrap,
             settings,
             clock: Arc::new(SystemClock),
+            storage: None,
             hash_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HASHES)),
             login_ip: WindowLimiter::new(cap),
             setup_ip: WindowLimiter::new(cap),
@@ -161,6 +178,14 @@ impl Services {
             guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
         }
+    }
+
+    /// Attaches the object store; without one, upload routes answer 503
+    /// `STORAGE_UNAVAILABLE`.
+    #[must_use]
+    pub fn with_storage(mut self, store: craftcloud_storage::LocalStore) -> Self {
+        self.storage = Some(store);
+        self
     }
 
     /// Replaces the clock (tests).

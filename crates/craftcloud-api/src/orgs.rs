@@ -839,7 +839,7 @@ pub(crate) struct CreateOrgRequest {
 }
 
 /// Policy check for instance-level (operator) actions.
-async fn operator_gate(
+pub(crate) async fn operator_gate(
     services: &Services,
     session: &AuthenticatedSession,
     action: Action,

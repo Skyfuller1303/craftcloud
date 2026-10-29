@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — PR-010 (CC-P02-02, quota part of CC-P02-06) implemented locally: upload sessions with quota reservation, streamed content with SHA-256 and length verification into the local object store, idempotency, caps, expiry, quota and usage routes, migration 0008. Staged (uncommitted) blobs only. Not reviewed or merged.
+
 2026-10-29 — PR-009 (CC-P02-03) implemented locally: crate `craftcloud-storage` (trait `ObjectStore`, local filesystem adapter with random keys, byte limits, SHA-256, atomic publish, range reads, listing, symlink defense, fault injection), config keys `CRAFTCLOUD_STORAGE_DIR` and `CRAFTCLOUD_MAX_FILE_SIZE_BYTES`. No HTTP routes. Not reviewed or merged.
 
 2026-10-29 — PR-008 (CC-P02-01) implemented locally: projects and file metadata (CC-F06) with soft delete/restore (`CRAFTCLOUD_TRASH_RETENTION_DAYS`), safe NFC file names, composite foreign keys, 12 new policy actions, migration 0007. Not reviewed or merged.

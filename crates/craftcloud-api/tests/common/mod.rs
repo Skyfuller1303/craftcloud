@@ -16,6 +16,7 @@ use craftcloud_auth::hash_password;
 use craftcloud_core::Capabilities;
 use craftcloud_db::PgPool;
 use craftcloud_db::setup::{self, NewInstance};
+use craftcloud_storage::{FaultPlan, LocalStore};
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection};
@@ -68,6 +69,8 @@ pub struct Req {
     csrf: Option<String>,
     origin: Option<String>,
     if_match: Option<String>,
+    headers: Vec<(String, String)>,
+    raw: Option<Body>,
 }
 
 impl Req {
@@ -80,7 +83,19 @@ impl Req {
             csrf: None,
             origin: Some(ORIGIN.to_owned()),
             if_match: None,
+            headers: Vec::new(),
+            raw: None,
         }
+    }
+    /// Adds a header.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+    /// A raw (octet-stream) body.
+    pub fn body(mut self, body: Body) -> Self {
+        self.raw = Some(body);
+        self
     }
     pub fn json(mut self, body: Value) -> Self {
         self.body = Some(body);
@@ -117,6 +132,15 @@ impl Req {
         }
         if let Some(value) = &self.if_match {
             builder = builder.header(header::IF_MATCH, value);
+        }
+        for (name, value) in &self.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(raw) = self.raw {
+            return builder
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(raw)
+                .unwrap();
         }
         match self.body {
             Some(body) => builder
@@ -236,6 +260,9 @@ pub struct TestEnv {
     pub clock: Arc<ManualClock>,
     pub app: Router,
     pub operator_id: Uuid,
+    /// Fault plan of the object store (nothing armed by default).
+    pub faults: Arc<FaultPlan>,
+    pub storage_dir: std::path::PathBuf,
 }
 
 fn shared_hash() -> &'static str {
@@ -251,6 +278,15 @@ impl TestEnv {
     }
 
     pub async fn with(settings: AuthSettings, config: ApiConfig) -> Self {
+        Self::build(settings, config, true).await
+    }
+
+    /// Like `new` but without an object store (storage not configured).
+    pub async fn without_storage() -> Self {
+        Self::build(settings(), ApiConfig::default(), false).await
+    }
+
+    async fn build(settings: AuthSettings, config: ApiConfig, storage: bool) -> Self {
         let url = std::env::var(ENV).expect("CC_TEST_DATABASE_URL must be set");
         let admin = PgConnectOptions::from_str(&url).unwrap();
         let name = format!("cc_test_{}", Uuid::new_v4().simple());
@@ -280,7 +316,17 @@ impl TestEnv {
         .unwrap()
         .user_id;
         let clock = ManualClock::new();
-        let services = Services::new(pool.clone(), None, settings).with_clock(clock.clone());
+        let storage_dir =
+            std::env::temp_dir().join(format!("cc-api-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let faults = Arc::new(FaultPlan::default());
+        let mut services = Services::new(pool.clone(), None, settings).with_clock(clock.clone());
+        if storage {
+            let store = LocalStore::open_with_faults(&storage_dir, faults.clone())
+                .await
+                .unwrap();
+            services = services.with_storage(store);
+        }
         let app = router_with_services(
             Capabilities::development_defaults(),
             &config,
@@ -293,6 +339,8 @@ impl TestEnv {
             clock,
             app,
             operator_id,
+            faults,
+            storage_dir,
         }
     }
 
@@ -342,6 +390,7 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.storage_dir);
         let admin = self.admin.clone();
         let name = self.name.clone();
         let _ = std::thread::spawn(move || {

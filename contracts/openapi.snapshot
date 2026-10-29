@@ -1,5 +1,6 @@
 # Normalized view of contracts/openapi.yaml. Regenerate with `cargo xtask openapi-snapshot --update`.
 GET /api/v1/admin/organizations auth=cookie req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
+PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf req=QuotaRequest ok=QuotaResponse codes=200,401,403,404,413,415,422,500,503
 GET /api/v1/admin/users auth=cookie req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
 POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf req=- ok=- codes=200,401,403,404,409,500,503
 POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
@@ -17,6 +18,7 @@ DELETE /api/v1/files/{file_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404
 GET /api/v1/files/{file_id} auth=cookie req=- ok=File codes=200,401,404,500,503
 PATCH /api/v1/files/{file_id} auth=cookie+csrf req=UpdateFileRequest ok=File codes=200,401,403,404,409,412,413,415,422,428,500,503
 POST /api/v1/files/{file_id}/restore auth=cookie+csrf req=- ok=File codes=200,401,403,404,409,410,500,503
+POST /api/v1/files/{file_id}/uploads auth=cookie+csrf req=CreateUploadRequest ok=Upload codes=200,201,401,403,404,409,413,415,422,500,503
 GET /api/v1/info auth=none req=- ok=- codes=200,503
 POST /api/v1/invitations/accept auth=none req=AcceptInvitationRequest ok=AcceptedInvitation codes=200,400,401,403,409,413,415,422,429,500,503
 GET /api/v1/organizations auth=cookie req=- ok=MyOrganizationPage codes=200,400,401,422,500,503
@@ -30,6 +32,7 @@ GET /api/v1/organizations/{org_id}/members auth=cookie req=- ok=MemberPage codes
 POST /api/v1/organizations/{org_id}/members auth=cookie+csrf req=AddMemberRequest ok=Member codes=201,401,403,404,409,413,415,422,500,503
 DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
 PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=ChangeRoleRequest ok=Member codes=200,401,403,404,409,413,415,422,500,503
+GET /api/v1/organizations/{org_id}/usage auth=cookie req=- ok=UsagePage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/workspaces auth=cookie req=- ok=WorkspacePage codes=200,400,401,404,422,500,503
 POST /api/v1/organizations/{org_id}/workspaces auth=cookie+csrf req=CreateWorkspaceRequest ok=Workspace codes=201,401,403,404,413,415,422,500,503
 DELETE /api/v1/projects/{project_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
@@ -40,6 +43,9 @@ POST /api/v1/projects/{project_id}/files auth=cookie+csrf req=CreateFileRequest 
 POST /api/v1/projects/{project_id}/restore auth=cookie+csrf req=- ok=Project codes=200,401,403,404,409,410,500,503
 POST /api/v1/setup/complete auth=none req=SetupCompleteRequest ok=- codes=201,403,409,413,415,422,500,503
 GET /api/v1/setup/status auth=none req=- ok=- codes=200,500,503
+DELETE /api/v1/uploads/{upload_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
+GET /api/v1/uploads/{upload_id} auth=cookie req=- ok=Upload codes=200,401,403,404,500,503
+PUT /api/v1/uploads/{upload_id}/content auth=cookie+csrf req=- ok=Upload codes=200,400,401,403,404,408,409,410,413,422,500,503,507
 GET /api/v1/workspaces/{workspace_id} auth=cookie req=- ok=Workspace codes=200,401,404,500,503
 PATCH /api/v1/workspaces/{workspace_id} auth=cookie+csrf req=UpdateWorkspaceRequest ok=Workspace codes=200,401,403,404,412,413,415,422,428,500,503
 GET /api/v1/workspaces/{workspace_id}/members auth=cookie req=- ok=WorkspaceMemberPage codes=200,400,401,404,422,500,503
@@ -48,6 +54,7 @@ DELETE /api/v1/workspaces/{workspace_id}/members/{user_id} auth=cookie+csrf req=
 PATCH /api/v1/workspaces/{workspace_id}/members/{user_id} auth=cookie+csrf req=ChangeWorkspaceRoleRequest ok=WorkspaceMember codes=200,401,403,404,413,415,422,500,503
 GET /api/v1/workspaces/{workspace_id}/projects auth=cookie req=- ok=ProjectPage codes=200,400,401,404,422,500,503
 POST /api/v1/workspaces/{workspace_id}/projects auth=cookie+csrf req=CreateProjectRequest ok=Project codes=201,401,403,404,409,413,415,422,500,503
+PUT /api/v1/workspaces/{workspace_id}/quota auth=cookie+csrf req=QuotaRequest ok=QuotaResponse codes=200,401,403,404,413,415,422,500,503
 GET /health/live auth=none req=- ok=- codes=200,503
 # component schemas
 AcceptInvitationRequest
@@ -63,6 +70,7 @@ CreateFileRequest
 CreateInvitationRequest
 CreateOrganizationRequest
 CreateProjectRequest
+CreateUploadRequest
 CreateWorkspaceRequest
 CreatedInvitation
 CreatedOrganization
@@ -80,6 +88,8 @@ Organization
 OrganizationSummaryPage
 Project
 ProjectPage
+QuotaRequest
+QuotaResponse
 ResetLinkResponse
 ResetPasswordRequest
 SessionInfo
@@ -89,7 +99,11 @@ UpdateFileRequest
 UpdateOrganizationRequest
 UpdateProjectRequest
 UpdateWorkspaceRequest
+Upload
+UsageEntry
+UsagePage
 Workspace
 WorkspaceMember
 WorkspaceMemberPage
 WorkspacePage
+WorkspaceUsageEntry

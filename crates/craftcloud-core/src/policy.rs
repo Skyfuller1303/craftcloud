@@ -213,6 +213,20 @@ pub enum Action {
     FileDelete,
     /// Restore a file from the trash.
     FileRestore,
+    /// Create an upload session for a file.
+    UploadCreate,
+    /// Read an upload session.
+    UploadRead,
+    /// Send the content of an upload session.
+    UploadWrite,
+    /// Abort an upload session.
+    UploadAbort,
+    /// Set the storage quota of an organization (operator).
+    OrganizationQuotaSet,
+    /// Set the storage quota of a workspace.
+    WorkspaceQuotaSet,
+    /// Read the storage usage of an organization.
+    UsageRead,
 }
 
 impl Action {
@@ -233,7 +247,9 @@ impl Action {
             | Self::ProjectList
             | Self::ProjectRead
             | Self::FileList
-            | Self::FileRead => false,
+            | Self::FileRead
+            | Self::UploadRead
+            | Self::UsageRead => false,
             Self::OrganizationUpdate
             | Self::OrganizationCreate
             | Self::MemberAdd
@@ -257,12 +273,17 @@ impl Action {
             | Self::FileCreate
             | Self::FileRename
             | Self::FileDelete
-            | Self::FileRestore => true,
+            | Self::FileRestore
+            | Self::UploadCreate
+            | Self::UploadWrite
+            | Self::UploadAbort
+            | Self::OrganizationQuotaSet
+            | Self::WorkspaceQuotaSet => true,
         }
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 37] = [
+    pub const ALL: [Action; 44] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -300,6 +321,13 @@ impl Action {
         Action::FileRename,
         Action::FileDelete,
         Action::FileRestore,
+        Action::UploadCreate,
+        Action::UploadRead,
+        Action::UploadWrite,
+        Action::UploadAbort,
+        Action::OrganizationQuotaSet,
+        Action::WorkspaceQuotaSet,
+        Action::UsageRead,
     ];
 }
 
@@ -372,6 +400,15 @@ pub enum Resource {
         target: Option<WorkspaceMemberTarget>,
         /// The workspace role being assigned (add, change role).
         role: Option<WorkspaceRole>,
+    },
+    /// An upload session of a workspace, created by `creator`.
+    Upload {
+        /// The organization.
+        org_id: Uuid,
+        /// The workspace.
+        workspace_id: Uuid,
+        /// Who created the session.
+        creator: Uuid,
     },
     /// Invitations of an organization. `spec` is `None` for listing.
     Invitation {
@@ -479,6 +516,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             A::OrganizationCreate
             | A::OrganizationListAll
             | A::UserListAll
+            | A::OrganizationQuotaSet
             | A::UserDisable
             | A::UserEnable
             | A::PasswordResetIssue
@@ -753,6 +791,84 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             }
         },
 
+        // ---- uploads and quota ----
+        (
+            A::UploadCreate,
+            Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        ) => match (
+            role_in(actor, *org_id),
+            workspace_role_in(actor, *workspace_id),
+        ) {
+            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (Some(OrgRole::Owner | OrgRole::Admin), _)
+            | (Some(OrgRole::Member), Some(WorkspaceRole::Admin | WorkspaceRole::Editor)) => {
+                allow(action, Some(*org_id))
+            }
+            (Some(OrgRole::Member), Some(WorkspaceRole::Viewer)) => Decision::Forbidden,
+        },
+        (
+            A::UploadRead | A::UploadAbort | A::UploadWrite,
+            Resource::Upload {
+                org_id,
+                workspace_id,
+                creator,
+            },
+        ) => {
+            let ws_role = workspace_role_in(actor, *workspace_id);
+            let org_role = role_in(actor, *org_id);
+            let manager = matches!(
+                (org_role, ws_role),
+                (Some(OrgRole::Owner | OrgRole::Admin), _)
+                    | (Some(OrgRole::Member), Some(WorkspaceRole::Admin))
+            );
+            let can_write = manager
+                || matches!(
+                    (org_role, ws_role),
+                    (Some(OrgRole::Member), Some(WorkspaceRole::Editor))
+                );
+            match (org_role, ws_role) {
+                (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+                _ => {
+                    let own = *creator == actor.user_id;
+                    let ok = match action {
+                        // Reading and aborting: the creator (whatever their role
+                        // is now) or a manager of the workspace.
+                        A::UploadRead | A::UploadAbort => own || manager,
+                        // Sending content: only the creator, and only while they
+                        // still may write to the workspace.
+                        _ => own && can_write,
+                    };
+                    if ok {
+                        allow(action, Some(*org_id))
+                    } else {
+                        Decision::Forbidden
+                    }
+                }
+            }
+        }
+        (
+            A::WorkspaceQuotaSet,
+            Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        ) => match (
+            role_in(actor, *org_id),
+            workspace_role_in(actor, *workspace_id),
+        ) {
+            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (Some(OrgRole::Owner | OrgRole::Admin), _) => allow(action, Some(*org_id)),
+            (Some(OrgRole::Member), Some(_)) => Decision::Forbidden,
+        },
+        (A::UsageRead, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+            Some(OrgRole::Member) => Decision::Forbidden,
+            None => Decision::Hidden,
+        },
+
         // ---- invitations ----
         (A::InvitationList, Resource::Invitation { org_id, .. }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
@@ -1013,6 +1129,7 @@ mod tests {
             Action::OrganizationCreate,
             Action::OrganizationListAll,
             Action::UserListAll,
+            Action::OrganizationQuotaSet,
             Action::UserDisable,
             Action::UserEnable,
             Action::PasswordResetIssue,
@@ -1238,6 +1355,13 @@ mod tests {
             Action::FileRename,
             Action::FileDelete,
             Action::FileRestore,
+            Action::UploadCreate,
+            Action::UploadRead,
+            Action::UploadWrite,
+            Action::UploadAbort,
+            Action::OrganizationQuotaSet,
+            Action::WorkspaceQuotaSet,
+            Action::UsageRead,
         ]
         .into_iter()
         .collect();
@@ -1280,7 +1404,14 @@ mod tests {
                 | Action::FileCreate
                 | Action::FileRename
                 | Action::FileDelete
-                | Action::FileRestore => {}
+                | Action::FileRestore
+                | Action::UploadCreate
+                | Action::UploadRead
+                | Action::UploadWrite
+                | Action::UploadAbort
+                | Action::OrganizationQuotaSet
+                | Action::WorkspaceQuotaSet
+                | Action::UsageRead => {}
             }
             assert!(
                 covered.contains(&action),
@@ -1308,7 +1439,9 @@ mod tests {
                 Action::ProjectList,
                 Action::ProjectRead,
                 Action::FileList,
-                Action::FileRead
+                Action::FileRead,
+                Action::UploadRead,
+                Action::UsageRead
             ]
         );
     }
@@ -1373,6 +1506,80 @@ mod tests {
                 &foreign
             ),
             Decision::Hidden
+        );
+    }
+
+    #[test]
+    fn upload_and_quota_actions_follow_roles_and_creator() {
+        let ws = Resource::Workspace {
+            org_id: ORG,
+            workspace_id: WS,
+        };
+        let cast: [Actor; 7] = [
+            actor(None, false),
+            actor(Some(OrgRole::Member), false),
+            with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Viewer),
+            with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Editor),
+            with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Admin),
+            actor(Some(OrgRole::Admin), false),
+            actor(Some(OrgRole::Owner), false),
+        ];
+        let got =
+            |action| -> Vec<Want> { cast.iter().map(|a| outcome(can(a, action, &ws))).collect() };
+        assert_eq!(got(Action::UploadCreate), [H, H, F, Y, Y, Y, Y]);
+        assert_eq!(got(Action::WorkspaceQuotaSet), [H, H, F, F, F, Y, Y]);
+        // Upload sessions: creator or manager read/abort; only the creator, still editor+, writes.
+        let upload = |creator| Resource::Upload {
+            org_id: ORG,
+            workspace_id: WS,
+            creator,
+        };
+        let own = upload(ME);
+        let foreign = upload(OTHER);
+        let outcomes = |action, res: &Resource| -> Vec<Want> {
+            cast.iter().map(|a| outcome(can(a, action, res))).collect()
+        };
+        // Own session: everybody who sees the workspace reads and aborts it;
+        // writing needs editor or better.
+        assert_eq!(outcomes(Action::UploadRead, &own), [H, H, Y, Y, Y, Y, Y]);
+        assert_eq!(outcomes(Action::UploadAbort, &own), [H, H, Y, Y, Y, Y, Y]);
+        assert_eq!(outcomes(Action::UploadWrite, &own), [H, H, F, Y, Y, Y, Y]);
+        // Somebody else's session: managers read and abort, nobody else writes.
+        assert_eq!(
+            outcomes(Action::UploadRead, &foreign),
+            [H, H, F, F, Y, Y, Y]
+        );
+        assert_eq!(
+            outcomes(Action::UploadAbort, &foreign),
+            [H, H, F, F, Y, Y, Y]
+        );
+        assert_eq!(
+            outcomes(Action::UploadWrite, &foreign),
+            [H, H, F, F, F, F, F]
+        );
+        // Usage: organization owners and admins.
+        let org_res = Resource::Organization { org_id: ORG };
+        let usage: Vec<Want> = cast
+            .iter()
+            .map(|a| outcome(can(a, Action::UsageRead, &org_res)))
+            .collect();
+        assert_eq!(usage, [H, F, F, F, F, Y, Y]);
+        // The organization quota is the operator's.
+        assert_eq!(
+            can(
+                &actor(Some(OrgRole::Owner), false),
+                Action::OrganizationQuotaSet,
+                &Resource::Instance
+            ),
+            Decision::Forbidden
+        );
+        assert!(
+            can(
+                &actor(None, true),
+                Action::OrganizationQuotaSet,
+                &Resource::Instance
+            )
+            .is_allow()
         );
     }
 
