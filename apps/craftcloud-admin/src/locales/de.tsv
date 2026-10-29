@@ -105,3 +105,217 @@
 	Editor	Bearbeiter
 	Viewer	Betrachter
 	No workspace role	Keine Workspace-Rolle
+
+# Errors (PR-015)
+	An organization needs at least one active owner.	Eine Organisation braucht mindestens einen aktiven Besitzer.
+	File storage is not available on this server.	Auf diesem Server ist kein Dateispeicher eingerichtet.
+	Somebody else changed this item in the meantime. Reload and try again.	Jemand anderes hat dieses Element inzwischen geändert. Lade neu und versuche es erneut.
+	The file changed while it was being uploaded. Start the upload again.	Die Datei hat sich während des Hochladens geändert. Starte den Upload erneut.
+	The file is in the trash. Restore it first.	Die Datei liegt im Papierkorb. Stelle sie zuerst wieder her.
+	The project is in the trash. Restore it first.	Das Projekt liegt im Papierkorb. Stelle es zuerst wieder her.
+	The request took too long. Try again.	Die Anfrage hat zu lange gedauert. Versuche es erneut.
+	The retention period has passed; this item can no longer be restored.	Die Aufbewahrungsfrist ist abgelaufen; dieses Element lässt sich nicht mehr wiederherstellen.
+	The server has no space left to store this file.	Der Server hat keinen Speicherplatz mehr für diese Datei.
+	The storage quota is used up. Free space or ask an administrator for more.	Das Speicherkontingent ist aufgebraucht. Gib Platz frei oder bitte eine Administration um mehr.
+	The stored content failed verification. Ask an administrator.	Der gespeicherte Inhalt hat die Prüfung nicht bestanden. Wende dich an die Administration.
+	The upload stalled and was stopped. Check the connection and start it again.	Der Upload hing und wurde beendet. Prüfe die Verbindung und starte ihn erneut.
+	The upload took too long and expired. Start it again.	Der Upload hat zu lange gedauert und ist abgelaufen. Starte ihn erneut.
+	The upload was interrupted. Start it again.	Der Upload wurde unterbrochen. Starte ihn erneut.
+	There are too many open invitations. Revoke some first.	Es gibt zu viele offene Einladungen. Widerrufe zuerst einige.
+	This address already has an open invitation.	Für diese Adresse gibt es schon eine offene Einladung.
+	This file is larger than the server accepts.	Diese Datei ist größer, als der Server annimmt.
+	This item is gone.	Dieses Element existiert nicht mehr.
+	This person is already a member.	Diese Person ist bereits Mitglied.
+	This upload cannot continue. Start it again.	Dieser Upload kann nicht fortgesetzt werden. Starte ihn erneut.
+	Too many uploads are open at the moment. Finish or cancel some first.	Es sind gerade zu viele Uploads offen. Beende oder brich zuerst einige ab.
+	Reload	Neu laden
+	Too many requests. Wait a moment before trying again.	Zu viele Anfragen. Warte einen Moment, bevor du es erneut versuchst.
+	Try again in {seconds} s	Erneut versuchen in {seconds} s
+	You can try again now.	Du kannst es jetzt erneut versuchen.
+	Load more	Mehr laden
+	A project with this name already exists.	Ein Projekt mit diesem Namen gibt es schon.
+	A file with this name already exists in this project.	Eine Datei mit diesem Namen gibt es in diesem Projekt schon.
+
+# Common (PR-015)
+	Name	Name
+	Role	Rolle
+	Joined	Beigetreten
+	Actions	Aktionen
+	Save	Speichern
+	Cancel	Abbrechen
+	Close	Schließen
+	Status	Status
+	Size	Größe
+	None	Keine
+	Creating…	Wird angelegt …
+	Saving…	Wird gespeichert …
+	Deleted	Gelöscht
+	Updated	Geändert
+	Show trash	Papierkorb anzeigen
+	Download	Herunterladen
+	Restore	Wiederherstellen
+	Restored	Wiederhergestellt
+	Remove	Entfernen
+	Leave	Verlassen
+	Rename	Umbenennen
+	Move to trash	In den Papierkorb
+	Select an organization first.	Wähle zuerst eine Organisation.
+
+# Members (PR-015)
+	Organization members	Mitglieder der Organisation
+	Workspace members	Mitglieder des Workspace
+	Loading members…	Mitglieder werden geladen …
+	This organization has no members.	Diese Organisation hat keine Mitglieder.
+	This workspace has no members.	Dieser Workspace hat keine Mitglieder.
+	Select a workspace to see its members.	Wähle einen Workspace, um seine Mitglieder zu sehen.
+	Change role	Rolle ändern
+	Change role: {name}	Rolle ändern: {name}
+	Change workspace role	Workspace-Rolle ändern
+	Change role in workspace: {name}	Rolle ändern im Workspace: {name}
+	Remove {name}	{name} entfernen
+	Remove {name} from the workspace	{name} aus dem Workspace entfernen
+	Remove member	Mitglied entfernen
+	Remove from workspace	Aus dem Workspace entfernen
+	Leave organization	Organisation verlassen
+	Leave workspace	Workspace verlassen
+	You lose access to this organization and all its workspaces.	Du verlierst den Zugriff auf diese Organisation und alle ihre Workspaces.
+	{name} loses access to this organization and all its workspaces.	{name} verliert den Zugriff auf diese Organisation und alle ihre Workspaces.
+	{name} loses access to the projects of this workspace.	{name} verliert den Zugriff auf die Projekte dieses Workspace.
+	{name} is now {role}.	{name} ist jetzt {role}.
+	{name} was removed.	{name} wurde entfernt.
+	{name} was added to the workspace.	{name} wurde zum Workspace hinzugefügt.
+	Add to workspace	Zum Workspace hinzufügen
+	Add	Hinzufügen
+	Person	Person
+	Choose a person	Person wählen
+	Loading people…	Personen werden geladen …
+	Everybody in the organization is already in this workspace.	Alle aus der Organisation sind schon in diesem Workspace.
+
+# Invitations (PR-015)
+	Invite a person	Person einladen
+	As a workspace admin you can invite people into this workspace as editor or viewer.	Als Workspace-Admin kannst du Personen als Editor oder Betrachter in diesen Workspace einladen.
+	Only organization owners and admins can manage invitations.	Nur Besitzer und Admins der Organisation können Einladungen verwalten.
+	Organization role	Rolle in der Organisation
+	Workspace role	Rolle im Workspace
+	No workspace	Kein Workspace
+	Another workspace	Anderer Workspace
+	Create invitation	Einladung erstellen
+	Invitation created. Copy the link now; it is shown only once.	Einladung erstellt. Kopiere den Link jetzt; er wird nur einmal angezeigt.
+	Invitation link	Einladungslink
+	Shown only once. Send it to the person yourself; it works once and expires on {date}.	Wird nur einmal angezeigt. Schicke ihn der Person selbst; er funktioniert einmal und läuft am {date} ab.
+	Link	Link
+	Copy link	Link kopieren
+	Hide link	Link ausblenden
+	Link copied.	Link kopiert.
+	Copying failed. Select the link and copy it by hand.	Kopieren fehlgeschlagen. Markiere den Link und kopiere ihn von Hand.
+	Loading invitations…	Einladungen werden geladen …
+	There are no invitations yet.	Es gibt noch keine Einladungen.
+	Expires	Läuft ab
+	Open	Offen
+	Accepted	Angenommen
+	Revoked	Widerrufen
+	Expired	Abgelaufen
+	No longer valid	Nicht mehr gültig
+	Revoke	Widerrufen
+	Revoke invitation	Einladung widerrufen
+	Revoke invitation for {email}	Einladung für {email} widerrufen
+	The link for {email} stops working.	Der Link für {email} funktioniert danach nicht mehr.
+	Invitation for {email} revoked.	Einladung für {email} widerrufen.
+
+# Projects (PR-015)
+	Select a workspace to see its projects.	Wähle einen Workspace, um seine Projekte zu sehen.
+	You can read projects here but not change them.	Du kannst Projekte hier lesen, aber nicht ändern.
+	This workspace has no projects yet.	Dieser Workspace hat noch keine Projekte.
+	The trash has no projects.	Der Papierkorb enthält keine Projekte.
+	Loading projects…	Projekte werden geladen …
+	Projects in the trash	Projekte im Papierkorb
+	New project name	Name des neuen Projekts
+	Create project	Projekt anlegen
+	Project name	Projektname
+	Enter a name of 1 to {max} characters.	Gib einen Namen mit 1 bis {max} Zeichen ein.
+	Open files of {name}	Dateien von {name} öffnen
+	Rename {name}	{name} umbenennen
+	Rename project	Projekt umbenennen
+	Move to trash: {name}	In den Papierkorb: {name}
+	Move project to the trash	Projekt in den Papierkorb verschieben
+	{name} and its files become read-only and can be restored from the trash.	{name} und seine Dateien werden schreibgeschützt und lassen sich aus dem Papierkorb wiederherstellen.
+	Restore {name}	{name} wiederherstellen
+	Project {name} created.	Projekt {name} angelegt.
+	Project {name} moved to the trash.	Projekt {name} in den Papierkorb verschoben.
+	Project {name} restored.	Projekt {name} wiederhergestellt.
+	Project renamed to {name}.	Projekt in {name} umbenannt.
+
+# Files (PR-015)
+	Project	Projekt
+	Choose a project	Projekt wählen
+	Choose a project to see its files.	Wähle ein Projekt, um seine Dateien zu sehen.
+	Select a workspace to see its files.	Wähle einen Workspace, um seine Dateien zu sehen.
+	Load more projects	Weitere Projekte laden
+	Upload file	Datei hochladen
+	You can download files here but not change them.	Du kannst Dateien hier herunterladen, aber nicht ändern.
+	This project has no files yet.	Dieses Projekt hat noch keine Dateien.
+	The trash has no files.	Der Papierkorb enthält keine Dateien.
+	Loading files…	Dateien werden geladen …
+	Files in the trash	Dateien im Papierkorb
+	Format	Format
+	No content yet	Noch kein Inhalt
+	Download {name}	{name} herunterladen
+	Versions	Versionen
+	New version	Neue Version
+	Move file to the trash	Datei in den Papierkorb verschieben
+	{name} can be restored from the trash.	{name} lässt sich aus dem Papierkorb wiederherstellen.
+	File {name} moved to the trash.	Datei {name} in den Papierkorb verschoben.
+	File {name} restored.	Datei {name} wiederhergestellt.
+	Versions of {name}	Versionen von {name}
+	Loading versions…	Versionen werden geladen …
+	This file has no versions yet.	Diese Datei hat noch keine Versionen.
+	Version	Version
+	Saved	Gespeichert
+	SHA-256	SHA-256
+	Current	Aktuell
+	Download version {number}	Version {number} herunterladen
+	Restore version {number} as a new version	Version {number} als neue Version wiederherstellen
+	Version {from} restored as version {to}.	Version {from} als Version {to} wiederhergestellt.
+
+# Upload (PR-015)
+	Upload a file	Datei hochladen
+	Upload a new version of {name}	Neue Version von {name} hochladen
+	File	Datei
+	File name	Dateiname
+	App	App
+	Which Craft app the file belongs to, for example photocraft.	Zu welcher Craft-App die Datei gehört, zum Beispiel photocraft.
+	Choose a file.	Wähle eine Datei.
+	Enter a file name of 1 to {max} bytes.	Gib einen Dateinamen mit 1 bis {max} Bytes ein.
+	Use lowercase letters, digits and hyphens (1 to 32 characters).	Verwende Kleinbuchstaben, Ziffern und Bindestriche (1 bis 32 Zeichen).
+	Size: {size}	Größe: {size}
+	Upload	Hochladen
+	Cancel upload	Upload abbrechen
+	Creating the file…	Datei wird angelegt …
+	Checking the file…	Datei wird geprüft …
+	Reserving space…	Speicherplatz wird reserviert …
+	Uploading…	Wird hochgeladen …
+	Saving the version…	Version wird gespeichert …
+	{done} of {total}	{done} von {total}
+	{name} was uploaded.	{name} wurde hochgeladen.
+	Saved as a separate file: {name}.	Als eigene Datei gespeichert: {name}.
+	The file was changed meanwhile	Die Datei wurde inzwischen geändert
+	Somebody else saved a new version meanwhile. Choose how to continue.	Jemand anderes hat inzwischen eine neue Version gespeichert. Wähle, wie es weitergeht.
+	Somebody else saved a new version of {name} while you were uploading. Your upload is stored but not saved as a version yet.	Jemand anderes hat eine neue Version von {name} gespeichert, während du hochgeladen hast. Dein Upload ist abgelegt, aber noch nicht als Version gespeichert.
+	Keep both	Beide behalten
+	Overwrite	Überschreiben
+	Keep both: save your upload as a separate file next to the original.	Beide behalten: speichert deinen Upload als eigene Datei neben dem Original.
+	Overwrite: save your upload as the newest version. The other version stays in the history.	Überschreiben: speichert deinen Upload als neueste Version. Die andere Version bleibt im Verlauf.
+	Cancel: discard your upload.	Abbrechen: verwirft deinen Upload.
+
+# Password reset (PR-015)
+	Choose a new password	Neues Passwort wählen
+	New password	Neues Passwort
+	Repeat the new password	Neues Passwort wiederholen
+	The two passwords are not the same.	Die beiden Passwörter sind nicht gleich.
+	This password is not accepted. Choose a longer or less common one.	Dieses Passwort wird nicht akzeptiert. Wähle ein längeres oder weniger gebräuchliches.
+	All other sessions of this account end when the password is set.	Alle anderen Sitzungen dieses Kontos enden, sobald das Passwort gesetzt ist.
+	Set password	Passwort setzen
+	Password changed	Passwort geändert
+	Your password was changed. Log in with the new password.	Dein Passwort wurde geändert. Melde dich mit dem neuen Passwort an.
+	Go to log in	Zur Anmeldung
+	This reset link is not valid any more. Ask for a new one.	Dieser Rücksetzlink ist nicht mehr gültig. Bitte um einen neuen.

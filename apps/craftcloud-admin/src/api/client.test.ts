@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { apiError, mockFetch } from "../test/helpers.tsx";
-import { ApiError, ENDPOINTS, createApiClient } from "./client.ts";
+import { fakeXhr } from "../test/fakeXhr.ts";
+import { ABORTED_ERROR_CODE, ApiError, ENDPOINTS, createApiClient, parseRetryAfter } from "./client.ts";
 
 describe("api client", () => {
   it("sends same-origin cookies, never a CSRF header on GET and the token on unsafe methods", async () => {
@@ -126,5 +127,84 @@ describe("api client", () => {
       expect(endpoint.path.startsWith("/")).toBe(true);
       expect(endpoint.path.startsWith("/api")).toBe(false);
     }
+  });
+
+  it("sends preconditions and the idempotency key as headers and builds download URLs", async () => {
+    const { fetch, calls } = mockFetch({
+      "POST /files/f1/uploads": { status: 201, body: {} },
+      "POST /files/f1/versions": { status: 201, body: {} },
+      "POST /files/f1/versions/v1/restore": { status: 201, body: {} },
+      "PATCH /projects/p1": { body: {} },
+    });
+    const client = createApiClient({ fetchImpl: fetch });
+    await client.createUpload("f1", { size_bytes: 3, sha256: "ab" }, "key-1");
+    await client.commitVersion("f1", "u1", null);
+    await client.commitVersion("f1", "u1", "head-1", "key-1");
+    await client.restoreVersion("f1", "v1", "head-1");
+    await client.renameProject({ id: "p1", version: 7 }, "New");
+    expect(calls[0]?.headers["idempotency-key"]).toBe("key-1");
+    expect(calls[1]?.headers["if-none-match"]).toBe("*");
+    expect(calls[1]?.headers["if-match"]).toBeUndefined();
+    expect(calls[2]?.headers["if-match"]).toBe('"version:head-1"');
+    expect(calls[2]?.headers["idempotency-key"]).toBe("key-1");
+    expect(calls[3]?.headers["if-match"]).toBe('"version:head-1"');
+    expect(calls[4]?.headers["if-match"]).toBe('"prj-v7"');
+    expect(client.downloadUrl("f 1")).toBe("/api/v1/files/f%201/content");
+    expect(client.downloadUrl("f1", "v1")).toBe("/api/v1/files/f1/versions/v1/content");
+  });
+
+  it("streams an upload body through XHR with the CSRF token and reports errors like fetch does", async () => {
+    const { factory, requests } = fakeXhr((request) =>
+      request.url.includes("bad")
+        ? { status: 429, body: { error: { code: "RATE_LIMITED", message: "m", request_id: "r" } }, headers: { "Retry-After": "7" } }
+        : { body: { upload_id: "u", state: "stored" } },
+    );
+    const { fetch } = mockFetch({ "GET /auth/session": { body: { csrf_token: "tok" } } });
+    const client = createApiClient({ fetchImpl: fetch, xhrFactory: factory });
+    await client.session();
+    const blob = new Blob(["abcd"]);
+    const progress: number[] = [];
+    await client.uploadContent("good", blob, { onProgress: (p) => progress.push(p.sent) });
+    expect(requests[0]?.headers["x-csrf-token"]).toBe("tok");
+    expect(requests[0]?.body).toBe(blob);
+    expect(progress.at(-1)).toBe(4);
+    const failure = await client.uploadContent("bad", blob).catch((e: unknown) => e);
+    expect(failure).toMatchObject({ status: 429, code: "RATE_LIMITED", retryAfterSeconds: 7 });
+  });
+
+  it("maps an XHR network failure, an abort and a 401 on upload", async () => {
+    const outcomes: Array<"network-error" | "hang" | { status: number; body: unknown }> = [
+      "network-error",
+      "hang",
+      { status: 401, body: { error: { code: "UNAUTHENTICATED", message: "m", request_id: null } } },
+    ];
+    const { factory } = fakeXhr(() => outcomes.shift() ?? "network-error");
+    let ended = 0;
+    const client = createApiClient({ xhrFactory: factory, onUnauthenticated: () => (ended += 1) });
+    const blob = new Blob(["abcd"]);
+    await expect(client.uploadContent("u1", blob)).rejects.toMatchObject({ code: "NETWORK_ERROR", status: 0 });
+    const controller = new AbortController();
+    const pending = client.uploadContent("u2", blob, { signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: ABORTED_ERROR_CODE });
+    await expect(client.uploadContent("u3", blob)).rejects.toMatchObject({ status: 401 });
+    expect(ended).toBe(1);
+    const already = new AbortController();
+    already.abort();
+    await expect(client.uploadContent("u4", blob, { signal: already.signal })).rejects.toMatchObject({ code: ABORTED_ERROR_CODE });
+  });
+
+  it("reads Retry-After as seconds or as an HTTP date", () => {
+    const now = Date.parse("2026-10-29T12:00:00Z");
+    expect(parseRetryAfter("30", now)).toBe(30);
+    expect(parseRetryAfter(" 7 ", now)).toBe(7);
+    expect(parseRetryAfter("Thu, 29 Oct 2026 12:01:30 GMT", now)).toBe(90);
+    expect(parseRetryAfter("Thu, 29 Oct 2026 11:00:00 GMT", now)).toBe(0); // already past
+    expect(parseRetryAfter("Fri, 30 Oct 2099 12:00:00 GMT", now)).toBe(86_400); // capped
+    expect(parseRetryAfter("999999999", now)).toBe(86_400);
+    expect(parseRetryAfter("soon", now)).toBeUndefined();
+    expect(parseRetryAfter("-5", now)).toBeUndefined();
+    expect(parseRetryAfter(null, now)).toBeUndefined();
   });
 });

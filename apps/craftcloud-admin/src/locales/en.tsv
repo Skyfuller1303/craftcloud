@@ -107,3 +107,217 @@
 	Editor	Editor
 	Viewer	Viewer
 	No workspace role	No workspace role
+
+# Errors (PR-015)
+	An organization needs at least one active owner.	An organization needs at least one active owner.
+	File storage is not available on this server.	File storage is not available on this server.
+	Somebody else changed this item in the meantime. Reload and try again.	Somebody else changed this item in the meantime. Reload and try again.
+	The file changed while it was being uploaded. Start the upload again.	The file changed while it was being uploaded. Start the upload again.
+	The file is in the trash. Restore it first.	The file is in the trash. Restore it first.
+	The project is in the trash. Restore it first.	The project is in the trash. Restore it first.
+	The request took too long. Try again.	The request took too long. Try again.
+	The retention period has passed; this item can no longer be restored.	The retention period has passed; this item can no longer be restored.
+	The server has no space left to store this file.	The server has no space left to store this file.
+	The storage quota is used up. Free space or ask an administrator for more.	The storage quota is used up. Free space or ask an administrator for more.
+	The stored content failed verification. Ask an administrator.	The stored content failed verification. Ask an administrator.
+	The upload stalled and was stopped. Check the connection and start it again.	The upload stalled and was stopped. Check the connection and start it again.
+	The upload took too long and expired. Start it again.	The upload took too long and expired. Start it again.
+	The upload was interrupted. Start it again.	The upload was interrupted. Start it again.
+	There are too many open invitations. Revoke some first.	There are too many open invitations. Revoke some first.
+	This address already has an open invitation.	This address already has an open invitation.
+	This file is larger than the server accepts.	This file is larger than the server accepts.
+	This item is gone.	This item is gone.
+	This person is already a member.	This person is already a member.
+	This upload cannot continue. Start it again.	This upload cannot continue. Start it again.
+	Too many uploads are open at the moment. Finish or cancel some first.	Too many uploads are open at the moment. Finish or cancel some first.
+	Reload	Reload
+	Too many requests. Wait a moment before trying again.	Too many requests. Wait a moment before trying again.
+	Try again in {seconds} s	Try again in {seconds} s
+	You can try again now.	You can try again now.
+	Load more	Load more
+	A project with this name already exists.	A project with this name already exists.
+	A file with this name already exists in this project.	A file with this name already exists in this project.
+
+# Common (PR-015)
+	Name	Name
+	Role	Role
+	Joined	Joined
+	Actions	Actions
+	Save	Save
+	Cancel	Cancel
+	Close	Close
+	Status	Status
+	Size	Size
+	None	None
+	Creating…	Creating…
+	Saving…	Saving…
+	Deleted	Deleted
+	Updated	Updated
+	Show trash	Show trash
+	Download	Download
+	Restore	Restore
+	Restored	Restored
+	Remove	Remove
+	Leave	Leave
+	Rename	Rename
+	Move to trash	Move to trash
+	Select an organization first.	Select an organization first.
+
+# Members (PR-015)
+	Organization members	Organization members
+	Workspace members	Workspace members
+	Loading members…	Loading members…
+	This organization has no members.	This organization has no members.
+	This workspace has no members.	This workspace has no members.
+	Select a workspace to see its members.	Select a workspace to see its members.
+	Change role	Change role
+	Change role: {name}	Change role: {name}
+	Change workspace role	Change workspace role
+	Change role in workspace: {name}	Change role in workspace: {name}
+	Remove {name}	Remove {name}
+	Remove {name} from the workspace	Remove {name} from the workspace
+	Remove member	Remove member
+	Remove from workspace	Remove from workspace
+	Leave organization	Leave organization
+	Leave workspace	Leave workspace
+	You lose access to this organization and all its workspaces.	You lose access to this organization and all its workspaces.
+	{name} loses access to this organization and all its workspaces.	{name} loses access to this organization and all its workspaces.
+	{name} loses access to the projects of this workspace.	{name} loses access to the projects of this workspace.
+	{name} is now {role}.	{name} is now {role}.
+	{name} was removed.	{name} was removed.
+	{name} was added to the workspace.	{name} was added to the workspace.
+	Add to workspace	Add to workspace
+	Add	Add
+	Person	Person
+	Choose a person	Choose a person
+	Loading people…	Loading people…
+	Everybody in the organization is already in this workspace.	Everybody in the organization is already in this workspace.
+
+# Invitations (PR-015)
+	Invite a person	Invite a person
+	As a workspace admin you can invite people into this workspace as editor or viewer.	As a workspace admin you can invite people into this workspace as editor or viewer.
+	Only organization owners and admins can manage invitations.	Only organization owners and admins can manage invitations.
+	Organization role	Organization role
+	Workspace role	Workspace role
+	No workspace	No workspace
+	Another workspace	Another workspace
+	Create invitation	Create invitation
+	Invitation created. Copy the link now; it is shown only once.	Invitation created. Copy the link now; it is shown only once.
+	Invitation link	Invitation link
+	Shown only once. Send it to the person yourself; it works once and expires on {date}.	Shown only once. Send it to the person yourself; it works once and expires on {date}.
+	Link	Link
+	Copy link	Copy link
+	Hide link	Hide link
+	Link copied.	Link copied.
+	Copying failed. Select the link and copy it by hand.	Copying failed. Select the link and copy it by hand.
+	Loading invitations…	Loading invitations…
+	There are no invitations yet.	There are no invitations yet.
+	Expires	Expires
+	Open	Open
+	Accepted	Accepted
+	Revoked	Revoked
+	Expired	Expired
+	No longer valid	No longer valid
+	Revoke	Revoke
+	Revoke invitation	Revoke invitation
+	Revoke invitation for {email}	Revoke invitation for {email}
+	The link for {email} stops working.	The link for {email} stops working.
+	Invitation for {email} revoked.	Invitation for {email} revoked.
+
+# Projects (PR-015)
+	Select a workspace to see its projects.	Select a workspace to see its projects.
+	You can read projects here but not change them.	You can read projects here but not change them.
+	This workspace has no projects yet.	This workspace has no projects yet.
+	The trash has no projects.	The trash has no projects.
+	Loading projects…	Loading projects…
+	Projects in the trash	Projects in the trash
+	New project name	New project name
+	Create project	Create project
+	Project name	Project name
+	Enter a name of 1 to {max} characters.	Enter a name of 1 to {max} characters.
+	Open files of {name}	Open files of {name}
+	Rename {name}	Rename {name}
+	Rename project	Rename project
+	Move to trash: {name}	Move to trash: {name}
+	Move project to the trash	Move project to the trash
+	{name} and its files become read-only and can be restored from the trash.	{name} and its files become read-only and can be restored from the trash.
+	Restore {name}	Restore {name}
+	Project {name} created.	Project {name} created.
+	Project {name} moved to the trash.	Project {name} moved to the trash.
+	Project {name} restored.	Project {name} restored.
+	Project renamed to {name}.	Project renamed to {name}.
+
+# Files (PR-015)
+	Project	Project
+	Choose a project	Choose a project
+	Choose a project to see its files.	Choose a project to see its files.
+	Select a workspace to see its files.	Select a workspace to see its files.
+	Load more projects	Load more projects
+	Upload file	Upload file
+	You can download files here but not change them.	You can download files here but not change them.
+	This project has no files yet.	This project has no files yet.
+	The trash has no files.	The trash has no files.
+	Loading files…	Loading files…
+	Files in the trash	Files in the trash
+	Format	Format
+	No content yet	No content yet
+	Download {name}	Download {name}
+	Versions	Versions
+	New version	New version
+	Move file to the trash	Move file to the trash
+	{name} can be restored from the trash.	{name} can be restored from the trash.
+	File {name} moved to the trash.	File {name} moved to the trash.
+	File {name} restored.	File {name} restored.
+	Versions of {name}	Versions of {name}
+	Loading versions…	Loading versions…
+	This file has no versions yet.	This file has no versions yet.
+	Version	Version
+	Saved	Saved
+	SHA-256	SHA-256
+	Current	Current
+	Download version {number}	Download version {number}
+	Restore version {number} as a new version	Restore version {number} as a new version
+	Version {from} restored as version {to}.	Version {from} restored as version {to}.
+
+# Upload (PR-015)
+	Upload a file	Upload a file
+	Upload a new version of {name}	Upload a new version of {name}
+	File	File
+	File name	File name
+	App	App
+	Which Craft app the file belongs to, for example photocraft.	Which Craft app the file belongs to, for example photocraft.
+	Choose a file.	Choose a file.
+	Enter a file name of 1 to {max} bytes.	Enter a file name of 1 to {max} bytes.
+	Use lowercase letters, digits and hyphens (1 to 32 characters).	Use lowercase letters, digits and hyphens (1 to 32 characters).
+	Size: {size}	Size: {size}
+	Upload	Upload
+	Cancel upload	Cancel upload
+	Creating the file…	Creating the file…
+	Checking the file…	Checking the file…
+	Reserving space…	Reserving space…
+	Uploading…	Uploading…
+	Saving the version…	Saving the version…
+	{done} of {total}	{done} of {total}
+	{name} was uploaded.	{name} was uploaded.
+	Saved as a separate file: {name}.	Saved as a separate file: {name}.
+	The file was changed meanwhile	The file was changed meanwhile
+	Somebody else saved a new version meanwhile. Choose how to continue.	Somebody else saved a new version meanwhile. Choose how to continue.
+	Somebody else saved a new version of {name} while you were uploading. Your upload is stored but not saved as a version yet.	Somebody else saved a new version of {name} while you were uploading. Your upload is stored but not saved as a version yet.
+	Keep both	Keep both
+	Overwrite	Overwrite
+	Keep both: save your upload as a separate file next to the original.	Keep both: save your upload as a separate file next to the original.
+	Overwrite: save your upload as the newest version. The other version stays in the history.	Overwrite: save your upload as the newest version. The other version stays in the history.
+	Cancel: discard your upload.	Cancel: discard your upload.
+
+# Password reset (PR-015)
+	Choose a new password	Choose a new password
+	New password	New password
+	Repeat the new password	Repeat the new password
+	The two passwords are not the same.	The two passwords are not the same.
+	This password is not accepted. Choose a longer or less common one.	This password is not accepted. Choose a longer or less common one.
+	All other sessions of this account end when the password is set.	All other sessions of this account end when the password is set.
+	Set password	Set password
+	Password changed	Password changed
+	Your password was changed. Log in with the new password.	Your password was changed. Log in with the new password.
+	Go to log in	Go to log in
+	This reset link is not valid any more. Ask for a new one.	This reset link is not valid any more. Ask for a new one.

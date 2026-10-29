@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { takeInviteToken } from "./App.tsx";
@@ -309,7 +309,19 @@ describe("organization and workspace selectors", () => {
     renderApp(fetch);
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("You do not have permission");
-    expect(within(alert).getByRole("button", { name: "Try again" })).toBeTruthy();
+    // 403 means the data on screen may be stale: reload, not blind retry.
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("offers a plain retry for 503 on the lists", async () => {
+    const { fetch } = mockFetch(
+      loggedInRoutes({ [`GET /organizations/${ORG_A.id}/workspaces`]: apiError(503, "UNAVAILABLE") }),
+    );
+    renderApp(fetch);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("temporarily unavailable");
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
   });
 
   it("logs out and sends the CSRF token", async () => {
@@ -325,9 +337,9 @@ describe("organization and workspace selectors", () => {
     const { fetch } = mockFetch(loggedInRoutes());
     const user = userEvent.setup();
     renderApp(fetch);
-    await user.click(await screen.findByRole("button", { name: "Projects" }));
-    expect(screen.getByRole("heading", { level: 1, name: "Projects" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Projects" }).getAttribute("aria-current")).toBe("page");
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByText("This view is not available yet.")).toBeTruthy();
   });
 });

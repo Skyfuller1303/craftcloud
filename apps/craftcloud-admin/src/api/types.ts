@@ -95,3 +95,125 @@ export interface AcceptedInvitation {
   csrf_token?: string;
   expires_at?: string;
 }
+
+export interface OrgMember {
+  user_id: Uuid;
+  display_name: string;
+  email: string;
+  role: OrgRole;
+  joined_at: string;
+}
+
+export interface WorkspaceMember {
+  user_id: Uuid;
+  display_name: string;
+  email: string;
+  role: WorkspaceRole;
+  joined_at: string;
+}
+
+export interface Invitation {
+  id: Uuid;
+  email: string;
+  org_role: "admin" | "member";
+  workspace_id: Uuid | null;
+  workspace_role: WorkspaceRole | null;
+  status: "pending" | "accepted" | "revoked" | "expired" | "invalid";
+  created_by: Uuid;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface CreateInvitationRequest {
+  email: string;
+  org_role: "admin" | "member";
+  workspace_id?: Uuid;
+  workspace_role?: WorkspaceRole;
+}
+
+/** Returned once; `invite_url` is a secret and must never be stored. */
+export interface CreatedInvitation {
+  invitation_id: Uuid;
+  invite_url: string;
+  expires_at: string;
+}
+
+export interface Project {
+  id: Uuid;
+  organization_id: Uuid;
+  workspace_id: Uuid;
+  name: string;
+  version: number;
+  created_by: Uuid;
+  created_at: string;
+  updated_by: Uuid;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+/** File metadata (named `FileRecord` so it does not shadow the DOM `File`). */
+export interface FileRecord {
+  id: Uuid;
+  organization_id: Uuid;
+  workspace_id: Uuid;
+  project_id: Uuid;
+  name: string;
+  app: string;
+  format: string;
+  size_bytes: number;
+  sha256: string | null;
+  head_version_id: Uuid | null;
+  version: number;
+  created_by: Uuid;
+  created_at: string;
+  updated_by: Uuid;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+export interface CreateFileRequest {
+  name: string;
+  app: string;
+  format: string;
+}
+
+export type UploadState =
+  | "created"
+  | "receiving"
+  | "stored"
+  | "committed"
+  | "aborted"
+  | "expired"
+  | "failed";
+
+export interface Upload {
+  upload_id: Uuid;
+  file_id: Uuid;
+  project_id: Uuid;
+  workspace_id: Uuid;
+  state: UploadState;
+  size_bytes: number;
+  sha256: string;
+  max_bytes: number;
+  created_by: Uuid;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface FileVersion {
+  id: Uuid;
+  file_id: Uuid;
+  number: number;
+  size_bytes: number;
+  sha256: string;
+  base_version_id: Uuid | null;
+  restored_from_version_id: Uuid | null;
+  upload_id: Uuid | null;
+  created_by: Uuid;
+  created_at: string;
+}
+
+export interface ResetPasswordRequest {
+  token: string;
+  new_password: string;
+}

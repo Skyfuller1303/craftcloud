@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "react-aria-components";
-import { describeError } from "../api/errors.ts";
-import type { OrgRole, Organization, SessionInfo, Workspace, WorkspaceRole } from "../api/types.ts";
+import type { Organization, Project, SessionInfo, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { ContextSelect } from "../components/ContextSelect.tsx";
+import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Alert, ScreenHeading } from "../components/forms.tsx";
 import { Preferences } from "../components/Preferences.tsx";
 import { useI18n } from "../i18n/index.tsx";
+import { useRoleNames } from "../roles.ts";
 import type { ThemeChoice } from "../preferences.ts";
 import { usePagedList } from "../usePagedList.ts";
+import { FilesScreen } from "./FilesScreen.tsx";
+import { InvitationsScreen } from "./InvitationsScreen.tsx";
+import { MembersScreen } from "./MembersScreen.tsx";
+import { ProjectsScreen } from "./ProjectsScreen.tsx";
 
-/** Sections of the later dashboard views (CC-P03-03 and following); placeholders for now. */
+/** Dashboard sections. Settings and activity follow with CC-P03-05 and later; they stay placeholders. */
 const SECTIONS = ["overview", "projects", "files", "members", "invitations", "settings", "activity"] as const;
 type Section = (typeof SECTIONS)[number];
 
@@ -32,6 +37,8 @@ export function Shell({
   const [section, setSection] = useState<Section>("overview");
   const [organizationId, setOrganizationId] = useState<string | null>(null);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const names = useRoleNames();
 
   const loadOrganizations = useCallback((cursor?: string) => api.listOrganizations(cursor), [api]);
   const organizations = usePagedList<Organization>(loadOrganizations);
@@ -73,12 +80,7 @@ export function Shell({
   const organization = organizations.items.find((org) => org.id === organizationId) ?? null;
   const workspace = workspaces.items.find((ws) => ws.id === workspaceId) ?? null;
 
-  const orgRole = (role: OrgRole): string =>
-    ({ owner: t("Owner"), admin: t("Admin"), member: t("Member") })[role];
-  const workspaceRole = (role: WorkspaceRole | null): string =>
-    role === null
-      ? t("No workspace role")
-      : { admin: t("Admin"), editor: t("Editor"), viewer: t("Viewer") }[role];
+  const scope = { userId: session.user_id, organization, workspace };
   const sectionLabel: Record<Section, string> = {
     overview: t("Overview"),
     projects: t("Projects"),
@@ -102,6 +104,7 @@ export function Shell({
             onSelect={(id) => {
               setOrganizationId(id);
               setWorkspaceId(null);
+              setProjectId(null);
             }}
             isDisabled={organizations.items.length === 0}
           />
@@ -114,7 +117,10 @@ export function Shell({
             }
             choices={workspaces.items.map((ws) => ({ id: ws.id, label: ws.name }))}
             selectedId={workspaceId}
-            onSelect={setWorkspaceId}
+            onSelect={(id) => {
+              setWorkspaceId(id);
+              setProjectId(null);
+            }}
             isDisabled={workspaces.items.length === 0}
           />
         </div>
@@ -150,20 +156,10 @@ export function Shell({
           <ScreenHeading key={section}>{sectionLabel[section]}</ScreenHeading>
 
           {organizations.status === "error" && (
-            <Alert>
-              {describeError(t, organizations.error)}{" "}
-              <Button className="button button--link" onPress={organizations.reload}>
-                {t("Try again")}
-              </Button>
-            </Alert>
+            <ErrorNotice error={organizations.error} onRetry={organizations.reload} onReload={organizations.reload} />
           )}
           {workspaces.status === "error" && (
-            <Alert>
-              {describeError(t, workspaces.error)}{" "}
-              <Button className="button button--link" onPress={workspaces.reload}>
-                {t("Try again")}
-              </Button>
-            </Alert>
+            <ErrorNotice error={workspaces.error} onRetry={workspaces.reload} onReload={workspaces.reload} />
           )}
           {organizations.status === "loading" && (
             <p role="status" className="muted">
@@ -205,7 +201,7 @@ export function Shell({
               <dd>
                 {organization === null
                   ? t("None selected")
-                  : `${organization.name} · ${orgRole(organization.role)}`}
+                  : `${organization.name} · ${names.orgRole(organization.role)}`}
               </dd>
               <dt>{t("Workspace")}</dt>
               <dd>
@@ -213,9 +209,27 @@ export function Shell({
                   ? workspaces.status === "ready" && organization !== null
                     ? t("This organization has no workspace you can see.")
                     : t("None selected")
-                  : `${workspace.name} · ${workspaceRole(workspace.workspace_role)}`}
+                  : `${workspace.name} · ${names.workspaceRole(workspace.workspace_role)}`}
               </dd>
             </dl>
+          ) : section === "projects" ? (
+            <ProjectsScreen
+              scope={scope}
+              onOpenProject={(project: Project) => {
+                setProjectId(project.id);
+                setSection("files");
+              }}
+            />
+          ) : section === "files" ? (
+            <FilesScreen scope={scope} projectId={projectId} onProjectChange={setProjectId} />
+          ) : section === "members" ? (
+            <MembersScreen
+              scope={scope}
+              onOrganizationsChanged={organizations.refresh}
+              onWorkspacesChanged={workspaces.refresh}
+            />
+          ) : section === "invitations" ? (
+            <InvitationsScreen key={organizationId} scope={scope} workspaces={workspaces.items} />
           ) : (
             <p className="muted">{t("This view is not available yet.")}</p>
           )}

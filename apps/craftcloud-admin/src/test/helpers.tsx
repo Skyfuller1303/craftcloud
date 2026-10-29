@@ -117,13 +117,25 @@ export function loggedInRoutes(overrides: Record<string, Handler> = {}): Record<
 
 export function renderApp(
   fetchImpl: typeof fetch,
-  options: { inviteToken?: string | null; language?: string } = {},
+  options: {
+    inviteToken?: string | null;
+    resetToken?: string | null;
+    language?: string;
+    xhrFactory?: () => XMLHttpRequest;
+  } = {},
 ) {
   return render(
     <I18nProvider initial={options.language ?? "en"}>
       <App
         inviteToken={options.inviteToken ?? null}
-        createClient={(onUnauthenticated) => createApiClient({ fetchImpl, onUnauthenticated })}
+        resetToken={options.resetToken ?? null}
+        createClient={(onUnauthenticated) =>
+          createApiClient({
+            fetchImpl,
+            onUnauthenticated,
+            ...(options.xhrFactory === undefined ? {} : { xhrFactory: options.xhrFactory }),
+          })
+        }
       />
     </I18nProvider>,
   );
@@ -136,7 +148,12 @@ export function renderApp(
  */
 export async function expectNoAxeViolations(container: Element = document.body): Promise<void> {
   const results = await axe.run(container, {
-    rules: { "color-contrast": { enabled: false } },
+    rules: {
+      "color-contrast": { enabled: false },
+      // Experimental in axe, but WCAG 2.5.3 (Label in Name): a control's accessible name
+      // must contain its visible text. It caught "Move Brand kit to the trash" vs "Move to trash".
+      "label-content-name-mismatch": { enabled: true },
+    },
   });
   const summary = results.violations.map(
     (violation) =>

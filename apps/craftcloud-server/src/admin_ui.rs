@@ -24,7 +24,9 @@
 //! - Hashed build assets (`/admin/assets/*`) are immutable; everything else,
 //!   including `index.html`, is `no-store`.
 //! - Invitation links created by the API point at `/invite#token=...`; that
-//!   path redirects to `/admin/invite` (browsers keep the fragment).
+//!   path redirects to `/admin/invite` (browsers keep the fragment). Password
+//!   reset links point at `/reset-password#token=...` and redirect to
+//!   `/admin/reset-password` the same way.
 
 use std::collections::HashMap;
 use std::fs;
@@ -223,6 +225,7 @@ pub fn router(assets: Assets) -> Router {
         .route("/admin/", get(serve_index))
         .route("/admin/{*path}", get(serve_path))
         .route("/invite", get(redirect_invite))
+        .route("/reset-password", get(redirect_reset_password))
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(Arc::new(assets))
 }
@@ -234,6 +237,11 @@ async fn redirect_to_base() -> Response {
 async fn redirect_invite() -> Response {
     // The token lives in the fragment, which the browser carries over.
     redirect("/admin/invite")
+}
+
+async fn redirect_reset_password() -> Response {
+    // Same as the invitation link: the token stays in the fragment.
+    redirect("/admin/reset-password")
 }
 
 fn redirect(location: &'static str) -> Response {
@@ -717,6 +725,11 @@ mod tests {
         assert_eq!(invite.status, 307);
         assert_eq!(invite.header("location").unwrap(), "/admin/invite");
         assert_security_headers(&invite);
+
+        let reset = raw(running.addr, "GET", "/reset-password").await;
+        assert_eq!(reset.status, 307);
+        assert_eq!(reset.header("location").unwrap(), "/admin/reset-password");
+        assert_security_headers(&reset);
         running.stop().await;
     }
 
@@ -903,7 +916,13 @@ mod tests {
     #[tokio::test]
     async fn without_a_directory_nothing_is_mounted() {
         let running = start_with(None).await;
-        for target in ["/admin", "/admin/", "/admin/assets/app.js", "/invite"] {
+        for target in [
+            "/admin",
+            "/admin/",
+            "/admin/assets/app.js",
+            "/invite",
+            "/reset-password",
+        ] {
             let reply = raw(running.addr, "GET", target).await;
             assert_eq!(reply.status, 404, "{target}");
             assert!(reply.body.contains("NOT_FOUND"), "{target}: {}", reply.body);

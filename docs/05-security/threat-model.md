@@ -174,5 +174,18 @@ The browser UI is a static single-page app served by `craftcloud-server` under `
 | Clickjacking of the login or admin screens | `frame-ancestors 'none'` and `X-Frame-Options: DENY` on every `/admin` answer | `serves_index_assets_and_static_files_with_strict_headers` |
 | Malicious npm dependency in the UI build | exact versions, committed lockfile, `npm ci --ignore-scripts`, versions at least two weeks old, `npm audit` (runtime dependencies: 0 findings at PR time) | `cargo xtask web` |
 
+### Additional abuse cases of the dashboard views (PR-015, CC-P03-03/04)
+
+| Abuse case | Mitigation | Test |
+|---|---|---|
+| UI offers an action the viewer must not do and the user relies on it | the UI only hides or disables controls from the same rules as the permission matrix (`src/permissions.ts`); every request is authorized by the API again, and a 403/404 after a role change is shown inside the dialog with a reload action | `permissions.test.ts`, `shows the server's 403 inside the dialog and reloads on request` |
+| One-time invitation link leaks (storage, URL, history, list responses) | the link lives only in component state, is never written to `localStorage`/`sessionStorage`/URL, disappears on dismiss or when the view is left, and the invitation list never contains links or tokens | `creates an invitation, shows the one-time link with a copy button and never stores it` |
+| Reset token leaks through URL, history or Referer | read from the fragment and replaced with `/admin/` before the first request; sent only in the JSON body; `/reset-password` redirects without the fragment being visible to the server | `takes the token from the fragment and replaces the address before anything else`, `only_get_and_head_and_redirects` |
+| Lost update when two people save the same file | the commit sends `If-Match: "version:<head>"` (or `If-None-Match: *`); 412 `VERSION_CONFLICT` opens a dialog (keep both, overwrite on top of `details.current_version_id`, cancel which aborts the stored upload) and never silently overwrites | `conflict on a new version (412 VERSION_CONFLICT)` |
+| Memory exhaustion or blob in page memory through big files | the file is hashed in 4 MiB chunks, sent as a `Blob` body of one `PUT` and downloaded through a plain link; nothing is read completely into memory | `hashes a blob in chunks`, `uploads a new file ...` (request body is the `File` itself) |
+| Double submit or replay of an upload reservation | one in-flight action per control; the reservation carries an `Idempotency-Key` that is reused only while the session was not used, a failed body needs a new session | `reuses the idempotency key when only the reservation failed`, `retries after a network error with a fresh session ...` |
+| Hostile file names (bidi, control characters, long names) in lists | React escapes all values; names are shown as text only and are never used as paths (downloads use the server's sanitized `Content-Disposition`); the conflict copy name is shortened to 255 bytes | `keeps the copy name within 255 bytes ...` |
+| Rate-limit hammering by retry buttons | `Retry-After` countdown keeps the retry control disabled; no automatic retries of unsafe requests | `counts down Retry-After, keeps retry disabled until zero and announces the end` |
+
 Residual risks: the UI directory is trusted build output (whoever writes it controls the UI); the UI and the API share an origin, so an XSS in the UI would be an XSS against the API session; colour contrast and assistive-technology behaviour are not verified in real browsers (docs/gaps.md).
 
