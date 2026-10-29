@@ -262,6 +262,8 @@ dependencies = [
  "craftcloud-storage",
  "ipnet",
  "libc",
+ "serde_json",
+ "sha2",
  "sqlx",
  "time",
  "tokio",

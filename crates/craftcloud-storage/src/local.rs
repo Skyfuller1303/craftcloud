@@ -79,6 +79,12 @@ pub struct MarkerInfo {
 /// Name of the marker file that identifies a store (see [`LocalStore::read_marker`]).
 pub const MARKER_FILE: &str = "craftcloud-store.json";
 
+/// How often a replacing marker write retries a rename that Windows refused
+/// because another process briefly held the old marker open (about 1.4 s total).
+/// Windows reports this as access denied or as a sharing/lock violation
+/// (`ERROR_SHARING_VIOLATION` 32, `ERROR_LOCK_VIOLATION` 33).
+const MARKER_REPLACE_RETRIES: u32 = 10;
+
 /// Directory below the root that receives objects removed by reconciliation.
 pub const QUARANTINE_DIR: &str = "quarantine";
 
@@ -380,6 +386,7 @@ impl TempObject {
         .await;
         if result.is_ok() {
             self.flushed += len;
+            crate::crash_point("upload-mid-stream", self.flushed);
         }
         result
     }
@@ -940,14 +947,34 @@ impl LocalStore {
             permissions.set_readonly(true);
             std::fs::set_permissions(&temp2, permissions)?;
             if replace {
-                // The old marker is read-only; a replacing rename needs it writable.
-                if let Ok(meta) = std::fs::metadata(&target2) {
-                    let mut old = meta.permissions();
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    old.set_readonly(false);
-                    let _ = std::fs::set_permissions(&target2, old);
+                // On Windows a replacing rename fails with "access denied" while
+                // another process (a virus scanner, the indexer or a concurrent
+                // reader) briefly holds the old marker open. Retry a few times
+                // with a short backoff; the old marker stays valid in between.
+                let mut attempt = 0u32;
+                loop {
+                    // The old marker is read-only; a replacing rename needs it writable.
+                    if let Ok(meta) = std::fs::metadata(&target2) {
+                        let mut old = meta.permissions();
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        old.set_readonly(false);
+                        let _ = std::fs::set_permissions(&target2, old);
+                    }
+                    match std::fs::rename(&temp2, &target2) {
+                        Err(e)
+                            if (e.kind() == io::ErrorKind::PermissionDenied
+                                || (cfg!(windows)
+                                    && matches!(e.raw_os_error(), Some(32 | 33))))
+                                && attempt < MARKER_REPLACE_RETRIES =>
+                        {
+                            attempt += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                25 * u64::from(attempt),
+                            ));
+                        }
+                        other => break other,
+                    }
                 }
-                std::fs::rename(&temp2, &target2)
             } else {
                 std::fs::hard_link(&temp2, &target2)
             }

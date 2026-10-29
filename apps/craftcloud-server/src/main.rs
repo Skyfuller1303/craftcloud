@@ -142,6 +142,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Crash tests only: arm the process-level crash point from the environment.
+    // Compiled out of normal builds.
+    #[cfg(feature = "fault-injection")]
+    if let Err(message) = craftcloud_storage::arm_crash_point_from_env() {
+        eprintln!("craftcloud-server: {message}");
+        return ExitCode::from(EXIT_CONFIG);
+    }
+
     let config = match Config::from_process_env() {
         Ok(config) => config,
         Err(errors) => {

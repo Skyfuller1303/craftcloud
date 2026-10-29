@@ -17,11 +17,15 @@
 //! This crate has no HTTP code. Uploads and downloads use it from the API
 //! crate in later milestones.
 
+mod crash;
 mod error;
 mod faults;
 mod key;
 mod local;
 
+pub use crash::crash_point;
+#[cfg(feature = "fault-injection")]
+pub use crash::{CRASH_ENV, CRASH_POINTS, arm_crash_point_from_env};
 pub use error::{StorageError, StoreSetupError, map_io_error};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use faults::{FaultKind, FaultPlan};

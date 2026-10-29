@@ -24,7 +24,18 @@ tracing-subscriber.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[features]
+# Test builds only: lets crash tests abort the process at named points
+# (`CC_FAULT_ABORT_AT`). Never enabled in a normal build.
+fault-injection = ["craftcloud-storage/fault-injection"]
+
+[[test]]
+name = "crash"
+required-features = ["fault-injection"]
+
 [dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
 sqlx.workspace = true
 

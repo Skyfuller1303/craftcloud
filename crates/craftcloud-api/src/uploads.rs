@@ -721,6 +721,8 @@ async fn finish_upload(finish: Finish) -> Response {
     };
     match stored {
         StoreOutcome::Stored(upload, _blob) => {
+            // Crash test hook: object published, blob row not committed yet.
+            craftcloud_storage::crash_point("upload-before-record", 0);
             if let Err(error) = tx.commit().await {
                 guard.key = None;
                 delete_object(&services, &key).await;

@@ -265,6 +265,8 @@ pub(crate) async fn commit_version(
     }
     match outcome {
         CommitOutcome::Committed(version) => {
+            // Crash test hook: committed, response not sent yet.
+            craftcloud_storage::crash_point("version-after-commit", 0);
             audit(
                 &headers,
                 session.user_id,

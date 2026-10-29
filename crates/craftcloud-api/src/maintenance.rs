@@ -1193,6 +1193,8 @@ impl Maintenance {
         blob_id: Uuid,
         object_key: &str,
     ) {
+        // Crash test hook: the claim is committed, the object not deleted yet.
+        craftcloud_storage::crash_point("gc-after-claim", 0);
         let Ok(key) = ObjectKey::parse(object_key) else {
             tracing::error!(target: "craftcloud::maintenance", blob = %blob_id, "blob has an invalid object key");
             report.add("storage_errors", 1);

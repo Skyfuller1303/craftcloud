@@ -76,7 +76,7 @@ fn repo_root() -> PathBuf {
 
 fn ci() -> ExitCode {
     let root = repo_root();
-    let steps: [(&str, &[&str]); 3] = [
+    let steps: [(&str, &[&str]); 4] = [
         ("cargo fmt", &["fmt", "--all", "--", "--check"]),
         (
             "cargo clippy",
@@ -84,6 +84,21 @@ fn ci() -> ExitCode {
                 "clippy",
                 "--workspace",
                 "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ),
+        // The crash tests (CC-P02-08) are only built with the feature; lint them too.
+        (
+            "cargo clippy (fault-injection)",
+            &[
+                "clippy",
+                "-p",
+                "craftcloud-server",
+                "--all-targets",
+                "--features",
+                "fault-injection",
                 "--",
                 "-D",
                 "warnings",
