@@ -30,6 +30,8 @@ const DEFAULT_SESSION_IDLE_MINUTES: u64 = 8 * 60;
 const SESSION_IDLE_MINUTES_RANGE: (u64, u64) = (5, 72 * 60);
 const DEFAULT_SESSION_ABSOLUTE_HOURS: u64 = 7 * 24;
 const SESSION_ABSOLUTE_HOURS_RANGE: (u64, u64) = (1, 30 * 24);
+const DEFAULT_TRASH_RETENTION_DAYS: u64 = 30;
+const TRASH_RETENTION_DAYS_RANGE: (u64, u64) = (1, 3650);
 const DEFAULT_DB_MAX_CONNECTIONS: u64 = 10;
 const DB_MAX_CONNECTIONS_RANGE: (u64, u64) = (1, 100);
 const DEFAULT_DB_CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -44,7 +46,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 13] = [
+const SUPPORTED_KEYS: [&str; 14] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -55,6 +57,7 @@ const SUPPORTED_KEYS: [&str; 13] = [
     "BOOTSTRAP_SECRET_FILE",
     "SESSION_IDLE_TIMEOUT_MINUTES",
     "SESSION_ABSOLUTE_TIMEOUT_HOURS",
+    "TRASH_RETENTION_DAYS",
     "DATABASE_URL_FILE",
     "DATABASE_MAX_CONNECTIONS",
     "DATABASE_CONNECT_TIMEOUT_SECS",
@@ -139,6 +142,8 @@ pub struct Config {
     pub session_idle_timeout: Duration,
     /// Session absolute timeout.
     pub session_absolute_timeout: Duration,
+    /// How long soft-deleted projects and files stay restorable (ADR-0014).
+    pub trash_retention: Duration,
 }
 
 impl Config {
@@ -288,6 +293,10 @@ impl Config {
             |key, raw| parse_ranged(key, raw, SESSION_ABSOLUTE_HOURS_RANGE),
         )
         .unwrap_or(DEFAULT_SESSION_ABSOLUTE_HOURS);
+        let trash_retention_days = field(&mut errors, env, "TRASH_RETENTION_DAYS", |key, raw| {
+            parse_ranged(key, raw, TRASH_RETENTION_DAYS_RANGE)
+        })
+        .unwrap_or(DEFAULT_TRASH_RETENTION_DAYS);
         if session_idle_minutes > session_absolute_hours * 60 {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}SESSION_IDLE_TIMEOUT_MINUTES"),
@@ -327,6 +336,7 @@ impl Config {
                 cookie_secure,
                 session_idle_timeout: Duration::from_secs(session_idle_minutes * 60),
                 session_absolute_timeout: Duration::from_secs(session_absolute_hours * 3600),
+                trash_retention: Duration::from_secs(trash_retention_days * 24 * 3600),
             })
         } else {
             Err(errors)
@@ -610,6 +620,20 @@ mod tests {
             ("CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS", "24"),
         ]))
         .unwrap();
+        assert_eq!(
+            defaults.trash_retention,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        let retention =
+            Config::from_env_map(&env(&[("CRAFTCLOUD_TRASH_RETENTION_DAYS", "7")])).unwrap();
+        assert_eq!(
+            retention.trash_retention,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+        for bad in ["0", "3651", "abc", "-1"] {
+            let key = "CRAFTCLOUD_TRASH_RETENTION_DAYS";
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
         assert_eq!(custom.session_idle_timeout, Duration::from_secs(1800));
         assert_eq!(
             custom.session_absolute_timeout,

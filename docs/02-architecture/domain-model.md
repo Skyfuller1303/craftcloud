@@ -46,6 +46,10 @@ Migration 0006: `workspaces.version` (ETag), `workspace_members.created_at`, `or
 
 Sperrreihenfolge (immer in dieser Richtung, damit es keine Verklemmungen gibt): Organisationszeile → Nutzerzeilen → Einladungen/Sitzungen/Tokens. Kontenpfade sperren zuerst Nutzerzeilen und nehmen nie Organisationssperren. Das Annehmen sperrt Organisation, teilt die Sperre auf Einlader und Zielkonto und verbraucht die Einladung mit `UPDATE ... WHERE accepted_at IS NULL AND revoked_at IS NULL AND invalidated_at IS NULL AND expires_at > now`.
 
+## Umsetzungsstand (PR-008)
+
+Migration 0007: `projects` (je Workspace, Fremdschlüssel `(org_id, workspace_id)` auf `workspaces`, `UNIQUE (org_id, workspace_id, id)`) und `files` (Fremdschlüssel `(org_id, workspace_id, project_id)` auf `projects`; damit sind mandantenübergreifende Zeilen unmöglich). Beide tragen `version` (ETag `"prj-v<n>"` bzw. `"file-v<n>"`), Ersteller/Bearbeiter (`RESTRICT` auf `users`, Dateien überleben das Entfernen von Mitgliedern) und `deleted_at`/`deleted_by_user_id` für den Papierkorb. Der Name ist untrusted Anzeigemetadatum; `name_key` (NFKC und Casefold; der angezeigte Name bleibt NFC wie getippt, von der Anwendung berechnet) steckt in einem partiellen eindeutigen Index über SHA-256 des Schlüssels (Spalte `name_hash`, per Trigger gepflegt) über die nicht gelöschten Zeilen (je Workspace bzw. je Projekt). Dateien haben `size_bytes` (0), `sha256` und `head_version_id` (beide `NULL`, die Fremdschlüssel auf Versionen kommen mit einer späteren Migration). Zeitstempel kommen aus der Uhr der Anwendung. Es gibt keine Löschroutine für abgelaufene Papierkorb-Einträge (CC-P02-06); die Sperrreihenfolge bleibt Organisationszeile, dann Projekt-/Dateizeilen.
+
 ## Wichtige Designregeln
 
 - Alle tenant-gebundenen Datensätze tragen `org_id`, obwohl sie über FKs indirekt zuordenbar wären; verhindert versehentliche Cross-Org-Abfragen und erleichtert Policy/Partitionierung. FK-/Constraint-Design muss das tatsächlich erzwingen.

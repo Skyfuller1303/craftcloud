@@ -10,6 +10,7 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 ## Umsetzungstickets
 
 - [ ] **CC-P02-01** — Project/File metadata + safe filename/path handling (CC-F06)
+  - Status: Umsetzung lokal vorhanden (PR-008, Review offen): Projekte und Dateimetadaten mit Soft-Delete/Restore, Namensvalidierung und Eindeutigkeit, Paginierung, Rollenmatrix, IDOR-Tests. Nicht enthalten: Ordner, Dateiinhalte, endgültiges Löschen. Das Ticket wird nach der Übergabe angehakt.
 - [ ] **CC-P02-02** — Stream upload session, quota reservation, bounded memory, SHA-256 verify (CC-F07)
 - [ ] **CC-P02-03** — local FS storage adapter and fault-injection tests (CC-F09)
 - [ ] **CC-P02-04** — Immutable blobs, version commit with CAS/ETag and conflict codes (CC-F08)

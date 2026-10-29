@@ -3,7 +3,7 @@ info:
   title: CraftCloud Core API — proposal sketch
   version: 0.0.0-rfc
   description: >-
-    RFC EXAMPLE ONLY. Not deployed, not an upstream contract, deliberately incomplete. Contains only operations that the server implements (checked by crates/craftcloud-api/tests/contract.rs); project, file and upload endpoints are added with their features.
+    RFC EXAMPLE ONLY. Not deployed, not an upstream contract, deliberately incomplete. Contains only operations that the server implements (checked by crates/craftcloud-api/tests/contract.rs); upload and version endpoints are added with their features.
     Authorization details and full response schemas must be decided before implementation.
 servers:
   - url: https://craftcloud.example.invalid/api/v1
@@ -19,6 +19,8 @@ tags:
   - name: Discovery
   - name: Workspaces
   - name: Invitations
+  - name: Projects
+  - name: Files
 paths:
   /health/live:
     get:
@@ -986,6 +988,386 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /workspaces/{workspace_id}/projects:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+    get:
+      tags: [Projects]
+      summary: List the projects of a workspace (workspace members, organization owner and admin)
+      description: >-
+        Live projects, or with `deleted=true` the trash. Keyset paginated by creation time and id; the cursor holds
+        timestamp and id only and is bound to the workspace and the `deleted` switch (400 INVALID_CURSOR otherwise).
+        Callers who cannot see the workspace answer 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Deleted'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Projects]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Create a project (organization owner/admin, workspace admin and editor)
+      description: >-
+        Viewers: 403; callers who cannot see the workspace: 404. The name follows the display-name rules after NFC
+        normalization (422 VALIDATION_ERROR with details.fields ["name"]) and is unique among the live projects of
+        the workspace by its NFC and case-folded form (409 PROJECT_NAME_TAKEN).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateProjectRequest'}
+      responses:
+        '201':
+          description: Created
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "prj-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: PROJECT_NAME_TAKEN
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /projects/{project_id}:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    get:
+      tags: [Projects]
+      summary: Get a project (also one in the trash)
+      description: >-
+        The workspace and organization come from the project row. Unknown ids, ids of other tenants and projects in
+        workspaces the caller cannot see are indistinguishable: 404.
+      responses:
+        '200':
+          description: The project
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "prj-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Projects]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Rename a project (organization owner/admin, workspace admin and editor)
+      description: >-
+        Requires If-Match (428 PRECONDITION_REQUIRED without, 412 VERSION_CONFLICT with a stale or malformed value; the
+        response carries the current ETag). A project in the trash answers 409 PROJECT_DELETED, a taken name
+        409 PROJECT_NAME_TAKEN.
+      parameters:
+        - in: header
+          name: If-Match
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateProjectRequest'}
+      responses:
+        '200':
+          description: Renamed
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "prj-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: PROJECT_NAME_TAKEN or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '412':
+          description: VERSION_CONFLICT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '428':
+          description: PRECONDITION_REQUIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Projects]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Move a project to the trash (organization owner/admin and workspace admin)
+      description: >-
+        Soft delete; idempotent (an already deleted project answers 204 and is not changed). Editors and viewers: 403.
+        The files stay with the project; a project in the trash is read-only. Restorable for the retention period
+        (`CRAFTCLOUD_TRASH_RETENTION_DAYS`, default 30); nothing is purged yet.
+      responses:
+        '204': {description: In the trash}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /projects/{project_id}/restore:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    post:
+      tags: [Projects]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Restore a project from the trash (organization owner/admin and workspace admin)
+      description: >-
+        Within the retention period only (410 RETENTION_EXPIRED afterwards); 409 PROJECT_NAME_TAKEN when a live
+        project took the name meanwhile. Restoring a live project changes nothing (200).
+      responses:
+        '200':
+          description: Restored
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "prj-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: PROJECT_NAME_TAKEN
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '410':
+          description: RETENTION_EXPIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /projects/{project_id}/files:
+    parameters:
+      - {$ref: '#/components/parameters/ProjectId'}
+    get:
+      tags: [Files]
+      summary: List the file metadata of a project (workspace members, organization owner and admin)
+      description: >-
+        Live files, or with `deleted=true` the trash. Keyset paginated by creation time and id; the cursor is bound to
+        the project and the `deleted` switch. Callers who cannot see the workspace: 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/Deleted'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FilePage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Create file metadata (organization owner/admin, workspace admin and editor)
+      description: >-
+        Metadata only; contents and versions follow with the upload feature. The name is untrusted display metadata,
+        never used as a path: NFC-normalized, 1 to 255 bytes, no control characters (including NUL), none of
+        `/ \ : * ? " < > |`, not `.` or `..`, no leading or trailing whitespace, no trailing dot, no invisible format
+        or bidirectional characters, no Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with any
+        extension). Invalid names answer 422 with details.fields ["name"]. Names are unique among the live files of
+        the project by their NFC and case-folded form (409 FILE_NAME_TAKEN). `app` matches `^[a-z0-9-]{1,32}$`,
+        `format` matches `^[a-z0-9.+-]{1,64}$`. A project in the trash answers 409 PROJECT_DELETED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateFileRequest'}
+      responses:
+        '201':
+          description: Created
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "file-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/File'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: FILE_NAME_TAKEN or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    get:
+      tags: [Files]
+      summary: Get file metadata (also one in the trash)
+      description: >-
+        Organization, workspace and project come from the file row. Unknown ids, ids of other tenants, ids of other
+        kinds (a project id) and files in workspaces the caller cannot see are indistinguishable: 404.
+      responses:
+        '200':
+          description: The file metadata
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "file-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/File'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Rename a file (organization owner/admin, workspace admin and editor)
+      description: >-
+        Requires If-Match (428 without, 412 VERSION_CONFLICT with a stale or malformed value; the response carries the
+        current ETag). A file in the trash answers 409 FILE_DELETED, a file of a project in the trash 409
+        PROJECT_DELETED, a taken name 409 FILE_NAME_TAKEN. App and format cannot be changed.
+      parameters:
+        - in: header
+          name: If-Match
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateFileRequest'}
+      responses:
+        '200':
+          description: Renamed
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "file-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/File'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: FILE_NAME_TAKEN, FILE_DELETED or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '412':
+          description: VERSION_CONFLICT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '428':
+          description: PRECONDITION_REQUIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Move a file to the trash (organization owner/admin, workspace admin and editor)
+      description: >-
+        Soft delete; idempotent. Restorable for the retention period; nothing is purged yet. Viewers: 403. A file of
+        a project in the trash answers 409 PROJECT_DELETED.
+      responses:
+        '204': {description: In the trash}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/restore:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    post:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Restore a file from the trash (organization owner/admin, workspace admin and editor)
+      description: >-
+        Within the retention period only (410 RETENTION_EXPIRED afterwards); 409 FILE_NAME_TAKEN when a live file took
+        the name meanwhile; 409 PROJECT_DELETED when the project is in the trash. Restoring a live file changes
+        nothing (200).
+      responses:
+        '200':
+          description: Restored
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "file-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/File'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: FILE_NAME_TAKEN or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '410':
+          description: RETENTION_EXPIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /organizations/{org_id}/invitations:
     parameters:
       - {$ref: '#/components/parameters/OrgId'}
@@ -1138,6 +1520,22 @@ components:
       name: org_id
       required: true
       schema: {type: string, format: uuid}
+    ProjectId:
+      in: path
+      name: project_id
+      required: true
+      schema: {type: string, format: uuid}
+    FileId:
+      in: path
+      name: file_id
+      required: true
+      schema: {type: string, format: uuid}
+    Deleted:
+      in: query
+      name: deleted
+      required: false
+      schema: {type: boolean, default: false}
+      description: List the trash (soft-deleted items) instead of the live ones.
     WorkspaceId:
       in: path
       name: workspace_id
@@ -1437,6 +1835,84 @@ components:
       required: [role]
       properties:
         role: {type: string, enum: [admin, editor, viewer]}
+    Project:
+      type: object
+      required: [id, organization_id, workspace_id, name, version, created_by, created_at, updated_by, updated_at, deleted_at]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        name: {type: string, minLength: 1, maxLength: 100}
+        version: {type: integer, minimum: 1}
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        updated_by: {type: string, format: uuid}
+        updated_at: {type: string, format: date-time}
+        deleted_at: {type: [string, 'null'], format: date-time}
+    ProjectPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/Project'}
+        next_cursor: {type: [string, 'null']}
+    CreateProjectRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+    UpdateProjectRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+    File:
+      type: object
+      required: [id, organization_id, workspace_id, project_id, name, app, format, size_bytes, sha256, head_version_id, version, created_by, created_at, updated_by, updated_at, deleted_at]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        name: {type: string, minLength: 1, maxLength: 255, description: Untrusted display metadata; never a path}
+        app: {type: string, pattern: '^[a-z0-9-]{1,32}$'}
+        format: {type: string, pattern: '^[a-z0-9.+-]{1,64}$'}
+        size_bytes: {type: integer, minimum: 0, description: 0 until a version exists}
+        sha256: {type: [string, 'null'], description: Lowercase hex; null until a version exists}
+        head_version_id: {type: [string, 'null'], format: uuid, description: Null until the first commit}
+        version: {type: integer, minimum: 1}
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        updated_by: {type: string, format: uuid}
+        updated_at: {type: string, format: date-time}
+        deleted_at: {type: [string, 'null'], format: date-time}
+    FilePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/File'}
+        next_cursor: {type: [string, 'null']}
+    CreateFileRequest:
+      type: object
+      additionalProperties: false
+      required: [name, app, format]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        app: {type: string, pattern: '^[a-z0-9-]{1,32}$'}
+        format: {type: string, pattern: '^[a-z0-9.+-]{1,64}$'}
+    UpdateFileRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
     AdminUser:
       type: object
       required: [id, email, display_name, created_at, disabled, email_verified, origin]

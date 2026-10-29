@@ -24,6 +24,7 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE` | nicht gesetzt (Setup deaktiviert) | absoluter Pfad einer Secret-Datei mit dem Bootstrap-Token (mindestens 32 Zeichen nach dem Trimmen); erfordert `CRAFTCLOUD_DATABASE_URL_FILE` |
 | `CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES` | `480` (8 h) | 5 bis 4320; nicht größer als die absolute Dauer |
 | `CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS` | `168` (7 Tage) | 1 bis 720 |
+| `CRAFTCLOUD_TRASH_RETENTION_DAYS` | `30` | 1 bis 3650; so lange bleiben in den Papierkorb verschobene Projekte und Dateien wiederherstellbar (ADR-0014). Es gibt noch keine automatische endgültige Löschung (CC-P02-06): abgelaufene Einträge bleiben in der Datenbank, sind aber nicht mehr wiederherstellbar |
 | `CRAFTCLOUD_DATABASE_URL_FILE` | nicht gesetzt (Prototypmodus ohne Datenbank) | absoluter Pfad einer Secret-Datei mit der PostgreSQL-URL |
 | `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` | `10` | 1 bis 100 |
 | `CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS` | `5` | 1 bis 60 |

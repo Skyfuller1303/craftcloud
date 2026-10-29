@@ -1,6 +1,6 @@
 # CC-F06 — Projekte, Verzeichnisse, Dateimetadaten
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
+> **Status:** Projekte und Dateimetadaten lokal umgesetzt (PR-008, Review offen): Projekte je Workspace und flache Dateiliste je Projekt, nur Metadaten (Größe 0, Hash und Head-Version `null` bis zur ersten Version), sichere Namen (NFC, Windows-Reservierungen, Steuer- und Bidi-Zeichen, Eindeutigkeit über NFC+Casefold-Schlüssel), Soft-Delete mit Papierkorb und Wiederherstellungsfenster (`CRAFTCLOUD_TRASH_RETENTION_DAYS`, Standard 30), ETag/If-Match, Scope-gebundene stabile Paginierung. Nicht umgesetzt: Ordnerhierarchie, Verschieben zwischen Projekten, endgültiges Löschen (CC-P02-06), Dateiinhalte und Versionen (CC-F07/F08). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

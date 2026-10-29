@@ -172,7 +172,7 @@ impl DisplayName {
 /// (U+200E/200F, U+202A-202E, U+2066-2069, U+061C), zero-width characters
 /// (U+200B-200D, U+2060-2064, U+FEFF) and the other Cf code points of
 /// Unicode 15; newer additions are not covered.
-fn is_format_char(c: char) -> bool {
+pub(crate) fn is_format_char(c: char) -> bool {
     matches!(
         u32::from(c),
         0x00AD
@@ -201,7 +201,7 @@ fn is_format_char(c: char) -> bool {
 
 /// A character that renders as something: not whitespace, not a format
 /// character and not one of the common blank "filler" letters.
-fn is_visible_char(c: char) -> bool {
+pub(crate) fn is_visible_char(c: char) -> bool {
     !c.is_whitespace()
         && !is_format_char(c)
         && !matches!(u32::from(c), 0x115F | 0x1160 | 0x2800 | 0x3164 | 0xFFA0)

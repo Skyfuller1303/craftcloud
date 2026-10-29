@@ -80,7 +80,7 @@ fn parse_etag(raw: &str) -> Option<i64> {
 
 /// Read-side actor for a workspace request: org role and workspace role from
 /// the database for this request.
-async fn read_actor(
+pub(crate) async fn read_actor(
     pool: &craftcloud_db::PgPool,
     user_id: Uuid,
     org_id: Uuid,
@@ -97,12 +97,12 @@ async fn read_actor(
 
 /// Opens a locked transaction for a workspace request and loads the actor
 /// inside it. `None` responses are the uniform 404.
-struct Locked {
-    tx: OrgTx,
-    actor: Actor,
+pub(crate) struct Locked {
+    pub(crate) tx: OrgTx,
+    pub(crate) actor: Actor,
 }
 
-async fn lock(
+pub(crate) async fn lock(
     pool: &craftcloud_db::PgPool,
     user_id: Uuid,
     org_id: Uuid,

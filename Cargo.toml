@@ -39,6 +39,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = { version = "2", default-features = false, features = ["std"] }
 ipnet = "2"
 zeroize = "1"
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [workspace.lints.rust]

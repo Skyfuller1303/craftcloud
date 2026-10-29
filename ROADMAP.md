@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — PR-008 (CC-P02-01) implemented locally: projects and file metadata (CC-F06) with soft delete/restore (`CRAFTCLOUD_TRASH_RETENTION_DAYS`), safe NFC file names, composite foreign keys, 12 new policy actions, migration 0007. Not reviewed or merged.
+
 2026-10-29 — CC-P01-09 implemented locally: contract tests (`crates/craftcloud-api/tests/contract.rs`) comparing `contracts/openapi.yaml` with the served routes, committed `contracts/openapi.snapshot` (`cargo xtask openapi-snapshot [--update]`), common error shape tests; stale `/files` placeholder removed from the OpenAPI document; phase-01 status lines and exit gates updated. Dev-dependency `serde_yaml_ng` (tests only). Not reviewed or merged.
 
 2026-10-29 — PR-007 (CC-P01-07/08 parts) implemented locally: workspaces and workspace members (admin/editor/viewer), link invitations (72 h, single use, revocable, SHA-256 only, inviter rights re-checked at acceptance), anonymous and logged-in acceptance, org setting `workspace_admin_invites_enabled`, migration 0006, 9 new policy actions. No e-mail delivery, no workspace deletion. Not reviewed or merged.

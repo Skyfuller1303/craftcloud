@@ -43,6 +43,8 @@ pub struct AuthSettings {
     pub absolute_timeout: Duration,
     /// Minimum time between recorded activity updates of one session.
     pub touch_interval: Duration,
+    /// How long soft-deleted projects and files stay restorable.
+    pub trash_retention: Duration,
     /// Operator-configured public URL without trailing slash; the only
     /// source for absolute URLs (never derived from request headers).
     pub public_url: Option<String>,
@@ -83,6 +85,7 @@ impl Default for AuthSettings {
             idle_timeout: Duration::from_secs(8 * 3600),
             absolute_timeout: Duration::from_secs(7 * 24 * 3600),
             touch_interval: Duration::from_secs(60),
+            trash_retention: Duration::from_secs(30 * 24 * 3600),
             public_url: None,
             public_origin: None,
             cookie_secure: true,

@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 uuid.workspace = true
+# NFC normalization of file and project names (already part of the lock file via sqlx).
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

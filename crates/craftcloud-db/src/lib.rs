@@ -15,12 +15,14 @@
 
 pub mod accounts;
 mod error;
+pub mod files;
 pub mod invitations;
 pub mod members;
 pub mod migrate;
 pub mod organizations;
 pub mod password_reset;
 mod pool;
+pub mod projects;
 pub mod recovery;
 mod scope;
 pub mod sessions;

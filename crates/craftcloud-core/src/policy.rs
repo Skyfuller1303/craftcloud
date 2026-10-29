@@ -189,6 +189,30 @@ pub enum Action {
     InvitationCreate,
     /// Revoke an invitation.
     InvitationRevoke,
+    /// List the projects of a workspace.
+    ProjectList,
+    /// Read a project.
+    ProjectRead,
+    /// Create a project.
+    ProjectCreate,
+    /// Rename a project.
+    ProjectRename,
+    /// Move a project to the trash.
+    ProjectDelete,
+    /// Restore a project from the trash.
+    ProjectRestore,
+    /// List the files of a project (also the trash).
+    FileList,
+    /// Read file metadata.
+    FileRead,
+    /// Create a file (metadata).
+    FileCreate,
+    /// Rename a file.
+    FileRename,
+    /// Move a file to the trash.
+    FileDelete,
+    /// Restore a file from the trash.
+    FileRestore,
 }
 
 impl Action {
@@ -205,7 +229,11 @@ impl Action {
             | Self::WorkspaceRead
             | Self::WorkspaceList
             | Self::WorkspaceMemberList
-            | Self::InvitationList => false,
+            | Self::InvitationList
+            | Self::ProjectList
+            | Self::ProjectRead
+            | Self::FileList
+            | Self::FileRead => false,
             Self::OrganizationUpdate
             | Self::OrganizationCreate
             | Self::MemberAdd
@@ -221,12 +249,20 @@ impl Action {
             | Self::WorkspaceMemberChangeRole
             | Self::WorkspaceMemberRemove
             | Self::InvitationCreate
-            | Self::InvitationRevoke => true,
+            | Self::InvitationRevoke
+            | Self::ProjectCreate
+            | Self::ProjectRename
+            | Self::ProjectDelete
+            | Self::ProjectRestore
+            | Self::FileCreate
+            | Self::FileRename
+            | Self::FileDelete
+            | Self::FileRestore => true,
         }
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 37] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -252,6 +288,18 @@ impl Action {
         Action::InvitationList,
         Action::InvitationCreate,
         Action::InvitationRevoke,
+        Action::ProjectList,
+        Action::ProjectRead,
+        Action::ProjectCreate,
+        Action::ProjectRename,
+        Action::ProjectDelete,
+        Action::ProjectRestore,
+        Action::FileList,
+        Action::FileRead,
+        Action::FileCreate,
+        Action::FileRename,
+        Action::FileDelete,
+        Action::FileRestore,
     ];
 }
 
@@ -650,6 +698,60 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                 _ => Decision::Forbidden,
             }
         }
+
+        // ---- projects and files (decided by the roles in the workspace) ----
+        (
+            A::ProjectList | A::ProjectRead | A::FileList | A::FileRead,
+            Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        ) => match (
+            role_in(actor, *org_id),
+            workspace_role_in(actor, *workspace_id),
+        ) {
+            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            _ => allow(action, Some(*org_id)),
+        },
+        (
+            A::ProjectCreate
+            | A::ProjectRename
+            | A::FileCreate
+            | A::FileRename
+            | A::FileDelete
+            | A::FileRestore,
+            Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        ) => match (
+            role_in(actor, *org_id),
+            workspace_role_in(actor, *workspace_id),
+        ) {
+            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (Some(OrgRole::Owner | OrgRole::Admin), _)
+            | (Some(OrgRole::Member), Some(WorkspaceRole::Admin | WorkspaceRole::Editor)) => {
+                allow(action, Some(*org_id))
+            }
+            (Some(OrgRole::Member), Some(WorkspaceRole::Viewer)) => Decision::Forbidden,
+        },
+        (
+            A::ProjectDelete | A::ProjectRestore,
+            Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        ) => match (
+            role_in(actor, *org_id),
+            workspace_role_in(actor, *workspace_id),
+        ) {
+            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (Some(OrgRole::Owner | OrgRole::Admin), _)
+            | (Some(OrgRole::Member), Some(WorkspaceRole::Admin)) => allow(action, Some(*org_id)),
+            (Some(OrgRole::Member), Some(WorkspaceRole::Editor | WorkspaceRole::Viewer)) => {
+                Decision::Forbidden
+            }
+        },
 
         // ---- invitations ----
         (A::InvitationList, Resource::Invitation { org_id, .. }) => match role_in(actor, *org_id) {
@@ -1124,6 +1226,18 @@ mod tests {
             Action::InvitationList,
             Action::InvitationCreate,
             Action::InvitationRevoke,
+            Action::ProjectList,
+            Action::ProjectRead,
+            Action::ProjectCreate,
+            Action::ProjectRename,
+            Action::ProjectDelete,
+            Action::ProjectRestore,
+            Action::FileList,
+            Action::FileRead,
+            Action::FileCreate,
+            Action::FileRename,
+            Action::FileDelete,
+            Action::FileRestore,
         ]
         .into_iter()
         .collect();
@@ -1154,7 +1268,19 @@ mod tests {
                 | Action::WorkspaceMemberRemove
                 | Action::InvitationList
                 | Action::InvitationCreate
-                | Action::InvitationRevoke => {}
+                | Action::InvitationRevoke
+                | Action::ProjectList
+                | Action::ProjectRead
+                | Action::ProjectCreate
+                | Action::ProjectRename
+                | Action::ProjectDelete
+                | Action::ProjectRestore
+                | Action::FileList
+                | Action::FileRead
+                | Action::FileCreate
+                | Action::FileRename
+                | Action::FileDelete
+                | Action::FileRestore => {}
             }
             assert!(
                 covered.contains(&action),
@@ -1178,8 +1304,75 @@ mod tests {
                 Action::WorkspaceRead,
                 Action::WorkspaceList,
                 Action::WorkspaceMemberList,
-                Action::InvitationList
+                Action::InvitationList,
+                Action::ProjectList,
+                Action::ProjectRead,
+                Action::FileList,
+                Action::FileRead
             ]
+        );
+    }
+
+    #[test]
+    fn project_and_file_actions_follow_workspace_roles() {
+        let ws = Resource::Workspace {
+            org_id: ORG,
+            workspace_id: WS,
+        };
+        // Columns: outsider, plain member (no workspace role), viewer, editor,
+        // workspace admin, organization admin, organization owner.
+        let cast: [Actor; 7] = [
+            actor(None, false),
+            actor(Some(OrgRole::Member), false),
+            with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Viewer),
+            with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Editor),
+            with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Admin),
+            actor(Some(OrgRole::Admin), false),
+            actor(Some(OrgRole::Owner), false),
+        ];
+        let reads = [H, H, Y, Y, Y, Y, Y];
+        let editor_writes = [H, H, F, Y, Y, Y, Y];
+        let admin_writes = [H, H, F, F, Y, Y, Y];
+        for (action, expected) in [
+            (Action::ProjectList, reads),
+            (Action::ProjectRead, reads),
+            (Action::FileList, reads),
+            (Action::FileRead, reads),
+            (Action::ProjectCreate, editor_writes),
+            (Action::ProjectRename, editor_writes),
+            (Action::FileCreate, editor_writes),
+            (Action::FileRename, editor_writes),
+            (Action::FileDelete, editor_writes),
+            (Action::FileRestore, editor_writes),
+            (Action::ProjectDelete, admin_writes),
+            (Action::ProjectRestore, admin_writes),
+        ] {
+            let got: Vec<Want> = cast.iter().map(|a| outcome(can(a, action, &ws))).collect();
+            assert_eq!(got, expected, "{action:?}");
+        }
+        // A workspace role in another workspace grants nothing here, and the
+        // operator has no implicit access.
+        let mut elsewhere = actor(Some(OrgRole::Member), false);
+        elsewhere.workspace = Some(WorkspaceMembership {
+            workspace_id: Uuid::from_u128(11),
+            role: WorkspaceRole::Admin,
+        });
+        assert_eq!(can(&elsewhere, Action::FileCreate, &ws), Decision::Hidden);
+        assert_eq!(
+            can(&actor(None, true), Action::FileRead, &ws),
+            Decision::Hidden
+        );
+        let foreign = Resource::Workspace {
+            org_id: OTHER_ORG,
+            workspace_id: WS,
+        };
+        assert_eq!(
+            can(
+                &actor(Some(OrgRole::Owner), false),
+                Action::ProjectCreate,
+                &foreign
+            ),
+            Decision::Hidden
         );
     }
 

@@ -70,3 +70,14 @@ Until e-mail verification exists, link possession is the proof of an address (AD
 | No information leak | the `LOGIN_REQUIRED` answer of another organization's invitation contains nothing about the existing account's origin | `invitations_for_existing_accounts_need_that_account_logged_in` |
 | Remedy | operator disables the squatted account (`POST /admin/users/{id}/disable`; sessions revoked, logins refused) and agrees a replacement with the real owner; break-glass steps in the deployment guide | same test |
 | Not before production | email verification is required before multi-tenant production use | docs/gaps.md |
+
+## File name and tenant abuse (PR-008, CC-F06)
+
+| Abuse case | Mitigation | Test |
+|---|---|---|
+| Path traversal or device names through file names (`../`, NUL, `CON.txt`) | the name is display metadata only and never part of a path (storage keys will be ids); strict validation: NFC, 1 to 255 bytes, no control, separator or reserved characters, no Windows device names, no trailing dot or space, no bidi or zero-width characters | `file_names_are_validated_normalized_and_unique_by_key`, unit tests in `crates/craftcloud-core/src/names.rs` |
+| Lookalike or duplicate names (NFC vs NFD, case, `ß`, fullwidth letters, ligatures) | uniqueness over the NFKC and case-folded key among live rows (display name stays NFC as typed), enforced by a partial unique index over sha256 of the key; reserved device names include CON, PRN, AUX, NUL, CONIN$, CONOUT$, CLOCK$, COM0-9, LPT0-9 | same, `concurrent_creations_of_one_name_yield_exactly_one_file` |
+| Guessing ids of another tenant's projects or files (IDOR), ids of the wrong kind | scope resolved from the row, composite foreign keys, policy before any data access, uniform 404 | `projects_and_files_never_cross_organizations_workspaces_or_kinds`, `composite_foreign_keys_and_unique_indexes_hold_below_the_api` |
+| Viewer or editor exceeding their role | exact policy actions, roles loaded freshly in the locked transaction | `project_role_matrix`, `file_role_matrix_and_metadata_defaults` |
+| Names as personal data in logs | audit lines carry ids only | `the_file_name_never_reaches_a_path_or_the_logs` |
+| Resurrecting data after the retention period, or into a taken name | restore checks the clock and the name key; 410 / 409 | `trash_restore_and_retention_follow_the_clock` |

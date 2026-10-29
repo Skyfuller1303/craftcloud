@@ -55,6 +55,33 @@ impl UserListQuery {
     }
 }
 
+/// Query parameters of a listing with the trash switch (`deleted=true|false`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TrashListQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+    deleted: Option<String>,
+}
+
+impl TrashListQuery {
+    /// Paging parameters and the `deleted` switch (`true` or `false`).
+    pub(crate) fn split(self) -> Result<(PageQuery, bool), PageError> {
+        let deleted = match self.deleted.as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err(PageError::Limit),
+        };
+        Ok((
+            PageQuery {
+                limit: self.limit,
+                cursor: self.cursor,
+            },
+            deleted,
+        ))
+    }
+}
+
 /// Why paging parameters were rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageError {

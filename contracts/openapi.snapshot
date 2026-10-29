@@ -13,6 +13,10 @@ POST /api/v1/auth/password/change auth=cookie+csrf req=ChangePasswordRequest ok=
 GET /api/v1/auth/session auth=cookie req=- ok=SessionInfo codes=200,401,500,503
 GET /api/v1/auth/sessions auth=cookie req=- ok=SessionList codes=200,401,500,503
 DELETE /api/v1/auth/sessions/{session_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+DELETE /api/v1/files/{file_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
+GET /api/v1/files/{file_id} auth=cookie req=- ok=File codes=200,401,404,500,503
+PATCH /api/v1/files/{file_id} auth=cookie+csrf req=UpdateFileRequest ok=File codes=200,401,403,404,409,412,413,415,422,428,500,503
+POST /api/v1/files/{file_id}/restore auth=cookie+csrf req=- ok=File codes=200,401,403,404,409,410,500,503
 GET /api/v1/info auth=none req=- ok=- codes=200,503
 POST /api/v1/invitations/accept auth=none req=AcceptInvitationRequest ok=AcceptedInvitation codes=200,400,401,403,409,413,415,422,429,500,503
 GET /api/v1/organizations auth=cookie req=- ok=MyOrganizationPage codes=200,400,401,422,500,503
@@ -28,6 +32,12 @@ DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=- o
 PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=ChangeRoleRequest ok=Member codes=200,401,403,404,409,413,415,422,500,503
 GET /api/v1/organizations/{org_id}/workspaces auth=cookie req=- ok=WorkspacePage codes=200,400,401,404,422,500,503
 POST /api/v1/organizations/{org_id}/workspaces auth=cookie+csrf req=CreateWorkspaceRequest ok=Workspace codes=201,401,403,404,413,415,422,500,503
+DELETE /api/v1/projects/{project_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+GET /api/v1/projects/{project_id} auth=cookie req=- ok=Project codes=200,401,404,500,503
+PATCH /api/v1/projects/{project_id} auth=cookie+csrf req=UpdateProjectRequest ok=Project codes=200,401,403,404,409,412,413,415,422,428,500,503
+GET /api/v1/projects/{project_id}/files auth=cookie req=- ok=FilePage codes=200,400,401,404,422,500,503
+POST /api/v1/projects/{project_id}/files auth=cookie+csrf req=CreateFileRequest ok=File codes=201,401,403,404,409,413,415,422,500,503
+POST /api/v1/projects/{project_id}/restore auth=cookie+csrf req=- ok=Project codes=200,401,403,404,409,410,500,503
 POST /api/v1/setup/complete auth=none req=SetupCompleteRequest ok=- codes=201,403,409,413,415,422,500,503
 GET /api/v1/setup/status auth=none req=- ok=- codes=200,500,503
 GET /api/v1/workspaces/{workspace_id} auth=cookie req=- ok=Workspace codes=200,401,404,500,503
@@ -36,6 +46,8 @@ GET /api/v1/workspaces/{workspace_id}/members auth=cookie req=- ok=WorkspaceMemb
 POST /api/v1/workspaces/{workspace_id}/members auth=cookie+csrf req=AddWorkspaceMemberRequest ok=WorkspaceMember codes=201,401,403,404,409,413,415,422,500,503
 DELETE /api/v1/workspaces/{workspace_id}/members/{user_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
 PATCH /api/v1/workspaces/{workspace_id}/members/{user_id} auth=cookie+csrf req=ChangeWorkspaceRoleRequest ok=WorkspaceMember codes=200,401,403,404,413,415,422,500,503
+GET /api/v1/workspaces/{workspace_id}/projects auth=cookie req=- ok=ProjectPage codes=200,400,401,404,422,500,503
+POST /api/v1/workspaces/{workspace_id}/projects auth=cookie+csrf req=CreateProjectRequest ok=Project codes=201,401,403,404,409,413,415,422,500,503
 GET /health/live auth=none req=- ok=- codes=200,503
 # component schemas
 AcceptInvitationRequest
@@ -47,12 +59,16 @@ AdminUserPage
 ChangePasswordRequest
 ChangeRoleRequest
 ChangeWorkspaceRoleRequest
+CreateFileRequest
 CreateInvitationRequest
 CreateOrganizationRequest
+CreateProjectRequest
 CreateWorkspaceRequest
 CreatedInvitation
 CreatedOrganization
 Error
+File
+FilePage
 Invitation
 InvitationPage
 LoginRequest
@@ -62,12 +78,16 @@ MemberPage
 MyOrganizationPage
 Organization
 OrganizationSummaryPage
+Project
+ProjectPage
 ResetLinkResponse
 ResetPasswordRequest
 SessionInfo
 SessionList
 SetupCompleteRequest
+UpdateFileRequest
 UpdateOrganizationRequest
+UpdateProjectRequest
 UpdateWorkspaceRequest
 Workspace
 WorkspaceMember

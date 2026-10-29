@@ -370,6 +370,7 @@ async fn run(config: Config) -> Result<(), Failure> {
         public_url: config.public_url.clone(),
         public_origin: config.public_origin.clone(),
         cookie_secure: config.cookie_secure,
+        trash_retention: config.trash_retention,
         ..AuthSettings::default()
     };
     let services = pool

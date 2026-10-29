@@ -13,9 +13,11 @@
 mod auth;
 mod client_ip;
 mod clock;
+mod files;
 mod invitations;
 mod orgs;
 mod pagination;
+mod projects;
 mod ratelimit;
 mod responses;
 mod services;
@@ -116,6 +118,15 @@ pub const ROUTES: &[(&str, &[&str])] = &[
         &["DELETE"],
     ),
     ("/api/v1/invitations/accept", &["POST"]),
+    (
+        "/api/v1/workspaces/{workspace_id}/projects",
+        &["GET", "POST"],
+    ),
+    ("/api/v1/projects/{project_id}", &["GET", "PATCH", "DELETE"]),
+    ("/api/v1/projects/{project_id}/restore", &["POST"]),
+    ("/api/v1/projects/{project_id}/files", &["GET", "POST"]),
+    ("/api/v1/files/{file_id}", &["GET", "PATCH", "DELETE"]),
+    ("/api/v1/files/{file_id}/restore", &["POST"]),
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
     ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
@@ -205,6 +216,31 @@ pub fn router_with_services(
             "/api/v1/invitations/accept",
             post(invitations::accept_invitation),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/projects",
+            get(projects::list_projects).post(projects::create_project),
+        )
+        .route(
+            "/api/v1/projects/{project_id}",
+            get(projects::get_project)
+                .patch(projects::update_project)
+                .delete(projects::delete_project),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/restore",
+            post(projects::restore_project),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files",
+            get(files::list_files).post(files::create_file),
+        )
+        .route(
+            "/api/v1/files/{file_id}",
+            get(files::get_file)
+                .patch(files::update_file)
+                .delete(files::delete_file),
+        )
+        .route("/api/v1/files/{file_id}/restore", post(files::restore_file))
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
         .route("/api/v1/admin/users", get(orgs::list_all_users))
         .route(

@@ -65,6 +65,21 @@ Einladungen annehmen (`POST /invitations/accept`) ist die Tokenbesitz-Aktion: we
 
 Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (Tabellentests) und `crates/craftcloud-api/tests/workspaces_invites.rs` (`workspace_member_role_matrix_including_workspace_admin_limits`, `workspaces_never_cross_organizations_and_swapped_ids_find_nothing`, `who_may_invite_what`, `stale_invitations_of_demoted_or_disabled_inviters_and_changed_settings_are_refused`, ...).
 
+## Umgesetzt (PR-008): Projekte und Dateimetadaten
+
+Alle Projekt- und Dateiaktionen entscheiden anhand der Rollen im Workspace des Projekts (die Organisation und der Workspace werden aus der Projekt- bzw. Dateizeile bestimmt, nie aus Client-Parametern). Wer den Workspace nicht sehen darf, bekommt 404 (identisch zu unbekannten IDs, auch bei IDs der falschen Art); Viewer bekommen bei Schreibaktionen 403.
+
+| Aktion | Nicht sichtbar (Außenstehender, Org-`member` ohne Workspace-Rolle, Operator) | viewer | editor | WS-admin | Org-admin / -owner |
+|---|---|---|---|---|---|
+| Projekte / Dateien listen und lesen (auch Papierkorb) | 404 | ja | ja | ja | ja |
+| Projekt anlegen / umbenennen | 404 | 403 | ja | ja | ja |
+| Projekt in den Papierkorb / wiederherstellen | 404 | 403 | 403 | ja | ja |
+| Datei anlegen / umbenennen / in den Papierkorb / wiederherstellen | 404 | 403 | ja | ja | ja |
+
+Ein Projekt im Papierkorb ist schreibgeschützt (Dateien lesbar, Schreibaktionen 409 `PROJECT_DELETED`). Wiederherstellen ist nur innerhalb des Aufbewahrungsfensters möglich (410 `RETENTION_EXPIRED`). Quelle: ADR-0013 Punkt 8, ADR-0014.
+
+Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (`project_and_file_actions_follow_workspace_roles`) und `crates/craftcloud-api/tests/projects_files.rs` (`project_role_matrix`, `file_role_matrix_and_metadata_defaults`, `projects_and_files_never_cross_organizations_workspaces_or_kinds`).
+
 ## Negativtests
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.
