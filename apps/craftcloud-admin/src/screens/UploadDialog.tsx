@@ -391,8 +391,7 @@ export function UploadDialog({
 
       {phase.name === "working" && (
         <div className="stack">
-          <p>{stepLabel[phase.step]}</p>
-          {phase.total > 0 && (phase.step === "hashing" || phase.step === "uploading") && (
+          {phase.total > 0 && (phase.step === "hashing" || phase.step === "uploading") ? (
               <div className="progress">
                 <div className="progress__label">
                   <span>{stepLabel[phase.step]}</span>
@@ -409,6 +408,8 @@ export function UploadDialog({
                   aria-label={stepLabel[phase.step]}
                 />
               </div>
+          ) : (
+            <p>{stepLabel[phase.step]}</p>
           )}
           <div className="form__actions">
             {/* While the version is being recorded the outcome is decided on the server; cancelling would only guess. */}

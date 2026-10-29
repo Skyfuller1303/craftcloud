@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Button, Dialog, Heading, Modal, ModalOverlay } from "react-aria-components";
 import { useI18n } from "../i18n/index.tsx";
@@ -11,6 +11,7 @@ import { ErrorNotice } from "./ErrorNotice.tsx";
  *
  * When the opening control is gone afterwards (for example the row was removed),
  * focus would fall to the page body; it then moves to the main region instead.
+ * If focus lands on the body although the opener still exists, it goes back to the opener.
  */
 export function AppModal({
   title,
@@ -25,16 +26,25 @@ export function AppModal({
   size?: "sm" | "md" | "lg";
   children: ReactNode;
 }) {
+  // The control that had focus when the dialog opened (read during the first
+  // render, before React Aria moves focus into the dialog).
+  const [opener] = useState(() => document.activeElement);
   useEffect(
     () => () => {
       window.setTimeout(() => {
         const active = document.activeElement;
         if (active === null || active === document.body) {
-          document.getElementById("main")?.focus();
+          // React Aria's own restore can lose a race with the unmount; prefer the
+          // opener while it is still on the page, the main region otherwise.
+          if (opener instanceof HTMLElement && opener.isConnected) {
+            opener.focus();
+          } else {
+            document.getElementById("main")?.focus();
+          }
         }
       }, 80);
     },
-    [],
+    [opener],
   );
   return (
     <ModalOverlay

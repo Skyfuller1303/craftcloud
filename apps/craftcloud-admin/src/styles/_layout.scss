@@ -119,8 +119,9 @@
   .screen--narrow { margin-top: var(--space-4); padding: var(--space-5); }
   .shell__body { display: block; min-width: 0; }
   .shell__nav { position: sticky; z-index: 5; top: 0; width: 100%; padding: 0; border-right: 0; border-bottom: var(--hairline) solid var(--line); background: var(--bg); }
-  .shell__nav ul, .shell__nav ul + ul { display: flex; width: 100%; gap: 0; margin: 0; padding: 0; overflow-x: auto; border: 0; scroll-snap-type: x mandatory; }
-  .shell__nav li { flex: 0 0 auto; padding: 0; scroll-snap-align: start; }
+  // Items wrap onto further rows instead of scrolling, so every section stays visible.
+  .shell__nav ul, .shell__nav ul + ul { display: flex; flex-wrap: wrap; width: 100%; gap: 0; margin: 0; padding: 0; border: 0; }
+  .shell__nav li { flex: 0 0 auto; padding: 0; }
   .nav__item { width: auto; min-height: 40px; padding-inline: var(--space-3); white-space: nowrap; }
   .shell__nav + .shell__main { margin: 0; }
   .form--inline > * { flex: 1 1 100%; }
