@@ -15,7 +15,9 @@ The repository now contains a minimal Rust workspace skeleton (PR-001 / CC-P01-0
 ```sh
 cargo build --locked -p craftcloud-server   # build the server
 CRAFTCLOUD_BIND=127.0.0.1:8080 cargo run -p craftcloud-server   # default bind is 127.0.0.1:8080
-cargo xtask ci   # fmt check, clippy -D warnings, tests, relative-link check of all Markdown files
+cargo xtask ci   # fmt check, clippy -D warnings, tests, admin UI checks (needs Node.js, see below), relative-link check of all Markdown files
+cargo xtask ci --skip-web   # same without the admin UI step; the skip is printed, never silent
+cargo xtask web   # admin UI only: npm ci, typecheck, build, component tests, translation check
 cargo xtask db-test   # PostgreSQL integration tests in a throwaway Docker container (needs Docker; pinned postgres:18.6)
 craftcloud-server migrate   # apply pending DB migrations (needs CRAFTCLOUD_DATABASE_URL_FILE); never run implicitly
 ```
@@ -24,7 +26,15 @@ Authentication is cookie-session based (`/api/v1/auth/*`) with CSRF protection a
 
 Organizations are created by the instance operator; members, roles (owner, admin, member) and access are enforced by a central policy engine (see [permission matrix](docs/05-security/permission-matrix.md)).
 
-First-time setup (operator account and organization) is a one-shot `POST /api/v1/setup/complete` guarded by a bootstrap token file you create yourself; see [docs/06-operations/deployment.md](docs/06-operations/deployment.md). There is no login yet.
+First-time setup (operator account and organization) is a one-shot `POST /api/v1/setup/complete` guarded by a bootstrap token file you create yourself; see [docs/06-operations/deployment.md](docs/06-operations/deployment.md). The browser admin UI (below) offers the same flow without `curl`.
+
+**Admin UI (CC-P03-01/02).** `apps/craftcloud-admin` is a React and TypeScript single-page app (Vite, React Aria Components, own SCSS with design tokens, English and German via `src/locales/<lang>.tsv`). It needs Node.js (current LTS); `cargo xtask web` looks for it in the directory named by `CRAFTCLOUD_NODE_DIR`, then on `PATH` (a zip or tarball unpacked anywhere is enough; set the variable to that directory). Dependencies are pinned to exact versions in `package-lock.json` and installed with `npm ci --ignore-scripts`. Build it with `cargo xtask web` (output: `apps/craftcloud-admin/dist`) and let the server serve it on the same origin (the directory is read into memory at startup; rebuild, then restart the server; `CRAFTCLOUD_PUBLIC_URL` must not have a path):
+
+```sh
+CRAFTCLOUD_ADMIN_DIR=/abs/path/to/apps/craftcloud-admin/dist cargo run -p craftcloud-server   # UI at http://127.0.0.1:8080/admin/
+```
+
+For UI development run `npm run dev` in `apps/craftcloud-admin` (Vite proxies `/api` to `127.0.0.1:8080`); `npm test`, `npm run typecheck` and `npm run i18n:check` run single checks. New UI texts are English sources in code (`t("...")`) and must be added to every `src/locales/*.tsv`; a new language is a new file.
 
 Invalid configuration prints every problem and exits with code 2 without binding a socket (runtime failures exit with 1); keys and rules are in [docs/06-operations/deployment.md](docs/06-operations/deployment.md) and [ADR-0011](docs/09-decisions/adr-0011-configuration-policy.md).
 

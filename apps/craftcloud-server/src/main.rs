@@ -7,6 +7,7 @@
 //! Exit codes: 0 clean shutdown, 1 runtime failure (including a database that
 //! is not migrated), 2 invalid configuration or usage.
 
+mod admin_ui;
 mod config;
 mod secret;
 mod server;
@@ -503,6 +504,16 @@ async fn maintenance_once(config: &Config, dry_run: bool) -> Result<(), Failure>
 }
 
 async fn run(config: Config) -> Result<(), Failure> {
+    // The admin UI is loaded into memory before anything else is touched
+    // (database, object store, maintenance, socket): a bad directory is a
+    // configuration error (exit 2) and leaves no side effects behind.
+    let admin_ui = match &config.admin_dir {
+        Some(dir) => Some(
+            admin_ui::load(dir)
+                .map_err(|message| Failure::config(format!("CRAFTCLOUD_ADMIN_DIR: {message}")))?,
+        ),
+        None => None,
+    };
     // Validate the bootstrap secret first: a bad file is a configuration
     // error (exit 2) and must stop startup before anything is bound.
     let bootstrap = load_bootstrap_token(&config)?;
@@ -641,15 +652,26 @@ async fn run(config: Config) -> Result<(), Failure> {
             None => services,
         }
     });
+    let api_config = ApiConfig {
+        max_body_bytes: config.max_body_bytes,
+        request_timeout: config.request_timeout,
+        trusted_proxies: config.trusted_proxies.clone(),
+    };
     let router = craftcloud_api::router_with_services(
         Capabilities::development_defaults(),
-        &ApiConfig {
-            max_body_bytes: config.max_body_bytes,
-            request_timeout: config.request_timeout,
-            trusted_proxies: config.trusted_proxies.clone(),
-        },
+        &api_config,
         services,
     );
+    let router = match admin_ui {
+        Some(assets) => {
+            tracing::info!("serving the admin UI under /admin");
+            router.merge(craftcloud_api::with_request_context(
+                admin_ui::router(assets),
+                &api_config,
+            ))
+        }
+        None => router,
+    };
     let outcome = server::serve(listener, router, shutdown_signal(), config.shutdown_grace)
         .await
         .map_err(Failure::runtime);

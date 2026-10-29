@@ -1,0 +1,449 @@
+@use "tokens";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: var(--font-body);
+  font-size: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-size: var(--text-body);
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+// Same rule that React Aria would inject as a <style> element (blocked by the CSP).
+[data-react-aria-pressable] {
+  touch-action: pan-x pan-y pinch-zoom;
+}
+
+// Visible focus for every interactive element (WCAG 2.4.7, 2.4.11).
+:focus-visible {
+  outline: var(--focus-ring) solid var(--accent-ink);
+  outline-offset: 2px;
+}
+
+[tabindex="-1"]:focus {
+  outline: none;
+}
+
+.skip-link {
+  position: absolute;
+  left: var(--space-2);
+  top: -100px;
+  z-index: 10;
+  padding: var(--space-2) var(--space-3);
+  background: var(--invert-bg);
+  color: var(--invert-fg);
+
+  &:focus {
+    top: var(--space-2);
+  }
+}
+
+.muted {
+  color: var(--muted);
+}
+
+// ---- Layout -------------------------------------------------------------
+
+.frame {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+
+  &__bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: var(--hairline) solid var(--line);
+  }
+
+  &__main {
+    flex: 1;
+    padding: var(--space-5) var(--space-4);
+  }
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+
+  &__header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border-bottom: var(--hairline) solid var(--line);
+  }
+
+  &__brand {
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    margin-right: auto;
+    align-self: center;
+  }
+
+  &__context,
+  &__prefs,
+  &__user {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+  }
+
+  &__user-name {
+    align-self: center;
+    color: var(--muted);
+  }
+
+  &__body {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    align-content: flex-start;
+  }
+
+  &__nav {
+    flex: 0 0 12rem;
+    padding: var(--space-4);
+    border-right: var(--hairline) solid var(--line);
+  }
+
+  &__main {
+    flex: 1 1 24rem;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-4);
+    padding: var(--space-5) var(--space-4);
+    min-width: 0;
+  }
+}
+
+// On narrow screens the navigation moves above the content.
+@media (max-width: 40rem) {
+  .shell__nav {
+    flex-basis: 100%;
+    border-right: 0;
+    border-bottom: var(--hairline) solid var(--line);
+
+    ul {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-2);
+    }
+  }
+}
+
+.nav__item {
+  display: block;
+  width: 100%;
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-3);
+  border: var(--hairline) solid transparent;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--sunken);
+    border-color: var(--line);
+  }
+
+  &[aria-current="page"] {
+    border-color: var(--line-strong);
+    background: var(--sunken);
+    color: var(--ink-strong);
+    font-weight: 600;
+  }
+}
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+
+  &--narrow {
+    max-width: 30rem;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  &__title {
+    font-size: var(--text-title);
+    font-weight: 700;
+    color: var(--ink-strong);
+    line-height: 1.2;
+  }
+
+  &__lead {
+    color: var(--muted);
+  }
+}
+
+// ---- Forms --------------------------------------------------------------
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+
+  &__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+
+  &__label,
+  .select__label {
+    font-size: var(--text-label);
+    font-weight: 500;
+    letter-spacing: var(--label-tracking);
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  &__input {
+    min-height: var(--control-height);
+    padding: var(--space-1) var(--space-3);
+    border: var(--hairline) solid var(--control-border);
+    border-radius: var(--radius);
+    background: var(--sunken);
+    color: var(--ink);
+    font: inherit;
+
+    &[aria-invalid="true"] {
+      border-color: var(--bad);
+    }
+  }
+
+  &__hint {
+    font-size: var(--text-small);
+    color: var(--muted);
+  }
+
+  &__error {
+    font-size: var(--text-small);
+    color: var(--bad);
+  }
+}
+
+// ---- Buttons ------------------------------------------------------------
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-4);
+  border: var(--hairline) solid var(--control-border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--motion),
+    color var(--motion);
+
+  &:hover {
+    background: var(--sunken);
+  }
+
+  &[data-disabled],
+  &:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  &--primary {
+    background: var(--invert-bg);
+    color: var(--invert-fg);
+    border-color: var(--invert-bg);
+
+    &:hover {
+      background: var(--accent-ink);
+      border-color: var(--accent-ink);
+    }
+  }
+
+  &--quiet {
+    border-color: transparent;
+    color: var(--muted);
+  }
+
+  &--link {
+    min-height: 0;
+    padding: 0;
+    border: 0;
+    color: var(--accent-ink);
+    text-decoration: underline;
+  }
+}
+
+// ---- Selects ------------------------------------------------------------
+
+.select {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 10rem;
+
+  &__label {
+    font-size: var(--text-label);
+    font-weight: 500;
+    letter-spacing: var(--label-tracking);
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  &__button,
+  &__native {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    min-height: var(--control-height);
+    padding: var(--space-1) var(--space-3);
+    border: var(--hairline) solid var(--control-border);
+    border-radius: var(--radius);
+    background: var(--sunken);
+    color: var(--ink);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+
+    &[data-disabled] {
+      opacity: 0.6;
+      cursor: default;
+    }
+  }
+
+  &__popover {
+    min-width: var(--trigger-width);
+    border: var(--hairline) solid var(--control-border);
+    background: var(--bg);
+    box-shadow: var(--shadow);
+  }
+
+  &__list {
+    max-height: 18rem;
+    overflow: auto;
+    padding: var(--space-1);
+    outline: none;
+  }
+
+  &__item {
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    outline: none;
+
+    &[data-focused],
+    &[data-hovered] {
+      background: var(--sunken);
+    }
+
+    &[data-focus-visible] {
+      outline: var(--focus-ring) solid var(--accent-ink);
+      outline-offset: -2px;
+    }
+
+    &[data-selected] {
+      font-weight: 700;
+      color: var(--ink-strong);
+    }
+  }
+}
+
+// ---- Messages and facts -------------------------------------------------
+
+.alert {
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border: var(--hairline) solid var(--control-border);
+  border-left-width: 4px;
+  background: var(--sunken);
+
+  &--error {
+    border-left-color: var(--bad);
+  }
+
+  &--success {
+    border-left-color: var(--good);
+  }
+
+  &--info {
+    border-left-color: var(--accent-ink);
+  }
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+
+  dt {
+    font-size: var(--text-label);
+    font-weight: 500;
+    letter-spacing: var(--label-tracking);
+    text-transform: uppercase;
+    color: var(--muted);
+    align-self: center;
+  }
+
+  dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

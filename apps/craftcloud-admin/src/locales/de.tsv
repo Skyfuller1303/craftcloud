@@ -1,0 +1,107 @@
+# CraftCloud-Verwaltungsoberfläche: deutscher Katalog (ADR-0015).
+# Spalten: Kontext <TAB> englischer Quelltext <TAB> Übersetzung. Der englische Text ist der Schlüssel.
+# Platzhalter {name} müssen unverändert in der Übersetzung stehen. Du-Form.
+# Escapes: \t \n \r \\ . `npm run i18n:check` meldet fehlende und überzählige Einträge.
+
+# Errors
+	Something went wrong. Try again.	Etwas ist schiefgelaufen. Versuche es erneut.
+	Reference: {id}	Referenz: {id}
+	The request was rejected for security reasons. Reload the page and try again.	Die Anfrage wurde aus Sicherheitsgründen abgelehnt. Lade die Seite neu und versuche es erneut.
+	You do not have permission to do this.	Dafür fehlt dir die Berechtigung.
+	The requested item was not found.	Das angeforderte Element wurde nicht gefunden.
+	This conflicts with the current state. Reload and try again.	Das widerspricht dem aktuellen Stand. Lade neu und versuche es erneut.
+	The request is too large.	Die Anfrage ist zu groß.
+	Some values are not valid. Check the marked fields.	Einige Werte sind ungültig. Prüfe die markierten Felder.
+	Too many attempts. Wait a moment and try again.	Zu viele Versuche. Warte einen Moment und versuche es erneut.
+	Too many attempts. Try again in {seconds} seconds.	Zu viele Versuche. Versuche es in {seconds} Sekunden erneut.
+	The server reported an internal error. Try again later.	Der Server meldet einen internen Fehler. Versuche es später erneut.
+	The service is temporarily unavailable. Try again later.	Der Dienst ist vorübergehend nicht verfügbar. Versuche es später erneut.
+	The server cannot be reached. Check the connection and try again.	Der Server ist nicht erreichbar. Prüfe die Verbindung und versuche es erneut.
+	The server is not available	Der Server ist nicht verfügbar
+	Try again	Erneut versuchen
+
+# General
+	Language name	Deutsch
+	CraftCloud admin	CraftCloud-Verwaltung
+	Skip to main content	Zum Hauptinhalt springen
+	Loading…	Lädt …
+	Language	Sprache
+	Theme	Darstellung
+	Match system	Wie System
+	Light	Hell
+	Dark	Dunkel
+	This value is not accepted.	Dieser Wert wird nicht akzeptiert.
+
+# Login
+	Log in	Anmelden
+	Logging in…	Anmeldung läuft …
+	Log out	Abmelden
+	E-mail address	E-Mail-Adresse
+	Password	Passwort
+	Enter your e-mail address.	Gib deine E-Mail-Adresse ein.
+	Enter your password.	Gib dein Passwort ein.
+	E-mail address or password is incorrect.	E-Mail-Adresse oder Passwort ist falsch.
+	Your session has ended. Log in again.	Deine Sitzung ist beendet. Melde dich erneut an.
+	Log in with the invited account to accept the invitation.	Melde dich mit dem eingeladenen Konto an, um die Einladung anzunehmen.
+
+# Setup
+	Set up CraftCloud	CraftCloud einrichten
+	Create the first operator account and organization. The setup token is in the secret file that the server operator configured.	Lege das erste Betreiberkonto und die erste Organisation an. Das Einrichtungstoken steht in der Geheimnisdatei, die der Serverbetreiber festgelegt hat.
+	Setup token	Einrichtungstoken
+	Your name	Dein Name
+	At least {min} characters.	Mindestens {min} Zeichen.
+	Organization name	Name der Organisation
+	Organization address name	Kurzname der Organisation
+	Lowercase letters, digits and hyphens. Used in links.	Kleinbuchstaben, Ziffern und Bindestriche. Wird in Links verwendet.
+	Complete setup	Einrichtung abschließen
+	Setting up…	Einrichtung läuft …
+	The setup token has at least {count} characters.	Das Einrichtungstoken hat mindestens {count} Zeichen.
+	Enter a valid e-mail address.	Gib eine gültige E-Mail-Adresse ein.
+	Enter a name of 1 to 100 characters.	Gib einen Namen mit 1 bis 100 Zeichen ein.
+	The password needs {min} to {max} characters.	Das Passwort braucht {min} bis {max} Zeichen.
+	Use lowercase letters, digits and hyphens; start with a letter or digit.	Verwende Kleinbuchstaben, Ziffern und Bindestriche; beginne mit einem Buchstaben oder einer Ziffer.
+	The setup token is not accepted.	Das Einrichtungstoken wird nicht akzeptiert.
+	The server did not answer in time. Setup may have completed: reload the page to check.	Der Server hat nicht rechtzeitig geantwortet. Die Einrichtung kann abgeschlossen sein: Lade die Seite neu, um das zu prüfen.
+	Setup is not available: the server has no reachable database.	Die Einrichtung ist nicht verfügbar: Der Server hat keine erreichbare Datenbank.
+	Setup is complete. Log in with the new operator account.	Die Einrichtung ist abgeschlossen. Melde dich mit dem neuen Betreiberkonto an.
+
+# Invitation
+	Accept invitation	Einladung annehmen
+	Accepting…	Wird angenommen …
+	I already have an account	Ich habe bereits ein Konto
+	Discard invitation	Einladung verwerfen
+	Invitation accepted.	Einladung angenommen.
+	You are invited to join an organization. Accept to continue with your current account.	Du wurdest in eine Organisation eingeladen. Nimm die Einladung an, um mit deinem aktuellen Konto fortzufahren.
+	You are invited to join an organization. Create your account to accept.	Du wurdest in eine Organisation eingeladen. Lege dein Konto an, um die Einladung anzunehmen.
+	This invitation link is not valid. It may have expired, been used or been withdrawn.	Dieser Einladungslink ist ungültig. Er kann abgelaufen, bereits verwendet oder zurückgezogen worden sein.
+	An account exists for the invited address. Log in with it first.	Für die eingeladene Adresse gibt es bereits ein Konto. Melde dich zuerst damit an.
+	You are logged in with a different account than the one invited.	Du bist mit einem anderen Konto angemeldet als dem eingeladenen.
+	You are already a member of this organization.	Du bist bereits Mitglied dieser Organisation.
+
+# Main shell
+	Main navigation	Hauptnavigation
+	Overview	Übersicht
+	Projects	Projekte
+	Files	Dateien
+	Members	Mitglieder
+	Invitations	Einladungen
+	Settings	Einstellungen
+	Activity	Aktivität
+	Organization	Organisation
+	Workspace	Workspace
+	None available	Keine verfügbar
+	None selected	Keine ausgewählt
+	Loading organizations…	Organisationen werden geladen …
+	Load more organizations	Weitere Organisationen laden
+	Load more workspaces	Weitere Workspaces laden
+	You are not a member of any organization yet. Ask an organization owner for an invitation.	Du bist noch in keiner Organisation Mitglied. Bitte den Eigentümer einer Organisation um eine Einladung.
+	This organization has no workspace you can see.	Diese Organisation hat keinen Workspace, den du sehen kannst.
+	This view is not available yet.	Diese Ansicht ist noch nicht verfügbar.
+	Signed in as	Angemeldet als
+	Instance operator	Instanz-Betreiber
+	Owner	Eigentümer
+	Admin	Administrator
+	Member	Mitglied
+	Editor	Bearbeiter
+	Viewer	Betrachter
+	No workspace role	Keine Workspace-Rolle

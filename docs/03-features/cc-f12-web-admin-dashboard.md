@@ -1,6 +1,6 @@
 # CC-F12 — Browser-Adminpanel und Setup-UX
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P3 (Admin & Operations). **Priorität:** MVP/Blocker.  
+> **Status:** teilweise umgesetzt (lokal, ungeprüft): Gerüst, API-Client, Setup, Login, Einladung annehmen sowie Organisations-/Workspace-Auswahl (CC-P03-01/02, PR-014); alle übrigen Ansichten sind geplant. **Zielphase:** P3 (Admin & Operations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

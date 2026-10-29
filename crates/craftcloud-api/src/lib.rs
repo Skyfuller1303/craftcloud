@@ -366,6 +366,18 @@ fn with_middleware(router: Router, config: &ApiConfig, streaming: bool) -> Route
                 limits_to_json_errors,
             ))
     };
+    // API answers are never cacheable; outermost so it also covers errors.
+    with_request_context(router, config).layer(SetResponseHeaderLayer::overriding(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    ))
+}
+
+/// Request id, tracing and client-address resolution, without any
+/// cache policy. The API wraps its routes with this plus `no-store`; the
+/// server uses it directly for the static admin UI, which sets its own
+/// `Cache-Control` per file.
+pub fn with_request_context(router: Router, config: &ApiConfig) -> Router {
     router
         .layer(middleware::from_fn_with_state(
             Arc::new(config.trusted_proxies.clone()),
@@ -396,10 +408,6 @@ fn with_middleware(router: Router, config: &ApiConfig, streaming: bool) -> Route
             UuidRequestId,
         ))
         .layer(middleware::from_fn(discard_untrusted_request_id))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
 }
 
 /// Enforces the handler timeout and turns bare 413 responses (from the body

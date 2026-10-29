@@ -71,6 +71,38 @@ mod tests {
     }
 
     #[test]
+    fn bad_admin_dir_exits_2_before_anything_else_is_touched() {
+        let missing = std::env::temp_dir().join("craftcloud-cli-test-no-admin-dir");
+        let missing = missing.to_string_lossy().into_owned();
+        // A database file that does not exist would also be exit 2; the message
+        // proves that the admin directory is checked first.
+        let nowhere = std::env::temp_dir().join("craftcloud-cli-test-no-db-file");
+        let nowhere = nowhere.to_string_lossy().into_owned();
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_ADMIN_DIR", &missing),
+                ("CRAFTCLOUD_DATABASE_URL_FILE", &nowhere),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2));
+        let first = text(&out);
+        assert!(first.contains("CRAFTCLOUD_ADMIN_DIR"), "{first}");
+        assert!(!first.contains("CRAFTCLOUD_DATABASE_URL_FILE"), "{first}");
+        // A directory without index.html is refused the same way.
+        let empty = std::env::temp_dir().join(format!(
+            "craftcloud-cli-test-empty-admin-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty).unwrap();
+        let empty_text = empty.to_string_lossy().into_owned();
+        let out = run(&[], &[("CRAFTCLOUD_ADMIN_DIR", &empty_text)]);
+        let _ = std::fs::remove_dir_all(&empty);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(text(&out).contains("no index.html"));
+    }
+
+    #[test]
     fn missing_secret_file_exits_2() {
         let path = std::env::temp_dir().join("craftcloud-cli-test-does-not-exist");
         let path = path.to_string_lossy().into_owned();

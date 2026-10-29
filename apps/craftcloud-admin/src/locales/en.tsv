@@ -1,0 +1,109 @@
+# CraftCloud admin UI: English catalogue (reference language, ADR-0015).
+# Columns: context <TAB> source <TAB> translation. The English source text is the key;
+# the context column is empty unless identical source texts need to be told apart.
+# Placeholders are written {name} and must appear unchanged in every translation.
+# Escapes: \t \n \r \\ . There are no plural forms yet; a count-dependent text must
+# be split into separate source texts. `npm run i18n:check` compares all catalogues.
+
+# Errors
+	Something went wrong. Try again.	Something went wrong. Try again.
+	Reference: {id}	Reference: {id}
+	The request was rejected for security reasons. Reload the page and try again.	The request was rejected for security reasons. Reload the page and try again.
+	You do not have permission to do this.	You do not have permission to do this.
+	The requested item was not found.	The requested item was not found.
+	This conflicts with the current state. Reload and try again.	This conflicts with the current state. Reload and try again.
+	The request is too large.	The request is too large.
+	Some values are not valid. Check the marked fields.	Some values are not valid. Check the marked fields.
+	Too many attempts. Wait a moment and try again.	Too many attempts. Wait a moment and try again.
+	Too many attempts. Try again in {seconds} seconds.	Too many attempts. Try again in {seconds} seconds.
+	The server reported an internal error. Try again later.	The server reported an internal error. Try again later.
+	The service is temporarily unavailable. Try again later.	The service is temporarily unavailable. Try again later.
+	The server cannot be reached. Check the connection and try again.	The server cannot be reached. Check the connection and try again.
+	The server is not available	The server is not available
+	Try again	Try again
+
+# General
+	Language name	English
+	CraftCloud admin	CraftCloud admin
+	Skip to main content	Skip to main content
+	Loading…	Loading…
+	Language	Language
+	Theme	Theme
+	Match system	Match system
+	Light	Light
+	Dark	Dark
+	This value is not accepted.	This value is not accepted.
+
+# Login
+	Log in	Log in
+	Logging in…	Logging in…
+	Log out	Log out
+	E-mail address	E-mail address
+	Password	Password
+	Enter your e-mail address.	Enter your e-mail address.
+	Enter your password.	Enter your password.
+	E-mail address or password is incorrect.	E-mail address or password is incorrect.
+	Your session has ended. Log in again.	Your session has ended. Log in again.
+	Log in with the invited account to accept the invitation.	Log in with the invited account to accept the invitation.
+
+# Setup
+	Set up CraftCloud	Set up CraftCloud
+	Create the first operator account and organization. The setup token is in the secret file that the server operator configured.	Create the first operator account and organization. The setup token is in the secret file that the server operator configured.
+	Setup token	Setup token
+	Your name	Your name
+	At least {min} characters.	At least {min} characters.
+	Organization name	Organization name
+	Organization address name	Organization address name
+	Lowercase letters, digits and hyphens. Used in links.	Lowercase letters, digits and hyphens. Used in links.
+	Complete setup	Complete setup
+	Setting up…	Setting up…
+	The setup token has at least {count} characters.	The setup token has at least {count} characters.
+	Enter a valid e-mail address.	Enter a valid e-mail address.
+	Enter a name of 1 to 100 characters.	Enter a name of 1 to 100 characters.
+	The password needs {min} to {max} characters.	The password needs {min} to {max} characters.
+	Use lowercase letters, digits and hyphens; start with a letter or digit.	Use lowercase letters, digits and hyphens; start with a letter or digit.
+	The setup token is not accepted.	The setup token is not accepted.
+	The server did not answer in time. Setup may have completed: reload the page to check.	The server did not answer in time. Setup may have completed: reload the page to check.
+	Setup is not available: the server has no reachable database.	Setup is not available: the server has no reachable database.
+	Setup is complete. Log in with the new operator account.	Setup is complete. Log in with the new operator account.
+
+# Invitation
+	Accept invitation	Accept invitation
+	Accepting…	Accepting…
+	I already have an account	I already have an account
+	Discard invitation	Discard invitation
+	Invitation accepted.	Invitation accepted.
+	You are invited to join an organization. Accept to continue with your current account.	You are invited to join an organization. Accept to continue with your current account.
+	You are invited to join an organization. Create your account to accept.	You are invited to join an organization. Create your account to accept.
+	This invitation link is not valid. It may have expired, been used or been withdrawn.	This invitation link is not valid. It may have expired, been used or been withdrawn.
+	An account exists for the invited address. Log in with it first.	An account exists for the invited address. Log in with it first.
+	You are logged in with a different account than the one invited.	You are logged in with a different account than the one invited.
+	You are already a member of this organization.	You are already a member of this organization.
+
+# Main shell
+	Main navigation	Main navigation
+	Overview	Overview
+	Projects	Projects
+	Files	Files
+	Members	Members
+	Invitations	Invitations
+	Settings	Settings
+	Activity	Activity
+	Organization	Organization
+	Workspace	Workspace
+	None available	None available
+	None selected	None selected
+	Loading organizations…	Loading organizations…
+	Load more organizations	Load more organizations
+	Load more workspaces	Load more workspaces
+	You are not a member of any organization yet. Ask an organization owner for an invitation.	You are not a member of any organization yet. Ask an organization owner for an invitation.
+	This organization has no workspace you can see.	This organization has no workspace you can see.
+	This view is not available yet.	This view is not available yet.
+	Signed in as	Signed in as
+	Instance operator	Instance operator
+	Owner	Owner
+	Admin	Admin
+	Member	Member
+	Editor	Editor
+	Viewer	Viewer
+	No workspace role	No workspace role

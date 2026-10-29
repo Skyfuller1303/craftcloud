@@ -58,7 +58,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 22] = [
+const SUPPORTED_KEYS: [&str; 23] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -81,6 +81,7 @@ const SUPPORTED_KEYS: [&str; 22] = [
     "VERIFY_BYTES_PER_RUN",
     "QUARANTINE_DAYS",
     "MAINTENANCE_ENABLED",
+    "ADMIN_DIR",
 ];
 
 /// Log output format.
@@ -186,6 +187,9 @@ pub struct Config {
     /// Switch it off after restoring a database until the pairing with the
     /// object store is verified.
     pub maintenance_enabled: bool,
+    /// Directory with the built admin UI (`apps/craftcloud-admin/dist`), served
+    /// under `/admin`. `None` serves no UI. Validated when the server starts.
+    pub admin_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -388,6 +392,28 @@ impl Config {
                 },
             )
             .unwrap_or(true);
+        let admin_dir = field(&mut errors, env, "ADMIN_DIR", |key, raw| {
+            let path = PathBuf::from(raw.trim());
+            if raw.trim().is_empty() || !path.is_absolute() {
+                Err(ConfigError::new(
+                    key,
+                    "must be an absolute path to the built admin UI directory",
+                ))
+            } else {
+                Ok(path)
+            }
+        });
+        if admin_dir.is_some()
+            && public_url
+                .as_deref()
+                .and_then(|raw| Url::parse(raw).ok())
+                .is_some_and(|url| !matches!(url.path(), "" | "/"))
+        {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}ADMIN_DIR"),
+                "the admin UI is served at /admin of the origin; CRAFTCLOUD_PUBLIC_URL must not have a path (serve the server at the root of its host name)",
+            ));
+        }
         if session_idle_minutes > session_absolute_hours * 60 {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}SESSION_IDLE_TIMEOUT_MINUTES"),
@@ -436,6 +462,7 @@ impl Config {
                 verify_bytes_per_run,
                 quarantine_retention: Duration::from_secs(quarantine_days * 24 * 3600),
                 maintenance_enabled,
+                admin_dir,
             })
         } else {
             Err(errors)
@@ -1063,5 +1090,37 @@ mod tests {
             let errors = errors_of(&[("CRAFTCLOUD_BIND", bad)]);
             assert_eq!(keys(&errors), ["CRAFTCLOUD_BIND"]);
         }
+    }
+
+    #[test]
+    fn admin_dir_is_optional_and_must_be_absolute() {
+        assert_eq!(Config::from_env_map(&env(&[])).unwrap().admin_dir, None);
+        let dir = std::env::temp_dir();
+        let value = dir.to_string_lossy().into_owned();
+        let config = Config::from_env_map(&env(&[("CRAFTCLOUD_ADMIN_DIR", &value)])).unwrap();
+        assert_eq!(config.admin_dir, Some(dir));
+        for bad in ["", "   ", "dist", "./dist", "../dist"] {
+            let key = "CRAFTCLOUD_ADMIN_DIR";
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+    }
+
+    #[test]
+    fn admin_dir_needs_a_public_url_without_path() {
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let key = "CRAFTCLOUD_ADMIN_DIR";
+        for ok in ["https://cloud.example.org", "https://cloud.example.org/"] {
+            let env = env(&[(key, &dir), ("CRAFTCLOUD_PUBLIC_URL", ok)]);
+            assert!(Config::from_env_map(&env).is_ok(), "{ok}");
+        }
+        let env_with_path = env(&[
+            (key, &dir),
+            ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org/craft"),
+        ]);
+        let errors = Config::from_env_map(&env_with_path).unwrap_err();
+        assert_eq!(keys(&errors), [key]);
+        // Without the UI a path in the public URL stays allowed.
+        let without = env(&[("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org/craft")]);
+        assert!(Config::from_env_map(&without).is_ok());
     }
 }

@@ -1,0 +1,96 @@
+// Design tokens as CSS custom properties (ADR-0015).
+//
+// The token names and the light/dark/system structure follow the colour
+// tokens of the Craft launcher theme (crates/ui-egui/src/theme.rs). The numeric
+// colour values below are taken from that file; see ATTRIBUTION.md for file,
+// commit and license. Components never use literal colours, only these tokens.
+
+@mixin light {
+  color-scheme: light;
+  --bg: #f2f1ee;
+  --sunken: #e9e8e4;
+  --ink: #101014;
+  --ink-strong: #000000;
+  --muted: rgb(16 16 20 / 62%);
+  --faint: rgb(16 16 20 / 42%);
+  --line: rgb(16 16 20 / 16%);
+  --line-strong: rgb(16 16 20 / 40%);
+  // Own value (not from the launcher theme): borders of inputs and buttons need
+  // 3:1 against the surface (WCAG 1.4.11); the launcher's --line-strong has 2.6:1.
+  --control-border: rgb(16 16 20 / 58%);
+  --accent: #2d81ff;
+  --accent-ink: #1659c4;
+  --invert-bg: #101014;
+  --invert-fg: #f2f1ee;
+  --good: #0a7563;
+  --warn: #8a5800;
+  --bad: #b3261e;
+  --shadow: 0 8px 24px rgb(0 0 0 / 14%);
+}
+
+@mixin dark {
+  color-scheme: dark;
+  --bg: #121316;
+  --sunken: #060607;
+  --ink: #f2f1ee;
+  --ink-strong: #ffffff;
+  --muted: rgb(242 241 238 / 60%);
+  --faint: rgb(242 241 238 / 38%);
+  --line: rgb(242 241 238 / 15%);
+  --line-strong: rgb(242 241 238 / 40%);
+  --control-border: rgb(242 241 238 / 40%);
+  --accent: #2d81ff;
+  --accent-ink: #74aaff;
+  --invert-bg: #ffffff;
+  --invert-fg: #0b0b0c;
+  --good: #3fd6b8;
+  --warn: #ffc14d;
+  --bad: #ff6259;
+  --shadow: 0 8px 24px rgb(0 0 0 / 55%);
+}
+
+:root {
+  @include light;
+
+  // Spacing and shape tokens: an own 4 px scale; square corners, hairlines.
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 40px;
+  --control-height: 34px; // control height of the launcher theme (CONTROL_H)
+  --radius: 0;
+  --hairline: 1px;
+  --focus-ring: 2px;
+
+  --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+  --text-body: 0.9375rem;
+  --text-small: 0.8125rem;
+  --text-label: 0.6875rem; // 11 px label size of the launcher theme (HUD_SIZE)
+  --text-title: 1.5rem;
+  --label-tracking: 0.15em;
+
+  --motion: 120ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    @include dark;
+  }
+}
+
+:root[data-theme="light"] {
+  @include light;
+}
+
+:root[data-theme="dark"] {
+  @include dark;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion: 0ms;
+  }
+}

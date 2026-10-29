@@ -3,6 +3,7 @@
 
 mod db_test;
 mod docs_check;
+mod web;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -10,7 +11,12 @@ use std::process::{Command, ExitCode};
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("ci") if args.next().is_none() => ci(),
+        Some("ci") => match (args.next().as_deref(), args.next()) {
+            (None, None) => ci(false),
+            (Some("--skip-web"), None) => ci(true),
+            _ => usage(),
+        },
+        Some("web") if args.next().is_none() => web::run(&repo_root()),
         Some("db-test") if args.next().is_none() => db_test::run(&repo_root()),
         Some("openapi-snapshot") => match (args.next().as_deref(), args.next()) {
             (None, None) => openapi_snapshot(false),
@@ -22,7 +28,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: cargo xtask <ci|db-test|openapi-snapshot [--update]>");
+    eprintln!("usage: cargo xtask <ci [--skip-web]|web|db-test|openapi-snapshot [--update]>");
     ExitCode::from(2)
 }
 
@@ -74,7 +80,9 @@ fn repo_root() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-fn ci() -> ExitCode {
+/// `skip_web` is only set by the explicit `--skip-web` flag; a missing Node.js
+/// never skips the web step silently.
+fn ci(skip_web: bool) -> ExitCode {
     let root = repo_root();
     let steps: [(&str, &[&str]); 4] = [
         ("cargo fmt", &["fmt", "--all", "--", "--check"]),
@@ -124,6 +132,17 @@ fn ci() -> ExitCode {
         }
     }
 
+    if skip_web {
+        println!("==> web: SKIPPED by --skip-web (admin UI NOT checked)");
+    } else {
+        println!("==> web");
+        if let Err(message) = web::check(&root) {
+            println!("<== web: FAIL ({message})");
+            return ExitCode::FAILURE;
+        }
+        println!("<== web: PASS");
+    }
+
     println!("==> docs links");
     match docs_check::check_repository(&root) {
         Ok(checked) => println!("<== docs links: PASS ({checked} relative links resolved)"),
@@ -136,7 +155,11 @@ fn ci() -> ExitCode {
         }
     }
 
-    println!("ci: all steps passed");
+    if skip_web {
+        println!("ci: all steps passed EXCEPT the skipped web step (--skip-web)");
+    } else {
+        println!("ci: all steps passed");
+    }
     ExitCode::SUCCESS
 }
 

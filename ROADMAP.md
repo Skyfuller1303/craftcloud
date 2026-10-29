@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — PR-014 (CC-P03-01, CC-P03-02) implemented locally: browser admin UI `apps/craftcloud-admin` (React, TypeScript, React Aria Components, own SCSS tokens, English and German TSV catalogues, hand-written typed API client checked against `contracts/openapi.yaml`) with first-run setup, login/logout, invitation acceptance, organization and workspace selectors and a navigation shell with placeholders for CC-P03-03; static delivery by `craftcloud-server` under `/admin` (`CRAFTCLOUD_ADMIN_DIR`, strict CSP, SPA fallback, traversal-safe); `cargo xtask web` and a web step in `cargo xtask ci` (`--skip-web` must be explicit). Not reviewed or merged; ticket boxes stay open until review.
+
 2026-10-29 — PR-013 (CC-P02-08): process crash tests against the real server binary (`apps/craftcloud-server/tests/crash.rs`, feature `fault-injection`, `CC_FAULT_ABORT_AT`), bounded retry for the Windows store-marker replace. P2 exit gates evidenced; P2 closed. 
 2026-10-29 — PR-012 (rest of CC-P02-06, CC-P02-07) implemented locally: maintenance job (in-process loop with `CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS` plus `craftcloud-server admin maintenance --once [--dry-run]`, one runner via PostgreSQL advisory lock) with retention purge of trashed files and projects, version retention (`CRAFTCLOUD_VERSION_RETENTION_DAYS`), two-phase blob garbage collection (new blob state `deleting`), reconciliation of stray objects and temporary files, integrity verification (`CRAFTCLOUD_VERIFY_BYTES_PER_RUN`), usage drift correction, run log table and `GET /api/v1/admin/maintenance` (operator), migration 0010, policy action `MaintenanceRead`. Not reviewed or merged.
 
