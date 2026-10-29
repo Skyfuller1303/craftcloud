@@ -227,6 +227,16 @@ pub enum Action {
     WorkspaceQuotaSet,
     /// Read the storage usage of an organization.
     UsageRead,
+    /// List the versions of a file.
+    VersionList,
+    /// Read one version of a file.
+    VersionRead,
+    /// Download the content of a file version.
+    FileDownload,
+    /// Commit a stored upload as a new version of a file.
+    VersionCommit,
+    /// Create a new version from an older one.
+    VersionRestore,
 }
 
 impl Action {
@@ -249,7 +259,10 @@ impl Action {
             | Self::FileList
             | Self::FileRead
             | Self::UploadRead
-            | Self::UsageRead => false,
+            | Self::UsageRead
+            | Self::VersionList
+            | Self::VersionRead
+            | Self::FileDownload => false,
             Self::OrganizationUpdate
             | Self::OrganizationCreate
             | Self::MemberAdd
@@ -278,12 +291,14 @@ impl Action {
             | Self::UploadWrite
             | Self::UploadAbort
             | Self::OrganizationQuotaSet
-            | Self::WorkspaceQuotaSet => true,
+            | Self::WorkspaceQuotaSet
+            | Self::VersionCommit
+            | Self::VersionRestore => true,
         }
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 44] = [
+    pub const ALL: [Action; 49] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -328,6 +343,11 @@ impl Action {
         Action::OrganizationQuotaSet,
         Action::WorkspaceQuotaSet,
         Action::UsageRead,
+        Action::VersionList,
+        Action::VersionRead,
+        Action::FileDownload,
+        Action::VersionCommit,
+        Action::VersionRestore,
     ];
 }
 
@@ -739,7 +759,13 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
 
         // ---- projects and files (decided by the roles in the workspace) ----
         (
-            A::ProjectList | A::ProjectRead | A::FileList | A::FileRead,
+            A::ProjectList
+            | A::ProjectRead
+            | A::FileList
+            | A::FileRead
+            | A::VersionList
+            | A::VersionRead
+            | A::FileDownload,
             Resource::Workspace {
                 org_id,
                 workspace_id,
@@ -757,7 +783,8 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             | A::FileCreate
             | A::FileRename
             | A::FileDelete
-            | A::FileRestore,
+            | A::FileRestore
+            | A::VersionRestore,
             Resource::Workspace {
                 org_id,
                 workspace_id,
@@ -810,7 +837,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             (Some(OrgRole::Member), Some(WorkspaceRole::Viewer)) => Decision::Forbidden,
         },
         (
-            A::UploadRead | A::UploadAbort | A::UploadWrite,
+            A::UploadRead | A::UploadAbort | A::UploadWrite | A::VersionCommit,
             Resource::Upload {
                 org_id,
                 workspace_id,
@@ -1362,6 +1389,11 @@ mod tests {
             Action::OrganizationQuotaSet,
             Action::WorkspaceQuotaSet,
             Action::UsageRead,
+            Action::VersionList,
+            Action::VersionRead,
+            Action::FileDownload,
+            Action::VersionCommit,
+            Action::VersionRestore,
         ]
         .into_iter()
         .collect();
@@ -1411,7 +1443,12 @@ mod tests {
                 | Action::UploadAbort
                 | Action::OrganizationQuotaSet
                 | Action::WorkspaceQuotaSet
-                | Action::UsageRead => {}
+                | Action::UsageRead
+                | Action::VersionList
+                | Action::VersionRead
+                | Action::FileDownload
+                | Action::VersionCommit
+                | Action::VersionRestore => {}
             }
             assert!(
                 covered.contains(&action),
@@ -1441,7 +1478,10 @@ mod tests {
                 Action::FileList,
                 Action::FileRead,
                 Action::UploadRead,
-                Action::UsageRead
+                Action::UsageRead,
+                Action::VersionList,
+                Action::VersionRead,
+                Action::FileDownload
             ]
         );
     }
@@ -1464,6 +1504,7 @@ mod tests {
             actor(Some(OrgRole::Owner), false),
         ];
         let reads = [H, H, Y, Y, Y, Y, Y];
+        let version_reads = reads;
         let editor_writes = [H, H, F, Y, Y, Y, Y];
         let admin_writes = [H, H, F, F, Y, Y, Y];
         for (action, expected) in [
@@ -1471,6 +1512,10 @@ mod tests {
             (Action::ProjectRead, reads),
             (Action::FileList, reads),
             (Action::FileRead, reads),
+            (Action::VersionList, version_reads),
+            (Action::VersionRead, version_reads),
+            (Action::FileDownload, version_reads),
+            (Action::VersionRestore, [H, H, F, Y, Y, Y, Y]),
             (Action::ProjectCreate, editor_writes),
             (Action::ProjectRename, editor_writes),
             (Action::FileCreate, editor_writes),
@@ -1555,6 +1600,12 @@ mod tests {
         );
         assert_eq!(
             outcomes(Action::UploadWrite, &foreign),
+            [H, H, F, F, F, F, F]
+        );
+        // Committing follows the same rule as sending content: creator, still editor or better.
+        assert_eq!(outcomes(Action::VersionCommit, &own), [H, H, F, Y, Y, Y, Y]);
+        assert_eq!(
+            outcomes(Action::VersionCommit, &foreign),
             [H, H, F, F, F, F, F]
         );
         // Usage: organization owners and admins.

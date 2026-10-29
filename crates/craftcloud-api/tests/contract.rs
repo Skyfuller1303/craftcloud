@@ -180,7 +180,7 @@ mod tests {
             "/metrics",
             "/api/v1/nope",
             "/api/v1/workspaces",
-            "/api/v1/files/00000000-0000-4000-8000-000000000001/versions",
+            "/api/v1/files/00000000-0000-4000-8000-000000000001/history",
             "/api/v2/info",
         ] {
             let reply = send(

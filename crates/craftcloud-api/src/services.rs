@@ -55,6 +55,8 @@ pub struct AuthSettings {
     pub uploads_per_org: i64,
     /// Longest wait for the next piece of an upload body.
     pub upload_idle_timeout: Duration,
+    /// Longest wait for a download client to take the next chunk.
+    pub download_idle_timeout: Duration,
     /// Operator-configured public URL without trailing slash; the only
     /// source for absolute URLs (never derived from request headers).
     pub public_url: Option<String>,
@@ -101,6 +103,7 @@ impl Default for AuthSettings {
             uploads_per_user: 10,
             uploads_per_org: 200,
             upload_idle_timeout: Duration::from_secs(60),
+            download_idle_timeout: Duration::from_secs(60),
             public_url: None,
             public_origin: None,
             cookie_secure: true,

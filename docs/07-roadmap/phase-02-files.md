@@ -16,7 +16,9 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 - [ ] **CC-P02-03** — local FS storage adapter and fault-injection tests (CC-F09)
   - Status: Umsetzung lokal vorhanden (PR-009, Review offen): `craftcloud-storage` mit Fehlerinjektion (Fehler bei Byte N, fsync, Rename, volles Gerät), Abbruch-/Drop-Tests, Nebenläufigkeit, Range-Randfälle, 1-GiB-Streaming-Test (manuell, `#[ignore]`). Echte ENOSPC-Fälle sind nur über die Fehlerabbildung getestet. Das Ticket wird nach der Übergabe angehakt.
 - [ ] **CC-P02-04** — Immutable blobs, version commit with CAS/ETag and conflict codes (CC-F08)
+  - Status: Umsetzung lokal vorhanden (PR-011, Review offen): Migration 0009, Commit mit CAS, 412-Konfliktantwort, Restore, Idempotenz, Quota-Umbuchung reserved→committed genau einmal. Das Ticket wird nach der Übergabe angehakt.
 - [ ] **CC-P02-05** — File download with ACL recheck and integrity verification
+  - Status: Umsetzung lokal vorhanden (PR-011, Review offen): Rechteprüfung pro Anfrage, sichere Header, Einzel-Range (206/416), SHA-256 beim Streamen mit zurückgehaltenem letzten Block, defekte Blobs werden markiert. Das Ticket wird nach der Übergabe angehakt.
 - [ ] **CC-P02-06** — Soft delete, retention, quota accounting, GC leases (CC-F10)
   - Status: Teilweise (PR-008 Soft-Delete/Aufbewahrung, PR-010 Quota-Buchhaltung). Offen: endgültiges Löschen, Garbage Collection mit Leases, Freigabe beim Löschen committeter Versionen.
 - [ ] **CC-P02-07** — Reconciliation job for orphaned uploads and blobs
@@ -24,10 +26,14 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 
 ## Exit-Gates / Abnahme
 
-- [ ] Two users same base → exactly one commit, one 412
+- [x] Two users same base → exactly one commit, one 412
+  - Beleg: `two_writers_on_one_base_yield_one_version_and_one_412_and_the_loser_can_save_a_copy`, `parallel_commits_on_the_same_base_have_exactly_one_winner` (`crates/craftcloud-api/tests/versions.rs`, `cargo xtask db-test`).
 - [ ] Crash or disk full does not show incomplete version
-- [ ] Download checksum matches committed upload
-- [ ] Quota cannot be bypassed through concurrent reservations
+  - Teilbeleg: Plattenvoll- und Abbruchfälle über Fehlerinjektion (`a_full_disk_answers_507_and_leaves_no_blob_no_object_and_no_reservation`, `cancelling_the_request_after_the_object_is_published_leaves_nothing_unaccounted`, `a_write_failing_at_byte_n_never_publishes_anything`); Prozessabsturz-Tests (CC-P02-08) fehlen noch, deshalb nicht angehakt.
+- [x] Download checksum matches committed upload
+  - Beleg: `a_64_mib_file_round_trips_with_a_matching_checksum` (Prüfsumme des Downloads gleich der des Uploads, `Repr-Digest` gleich), `a_corrupted_object_aborts_the_download_and_marks_the_blob`, `downloads_carry_the_safe_headers_and_the_exact_bytes`.
+- [x] Quota cannot be bypassed through concurrent reservations
+  - Beleg (PR-010): `parallel_reservations_can_never_exceed_the_quota` (30 parallele Reservierungen gegen 1000 Bytes: genau 10), `quotas_block_at_the_exact_boundary_and_lowering_never_deletes`.
 
 ## Test- und Review-Artefakte
 

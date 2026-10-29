@@ -22,6 +22,7 @@ tags:
   - name: Projects
   - name: Files
   - name: Uploads
+  - name: Versions
   - name: Quota
 paths:
   /health/live:
@@ -1630,6 +1631,319 @@ paths:
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/versions:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    get:
+      tags: [Versions]
+      summary: List the versions of a file, newest first (workspace members, organization owner and admin)
+      description: >-
+        Keyset paginated by version number (the cursor holds only the number and is bound to the file). Callers who
+        cannot see the workspace: 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/VersionPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Versions]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Commit a stored upload as the next version (compare-and-set)
+      description: >-
+        Needs `If-None-Match: *` for the first version or `If-Match: "version:<uuid>"` with the current head (the
+        content ETag, not the metadata ETag `"file-v<n>"`); neither: 428 PRECONDITION_REQUIRED, both: 422. `If-Match: *`, lists of
+        tags and weak tags (`W/`) are 422 VALIDATION_ERROR, not preconditions. A head that
+        differs, or a file that already has a version when `If-None-Match: *` is sent: 412 VERSION_CONFLICT with
+        `details.current_version_id` and the current ETag header (ADR-0009); the upload stays stored and can be
+        rebased, or committed with `If-None-Match: *` to another file of the same workspace (a copy). Only the creator
+        of the upload may commit it, and only while still editor or better (others who see the workspace: 403;
+        otherwise 404); roles are read fresh in the locking transaction. The upload must be `stored` and unexpired
+        (409 UPLOAD_INCOMPLETE / UPLOAD_CLOSED, 410 UPLOAD_EXPIRED); file or project in the trash: 409. A commit moves
+        the reserved bytes to committed (once). Retrying a finished commit with the same upload returns the same version
+        with 200 whatever the preconditions are (the upload id is the idempotency token); an `Idempotency-Key` header, if
+        sent, must equal the one the upload was created with (409 IDEMPOTENCY_KEY_REUSED). A quota lowered after the
+        reservation does not cancel it. Moves the metadata ETag of the file too.
+      parameters:
+        - in: header
+          name: If-Match
+          required: false
+          schema: {type: string}
+          description: The content ETag of the current head
+        - in: header
+          name: If-None-Match
+          required: false
+          schema: {type: string}
+          description: The value `*` for the first version
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: {type: string}
+          description: Must match the key of the upload when sent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CommitVersionRequest'}
+      responses:
+        '201':
+          description: Committed
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Version'}
+        '200':
+          description: Replay of an earlier commit of the same upload
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Version'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: UPLOAD_INCOMPLETE, UPLOAD_CLOSED, FILE_DELETED, PROJECT_DELETED or IDEMPOTENCY_KEY_REUSED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '410':
+          description: UPLOAD_EXPIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '412':
+          description: VERSION_CONFLICT (details.current_version_id)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '428':
+          description: PRECONDITION_REQUIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/versions/{version_id}:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+      - {$ref: '#/components/parameters/VersionId'}
+    get:
+      tags: [Versions]
+      summary: Get one version (workspace members, organization owner and admin)
+      description: Unknown ids, versions of other files or tenants and callers who cannot see the workspace are indistinguishable (404).
+      responses:
+        '200':
+          description: The version
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Version'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/versions/{version_id}/restore:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+      - {$ref: '#/components/parameters/VersionId'}
+    post:
+      tags: [Versions]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Make an older version the head again, as a new version (editor and better)
+      description: >-
+        Creates a new version that references the blob of the old one (`restored_from_version_id`); no new bytes are
+        stored or counted. Requires `If-Match` with the current head (428 without, 422 with `If-None-Match`, 412 when
+        stale). The old versions stay. A blob that failed verification answers 500 BLOB_CORRUPT. File or project in the
+        trash: 409.
+      parameters:
+        - in: header
+          name: If-Match
+          required: false
+          schema: {type: string}
+          description: The content ETag of the current head
+      responses:
+        '201':
+          description: Restored as a new version
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Version'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: FILE_DELETED or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '412':
+          description: VERSION_CONFLICT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '428':
+          description: PRECONDITION_REQUIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500':
+          description: BLOB_CORRUPT or INTERNAL
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+  /files/{file_id}/content:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    get:
+      tags: [Versions]
+      summary: Download the head version
+      description: >-
+        Streams the content with bounded memory. The caller's roles are re-checked for this request (viewers and better; others 404). The response is always `application/octet-stream` with `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`, `Cache-Control: no-store`, an attachment disposition built from a sanitized name (ASCII fallback plus RFC 5987 `filename*`), `Repr-Digest` (SHA-256 of the whole version) and the content ETag. A single byte range is served as 206 (`Accept-Ranges: bytes`); several ranges, other units and malformed values are ignored (the whole content is sent), an unsatisfiable range is 416 with `Content-Range: bytes */<size>`. A full download is hashed while streaming and its last chunk is held back until the digest matches: on a mismatch or a short read the body ends with an error (the connection is cut, never a clean end), the blob is marked corrupt and later requests answer 500 BLOB_CORRUPT. Ranges are not verified by the server; clients check full downloads against Repr-Digest. A file or project in the trash answers 409 FILE_DELETED / PROJECT_DELETED, a file without version 404.
+      parameters:
+        - in: header
+          name: Range
+          required: false
+          schema: {type: string}
+          description: A single byte range `bytes=a-b`, `bytes=a-` or `bytes=-n`
+        - in: header
+          name: If-Range
+          required: false
+          schema: {type: string}
+          description: >-
+            Honors Range only if it equals exactly the strong content ETag `"version:<uuid>"` of the served version;
+            anything else (another tag, weak tags, dates) sends the whole content with 200.
+      responses:
+        '200':
+          description: The content
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+            Repr-Digest: {schema: {type: string}, description: 'RFC 9530 digest of the whole representation: sha-256=:<base64>:'}
+            Content-Disposition: {schema: {type: string}, description: 'attachment with a sanitized ASCII filename and filename*=UTF-8'''}
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Content-Security-Policy: {schema: {type: string, enum: [sandbox]}}
+            Accept-Ranges: {schema: {type: string, enum: [bytes]}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '206':
+          description: One byte range
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+            Repr-Digest: {schema: {type: string}, description: 'RFC 9530 digest of the whole representation: sha-256=:<base64>:'}
+            Content-Disposition: {schema: {type: string}, description: 'attachment with a sanitized ASCII filename and filename*=UTF-8'''}
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Content-Security-Policy: {schema: {type: string, enum: [sandbox]}}
+            Accept-Ranges: {schema: {type: string, enum: [bytes]}}
+            Content-Range: {schema: {type: string}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: FILE_DELETED or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '416':
+          description: RANGE_NOT_SATISFIABLE
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500':
+          description: BLOB_CORRUPT or INTERNAL
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/versions/{version_id}/content:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+      - {$ref: '#/components/parameters/VersionId'}
+    get:
+      tags: [Versions]
+      summary: Download one version
+      description: >-
+        Streams the content with bounded memory. The caller's roles are re-checked for this request (viewers and better; others 404). The response is always `application/octet-stream` with `X-Content-Type-Options: nosniff`, `Content-Security-Policy: sandbox`, `Cache-Control: no-store`, an attachment disposition built from a sanitized name (ASCII fallback plus RFC 5987 `filename*`), `Repr-Digest` (SHA-256 of the whole version) and the content ETag. A single byte range is served as 206 (`Accept-Ranges: bytes`); several ranges, other units and malformed values are ignored (the whole content is sent), an unsatisfiable range is 416 with `Content-Range: bytes */<size>`. A full download is hashed while streaming and its last chunk is held back until the digest matches: on a mismatch or a short read the body ends with an error (the connection is cut, never a clean end), the blob is marked corrupt and later requests answer 500 BLOB_CORRUPT. Ranges are not verified by the server; clients check full downloads against Repr-Digest. A file or project in the trash answers 409 FILE_DELETED / PROJECT_DELETED, a file without version 404.
+      parameters:
+        - in: header
+          name: Range
+          required: false
+          schema: {type: string}
+          description: A single byte range `bytes=a-b`, `bytes=a-` or `bytes=-n`
+        - in: header
+          name: If-Range
+          required: false
+          schema: {type: string}
+          description: >-
+            Honors Range only if it equals exactly the strong content ETag `"version:<uuid>"` of the served version;
+            anything else (another tag, weak tags, dates) sends the whole content with 200.
+      responses:
+        '200':
+          description: The content
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+            Repr-Digest: {schema: {type: string}, description: 'RFC 9530 digest of the whole representation: sha-256=:<base64>:'}
+            Content-Disposition: {schema: {type: string}, description: 'attachment with a sanitized ASCII filename and filename*=UTF-8'''}
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Content-Security-Policy: {schema: {type: string, enum: [sandbox]}}
+            Accept-Ranges: {schema: {type: string, enum: [bytes]}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '206':
+          description: One byte range
+          headers:
+            ETag: {schema: {type: string}, description: 'Content ETag "version:<uuid>"'}
+            Repr-Digest: {schema: {type: string}, description: 'RFC 9530 digest of the whole representation: sha-256=:<base64>:'}
+            Content-Disposition: {schema: {type: string}, description: 'attachment with a sanitized ASCII filename and filename*=UTF-8'''}
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Content-Security-Policy: {schema: {type: string, enum: [sandbox]}}
+            Accept-Ranges: {schema: {type: string, enum: [bytes]}}
+            Content-Range: {schema: {type: string}}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: FILE_DELETED or PROJECT_DELETED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '416':
+          description: RANGE_NOT_SATISFIABLE
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500':
+          description: BLOB_CORRUPT or INTERNAL
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /organizations/{org_id}/invitations:
     parameters:
       - {$ref: '#/components/parameters/OrgId'}
@@ -1790,6 +2104,11 @@ components:
     FileId:
       in: path
       name: file_id
+      required: true
+      schema: {type: string, format: uuid}
+    VersionId:
+      in: path
+      name: version_id
       required: true
       schema: {type: string, format: uuid}
     UploadId:
@@ -2238,6 +2557,35 @@ components:
           type: array
           maxItems: 100
           items: {$ref: '#/components/schemas/WorkspaceUsageEntry'}
+        next_cursor: {type: [string, 'null']}
+    CommitVersionRequest:
+      type: object
+      additionalProperties: false
+      required: [upload_id]
+      properties:
+        upload_id: {type: string, format: uuid}
+    Version:
+      type: object
+      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        file_id: {type: string, format: uuid}
+        number: {type: integer, minimum: 1}
+        size_bytes: {type: integer, minimum: 0}
+        sha256: {type: string}
+        base_version_id: {type: [string, 'null'], format: uuid}
+        restored_from_version_id: {type: [string, 'null'], format: uuid}
+        upload_id: {type: [string, 'null'], format: uuid}
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+    VersionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/Version'}
         next_cursor: {type: [string, 'null']}
     AdminUser:
       type: object

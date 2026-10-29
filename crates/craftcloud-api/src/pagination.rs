@@ -163,6 +163,24 @@ pub(crate) fn decode_time_cursor(
     Ok((at, id))
 }
 
+/// Cursor of a listing ordered by a number (newest first).
+pub(crate) fn encode_number_cursor(kind: &str, scope: &str, number: i64) -> String {
+    encode(&["v1", kind, scope, &number.to_string()])
+}
+
+pub(crate) fn decode_number_cursor(
+    cursor: &str,
+    kind: &str,
+    scope: &str,
+) -> Result<i64, PageError> {
+    let fields = decode(cursor, kind, scope, 1)?;
+    fields
+        .first()
+        .and_then(|n| n.parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .ok_or(PageError::Cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

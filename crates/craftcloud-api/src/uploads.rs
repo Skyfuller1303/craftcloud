@@ -248,7 +248,7 @@ async fn upload_read_gate(
 }
 
 /// Locks the organization, loads fresh roles and decides for an upload session.
-async fn upload_write_gate(
+pub(crate) async fn upload_write_gate(
     resolved: &Resolved,
     session: &AuthenticatedSession,
     headers: &HeaderMap,

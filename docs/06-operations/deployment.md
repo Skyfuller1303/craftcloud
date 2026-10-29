@@ -123,6 +123,13 @@ Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt ode
 - Verwaiste Blobs (Sitzung abgebrochen, abgelaufen oder fehlgeschlagen) bleiben bis zum Bereinigungsjob (CC-P02-06/07) im Speicher und in der Tabelle `blobs` mit Status `orphaned`.
 - Migration 0008 muss mit `craftcloud-server migrate` eingespielt werden (nur vorwärts).
 
+## Versionen und Downloads (PR-011)
+
+- Downloads (`GET /api/v1/files/{id}/content`, `.../versions/{vid}/content`) streamen mit begrenztem Speicher; die Antwort wird erst durch den Body-Fortschritt bestimmt, das Handler-Zeitlimit gilt nur bis zum Antwortkopf. Ein Reverse-Proxy sollte Antwortpufferung für diese Routen abschalten (`proxy_buffering off` bei nginx) und lange Lese-Zeitlimits erlauben. Der Server setzt `Cache-Control: no-store`; Proxys dürfen Dateiinhalte nicht cachen.
+- Der Download prüft beim vollständigen Streamen den SHA-256 und hält den letzten Block bis zum Abgleich zurück: bei Abweichung wird die Verbindung abgebrochen, der Blob als `corrupt` markiert und später mit 500 `BLOB_CORRUPT` beantwortet (die Zeile in `blobs` und die Datei bleiben als Beweis, die Bytes zählen weiter zur Quota). Wiederherstellung: Objekt aus einem Backup zurückspielen und den Blob-Status per SQL auf `committed` setzen, oder die Datei aus einer anderen Version neu committen. Bereichsabrufe (Range) werden nicht geprüft.
+- Alte Versionen werden aufbewahrt; es gibt noch keine Löschung (CC-P02-06). Der Speicherverbrauch wächst mit jeder Version, ein Restore teilt sich den Blob mit der alten Version und braucht keinen zusätzlichen Platz.
+- Migration 0009 muss mit `craftcloud-server migrate` eingespielt werden (nur vorwärts).
+
 ## Setup-Runbook
 
 1. Host patchen, Docker/Podman gemäß Betreiberregel, DNS und TLS einrichten.

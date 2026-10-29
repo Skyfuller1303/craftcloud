@@ -345,7 +345,7 @@ impl OrgTx {
         .await?)
     }
 
-    async fn release(&mut self, workspace_id: Uuid, bytes: i64) -> Result<(), DbError> {
+    pub(crate) async fn release(&mut self, workspace_id: Uuid, bytes: i64) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE workspaces SET reserved_bytes = reserved_bytes - $2 \
              WHERE id = $1 AND org_id = $3",
@@ -360,6 +360,30 @@ impl OrgTx {
             .bind(bytes)
             .execute(&mut *self.tx)
             .await?;
+        Ok(())
+    }
+
+    /// Adds bytes to the committed counters of a workspace and its organization.
+    pub(crate) async fn add_committed(
+        &mut self,
+        workspace_id: Uuid,
+        bytes: i64,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE workspaces SET committed_bytes = committed_bytes + $2              WHERE id = $1 AND org_id = $3",
+        )
+        .bind(workspace_id)
+        .bind(bytes)
+        .bind(self.org_id)
+        .execute(&mut *self.tx)
+        .await?;
+        sqlx::query(
+            "UPDATE organizations SET committed_bytes = committed_bytes + $2 WHERE id = $1",
+        )
+        .bind(self.org_id)
+        .bind(bytes)
+        .execute(&mut *self.tx)
+        .await?;
         Ok(())
     }
 
@@ -404,7 +428,7 @@ impl OrgTx {
     }
 
     /// Locks a session and expires it if its time is up (lazy expiry).
-    async fn session_locked(
+    pub(crate) async fn session_locked(
         &mut self,
         id: Uuid,
         now: OffsetDateTime,
@@ -783,7 +807,7 @@ impl OrgTx {
                 reserved_bytes = COALESCE((SELECT sum(declared_size) FROM upload_sessions s \
                     WHERE s.workspace_id = w.id AND s.state IN {HOLDING}), 0), \
                 committed_bytes = COALESCE((SELECT sum(size_bytes) FROM blobs b \
-                    WHERE b.workspace_id = w.id AND b.state = 'committed'), 0) \
+                    WHERE b.workspace_id = w.id AND b.state IN ('committed', 'corrupt')), 0) \
              WHERE w.org_id = $1"
         ))
         .bind(self.org_id)

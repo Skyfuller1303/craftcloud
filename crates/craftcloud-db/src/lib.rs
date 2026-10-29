@@ -29,6 +29,7 @@ pub mod sessions;
 pub mod setup;
 pub mod uploads;
 pub mod users;
+pub mod versions;
 pub mod workspaces;
 
 pub use error::{DbError, SchemaProblem};

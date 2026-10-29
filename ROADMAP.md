@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — PR-011 (CC-P02-04, CC-P02-05) implemented locally: immutable file versions with compare-and-set commit (412 VERSION_CONFLICT, content ETag `"version:<uuid>"`), idempotent commit by upload id, restore, version listing, download with ACL re-check, safe headers, single byte ranges, `Repr-Digest` and integrity-checked streaming, migration 0009. Not reviewed or merged.
+
 2026-10-29 — PR-010 (CC-P02-02, quota part of CC-P02-06) implemented locally: upload sessions with quota reservation, streamed content with SHA-256 and length verification into the local object store, idempotency, caps, expiry, quota and usage routes, migration 0008. Staged (uncommitted) blobs only. Not reviewed or merged.
 
 2026-10-29 — PR-009 (CC-P02-03) implemented locally: crate `craftcloud-storage` (trait `ObjectStore`, local filesystem adapter with random keys, byte limits, SHA-256, atomic publish, range reads, listing, symlink defense, fault injection), config keys `CRAFTCLOUD_STORAGE_DIR` and `CRAFTCLOUD_MAX_FILE_SIZE_BYTES`. No HTTP routes. Not reviewed or merged.

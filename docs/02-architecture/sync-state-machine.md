@@ -36,3 +36,7 @@ stateDiagram-v2
 ## Test scenarios
 
 Two devices same base; interleaved uploads; retry with dropped response; upload succeeds but DB commit fails; expired upload; file deleted mid-upload; role revoked mid-upload; exhausted quota; remote 429; stale token; corruption in local blob; conflicting same file names in folder. Every scenario has deterministic result and a recovery path.
+
+## Umsetzungsstand (PR-011)
+
+Schritt 5 ist umgesetzt als `POST /files/{id}/versions` mit `{"upload_id": ...}` und `If-None-Match: *` (erste Version) oder `If-Match: "version:<uuid>"` (Kopf). Bei veraltetem Kopf antwortet der Server 412 `VERSION_CONFLICT` mit `details.current_version_id` und dem aktuellen Etag; der Upload bleibt `stored` (Quota reserviert, bis er abläuft oder abgebrochen wird) und kann auf den neuen Kopf aufgesetzt (Rebase) oder mit `If-None-Match: *` als **separate Datei** im selben Workspace gespeichert werden, ohne erneut hochzuladen. "Overwrite remote intentionally" bleibt ein Commit auf den frisch gelesenen Kopf (ein Restore einer alten Version ist ebenfalls ein CAS-Commit). Idempotenz nach Zeitüberschreitung: die Upload-ID ist das Token; ein wiederholter Commit desselben Uploads liefert dieselbe Version mit 200, unabhängig von den Preconditions.

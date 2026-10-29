@@ -24,6 +24,7 @@ mod services;
 mod session;
 mod setup;
 mod uploads;
+mod versions;
 mod workspaces;
 
 pub use client_ip::ClientIp;
@@ -129,6 +130,17 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/files/{file_id}", &["GET", "PATCH", "DELETE"]),
     ("/api/v1/files/{file_id}/restore", &["POST"]),
     ("/api/v1/files/{file_id}/uploads", &["POST"]),
+    ("/api/v1/files/{file_id}/versions", &["GET", "POST"]),
+    ("/api/v1/files/{file_id}/versions/{version_id}", &["GET"]),
+    (
+        "/api/v1/files/{file_id}/versions/{version_id}/restore",
+        &["POST"],
+    ),
+    ("/api/v1/files/{file_id}/content", &["GET"]),
+    (
+        "/api/v1/files/{file_id}/versions/{version_id}/content",
+        &["GET"],
+    ),
     ("/api/v1/uploads/{upload_id}", &["GET", "DELETE"]),
     ("/api/v1/uploads/{upload_id}/content", &["PUT"]),
     ("/api/v1/organizations/{org_id}/usage", &["GET"]),
@@ -251,6 +263,26 @@ pub fn router_with_services(
         .route(
             "/api/v1/files/{file_id}/uploads",
             post(uploads::create_upload),
+        )
+        .route(
+            "/api/v1/files/{file_id}/versions",
+            get(versions::list_versions).post(versions::commit_version),
+        )
+        .route(
+            "/api/v1/files/{file_id}/versions/{version_id}",
+            get(versions::get_version),
+        )
+        .route(
+            "/api/v1/files/{file_id}/versions/{version_id}/restore",
+            post(versions::restore_version),
+        )
+        .route(
+            "/api/v1/files/{file_id}/content",
+            get(versions::download_head),
+        )
+        .route(
+            "/api/v1/files/{file_id}/versions/{version_id}/content",
+            get(versions::download_version),
         )
         .route(
             "/api/v1/uploads/{upload_id}",

@@ -157,6 +157,8 @@ pub struct Resp {
     pub headers: HeaderMap,
     pub body: Value,
     pub text: String,
+    /// The raw body bytes.
+    pub bytes: Vec<u8>,
 }
 
 impl Resp {
@@ -166,6 +168,14 @@ impl Resp {
     pub fn etag(&self) -> String {
         self.headers[header::ETAG].to_str().unwrap().to_owned()
     }
+}
+
+/// Sends a request and returns status, headers and the still unread body.
+pub async fn call_stream(app: &Router, req: Req) -> (StatusCode, HeaderMap, Body) {
+    let response = app.clone().oneshot(req.build()).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    (status, headers, response.into_body())
 }
 
 pub async fn call(app: &Router, req: Req) -> Resp {
@@ -180,6 +190,7 @@ pub async fn call(app: &Router, req: Req) -> Resp {
         headers,
         body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         text: String::from_utf8_lossy(&bytes).into_owned(),
+        bytes: bytes.to_vec(),
     }
 }
 
