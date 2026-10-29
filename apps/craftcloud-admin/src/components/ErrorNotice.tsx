@@ -5,7 +5,7 @@ import { classifyError, describeError } from "../api/errors.ts";
 import { useCountdown } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
 import { useAnnounce } from "./Announcer.tsx";
-import { Alert } from "./forms.tsx";
+import { Banner } from "./Banner.tsx";
 
 /**
  * The one place that turns a failed request into text and recovery actions
@@ -49,7 +49,7 @@ export function ErrorNotice({
 
   useEffect(() => {
     if (wasCounting.current && !counting) {
-      announce(t("You can try again now."));
+      announce(t("You can try again now."), { toast: false });
     }
     wasCounting.current = counting;
   }, [counting, announce, t]);
@@ -66,23 +66,16 @@ export function ErrorNotice({
   const staleData = kind === "forbidden" || kind === "missing" || kind === "conflict" || kind === "precondition";
   const canRetry = kind === "rate-limited" || kind === "unavailable" || kind === "offline" || kind === "server";
 
+  const actions = (staleData && onReload !== undefined) || (canRetry && onRetry !== undefined)
+    ? <>
+        {staleData && onReload !== undefined && <Button className="button button--sm" onPress={onReload}>{t("Reload")}</Button>}
+        {canRetry && onRetry !== undefined && <Button className="button button--sm" onPress={onRetry} isDisabled={counting}>{counting ? t("Try again in {seconds} s", { seconds: left }) : t("Try again")}</Button>}
+      </>
+    : undefined;
   return (
     <div className="error-notice">
-      <Alert>{context === undefined ? text : `${context} ${text}`}</Alert>
-      {(staleData || canRetry) && (
-        <div className="error-notice__actions">
-          {staleData && onReload !== undefined && (
-            <Button className="button" onPress={onReload}>
-              {t("Reload")}
-            </Button>
-          )}
-          {canRetry && onRetry !== undefined && (
-            <Button className="button" onPress={onRetry} isDisabled={counting}>
-              {counting ? t("Try again in {seconds} s", { seconds: left }) : t("Try again")}
-            </Button>
-          )}
-        </div>
-      )}
+      <Banner tone="bad">{context === undefined ? text : `${context} ${text}`}</Banner>
+      {actions !== undefined && <div className="error-notice__actions">{actions}</div>}
     </div>
   );
 }

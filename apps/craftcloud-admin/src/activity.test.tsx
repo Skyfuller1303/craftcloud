@@ -35,8 +35,8 @@ const event = (n: number, extra: Record<string, unknown> = {}) => ({
 const PLAIN = { ...SESSION, instance_role: null };
 
 async function openActivity(user: User) {
-  await user.click(await screen.findByRole("button", { name: "Activity" }));
-  return screen.findByRole("heading", { level: 1, name: "Activity" });
+  await user.click(await screen.findByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
+  return screen.findByRole("heading", { level: 1, name: /^(Activity|Aktivit\u00e4t)$/ });
 }
 
 describe("activity log", () => {
@@ -223,7 +223,7 @@ describe.each(languages)("axe: activity log (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    await user.click(within(nav).getAllByRole("button")[6]!);
+      await user.click(within(nav).getByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
     await screen.findByRole("table");
     await expectNoAxeViolations();
     // Validation errors are exposed to assistive technology too.
@@ -241,7 +241,7 @@ describe.each(languages)("axe: activity log (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    await user.click(within(nav).getAllByRole("button")[6]!);
+      await user.click(within(nav).getByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
     await screen.findByRole("alert");
     await expectNoAxeViolations();
   });
@@ -251,7 +251,7 @@ describe.each(languages)("axe: activity log (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    const activity = within(nav).getAllByRole("button")[6]!;
+      const activity = within(nav).getByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ });
     activity.focus();
     await user.keyboard("{Enter}");
     await screen.findByRole("table");

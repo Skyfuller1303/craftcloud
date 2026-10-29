@@ -5,7 +5,7 @@ import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
 import { AppModal } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
-import { ListStatus } from "../components/ListStatus.tsx";
+import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatBytes, formatDateTime } from "../format.ts";
 import { useAction } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
@@ -45,7 +45,7 @@ export function VersionsDialog({
   }
 
   return (
-    <AppModal title={t("Versions of {name}", { name: file.name })} onClose={close} busy={action.pending}>
+    <AppModal title={t("Versions of {name}", { name: file.name })} onClose={close} busy={action.pending} size="lg">
       <ListStatus
         list={versions}
         empty={t("This file has no versions yet.")}
@@ -69,7 +69,7 @@ export function VersionsDialog({
                 <th scope="col">{t("Version")}</th>
                 <th scope="col">{t("Size")}</th>
                 <th scope="col">{t("Saved")}</th>
-                <th scope="col">{t("SHA-256")}</th>
+                <th scope="col" className="col--optional">{t("SHA-256")}</th>
                 <th scope="col">{t("Actions")}</th>
               </tr>
             </thead>
@@ -81,17 +81,17 @@ export function VersionsDialog({
                     {version.id === head ? ` · ${t("Current")}` : ""}
                     {version.restored_from_version_id !== null ? ` · ${t("Restored")}` : ""}
                   </th>
-                  <td>{formatBytes(language, version.size_bytes)}</td>
-                  <td>{formatDateTime(language, version.created_at)}</td>
-                  <td>
+                  <td className="numeric" data-label={t("Size")}>{formatBytes(language, version.size_bytes)}</td>
+                  <td className="numeric" data-label={t("Saved")}>{formatDateTime(language, version.created_at)}</td>
+                  <td className="col--optional" data-label={t("SHA-256")}>
                     <code className="hash" title={version.sha256}>
                       {version.sha256.slice(0, 12)}
                     </code>
                   </td>
-                  <td>
+                  <td data-label={t("Actions")}>
                     <div className="row-actions">
                       <a
-                        className="button"
+                        className="button button--sm"
                         href={api.downloadUrl(file.id, version.id)}
                         download
                         aria-label={t("Download version {number}", { number: version.number })}
@@ -100,7 +100,7 @@ export function VersionsDialog({
                       </a>
                       {canRestore && version.id !== head && head !== null && (
                         <Button
-                          className="button"
+                          className="button button--sm"
                           isDisabled={action.pending}
                           aria-label={t("Restore version {number} as a new version", {
                             number: version.number,
@@ -132,6 +132,7 @@ export function VersionsDialog({
           </table>
         </div>
       )}
+      <LoadMoreButton list={versions} />
       <div className="form__actions">
         <Button className="button" onPress={close}>
           {t("Close")}

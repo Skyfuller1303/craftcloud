@@ -4,6 +4,8 @@ import type { Organization, Project, SessionInfo, Workspace } from "../api/types
 import { useAuth } from "../auth.tsx";
 import { ContextSelect } from "../components/ContextSelect.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
+import { Badge } from "../components/Badge.tsx";
+import { EmptyState } from "../components/EmptyState.tsx";
 import { Alert, ScreenHeading } from "../components/forms.tsx";
 import { Preferences } from "../components/Preferences.tsx";
 import { useI18n } from "../i18n/index.tsx";
@@ -21,17 +23,16 @@ import { SystemScreen } from "./SystemScreen.tsx";
  * Dashboard sections. Settings follows with a later ticket and stays a
  * placeholder. "system" (CC-F15) is offered to the instance operator only.
  */
-const SECTIONS = [
+const CONTENT_SECTIONS = [
   "overview",
   "projects",
   "files",
   "members",
   "invitations",
-  "settings",
   "activity",
-  "system",
 ] as const;
-type Section = (typeof SECTIONS)[number];
+const ADMIN_SECTIONS = ["settings", "system"] as const;
+type Section = (typeof CONTENT_SECTIONS)[number] | (typeof ADMIN_SECTIONS)[number];
 
 export function Shell({
   session,
@@ -111,12 +112,16 @@ export function Shell({
     system: t("System"),
   };
   const isOperator = session.instance_role === "operator";
-  const visibleSections = SECTIONS.filter((key) => key !== "system" || isOperator);
+  const visibleAdminSections = ADMIN_SECTIONS.filter((key) => key !== "system" || isOperator);
 
   return (
     <div className="shell">
       <header className="shell__header">
-        <div className="shell__brand">{t("CraftCloud admin")}</div>
+        <div className="shell__brand">
+          <span className="visually-hidden">{t("CraftCloud admin")}</span>
+          <span aria-hidden="true" className="shell__brand-tag">CRAFTCLOUD</span>
+          <span aria-hidden="true" className="shell__brand-label">ADMIN</span>
+        </div>
         <div className="shell__context">
           <ContextSelect
             label={t("Organization")}
@@ -158,7 +163,21 @@ export function Shell({
       <div className="shell__body">
         <nav className="shell__nav" aria-label={t("Main navigation")}>
           <ul>
-            {visibleSections.map((key) => (
+            {CONTENT_SECTIONS.map((key) => (
+              <li key={key}>
+                <button
+                  type="button"
+                  className="nav__item"
+                  aria-current={section === key ? "page" : undefined}
+                  onClick={() => setSection(key)}
+                >
+                  {sectionLabel[key]}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <ul>
+            {visibleAdminSections.map((key) => (
               <li key={key}>
                 <button
                   type="button"
@@ -224,14 +243,14 @@ export function Shell({
             <dl className="facts">
               <dt>{t("Signed in as")}</dt>
               <dd>
-                {session.display_name} ({session.email})
-                {session.instance_role === "operator" ? ` · ${t("Instance operator")}` : ""}
+                <span>{session.display_name}<span className="cell__sub">{session.email}</span></span>
+                {session.instance_role === "operator" && <Badge>{t("Instance operator")}</Badge>}
               </dd>
               <dt>{t("Organization")}</dt>
               <dd>
                 {organization === null
                   ? t("None selected")
-                  : `${organization.name} · ${names.orgRole(organization.role)}`}
+                  : <>{organization.name}<Badge>{names.orgRole(organization.role)}</Badge></>}
               </dd>
               <dt>{t("Workspace")}</dt>
               <dd>
@@ -239,7 +258,7 @@ export function Shell({
                   ? workspaces.status === "ready" && organization !== null
                     ? t("This organization has no workspace you can see.")
                     : t("None selected")
-                  : `${workspace.name} · ${names.workspaceRole(workspace.workspace_role)}`}
+                  : <>{workspace.name}<Badge>{names.workspaceRole(workspace.workspace_role)}</Badge></>}
               </dd>
             </dl>
           ) : section === "projects" ? (
@@ -270,7 +289,7 @@ export function Shell({
           ) : section === "system" ? (
             <SystemScreen isOperator={isOperator} />
           ) : (
-            <p className="muted">{t("This view is not available yet.")}</p>
+            <EmptyState>{t("This view is not available yet.")}</EmptyState>
           )}
         </main>
       </div>

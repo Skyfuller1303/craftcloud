@@ -1,0 +1,91 @@
+// ---- Dashboard views (CC-P03-03/04) -------------------------------------
+// Tables scroll inside their own box on narrow screens (reflow, WCAG 1.4.10).
+.table-wrap { width: 100%; max-width: 100%; overflow-x: auto; border: var(--hairline) solid var(--line); }
+.table { width: 100%; border-collapse: collapse; background: var(--bg); font-size: var(--text-body); }
+.table th, .table td {
+  height: var(--row-height);
+  padding: 0 var(--space-4);
+  border-bottom: var(--hairline) solid var(--line);
+  text-align: left;
+  vertical-align: middle;
+  overflow-wrap: anywhere;
+}
+.table thead th {
+  height: var(--head-row-height);
+  color: var(--muted);
+  font: 500 var(--text-label)/1.3 var(--font-mono);
+  letter-spacing: var(--label-tracking);
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.table tbody th { color: var(--ink-strong); font-weight: 600; }
+.table tbody tr:hover { background: var(--sunken); }
+.table tbody tr:last-child > * { border-bottom: 0; }
+.table th.numeric, .table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
+// Short codes (action, result) stay on one line; the table scrolls instead.
+.table td.nowrap { white-space: nowrap; overflow-wrap: normal; }
+.table td:last-child { min-width: 8rem; }
+.table .col--optional { display: table-cell; }
+.cell__sub { display: block; margin-top: 2px; color: var(--muted); font-size: var(--text-small); font-weight: 400; }
+.cell__sub--email { display: none; }
+.row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+.row-actions .button { min-height: var(--control-height-sm); min-width: 0; padding: 0 10px; font-size: var(--text-label); }
+.hash, code { font-family: var(--font-mono); font-size: var(--text-code); }
+.hash { overflow-wrap: anywhere; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: var(--hairline) solid var(--line);
+  background: var(--sunken);
+  color: var(--muted);
+  font: 500 var(--text-badge)/1 var(--font-mono);
+  letter-spacing: var(--badge-tracking);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.badge--neutral { color: var(--muted); }
+.badge--good { color: var(--good); }
+.badge--warn { color: var(--warn); }
+.badge--bad { color: var(--bad); }
+.badge--info { color: var(--accent-ink); }
+.tag { display: inline-flex; padding: var(--space-1) var(--space-2); background: var(--invert-bg); color: var(--invert-fg); font: 700 var(--text-tag)/1 var(--font-mono); letter-spacing: 0.15em; text-transform: uppercase; }
+
+.facts { display: grid; grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr); max-width: var(--form-max); margin: 0; }
+.facts dt, .facts dd { display: flex; align-self: stretch; align-items: center; min-height: 40px; padding: var(--space-2) 0; border-bottom: var(--hairline) solid var(--line); }
+.facts dt { color: var(--muted); font: 500 var(--text-label)/1.3 var(--font-mono); letter-spacing: var(--label-tracking); text-transform: uppercase; }
+.facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.facts dd .badge { margin-left: var(--space-2); }
+.facts dd:last-child, .facts dt:nth-last-child(2) { border-bottom: 0; }
+.system-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-7); }
+.system-grid .section { margin: 0; padding: 0; border: 0; }
+
+@media (max-width: 68.75rem) {
+  .table .col--optional { display: none; }
+  .cell__sub--email { display: block; }
+}
+@media (max-width: 40rem) {
+  .table-wrap { overflow: visible; border: 0; }
+  .table, .table tbody, .table tr, .table td, .table th { display: block; width: 100%; }
+  .table { border: 0; background: transparent; }
+  .table thead { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .table tbody { display: grid; gap: var(--space-2); }
+  .table tbody tr { padding: var(--space-2) var(--space-4); border: var(--hairline) solid var(--line); background: var(--bg); }
+  .table tbody tr:hover { background: var(--bg); }
+  .table tbody tr > * { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); height: auto; min-height: 32px; padding: var(--space-1) 0; border: 0; text-align: right; }
+  .table tbody tr > td { display: grid; grid-template-columns: minmax(0, 40%) minmax(0, 1fr); }
+  .table tbody tr > th { display: block; padding: 0 0 var(--space-2); border-bottom: var(--hairline) solid var(--line); text-align: left; }
+  .table tbody td::before { content: attr(data-label); color: var(--muted); font: 500 var(--text-label)/1.3 var(--font-mono); letter-spacing: var(--label-tracking); text-align: left; text-transform: uppercase; }
+  .table tbody td > .badge { justify-self: end; }
+  .table tbody td:last-child .row-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .table tbody td:last-child { min-width: 0; }
+  .table td .row-actions { justify-content: flex-end; }
+  .facts { grid-template-columns: minmax(0, 1fr); }
+  .facts dt { min-height: auto; padding-bottom: 0; border: 0; }
+  .facts dd { min-height: 32px; padding-top: 0; }
+  .system-grid { grid-template-columns: minmax(0, 1fr); gap: var(--space-4); }
+}
+@media (min-width: 68.75rem) { .system-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

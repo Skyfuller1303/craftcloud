@@ -16,11 +16,13 @@ export function AppModal({
   title,
   onClose,
   busy = false,
+  size = "md",
   children,
 }: {
   title: string;
   onClose: () => void;
   busy?: boolean;
+  size?: "sm" | "md" | "lg";
   children: ReactNode;
 }) {
   useEffect(
@@ -46,7 +48,7 @@ export function AppModal({
         }
       }}
     >
-      <Modal className="modal">
+      <Modal className={`modal modal--${size}`}>
         <Dialog className="modal__dialog">
           <Heading slot="title" className="modal__title">
             {title}
@@ -82,19 +84,23 @@ export function ConfirmDialog({
 }) {
   const { t } = useI18n();
   return (
-    <AppModal title={title} onClose={onClose} busy={busy}>
+    <AppModal title={title} onClose={onClose} busy={busy} size="sm">
       <p>{message}</p>
       {error !== null && <ErrorNotice error={error} onRetry={onConfirm} onReload={onReload} />}
       <div className="form__actions">
+        <Button
+          className="button"
+          onPress={onClose}
+          isDisabled={busy}
+        >
+          {t("Cancel")}
+        </Button>
         <Button
           className={`button ${danger ? "button--danger" : "button--primary"}`}
           onPress={onConfirm}
           isDisabled={busy}
         >
           {confirmLabel}
-        </Button>
-        <Button className="button" onPress={onClose} isDisabled={busy}>
-          {t("Cancel")}
         </Button>
       </div>
     </AppModal>

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { ReactNode, RefObject } from "react";
 import { FieldError, Input, Label, Text, TextField } from "react-aria-components";
+import { Banner } from "./Banner.tsx";
 
 export function Field({
   label,
@@ -55,11 +56,8 @@ export function Alert({
   tone?: "error" | "info" | "success";
   children: ReactNode;
 }) {
-  return (
-    <div className={`alert alert--${tone}`} role={tone === "error" ? "alert" : "status"}>
-      {children}
-    </div>
-  );
+  const bannerTone = tone === "error" ? "bad" : tone === "success" ? "good" : "info";
+  return <Banner tone={bannerTone}>{children}</Banner>;
 }
 
 /** Moves keyboard focus to the screen heading when a screen appears. */

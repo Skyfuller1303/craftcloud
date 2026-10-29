@@ -7,12 +7,19 @@ import { FILE_1, ME, PROJECT_1, page, viewRoutes } from "./test/fixtures.ts";
 
 type User = ReturnType<typeof userEvent.setup>;
 
-// Navigation order of the shell: overview, projects, files, members, invitations, settings, activity.
-const NAV = { projects: 1, files: 2, members: 3, invitations: 4 } as const;
+// Navigation order was overview, projects, files, members, invitations, settings, activity.
+// The shell groups and reorders navigation by task; query labels so this helper
+// stays valid in both supported locales and does not depend on visual position.
+const NAV = {
+  projects: /^(Projects|Projekte)$/,
+  files: /^(Files|Dateien)$/,
+  members: /^(Members|Mitglieder)$/,
+  invitations: /^(Invitations|Einladungen)$/,
+} as const;
 
 async function go(user: User, section: keyof typeof NAV) {
   const nav = await screen.findByRole("navigation");
-  await user.click(within(nav).getAllByRole("button")[NAV[section]]!);
+  await user.click(within(nav).getByRole("button", { name: NAV[section] }));
   await screen.findByRole("heading", { level: 1 });
 }
 

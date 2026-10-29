@@ -123,16 +123,16 @@ export function InviteScreen({
             />
           </>
         )}
-        <div className="form__actions">
+        <div className="form__actions form__actions--invite">
           <Button type="submit" className="button button--primary" isDisabled={busy}>
             {busy ? t("Accepting…") : t("Accept invitation")}
           </Button>
           {!loggedIn && (
-            <Button type="button" className="button" onPress={onHaveAccount}>
+            <Button type="button" className="button button--link" onPress={onHaveAccount}>
               {t("I already have an account")}
             </Button>
           )}
-          <Button type="button" className="button button--quiet" onPress={onCancel}>
+          <Button type="button" className="button button--danger-quiet button--sm" onPress={onCancel}>
             {t("Discard invitation")}
           </Button>
         </div>

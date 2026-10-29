@@ -1,7 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { Toaster } from "./Toaster.tsx";
+import type { ToastMessage } from "./Toaster.tsx";
 
-type Announce = (message: string) => void;
+type Announce = (message: string, options?: { toast?: boolean }) => void;
 
 const AnnouncerContext = createContext<Announce>(() => undefined);
 
@@ -13,13 +15,19 @@ const AnnouncerContext = createContext<Announce>(() => undefined);
  */
 export function AnnouncerProvider({ children }: { children: ReactNode }) {
   const [message, setMessage] = useState("");
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const nextToastId = useRef(0);
   const timer = useRef<number | undefined>(undefined);
 
-  const announce = useCallback<Announce>((text) => {
+  const announce = useCallback<Announce>((text, options) => {
     // Clear first so that an identical message is announced again.
     setMessage("");
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => setMessage(text), 60);
+    if (options?.toast !== false) {
+      const toast = { id: ++nextToastId.current, message: text };
+      setToasts((current) => [...current, toast].slice(-4));
+    }
   }, []);
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
@@ -31,6 +39,7 @@ export function AnnouncerProvider({ children }: { children: ReactNode }) {
       <div className="visually-hidden" aria-live="polite" aria-atomic="true" data-testid="announcer">
         {message}
       </div>
+      <Toaster toasts={toasts} onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} />
     </AnnouncerContext.Provider>
   );
 }

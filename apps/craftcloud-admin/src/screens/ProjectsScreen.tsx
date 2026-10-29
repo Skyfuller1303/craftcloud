@@ -7,8 +7,9 @@ import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
 import { AppModal, ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
+import { Icon } from "../components/Icon.tsx";
 import { Field, focusFirstInvalid } from "../components/forms.tsx";
-import { ListStatus } from "../components/ListStatus.tsx";
+import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatDateTime } from "../format.ts";
 import { useAction } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
@@ -71,7 +72,7 @@ export function ProjectsScreen({
       )}
 
       <Checkbox className="checkbox" isSelected={showTrash} onChange={setShowTrash}>
-        <span className="checkbox__box" aria-hidden="true" />
+        <span className="checkbox__box" aria-hidden="true"><Icon name="check" size={12} /></span>
         {t("Show trash")}
       </Checkbox>
 
@@ -100,12 +101,12 @@ export function ProjectsScreen({
               {projects.items.map((project) => (
                 <tr key={project.id}>
                   <th scope="row">{project.name}</th>
-                  <td>{formatDateTime(language, project.deleted_at ?? project.updated_at)}</td>
-                  <td>
+                  <td className="numeric" data-label={showTrash ? t("Deleted") : t("Updated")}>{formatDateTime(language, project.deleted_at ?? project.updated_at)}</td>
+                  <td data-label={t("Actions")}>
                     <div className="row-actions">
                       {!showTrash && (
                         <Button
-                          className="button"
+                          className="button button--sm"
                           aria-label={t("Open files of {name}", { name: project.name })}
                           onPress={() => onOpenProject(project)}
                         >
@@ -114,7 +115,7 @@ export function ProjectsScreen({
                       )}
                       {!showTrash && mayWrite && (
                         <Button
-                          className="button"
+                          className="button button--sm"
                           aria-label={t("Rename {name}", { name: project.name })}
                           onPress={() => setRenaming(project)}
                         >
@@ -123,7 +124,7 @@ export function ProjectsScreen({
                       )}
                       {!showTrash && mayTrash && (
                         <Button
-                          className="button"
+                          className="button button--danger-quiet button--sm"
                           aria-label={t("Move to trash: {name}", { name: project.name })}
                           onPress={() => setTrashing(project)}
                         >
@@ -132,7 +133,7 @@ export function ProjectsScreen({
                       )}
                       {showTrash && mayTrash && (
                         <Button
-                          className="button"
+                          className="button button--sm"
                           aria-label={t("Restore {name}", { name: project.name })}
                           isDisabled={restoreAction.pending}
                           onPress={() => {
@@ -158,6 +159,7 @@ export function ProjectsScreen({
           </table>
         </div>
       )}
+      <LoadMoreButton list={projects} />
 
       {renaming !== null && (
         <RenameProjectDialog
@@ -315,16 +317,16 @@ function RenameProjectDialog({
   }
 
   return (
-    <AppModal title={t("Rename project")} onClose={onClose} busy={action.pending}>
+    <AppModal title={t("Rename project")} onClose={onClose} busy={action.pending} size="sm">
       <Form className="form" onSubmit={(event) => void submit(event)} ref={form} validationBehavior="aria">
         <Field label={t("Project name")} name="rename-project" value={name} onChange={setName} error={nameError} />
         {action.failed && nameError === undefined && <ErrorNotice error={action.error} onReload={onReload} />}
         <div className="form__actions">
-          <Button type="submit" className="button button--primary" isDisabled={action.pending}>
-            {t("Save")}
-          </Button>
           <Button className="button" onPress={onClose} isDisabled={action.pending}>
             {t("Cancel")}
+          </Button>
+          <Button type="submit" className="button button--primary" isDisabled={action.pending}>
+            {t("Save")}
           </Button>
         </div>
       </Form>

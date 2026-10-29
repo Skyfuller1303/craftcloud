@@ -1,0 +1,128 @@
+// ---- Layout -------------------------------------------------------------
+.frame, .shell { display: flex; flex-direction: column; min-height: 100vh; }
+.frame__bar, .shell__header {
+  display: flex;
+  align-items: center;
+  min-height: var(--header-height);
+  gap: 0;
+  padding: 0 var(--space-5);
+  border-bottom: var(--hairline) solid var(--line);
+  background: var(--bg);
+}
+.frame__bar { flex-wrap: wrap; justify-content: space-between; }
+.frame__main { flex: 1; padding: 0 var(--space-4) var(--space-8); }
+.frame__main > * { width: min(100%, var(--auth-card)); margin-inline: auto; }
+.frame__main > .screen--narrow { width: 100%; }
+.frame__main > .auth-card--wide { max-width: 480px; }
+
+.shell__brand {
+  display: flex;
+  flex: 0 0 calc(var(--nav-width) - var(--space-5));
+  width: calc(var(--nav-width) - var(--space-5));
+  align-items: center;
+  gap: var(--space-3);
+  align-self: stretch;
+  min-width: 0;
+  margin-right: 0;
+  padding-right: var(--space-4);
+  border-right: var(--hairline) solid var(--line);
+  font: 700 var(--text-tag)/1 var(--font-mono);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.shell__brand-tag { padding: var(--space-1) var(--space-2); background: var(--invert-bg); color: var(--invert-fg); }
+.shell__brand-label { color: var(--muted); }
+.shell__context, .shell__prefs, .shell__user { display: flex; align-items: stretch; min-width: 0; }
+.shell__context { flex: 1 1 auto; }
+.shell__prefs { flex: 0 0 auto; margin-left: auto; }
+.shell__user { flex: 0 0 auto; align-items: center; gap: var(--space-3); margin-left: var(--space-3); }
+.shell__user-name { max-width: 16ch; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.shell__body { display: flex; flex: 1; min-width: 0; }
+.shell__nav {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  flex: 0 0 var(--nav-width);
+  padding: var(--space-3) 0;
+  border-right: var(--hairline) solid var(--line);
+  ul + ul { margin-top: var(--space-3); padding-top: var(--space-3); border-top: var(--hairline) solid var(--line); }
+  li { padding: 0 var(--space-3); }
+}
+.shell__main {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-4);
+  min-width: 0;
+  max-width: calc(var(--content-max) + 40px);
+  padding: 18px var(--space-5) var(--space-8);
+  overflow-wrap: anywhere;
+}
+.shell__main > * { width: 100%; }
+.shell__main > .facts { max-width: var(--form-max); }
+.shell__nav + .shell__main { margin-inline: auto; }
+
+.nav__item {
+  display: block;
+  width: 100%;
+  min-height: var(--control-height);
+  padding: 0 var(--space-4);
+  border: var(--hairline) solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font: 500 var(--text-label)/1.3 var(--font-mono);
+  letter-spacing: var(--label-tracking);
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color var(--motion), background-color var(--motion), border-color var(--motion);
+  &:hover { color: var(--ink-strong); background: var(--sunken); }
+  &[aria-current="page"] { color: var(--invert-fg); background: var(--invert-bg); }
+  &:focus-visible { outline-offset: -2px; }
+}
+
+.screen { display: flex; flex-direction: column; gap: var(--space-4); }
+.screen--narrow { width: 100%; max-width: var(--auth-card); margin: clamp(24px, 12vh, 120px) auto 0; padding: var(--space-7); border: var(--hairline) solid var(--line); background: var(--bg); }
+.screen--setup { max-width: 480px; }
+.screen__heading, .page-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--space-4); }
+.screen__title { color: var(--ink-strong); font-size: var(--text-title); font-weight: 650; letter-spacing: -0.02em; line-height: 1.2; }
+.screen__lead { color: var(--muted); font-size: var(--text-small); }
+.section { display: flex; flex-direction: column; align-items: stretch; gap: var(--space-3); width: 100%; min-width: 0; }
+.section + .section { margin-top: var(--space-3); padding-top: var(--space-7); border-top: var(--hairline) solid var(--line); }
+.section__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.section__title, .section__subtitle { color: var(--ink-strong); font-size: var(--text-section); font-weight: 650; letter-spacing: -0.01em; line-height: 1.3; }
+.section__eyebrow { color: var(--muted); font: 500 var(--text-label)/1.3 var(--font-mono); letter-spacing: var(--label-tracking); text-transform: uppercase; }
+.stack { display: flex; flex-direction: column; gap: var(--space-3); width: 100%; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); width: 100%; }
+.toolbar--framed { padding: var(--space-4); border: var(--hairline) solid var(--line); }
+.toolbar__spacer { flex: 1; }
+.bullets { margin: 0; padding: 0; list-style: none; }
+.bullets li { padding: var(--space-2) 0; border-top: var(--hairline) solid var(--line); }
+
+@media (max-width: 68.75rem) {
+  .shell__user-name { display: none; }
+}
+@media (max-width: 40rem) {
+  // On narrow screens the navigation moves above the content.
+  // Phones: stack the shell, let controls use the full width (360 px and up).
+  .frame__bar, .shell__header { min-height: 0; padding: var(--space-2) var(--space-3); }
+  .frame__bar .shell__prefs { width: 100%; margin: 0; justify-content: flex-end; }
+  .frame__main, .shell__main { padding: var(--space-4) var(--space-3) var(--space-8); }
+  .shell__header { display: grid; grid-template-columns: 1fr auto; row-gap: var(--space-2); }
+  .shell__brand { grid-column: 1; grid-row: 1; min-height: var(--control-height); margin-right: 0; padding-right: 0; border: 0; }
+  .shell__user { grid-column: 2; grid-row: 1; justify-self: end; margin: 0; }
+  .shell__user .button { min-height: var(--control-height-sm); }
+  .shell__context { grid-column: 1 / -1; grid-row: 2; }
+  .shell__prefs { grid-column: 1 / -1; grid-row: 3; justify-content: flex-end; margin: 0; }
+  .screen--narrow { margin-top: var(--space-4); padding: var(--space-5); }
+  .shell__body { display: block; min-width: 0; }
+  .shell__nav { position: sticky; z-index: 5; top: 0; width: 100%; padding: 0; border-right: 0; border-bottom: var(--hairline) solid var(--line); background: var(--bg); }
+  .shell__nav ul, .shell__nav ul + ul { display: flex; width: 100%; gap: 0; margin: 0; padding: 0; overflow-x: auto; border: 0; scroll-snap-type: x mandatory; }
+  .shell__nav li { flex: 0 0 auto; padding: 0; scroll-snap-align: start; }
+  .nav__item { width: auto; min-height: 40px; padding-inline: var(--space-3); white-space: nowrap; }
+  .shell__nav + .shell__main { margin: 0; }
+  .form--inline > * { flex: 1 1 100%; }
+  .shell__context > * { flex: 1 1 50%; min-width: 0; }
+}

@@ -3,10 +3,11 @@ import { Button } from "react-aria-components";
 import type { OrgMember, Page, WorkspaceMember, WorkspaceRole } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
+import { Badge } from "../components/Badge.tsx";
 import { NativeSelect } from "../components/ContextSelect.tsx";
 import { AppModal, ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
-import { ListStatus } from "../components/ListStatus.tsx";
+import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { RoleDialog } from "../components/RoleDialog.tsx";
 import { formatDateTime } from "../format.ts";
 import { useAction } from "../hooks.ts";
@@ -89,7 +90,7 @@ export function MembersScreen({
               <thead>
                 <tr>
                   <th scope="col">{t("Name")}</th>
-                  <th scope="col">{t("E-mail address")}</th>
+                  <th scope="col" className="col--optional">{t("E-mail address")}</th>
                   <th scope="col">{t("Role")}</th>
                   <th scope="col">{t("Joined")}</th>
                   <th scope="col">{t("Actions")}</th>
@@ -102,15 +103,15 @@ export function MembersScreen({
                   const self = member.user_id === scope.userId;
                   return (
                     <tr key={member.user_id}>
-                      <th scope="row">{member.display_name}</th>
-                      <td>{member.email}</td>
-                      <td>{names.orgRole(member.role)}</td>
-                      <td>{formatDateTime(language, member.joined_at)}</td>
-                      <td>
+                      <th scope="row">{member.display_name}<span className="cell__sub cell__sub--email">{member.email}</span></th>
+                      <td className="col--optional" data-label={t("E-mail address")}>{member.email}</td>
+                      <td data-label={t("Role")}><Badge>{names.orgRole(member.role)}</Badge></td>
+                      <td className="numeric" data-label={t("Joined")}>{formatDateTime(language, member.joined_at)}</td>
+                      <td data-label={t("Actions")}>
                         <div className="row-actions">
                           {roles.length > 0 && (
                             <Button
-                              className="button"
+                              className="button button--sm"
                               aria-label={t("Change role: {name}", { name: member.display_name })}
                               onPress={() => setDialog({ kind: "org-role", member })}
                             >
@@ -119,7 +120,7 @@ export function MembersScreen({
                           )}
                           {removable && (
                             <Button
-                              className="button"
+                              className="button button--danger-quiet button--sm"
                               aria-label={
                                 self
                                   ? t("Leave organization")
@@ -139,6 +140,7 @@ export function MembersScreen({
             </table>
           </div>
         )}
+        <LoadMoreButton list={orgMembers} />
       </section>
 
       <section className="section" aria-labelledby="ws-members-title">
@@ -167,7 +169,7 @@ export function MembersScreen({
                   <thead>
                     <tr>
                       <th scope="col">{t("Name")}</th>
-                      <th scope="col">{t("E-mail address")}</th>
+                      <th scope="col" className="col--optional">{t("E-mail address")}</th>
                       <th scope="col">{t("Role")}</th>
                       <th scope="col">{t("Joined")}</th>
                       <th scope="col">{t("Actions")}</th>
@@ -180,15 +182,15 @@ export function MembersScreen({
                       const self = member.user_id === scope.userId;
                       return (
                         <tr key={member.user_id}>
-                          <th scope="row">{member.display_name}</th>
-                          <td>{member.email}</td>
-                          <td>{names.workspaceRole(member.role)}</td>
-                          <td>{formatDateTime(language, member.joined_at)}</td>
-                          <td>
+                          <th scope="row">{member.display_name}<span className="cell__sub cell__sub--email">{member.email}</span></th>
+                          <td className="col--optional" data-label={t("E-mail address")}>{member.email}</td>
+                          <td data-label={t("Role")}><Badge>{names.workspaceRole(member.role)}</Badge></td>
+                          <td className="numeric" data-label={t("Joined")}>{formatDateTime(language, member.joined_at)}</td>
+                          <td data-label={t("Actions")}>
                             <div className="row-actions">
                               {roles.length > 0 && (
                                 <Button
-                                  className="button"
+                                  className="button button--sm"
                                   aria-label={t("Change role in workspace: {name}", {
                                     name: member.display_name,
                                   })}
@@ -199,7 +201,7 @@ export function MembersScreen({
                               )}
                               {removable && (
                                 <Button
-                                  className="button"
+                                  className="button button--danger-quiet button--sm"
                                   aria-label={
                                     self
                                       ? t("Leave workspace")
@@ -221,6 +223,7 @@ export function MembersScreen({
                 </table>
               </div>
             )}
+              <LoadMoreButton list={wsMembers} />
           </>
         )}
       </section>
@@ -452,7 +455,7 @@ function AddWorkspaceMemberDialog({
   }
 
   return (
-    <AppModal title={t("Add to workspace")} onClose={onClose} busy={action.pending}>
+    <AppModal title={t("Add to workspace")} onClose={onClose} busy={action.pending} size="md">
       {loadError !== null && (
         <ErrorNotice error={loadError} onRetry={() => setAttempt((n) => n + 1)} onReload={() => setAttempt((n) => n + 1)} />
       )}
@@ -488,15 +491,15 @@ function AddWorkspaceMemberDialog({
       />
       {action.failed && <ErrorNotice error={action.error} onRetry={() => void submit()} />}
       <div className="form__actions">
+        <Button className="button" onPress={onClose} isDisabled={action.pending}>
+          {t("Cancel")}
+        </Button>
         <Button
           className="button button--primary"
           onPress={() => void submit()}
           isDisabled={action.pending || selected === ""}
         >
           {t("Add")}
-        </Button>
-        <Button className="button" onPress={onClose} isDisabled={action.pending}>
-          {t("Cancel")}
         </Button>
       </div>
     </AppModal>

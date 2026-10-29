@@ -44,7 +44,7 @@ export function RoleDialog<R extends string>({
   }
 
   return (
-    <AppModal title={title} onClose={onClose} busy={action.pending}>
+    <AppModal title={title} onClose={onClose} busy={action.pending} size="sm">
       <p>{who}</p>
       <NativeSelect
         label={t("Role")}
@@ -59,11 +59,11 @@ export function RoleDialog<R extends string>({
       />
       {action.failed && <ErrorNotice error={action.error} onRetry={() => void save()} onReload={onReload} />}
       <div className="form__actions">
-        <Button className="button button--primary" onPress={() => void save()} isDisabled={action.pending}>
-          {t("Save")}
-        </Button>
         <Button className="button" onPress={onClose} isDisabled={action.pending}>
           {t("Cancel")}
+        </Button>
+        <Button className="button button--primary" onPress={() => void save()} isDisabled={action.pending}>
+          {t("Save")}
         </Button>
       </div>
     </AppModal>

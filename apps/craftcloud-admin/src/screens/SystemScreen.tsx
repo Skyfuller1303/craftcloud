@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { Button } from "react-aria-components";
 import type { AdminHealth, HealthLevel, StorageBinding } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
+import { Badge } from "../components/Badge.tsx";
+import { Banner } from "../components/Banner.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Alert } from "../components/forms.tsx";
 import { formatBytes, formatDateTime } from "../format.ts";
@@ -56,9 +58,10 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
         </Button>
       </p>
       {state.status === "loading" && (
-        <p role="status" className="muted">
-          {t("Loading system status…")}
-        </p>
+        <>
+          <div className="progress progress--indeterminate" aria-hidden="true"><progress /></div>
+          <p role="status" className="muted">{t("Loading system status…")}</p>
+        </>
       )}
       {state.status === "error" && (
         <ErrorNotice error={state.error} onRetry={reload} onReload={reload} />
@@ -77,6 +80,12 @@ function HealthView({ health }: { health: AdminHealth }) {
     degraded: t("Degraded"),
     down: t("Down"),
     not_configured: t("Not configured"),
+  };
+  const tone = (value: HealthLevel) => {
+    if (value === "ok") return "good" as const;
+    if (value === "degraded") return "warn" as const;
+    if (value === "down") return "bad" as const;
+    return "neutral" as const;
   };
   const binding: Record<StorageBinding, string> = {
     matches: t("Paired with this database"),
@@ -112,21 +121,21 @@ function HealthView({ health }: { health: AdminHealth }) {
         <Alert>{t("At least one component is down. The server does not take traffic.")}</Alert>
       )}
       {maintenance.epoch_conflict && (
-        <Alert>
+        <Banner tone="warn" role="alert">
           {t(
             "The database and the object store disagree about their epoch, so a restore is suspected. Destructive maintenance is blocked. Verify the pairing, then run the storage-bind command described in the operations guide.",
           )}
-        </Alert>
+        </Banner>
       )}
+      <Banner tone={tone(health.status)}>
+        <Badge tone={tone(health.status)}>{level[health.status]}</Badge>
+      </Banner>
+      <div className="system-grid">
       <section className="section" aria-labelledby="system-overview-title">
         <h2 id="system-overview-title" className="section__title">
           {t("Overall status")}
         </h2>
         <dl className="facts">
-          <dt>{t("Status")}</dt>
-          <dd>
-            <span className={`status status--${health.status}`}>{level[health.status]}</span>
-          </dd>
           <dt>{t("Checked")}</dt>
           <dd>{formatDateTime(language, health.checked_at)}</dd>
           <dt>{t("Version")}</dt>
@@ -143,9 +152,9 @@ function HealthView({ health }: { health: AdminHealth }) {
         <dl className="facts">
           <dt>{t("Database")}</dt>
           <dd>
-            <span className={`status status--${components.database.status}`}>
+            <Badge tone={tone(components.database.status)}>
               {level[components.database.status]}
-            </span>
+            </Badge>
           </dd>
           <dt>{t("Database connections")}</dt>
           <dd>
@@ -157,15 +166,15 @@ function HealthView({ health }: { health: AdminHealth }) {
           </dd>
           <dt>{t("Database schema")}</dt>
           <dd>
-            <span className={`status status--${components.migrations.status}`}>
+            <Badge tone={tone(components.migrations.status)}>
               {level[components.migrations.status]}
-            </span>
+            </Badge>
           </dd>
           <dt>{t("Object storage")}</dt>
           <dd>
-            <span className={`status status--${components.storage.status}`}>
+            <Badge tone={tone(components.storage.status)}>
               {level[components.storage.status]}
-            </span>
+            </Badge>
           </dd>
           <dt>{t("Storage pairing")}</dt>
           <dd>{binding[components.storage.binding]}</dd>
@@ -239,6 +248,7 @@ function HealthView({ health }: { health: AdminHealth }) {
           </dd>
         </dl>
       </section>
+      </div>
     </>
   );
 }

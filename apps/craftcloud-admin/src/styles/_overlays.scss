@@ -1,0 +1,34 @@
+// Modal dialogs (React Aria ModalOverlay / Modal / Dialog).
+.overlay { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: var(--space-4); background: var(--scrim); }
+.modal { width: min(560px, 100%); max-height: calc(100vh - 32px); overflow: auto; border: var(--hairline) solid var(--line-strong); background: var(--bg); color: var(--ink); box-shadow: var(--shadow); }
+.modal--sm { width: min(440px, 100%); }
+.modal--md { width: min(560px, 100%); }
+.modal--lg { width: min(760px, 100%); }
+.modal__dialog { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-6); outline: none; }
+.modal__title { color: var(--ink-strong); font-size: var(--text-dialog); font-weight: 650; letter-spacing: -0.02em; line-height: 1.25; overflow-wrap: anywhere; }
+.modal__subtitle { color: var(--muted); font: 500 var(--text-label)/1.3 var(--font-mono); letter-spacing: var(--label-tracking); text-transform: uppercase; }
+.modal__actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-2); }
+.modal__actions > * { white-space: nowrap; }
+.modal__rule { border: 0; border-top: var(--hairline) solid var(--line); }
+
+.link-box { display: flex; flex-direction: column; gap: var(--space-3); width: 100%; padding: var(--space-4); border: var(--hairline) solid var(--line-strong); background: var(--sunken); }
+.link-box__row { display: flex; min-width: 0; }
+.link-box__row .field { flex: 1 1 auto; min-width: 0; }
+.link-box__row .field__input { border-right: 0; }
+.link-box__row .button { align-self: flex-end; }
+
+.toasts { position: fixed; right: 20px; bottom: 20px; z-index: 10; display: grid; gap: 6px; width: min(380px, calc(100vw - 32px)); }
+.toast { display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border: var(--hairline) solid var(--line-strong); background: var(--bg); color: var(--ink); box-shadow: var(--shadow); opacity: 1; transition: opacity var(--motion); }
+.toast--leaving { opacity: 0; }
+.toast__mark { flex: 0 0 6px; width: 6px; height: 6px; margin-top: 0.55em; background: var(--good); }
+.toast__dismiss { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 24px; height: 24px; margin-left: auto; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.toast__dismiss:hover { color: var(--ink-strong); }
+.icon { display: inline-block; flex: 0 0 auto; vertical-align: middle; }
+
+@media (max-width: 40rem) {
+  .overlay { place-items: end stretch; padding: 0; }
+  .modal { width: 100%; max-height: 90vh; border-width: 1px 0 0; }
+  .modal__dialog { padding: var(--space-5); }
+  .modal__actions { flex-direction: row; }
+  .toasts { right: 16px; bottom: 16px; width: calc(100vw - 32px); }
+}

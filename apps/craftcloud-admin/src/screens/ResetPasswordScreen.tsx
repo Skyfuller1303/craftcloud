@@ -93,7 +93,7 @@ export function ResetPasswordScreen({
       {tokenRejected ? (
         <>
           <Alert>{t("This reset link is not valid any more. Ask for a new one.")}</Alert>
-          <Button className="button" onPress={onFinished}>
+          <Button className="button button--primary" onPress={onFinished}>
             {t("Go to log in")}
           </Button>
         </>

@@ -3,9 +3,11 @@ import type { FormEvent } from "react";
 import { Button, Form } from "react-aria-components";
 import type { AuditEvent, AuditFilters, AuditResult, AuditSource, OrgMember, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
+import { Badge } from "../components/Badge.tsx";
+import { Banner } from "../components/Banner.tsx";
 import { NativeSelect } from "../components/ContextSelect.tsx";
 import { focusFirstInvalid } from "../components/forms.tsx";
-import { ListStatus } from "../components/ListStatus.tsx";
+import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatDateTime } from "../format.ts";
 import { useI18n } from "../i18n/index.tsx";
 import { canReadAudit } from "../permissions.ts";
@@ -175,9 +177,9 @@ export function ActivityScreen({
 
   return (
     <>
-      <p className="muted">
+      <Banner tone="info">
         {t("Events contain identifiers and codes only, never names, e-mail addresses or file contents.")}
-      </p>
+      </Banner>
       {isOperator && (
         <NativeSelect
           label={t("Log")}
@@ -199,7 +201,7 @@ export function ActivityScreen({
         <h2 id="activity-filter-title" className="section__title">
           {t("Filters")}
         </h2>
-        <Form className="form form--inline" onSubmit={apply} ref={form} validationBehavior="aria">
+        <Form className="form form--filters toolbar--framed" onSubmit={apply} ref={form} validationBehavior="aria">
           <NativeSelect
             label={t("Action")}
             value={draft.action}
@@ -274,24 +276,26 @@ export function ActivityScreen({
               </span>
             )}
           </label>
-          <Button type="submit" className="button button--primary">
-            {t("Apply filters")}
-          </Button>
-          <Button className="button" onPress={reset}>
-            {t("Reset filters")}
-          </Button>
+          <div className="form__actions">
+            <Button type="submit" className="button button--primary">
+              {t("Apply filters")}
+            </Button>
+            <Button className="button button--quiet" onPress={reset}>
+              {t("Reset filters")}
+            </Button>
+          </div>
         </Form>
       </section>
 
       <section className="section" aria-labelledby="activity-list-title">
-        <h2 id="activity-list-title" className="section__title">
-          {t("Events")}
-        </h2>
-        <p>
-          <a className="button" href={api.auditExportUrl(source, applied)} download>
+        <div className="section__head">
+          <h2 id="activity-list-title" className="section__title">
+            {t("Events")}
+          </h2>
+          <a className="button button--sm" href={api.auditExportUrl(source, applied)} download>
             {t("Export as NDJSON")}
           </a>
-        </p>
+        </div>
         <ListStatus
           list={events}
           empty={t("There are no matching events.")}
@@ -307,16 +311,16 @@ export function ActivityScreen({
                   <th scope="col">{t("Action")}</th>
                   <th scope="col">{t("Result")}</th>
                   <th scope="col">{t("Actor")}</th>
-                  <th scope="col">{t("Target")}</th>
-                  {!instanceView && <th scope="col">{t("Workspace")}</th>}
-                  <th scope="col">{t("Details")}</th>
-                  <th scope="col">{t("Request ID")}</th>
+                  <th scope="col" className="col--optional">{t("Target")}</th>
+                  {!instanceView && <th scope="col" className="col--optional">{t("Workspace")}</th>}
+                  <th scope="col" className="col--optional">{t("Details")}</th>
+                  <th scope="col" className="col--optional">{t("Request ID")}</th>
                 </tr>
               </thead>
               <tbody>
                 {events.items.map((event) => (
                   <tr key={event.id}>
-                    <th scope="row">
+                    <th scope="row" className="numeric">
                       {formatDateTime(language, event.created_at)}
                       {event.count > 1 && (
                         <>
@@ -330,29 +334,30 @@ export function ActivityScreen({
                         </>
                       )}
                     </th>
-                    <td className="hash nowrap">{event.action}</td>
-                    <td className="nowrap">{resultName[event.result]}</td>
-                    <td>
+                    <td className="hash nowrap" data-label={t("Action")}>{event.action}</td>
+                    <td className="nowrap" data-label={t("Result")}><Badge tone={event.result === "success" ? "good" : "bad"}>{resultName[event.result]}</Badge></td>
+                    <td data-label={t("Actor")}>
                       {event.actor_id === null ? t("System or unknown") : memberName(event.actor_id)}
                     </td>
-                    <td className="hash">
+                    <td className="hash col--optional" data-label={t("Target")}>
                       {event.target === null
-                        ? ""
+                        ? "—"
                         : `${event.target.type ?? ""} ${shortId(event.target.id)}`.trim()}
                     </td>
-                    {!instanceView && <td>{workspaceName(event.workspace_id)}</td>}
-                    <td className="hash">
+                    {!instanceView && <td className="col--optional" data-label={t("Workspace")}>{workspaceName(event.workspace_id)}</td>}
+                    <td className="hash col--optional" data-label={t("Details")}>
                       {Object.entries(event.details)
                         .map(([key, value]) => `${key}: ${String(value)}`)
-                        .join(", ")}
+                        .join(", ") || "—"}
                     </td>
-                    <td className="hash">{event.request_id ?? ""}</td>
+                    <td className="hash col--optional" data-label={t("Request ID")}>{event.request_id ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
+        <LoadMoreButton list={events} />
       </section>
     </>
   );

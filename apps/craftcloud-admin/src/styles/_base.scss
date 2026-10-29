@@ -1,0 +1,72 @@
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html {
+  min-width: 320px;
+  font-family: var(--font-body);
+  font-size: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-text-size-adjust: 100%;
+  scroll-padding-bottom: 100px;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-size: var(--text-body);
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+button, input, select, textarea { font: inherit; }
+h1, h2, h3, p { margin: 0; }
+ul { margin: 0; padding: 0; list-style: none; }
+[hidden] { display: none !important; }
+// Same rule that React Aria would inject as a <style> element (blocked by the CSP).
+[data-react-aria-pressable] { touch-action: pan-x pan-y pinch-zoom; }
+
+// Visible focus for every interactive element (WCAG 2.4.7, 2.4.11).
+:focus-visible {
+  outline: var(--focus-ring) solid var(--focus-ink);
+  outline-offset: 2px;
+}
+[tabindex="-1"]:focus { outline: none; }
+
+a { color: var(--accent-ink); text-decoration: underline; text-underline-offset: 2px; }
+a:hover { color: var(--ink-strong); }
+.muted { color: var(--muted); }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+.skip-link {
+  position: absolute;
+  left: var(--space-2);
+  top: -100px;
+  z-index: 50;
+  padding: var(--space-2) var(--space-3);
+  background: var(--invert-bg);
+  color: var(--invert-fg);
+  &:focus { top: var(--space-2); }
+}
+
+::selection { color: var(--invert-bg); background: var(--accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

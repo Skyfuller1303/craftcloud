@@ -3,10 +3,12 @@ import { Button, Checkbox } from "react-aria-components";
 import type { FileRecord, Project } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
+import { Badge } from "../components/Badge.tsx";
 import { ContextSelect } from "../components/ContextSelect.tsx";
 import { ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
-import { ListStatus } from "../components/ListStatus.tsx";
+import { Icon } from "../components/Icon.tsx";
+import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatBytes, formatDateTime } from "../format.ts";
 import { useAction } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
@@ -122,7 +124,7 @@ export function FilesScreen({
               </Button>
             )}
             <Checkbox className="checkbox" isSelected={showTrash} onChange={setShowTrash}>
-              <span className="checkbox__box" aria-hidden="true" />
+              <span className="checkbox__box" aria-hidden="true"><Icon name="check" size={12} /></span>
               {t("Show trash")}
             </Checkbox>
           </div>
@@ -142,7 +144,7 @@ export function FilesScreen({
                 <thead>
                   <tr>
                     <th scope="col">{t("Name")}</th>
-                    <th scope="col">{t("Format")}</th>
+                    <th scope="col" className="col--optional">{t("Format")}</th>
                     <th scope="col">{t("Size")}</th>
                     <th scope="col">{showTrash ? t("Deleted") : t("Updated")}</th>
                     <th scope="col">{t("Actions")}</th>
@@ -152,20 +154,20 @@ export function FilesScreen({
                   {files.items.map((file) => (
                     <tr key={file.id}>
                       <th scope="row">{file.name}</th>
-                      <td>
+                      <td className="hash col--optional" data-label={t("Format")}>
                         {file.app} · {file.format}
                       </td>
-                      <td>
+                      <td className="numeric" data-label={t("Size")}>
                         {file.head_version_id === null
-                          ? t("No content yet")
+                          ? <Badge>{t("No content yet")}</Badge>
                           : formatBytes(language, file.size_bytes)}
                       </td>
-                      <td>{formatDateTime(language, file.deleted_at ?? file.updated_at)}</td>
-                      <td>
+                      <td className="numeric" data-label={showTrash ? t("Deleted") : t("Updated")}>{formatDateTime(language, file.deleted_at ?? file.updated_at)}</td>
+                      <td data-label={t("Actions")}>
                         <div className="row-actions">
                           {!showTrash && file.head_version_id !== null && (
                             <a
-                              className="button"
+                              className="button button--sm"
                               href={api.downloadUrl(file.id)}
                               download
                               aria-label={t("Download {name}", { name: file.name })}
@@ -175,7 +177,7 @@ export function FilesScreen({
                           )}
                           {!showTrash && (
                             <Button
-                              className="button"
+                              className="button button--sm"
                               aria-label={t("Versions of {name}", { name: file.name })}
                               onPress={() => setVersionsOf(file)}
                             >
@@ -184,7 +186,7 @@ export function FilesScreen({
                           )}
                           {!showTrash && mayWrite && (
                             <Button
-                              className="button"
+                              className="button button--sm"
                               aria-label={t("Upload a new version of {name}", { name: file.name })}
                               onPress={() => setUploading({ kind: "new-version", file })}
                             >
@@ -193,7 +195,7 @@ export function FilesScreen({
                           )}
                           {!showTrash && mayWrite && (
                             <Button
-                              className="button"
+                              className="button button--danger-quiet button--sm"
                               aria-label={t("Move to trash: {name}", { name: file.name })}
                               onPress={() => setTrashing(file)}
                             >
@@ -202,7 +204,7 @@ export function FilesScreen({
                           )}
                           {showTrash && mayWrite && (
                             <Button
-                              className="button"
+                              className="button button--sm"
                               aria-label={t("Restore {name}", { name: file.name })}
                               isDisabled={restoreAction.pending}
                               onPress={() => {
@@ -228,6 +230,7 @@ export function FilesScreen({
           )}
         </>
       )}
+      {project !== null && <LoadMoreButton list={files} />}
 
       {uploading !== null && (
         <UploadDialog target={uploading} onChanged={files.refresh} onClose={() => setUploading(null)} />

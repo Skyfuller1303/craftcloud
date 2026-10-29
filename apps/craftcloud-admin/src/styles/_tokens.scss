@@ -20,12 +20,21 @@
   --control-border: rgb(16 16 20 / 58%);
   --accent: #2d81ff;
   --accent-ink: #1659c4;
+  // Original accessible focus color: launcher accent ink falls below 3:1 on the inverted surface.
+  --focus-ink: #1c60c5;
   --invert-bg: #101014;
   --invert-fg: #f2f1ee;
   --good: #0a7563;
   --warn: #8a5800;
   --bad: #b3261e;
+  --danger-fg: #ffffff;
   --shadow: 0 8px 24px rgb(0 0 0 / 14%);
+  --scrim: rgb(16 16 20 / 40%);
+  --tint-strength: 7%;
+  // Original accessible track: launcher hairline is too faint beside progress.
+  --progress-track: #c8c7c2;
+  // Original accessible progress color: blue launcher accent cannot reach 3:1 against a neutral track.
+  --progress-fill: #0045a8;
 }
 
 @mixin dark {
@@ -41,56 +50,69 @@
   --control-border: rgb(242 241 238 / 40%);
   --accent: #2d81ff;
   --accent-ink: #74aaff;
+  --focus-ink: #2d81ff;
   --invert-bg: #ffffff;
   --invert-fg: #0b0b0c;
   --good: #3fd6b8;
   --warn: #ffc14d;
   --bad: #ff6259;
+  --danger-fg: #0b0b0c;
   --shadow: 0 8px 24px rgb(0 0 0 / 55%);
+  --scrim: rgb(0 0 0 / 60%);
+  --tint-strength: 10%;
+  --progress-track: #45464a;
+  --progress-fill: #a9caff;
 }
 
 :root {
   @include light;
-
-  // Spacing and shape tokens: an own 4 px scale; square corners, hairlines.
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 40px;
+  // Spacing and shape tokens: an own 4 px scale; square corners, hairlines.
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
   --control-height: 34px; // control height of the launcher theme (CONTROL_H)
+  --control-height-sm: 28px;
+  --header-height: 48px;
+  --nav-width: 208px;
+  --row-height: 48px;
+  --head-row-height: 40px;
+  --content-max: 1280px;
+  --form-max: 560px;
+  --auth-card: 400px;
   --radius: 0;
   --hairline: 1px;
   --focus-ring: 2px;
-
   --font-body: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
-  --text-body: 0.9375rem;
-  --text-small: 0.8125rem;
-  --text-label: 0.6875rem; // 11 px label size of the launcher theme (HUD_SIZE)
-  --text-title: 1.5rem;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --text-body: 14px;
+  --text-small: 12.5px;
+  --text-label: 11px; // 11 px label size of the launcher theme (HUD_SIZE)
+  --text-button: 11px;
+  --text-badge: 10px;
+  --text-tag: 11px;
+  --text-code: 13px;
+  --text-title: 24px;
+  --text-section: 16px;
+  --text-dialog: 20px;
+  --table-row-min: var(--row-height);
   --label-tracking: 0.15em;
-
+  --button-tracking: 0.12em;
+  --badge-tracking: 0.1em;
   --motion: 120ms;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) {
-    @include dark;
-  }
+  :root:not([data-theme]) { @include dark; }
 }
 
-:root[data-theme="light"] {
-  @include light;
-}
-
-:root[data-theme="dark"] {
-  @include dark;
-}
+:root[data-theme="light"] { @include light; }
+:root[data-theme="dark"] { @include dark; }
 
 @media (prefers-reduced-motion: reduce) {
-  :root {
-    --motion: 0ms;
-  }
+  :root { --motion: 0ms; }
 }

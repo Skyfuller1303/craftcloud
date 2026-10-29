@@ -60,6 +60,8 @@ describe("members", () => {
     const select = within(dialog).getByRole("combobox", { name: "Role" });
     await user.selectOptions(select, "admin");
     await user.tab();
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.tab();
     expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Save" }));
     await user.keyboard("{Enter}");
 

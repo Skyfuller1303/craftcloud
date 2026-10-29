@@ -146,7 +146,8 @@ describe("upload", () => {
     const dialog = await chooseAndSubmit(user, file);
     expect((within(dialog).getByLabelText("File name") as HTMLInputElement).value).toBe("poster.png");
     expect(within(dialog).getByText(/Size: 5 MiB/)).toBeTruthy();
-    // Keyboard only from here: file input -> name -> app -> Upload.
+    // Keyboard only from here: file input -> name -> app -> Cancel -> Upload.
+    await user.tab();
     await user.tab();
     await user.tab();
     await user.tab();
@@ -387,7 +388,7 @@ describe("conflict on a new version (412 VERSION_CONFLICT)", () => {
     renderApp(fetch, { xhrFactory: fakeXhr(() => ({ body: { ...upload, state: "stored" } })).factory });
     const dialog = await reachConflict(user);
     const buttons = within(dialog).getAllByRole("button").map((b) => b.textContent);
-    expect(buttons).toEqual(["Keep both", "Overwrite", "Cancel"]);
+    expect(buttons).toEqual(["Cancel", "Overwrite", "Keep both"]);
     await waitFor(() => expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Keep both" })));
     await waitFor(() =>
       expect(screen.getByTestId("announcer").textContent).toContain("Somebody else saved a new version meanwhile"),
@@ -474,6 +475,8 @@ describe("conflict on a new version (412 VERSION_CONFLICT)", () => {
     renderApp(fetch, { xhrFactory: fakeXhr(() => ({ body: { ...upload, state: "stored" } })).factory });
     const dialog = await reachConflict(user);
     await waitFor(() => expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Keep both" })));
+    await user.tab(); // Cancel, first action in DOM order
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" }));
     await user.tab(); // Overwrite
     expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Overwrite" }));
     await user.keyboard("{Enter}");

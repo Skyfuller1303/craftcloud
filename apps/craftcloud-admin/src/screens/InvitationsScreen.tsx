@@ -5,11 +5,12 @@ import { isApiError } from "../api/client.ts";
 import type { CreatedInvitation, Invitation, Workspace, WorkspaceRole } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
+import { Badge } from "../components/Badge.tsx";
 import { NativeSelect } from "../components/ContextSelect.tsx";
 import { ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Alert, Field, focusFirstInvalid } from "../components/forms.tsx";
-import { ListStatus } from "../components/ListStatus.tsx";
+import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatDateTime } from "../format.ts";
 import { useAction } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
@@ -110,7 +111,7 @@ export function InvitationsScreen({
                   <tr>
                     <th scope="col">{t("E-mail address")}</th>
                     <th scope="col">{t("Organization role")}</th>
-                    <th scope="col">{t("Workspace")}</th>
+                    <th scope="col" className="col--optional">{t("Workspace")}</th>
                     <th scope="col">{t("Status")}</th>
                     <th scope="col">{t("Expires")}</th>
                     <th scope="col">{t("Actions")}</th>
@@ -120,19 +121,19 @@ export function InvitationsScreen({
                   {invitations.items.map((invitation) => (
                     <tr key={invitation.id}>
                       <th scope="row">{invitation.email}</th>
-                      <td>{names.orgRole(invitation.org_role)}</td>
-                      <td>
+                      <td data-label={t("Organization role")}><Badge>{names.orgRole(invitation.org_role)}</Badge></td>
+                      <td className="col--optional" data-label={t("Workspace")}>
                         {workspaceName(invitation.workspace_id)}
                         {invitation.workspace_role !== null
                           ? ` · ${names.workspaceRole(invitation.workspace_role)}`
                           : ""}
                       </td>
-                      <td>{statusName[invitation.status]}</td>
-                      <td>{formatDateTime(language, invitation.expires_at)}</td>
-                      <td>
+                      <td data-label={t("Status")}><Badge tone={invitation.status === "accepted" ? "good" : invitation.status === "pending" ? "info" : invitation.status === "revoked" ? "bad" : "neutral"}>{statusName[invitation.status]}</Badge></td>
+                      <td className="numeric" data-label={t("Expires")}>{formatDateTime(language, invitation.expires_at)}</td>
+                      <td data-label={t("Actions")}>
                         {invitation.status === "pending" && (
                           <Button
-                            className="button"
+                            className="button button--danger-quiet button--sm"
                             aria-label={t("Revoke invitation for {email}", { email: invitation.email })}
                             onPress={() => setRevoking(invitation)}
                           >
@@ -146,6 +147,7 @@ export function InvitationsScreen({
               </table>
             </div>
           )}
+          <LoadMoreButton list={invitations} />
         </section>
       )}
 
@@ -247,7 +249,7 @@ function InviteForm({
   }
 
   return (
-    <Form className="form form--inline" onSubmit={(event) => void submit(event)} ref={form} validationBehavior="aria">
+    <Form className="form form--grid" onSubmit={(event) => void submit(event)} ref={form} validationBehavior="aria">
       <Field
         label={t("E-mail address")}
         name="invite-email"

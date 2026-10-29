@@ -131,7 +131,7 @@ export function UploadDialog({
 
   function working(step: Step, done = 0, total = 0) {
     update({ name: "working", step, done, total });
-    announce(stepLabel[step]);
+    announce(stepLabel[step], { toast: false });
   }
 
   /** Head the commit is based on: the one shown when the dialog opened, `null` for a new file. */
@@ -150,7 +150,7 @@ export function UploadDialog({
       const current = isApiError(error) ? error.details?.["current_version_id"] : undefined;
       if (isApiError(error) && error.status === 412 && typeof current === "string") {
         update({ name: "conflict", currentVersionId: current });
-        announce(t("Somebody else saved a new version meanwhile. Choose how to continue."));
+        announce(t("Somebody else saved a new version meanwhile. Choose how to continue."), { toast: false });
         return;
       }
       throw error;
@@ -379,11 +379,11 @@ export function UploadDialog({
             <p className="muted">{t("Size: {size}", { size: formatBytes(language, chosen.size) })}</p>
           )}
           <div className="form__actions">
-            <Button type="submit" className="button button--primary">
-              {t("Upload")}
-            </Button>
             <Button className="button" onPress={finish}>
               {t("Cancel")}
+            </Button>
+            <Button type="submit" className="button button--primary">
+              {t("Upload")}
             </Button>
           </div>
         </Form>
@@ -393,20 +393,22 @@ export function UploadDialog({
         <div className="stack">
           <p>{stepLabel[phase.step]}</p>
           {phase.total > 0 && (phase.step === "hashing" || phase.step === "uploading") && (
-            <>
-              <progress
-                className="progress"
-                max={phase.total}
-                value={phase.done}
-                aria-label={stepLabel[phase.step]}
-              />
-              <p className="muted">
+              <div className="progress">
+                <div className="progress__label">
+                  <span>{stepLabel[phase.step]}</span>
+                  <span className="progress__count">
                 {t("{done} of {total}", {
                   done: formatBytes(language, phase.done),
                   total: formatBytes(language, phase.total),
                 })}
-              </p>
-            </>
+                  </span>
+                </div>
+                <progress
+                  max={phase.total}
+                  value={phase.done}
+                  aria-label={stepLabel[phase.step]}
+                />
+              </div>
           )}
           <div className="form__actions">
             {/* While the version is being recorded the outcome is decided on the server; cancelling would only guess. */}
@@ -433,14 +435,14 @@ export function UploadDialog({
             <li>{t("Cancel: discard your upload.")}</li>
           </ul>
           <div className="form__actions">
-            <Button className="button button--primary" autoFocus onPress={() => void keepBoth()}>
-              {t("Keep both")}
+            <Button className="button" onPress={finish}>
+              {t("Cancel")}
             </Button>
             <Button className="button" onPress={() => void overwrite(phase.currentVersionId)}>
               {t("Overwrite")}
             </Button>
-            <Button className="button" onPress={finish}>
-              {t("Cancel")}
+            <Button className="button button--primary" autoFocus onPress={() => void keepBoth()}>
+              {t("Keep both")}
             </Button>
           </div>
         </div>
@@ -477,15 +479,15 @@ export function UploadDialog({
             }
           />
           <div className="form__actions">
+            <Button className="button" onPress={finish}>
+              {t("Close")}
+            </Button>
             {/* 400/422 body failures carry no retry in ErrorNotice, but sending the file again is the fix. */}
             {isApiError(phase.error) && RESTART_CODES.has(phase.error.code) && chosen !== null && (
               <Button className="button button--primary" onPress={() => void run(chosen)}>
                 {t("Try again")}
               </Button>
             )}
-            <Button className="button" onPress={finish}>
-              {t("Close")}
-            </Button>
           </div>
         </div>
       )}

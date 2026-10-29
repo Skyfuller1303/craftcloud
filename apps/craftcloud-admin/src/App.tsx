@@ -177,7 +177,11 @@ function Screens({
       {framed ? (
         <div className="frame">
           <header className="frame__bar">
-            <span className="shell__brand">{t("CraftCloud admin")}</span>
+            <span className="shell__brand">
+              <span className="visually-hidden">{t("CraftCloud admin")}</span>
+              <span aria-hidden="true" className="shell__brand-tag">CRAFTCLOUD</span>
+              <span aria-hidden="true" className="shell__brand-label">ADMIN</span>
+            </span>
             <Preferences theme={theme} onThemeChange={changeTheme} />
           </header>
           <main id="main" className="frame__main" tabIndex={-1}>

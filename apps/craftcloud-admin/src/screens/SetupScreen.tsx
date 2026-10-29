@@ -140,7 +140,7 @@ export function SetupScreen({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <div className="screen screen--narrow">
+    <div className="screen screen--narrow screen--setup">
       <ScreenHeading>{t("Set up CraftCloud")}</ScreenHeading>
       <p className="screen__lead">
         {t("Create the first operator account and organization. The setup token is in the secret file that the server operator configured.")}
@@ -183,6 +183,7 @@ export function SetupScreen({ onDone }: { onDone: () => void }) {
           onChange={setPassword}
           error={errors.password}
         />
+        <hr className="form__rule" />
         <Field
           label={t("Organization name")}
           name="organization_name"

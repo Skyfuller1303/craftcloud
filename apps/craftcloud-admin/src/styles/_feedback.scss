@@ -1,0 +1,62 @@
+// ---- Messages and facts -------------------------------------------------
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  width: 100%;
+  padding: 10px var(--space-4);
+  border: var(--hairline) solid var(--line-strong);
+  background: var(--sunken);
+  color: var(--ink);
+}
+.banner::before { content: ""; flex: 0 0 6px; width: 6px; height: 6px; margin-top: 0.55em; background: var(--line-strong); }
+.banner--neutral { border-color: var(--line-strong); background: var(--sunken); }
+.banner--bad { border-color: color-mix(in srgb, var(--bad) 60%, transparent); background: color-mix(in srgb, var(--bad) var(--tint-strength), var(--bg)); }
+.banner--bad::before { background: var(--bad); }
+.banner--good { border-color: color-mix(in srgb, var(--good) 60%, transparent); background: color-mix(in srgb, var(--good) var(--tint-strength), var(--bg)); }
+.banner--good::before { background: var(--good); }
+.banner--info { border-color: color-mix(in srgb, var(--accent) 60%, transparent); background: color-mix(in srgb, var(--accent) var(--tint-strength), var(--bg)); }
+.banner--info::before { background: var(--accent); }
+.banner--warn { border-color: color-mix(in srgb, var(--warn) 60%, transparent); background: color-mix(in srgb, var(--warn) var(--tint-strength), var(--bg)); }
+.banner--warn::before { background: var(--warn); }
+.banner__content { min-width: 0; }
+.banner__title { display: block; margin-bottom: var(--space-1); color: var(--ink-strong); font-weight: 600; }
+.banner__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-left: auto; }
+.error-notice { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; }
+.error-notice__actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+.empty { padding: var(--space-8) var(--space-4); border: var(--hairline) solid var(--line); background: var(--bg); color: var(--muted); font: 500 var(--text-label)/1.3 var(--font-mono); letter-spacing: var(--label-tracking); text-align: center; text-transform: uppercase; }
+.empty__text { margin: 0; color: inherit; font: inherit; }
+.empty__action { margin-top: var(--space-3); }
+.list-status { display: flex; flex-direction: column; align-items: center; gap: var(--space-4); width: 100%; }
+.list-status__loading { width: 100%; }
+.list-status__more { margin: var(--space-4) auto 0; }
+.progress { display: flex; flex-direction: column; gap: var(--space-2); width: 100%; }
+.progress__label { display: flex; justify-content: space-between; gap: var(--space-3); color: var(--muted); font-size: var(--text-small); }
+.progress__count { font-variant-numeric: tabular-nums; }
+.progress progress, progress.progress { appearance: none; display: block; width: 100%; height: 4px; border: 0; background: var(--progress-track); color: var(--progress-fill); }
+.progress progress::-webkit-progress-bar, progress.progress::-webkit-progress-bar { background: var(--progress-track); }
+.progress progress::-webkit-progress-value, progress.progress::-webkit-progress-value { background: var(--progress-fill); }
+.progress progress::-moz-progress-bar, progress.progress::-moz-progress-bar { background: var(--progress-fill); }
+.progress--indeterminate { position: relative; height: 4px; overflow: hidden; background: var(--progress-track); }
+.progress--indeterminate > progress { position: absolute; inset: 0; height: 4px; opacity: 0; }
+.progress--indeterminate::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 30%; background: var(--progress-fill); animation: progress-slide 1.25s linear infinite; }
+@keyframes progress-slide { from { transform: translateX(-100%); } to { transform: translateX(333%); } }
+
+.steps { display: grid; gap: var(--space-1); }
+.steps li { display: flex; align-items: center; gap: var(--space-2); min-height: 24px; }
+.steps li::before { content: ""; width: 6px; height: 6px; background: var(--line-strong); }
+.steps [data-state="complete"] { color: var(--muted); }
+.steps [data-state="complete"]::before { background: var(--good); }
+.steps [data-state="current"] { color: var(--ink-strong); }
+.steps [data-state="current"]::before { background: var(--accent); }
+.steps [data-state="error"]::before { background: var(--bad); }
+
+@media (prefers-reduced-motion: reduce) {
+  .progress--indeterminate::after { animation: none; transform: none; }
+}
+
+@media (max-width: 40rem) {
+  .banner { flex-wrap: wrap; }
+  .banner__actions { width: 100%; margin-left: 0; }
+}

@@ -7,6 +7,7 @@ import {
   Select,
   SelectValue,
 } from "react-aria-components";
+import { Icon } from "./Icon.tsx";
 
 export interface Choice {
   id: string;
@@ -45,13 +46,14 @@ export function ContextSelect({
       <Button className="select__button">
         <SelectValue className="select__value" />
         <span aria-hidden="true" className="select__chevron">
-          ▾
+          <Icon name="chevron-down" />
         </span>
       </Button>
       <Popover className="select__popover">
         <ListBox className="select__list">
           {choices.map((choice) => (
             <ListBoxItem key={choice.id} id={choice.id} textValue={choice.label} className="select__item">
+              <span className="select__item-check" aria-hidden="true"><Icon name="check" size={12} /></span>
               {choice.label}
             </ListBoxItem>
           ))}
@@ -76,17 +78,20 @@ export function NativeSelect({
   return (
     <label className="select">
       <span className="select__label">{label}</span>
-      <select
-        className="select__native"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        {options.map((option) => (
-          <option key={option.id} value={option.id}>
-            {option.label}
-          </option>
-        ))}
-      </select>
+      <span className="select__control">
+        <select
+          className="select__native"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {options.map((option) => (
+            <option key={option.id} value={option.id}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <span aria-hidden="true" className="select__native-icon"><Icon name="chevron-down" size={12} /></span>
+      </span>
     </label>
   );
 }

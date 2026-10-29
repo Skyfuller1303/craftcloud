@@ -86,7 +86,9 @@ describe("login", () => {
     const user = userEvent.setup();
     renderApp(fetch);
     await fillLogin(user);
-    expect(await screen.findByText("Ada Example")).toBeTruthy();
+    expect(await screen.findAllByText("Ada Example")).toHaveLength(2);
+    const overview = await screen.findAllByRole("definition");
+    expect(overview[0]?.textContent).toContain("ada@example.test");
     const login = calls.find((c) => c.path === "/auth/login");
     expect(login?.body).toEqual({ email: "ada@example.test", password: "correct horse battery" });
     expect(JSON.stringify({ ...window.localStorage })).not.toMatch(/csrf|correct horse/);
@@ -237,28 +239,31 @@ describe("organization and workspace selectors", () => {
   it("selects the first organization and workspace and shows roles", async () => {
     const { fetch } = mockFetch(loggedInRoutes());
     renderApp(fetch);
-    expect(await screen.findByText(`${ORG_A.name} · Owner`)).toBeTruthy();
-    expect(await screen.findByText(`${WS_1.name} · Admin`)).toBeTruthy();
+    await waitFor(() => {
+      const definitions = screen.getAllByRole("definition");
+      expect(definitions[1]?.textContent).toContain(`${ORG_A.name}Owner`);
+      expect(definitions[2]?.textContent).toContain(`${WS_1.name}Admin`);
+    });
   });
 
   it("switches organization and workspace with the keyboard", async () => {
     const { fetch, calls } = mockFetch(loggedInRoutes());
     const user = userEvent.setup();
     renderApp(fetch);
-    await screen.findByText(`${WS_1.name} · Admin`);
+    await waitFor(() => expect(screen.getAllByRole("definition")[2]?.textContent).toContain(`${WS_1.name}Admin`));
 
     const workspaceButton = screen.getByRole("button", { name: /Workspace/ });
     workspaceButton.focus();
     await user.keyboard("{Enter}");
     const workspaceOption = await screen.findByRole("option", { name: WS_2.name });
     await user.click(workspaceOption);
-    expect(await screen.findByText(`${WS_2.name} · Viewer`)).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByRole("definition")[2]?.textContent).toContain(`${WS_2.name}Viewer`));
 
     const orgButton = screen.getByRole("button", { name: /Organization/ });
     orgButton.focus();
     await user.keyboard("{Enter}");
     await user.click(await screen.findByRole("option", { name: ORG_B.name }));
-    expect(await screen.findByText(`${ORG_B.name} · Member`)).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByRole("definition")[1]?.textContent).toContain(`${ORG_B.name}Member`));
     expect(await screen.findByText("This organization has no workspace you can see.")).toBeTruthy();
     expect(calls.some((c) => c.path === `/organizations/${ORG_B.id}/workspaces`)).toBe(true);
   });
@@ -397,8 +402,13 @@ describe("language and theme", () => {
   it("translates role names", async () => {
     const { fetch } = mockFetch(loggedInRoutes());
     renderApp(fetch, { language: "de" });
-    expect(await screen.findByText(`${ORG_A.name} · Eigentümer`)).toBeTruthy();
-    expect(await screen.findByText(`${WS_1.name} · Administrator`)).toBeTruthy();
+    await waitFor(() => {
+      const definitions = screen.getAllByRole("definition");
+      expect(definitions[1]?.textContent).toContain(ORG_A.name);
+      expect(definitions[1]?.textContent).toContain("Eigentümer");
+      expect(definitions[2]?.textContent).toContain(WS_1.name);
+      expect(definitions[2]?.textContent).toContain("Administrator");
+    });
   });
 
   it("renders error messages in German", async () => {
@@ -442,7 +452,8 @@ describe("invitation", () => {
     await user.type(screen.getByLabelText("Password"), "a long enough password");
     await user.click(screen.getByRole("button", { name: "Accept invitation" }));
     expect(await screen.findByText("Invitation accepted.")).toBeTruthy();
-    expect(await screen.findByText(`${ORG_B.name} · Member`)).toBeTruthy();
+    const definitions = await screen.findAllByRole("definition");
+    expect(definitions[1]?.textContent).toContain(`${ORG_B.name}Member`);
     expect(calls.find((c) => c.path === "/invitations/accept")?.body).toEqual({
       token: INVITE,
       display_name: "New Person",
@@ -541,7 +552,7 @@ describe("accessibility (axe-core)", () => {
     const { fetch } = mockFetch(loggedInRoutes());
     const user = userEvent.setup();
     renderApp(fetch, { language: "de" });
-    await screen.findByText(`${WS_1.name} · Administrator`);
+    await waitFor(() => expect(screen.getAllByRole("definition")[2]?.textContent).toContain(`${WS_1.name}Administrator`));
     await expectNoAxeViolations();
     await user.click(screen.getByRole("button", { name: /Organisation/ }));
     await screen.findByRole("option", { name: ORG_B.name });

@@ -6,8 +6,9 @@ import { describe, expect, it } from "vitest";
 // there. This test computes WCAG 2.2 contrast ratios straight from the tokens.
 
 type Rgb = [number, number, number];
+type Color = { rgb: Rgb; alpha: number };
 
-function parseColor(value: string): { rgb: Rgb; alpha: number } {
+function parseColor(value: string): Color {
   const hex = /^#([0-9a-f]{6})$/i.exec(value);
   if (hex?.[1] !== undefined) {
     const n = parseInt(hex[1], 16);
@@ -30,15 +31,18 @@ function mixinTokens(source: string, name: "light" | "dark"): Record<string, str
   return tokens;
 }
 
-function over(foreground: string, background: Rgb): Rgb {
-  const { rgb, alpha } = parseColor(foreground);
-  return rgb.map((c, i) => c * alpha + (background[i] ?? 0) * (1 - alpha)) as Rgb;
+function over(foreground: Color, background: Rgb): Rgb {
+  return foreground.rgb.map((c, i) => c * foreground.alpha + (background[i] ?? 0) * (1 - foreground.alpha)) as Rgb;
+}
+
+function mix(color: Rgb, background: Rgb, percent: number): Rgb {
+  return color.map((c, i) => c * percent + (background[i] ?? 0) * (1 - percent)) as Rgb;
 }
 
 function luminance([r, g, b]: Rgb): number {
   const lin = (c: number) => {
     const s = c / 255;
-    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
   };
   return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
 }
@@ -52,27 +56,65 @@ const scss = readFileSync(new URL("./_tokens.scss", import.meta.url), "utf8");
 
 describe.each(["light", "dark"] as const)("%s theme contrast", (name) => {
   const tokens = mixinTokens(scss, name);
-  const solid = (key: string, onto: Rgb) => over(tokens[key] ?? "", onto);
-  const surfaces = ["bg", "sunken"] as const;
+  const color = (key: string) => parseColor(tokens[key] ?? "");
+  const solid = (key: string, onto: Rgb = [0, 0, 0]) => over(color(key), onto);
+  const bg = solid("bg");
+  const sunken = solid("sunken");
+  const textPair = (foreground: string, background: Rgb, label: string) => {
+    const ratio = contrast(solid(foreground, background), background);
+    expect(ratio, `${foreground} on ${label} (${name}): ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(4.5);
+  };
 
-  it.each(surfaces)("body, muted and status text reach 4.5:1 on %s", (surface) => {
-    const background = solid(surface, [0, 0, 0]);
-    for (const key of ["ink", "ink-strong", "muted", "accent-ink", "good", "warn", "bad"]) {
-      const ratio = contrast(solid(key, background), background);
-      expect(ratio, `${key} on ${surface} (${name}): ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(4.5);
+  it("body, heading, and muted text reach 4.5:1 on their documented surfaces", () => {
+    for (const key of ["ink", "ink-strong", "muted"]) textPair(key, bg, "bg");
+    for (const key of ["ink", "muted"]) textPair(key, sunken, "sunken");
+  });
+
+  it("primary and danger button text reach 4.5:1", () => {
+    expect(contrast(solid("invert-fg"), solid("invert-bg"))).toBeGreaterThanOrEqual(4.5);
+    const ratio = contrast(solid("danger-fg"), solid("bad"));
+    expect(ratio, `danger-fg on bad (${name}): ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("danger button hover and pressed text reach 4.5:1", () => {
+    for (const background of [bg, sunken]) {
+      const danger = solid("bad", background);
+      for (const strength of [0.85, 0.9]) {
+        const state = mix(danger, background, strength);
+        expect(contrast(solid("danger-fg", state), state)).toBeGreaterThanOrEqual(4.5);
+      }
     }
   });
 
-  it("primary button text reaches 4.5:1", () => {
-    const ratio = contrast(solid("invert-fg", [0, 0, 0]), solid("invert-bg", [0, 0, 0]));
-    expect(ratio).toBeGreaterThanOrEqual(4.5);
+  it("badge tones reach 4.5:1 on sunken", () => {
+    for (const key of ["good", "warn", "bad", "accent-ink", "muted"]) textPair(key, sunken, "sunken");
   });
 
-  it.each(surfaces)("control borders and the focus ring reach 3:1 on %s (WCAG 1.4.11)", (surface) => {
-    const background = solid(surface, solid("bg", [0, 0, 0]));
-    for (const key of ["control-border", "accent-ink"]) {
-      const ratio = contrast(solid(key, background), background);
-      expect(ratio, `${key} on ${surface} (${name}): ${ratio.toFixed(2)}`).toBeGreaterThanOrEqual(3);
+  it("links reach 4.5:1 on the page", () => textPair("accent-ink", bg, "bg"));
+
+  it.each(["accent", "good", "warn", "bad"] as const)("ink reaches 4.5:1 on the %s banner tint", (tone) => {
+    const strength = Number((tokens["tint-strength"] ?? "0%").replace("%", "")) / 100;
+    const tinted = mix(color(tone).rgb, bg, strength);
+    textPair("ink", tinted, `${tone} tint`);
+  });
+
+  it("control border reaches 3:1 on page and sunken surfaces", () => {
+    for (const [label, surface] of [["bg", bg], ["sunken", sunken]] as const) {
+      const border = solid("control-border", surface);
+      expect(contrast(border, surface), `control-border on ${label} (${name})`).toBeGreaterThanOrEqual(3);
     }
+  });
+
+  it("focus ring reaches 3:1 on light, sunken, and inverted surfaces", () => {
+    for (const surface of [bg, sunken, solid("invert-bg")]) {
+      const ring = solid("focus-ink", surface);
+      expect(contrast(ring, surface), `focus-ink (${name})`).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("progress fill reaches 3:1 against its track", () => {
+    const track = solid("progress-track", bg);
+    const fill = solid("progress-fill", track);
+    expect(contrast(fill, track), `progress-fill on track (${name})`).toBeGreaterThanOrEqual(3);
   });
 });
