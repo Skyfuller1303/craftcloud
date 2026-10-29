@@ -32,7 +32,9 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::pagination::{PageError, PageQuery, decode_time_cursor, encode_time_cursor};
+use crate::pagination::{
+    PageError, PageQuery, UserListQuery, decode_time_cursor, encode_time_cursor,
+};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::services::Services;
 use crate::session::AuthenticatedSession;
@@ -40,11 +42,11 @@ use crate::{ApiState, REQUEST_ID_HEADER, error_response};
 
 // ---- shared helpers --------------------------------------------------------
 
-fn rfc3339(time: OffsetDateTime) -> String {
+pub(crate) fn rfc3339(time: OffsetDateTime) -> String {
     time.format(&Rfc3339).unwrap_or_default()
 }
 
-fn db_failure(error: &DbError, headers: &HeaderMap, what: &str) -> Response {
+pub(crate) fn db_failure(error: &DbError, headers: &HeaderMap, what: &str) -> Response {
     tracing::error!(%error, "{what}");
     match error {
         DbError::Connection(_) => unavailable(headers, "AUTH_UNAVAILABLE"),
@@ -52,7 +54,7 @@ fn db_failure(error: &DbError, headers: &HeaderMap, what: &str) -> Response {
     }
 }
 
-fn not_found(headers: &HeaderMap) -> Response {
+pub(crate) fn not_found(headers: &HeaderMap) -> Response {
     error_response(
         StatusCode::NOT_FOUND,
         "NOT_FOUND",
@@ -61,7 +63,7 @@ fn not_found(headers: &HeaderMap) -> Response {
     )
 }
 
-fn forbidden(headers: &HeaderMap) -> Response {
+pub(crate) fn forbidden(headers: &HeaderMap) -> Response {
     error_response(
         StatusCode::FORBIDDEN,
         "FORBIDDEN",
@@ -70,11 +72,11 @@ fn forbidden(headers: &HeaderMap) -> Response {
     )
 }
 
-fn conflict(code: &str, message: &str, headers: &HeaderMap) -> Response {
+pub(crate) fn conflict(code: &str, message: &str, headers: &HeaderMap) -> Response {
     error_response(StatusCode::CONFLICT, code, message, headers)
 }
 
-fn page_error(error: PageError, headers: &HeaderMap) -> Response {
+pub(crate) fn page_error(error: PageError, headers: &HeaderMap) -> Response {
     match error {
         PageError::Limit => validation_failed(&["limit"], headers),
         PageError::Cursor => error_response(
@@ -87,7 +89,7 @@ fn page_error(error: PageError, headers: &HeaderMap) -> Response {
 }
 
 /// Structured audit event. Contains only identifiers and the outcome.
-fn audit(
+pub(crate) fn audit(
     headers: &HeaderMap,
     actor: Uuid,
     action: &str,
@@ -113,7 +115,7 @@ fn audit(
 
 /// Loads the policy actor from the database for this request. Nothing is
 /// cached, so a changed role applies to the very next request.
-async fn load_actor(
+pub(crate) async fn load_actor(
     services: &Services,
     user_id: Uuid,
     org_id: Option<Uuid>,
@@ -134,12 +136,12 @@ async fn load_actor(
 }
 
 /// Outcome of a policy check in a handler.
-enum Gate {
+pub(crate) enum Gate {
     Open(Permit),
     Closed(Response),
 }
 
-fn gate(
+pub(crate) fn gate(
     decision: Decision,
     headers: &HeaderMap,
     actor: Uuid,
@@ -160,7 +162,7 @@ fn gate(
     }
 }
 
-fn parse_id(raw: &str) -> Option<Uuid> {
+pub(crate) fn parse_id(raw: &str) -> Option<Uuid> {
     Uuid::parse_str(raw).ok()
 }
 
@@ -176,20 +178,21 @@ fn parse_etag(raw: &str) -> Option<i64> {
         .ok()
 }
 
-fn with_etag(mut response: Response, version: i64) -> Response {
+pub(crate) fn with_etag(mut response: Response, version: i64) -> Response {
     if let Some(value) = etag(version) {
         response.headers_mut().insert(header::ETAG, value);
     }
     response
 }
 
-fn org_json(org: &Organization, role: Option<OrgRole>) -> Value {
+pub(crate) fn org_json(org: &Organization, role: Option<OrgRole>) -> Value {
     json!({
         "id": org.id.to_string(),
         "slug": org.slug,
         "name": org.name,
         "role": role.map(OrgRole::as_str),
         "version": org.version,
+        "workspace_admin_invites_enabled": org.workspace_admin_invites_enabled,
         "created_at": rfc3339(org.created_at),
     })
 }
@@ -316,7 +319,8 @@ pub(crate) async fn get_org(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateOrgRequest {
-    name: String,
+    name: Option<String>,
+    workspace_admin_invites_enabled: Option<bool>,
 }
 
 pub(crate) async fn update_org(
@@ -372,9 +376,14 @@ pub(crate) async fn update_org(
     let Some(scope) = OrgScope::from_permit(&permit) else {
         return internal(&headers);
     };
-    let Ok(name) = DisplayName::parse(&request.name) else {
-        return validation_failed(&["name"], &headers);
+    let name = match request.name.as_deref().map(DisplayName::parse) {
+        Some(Ok(name)) => Some(name),
+        Some(Err(_)) => return validation_failed(&["name"], &headers),
+        None => None,
     };
+    if name.is_none() && request.workspace_admin_invites_enabled.is_none() {
+        return validation_failed(&["name", "workspace_admin_invites_enabled"], &headers);
+    }
     // Optimistic concurrency (ADR-0009): the version the client last saw.
     let Some(if_match) = headers.get(header::IF_MATCH) else {
         return error_response(
@@ -386,7 +395,15 @@ pub(crate) async fn update_org(
     };
     // An unparsable value can never match the current version.
     let expected = if_match.to_str().ok().and_then(parse_etag).unwrap_or(-1);
-    match tx.update_name(&scope, name.as_str(), expected).await {
+    match tx
+        .update_settings(
+            &scope,
+            name.as_ref().map(DisplayName::as_str),
+            request.workspace_admin_invites_enabled,
+            expected,
+        )
+        .await
+    {
         Ok(UpdateOutcome::Updated(org)) => {
             if let Err(error) = tx.commit().await {
                 return db_failure(&error, &headers, "organization update failed");
@@ -979,6 +996,85 @@ pub(crate) async fn list_all_orgs(
             json!({
                 "id": o.id.to_string(), "slug": o.slug, "name": o.name,
                 "member_count": o.member_count, "created_at": rfc3339(o.created_at),
+            })
+        })
+        .collect();
+    Json(json!({ "items": items, "next_cursor": next })).into_response()
+}
+
+/// Instance-level account metadata for the operator, including the provenance
+/// of invitation-created accounts (squatting remedy: disable the account).
+pub(crate) async fn list_all_users(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    query: Result<Query<UserListQuery>, QueryRejection>,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(response) = operator_gate(
+        &services,
+        &session,
+        Action::UserListAll,
+        "user.list_all",
+        None,
+        &headers,
+    )
+    .await
+    {
+        return *response;
+    }
+    let Ok(Query(query)) = query else {
+        return validation_failed(&["query"], &headers);
+    };
+    let (page, unverified) = match query.split() {
+        Ok(parts) => parts,
+        Err(_) => return validation_failed(&["unverified"], &headers),
+    };
+    let limit = match page.limit() {
+        Ok(limit) => limit,
+        Err(error) => return page_error(error, &headers),
+    };
+    // The cursor is bound to the filter, so it cannot be replayed for another one.
+    let scope = if unverified { "unverified" } else { "all" };
+    let after = match page
+        .cursor()
+        .map(|c| decode_time_cursor(c, "admin-users", scope))
+    {
+        Some(Ok(key)) => Some(key),
+        Some(Err(error)) => return page_error(error, &headers),
+        None => None,
+    };
+    let mut rows = match accounts::list_all(&services.pool, limit + 1, after, unverified).await {
+        Ok(rows) => rows,
+        Err(error) => return db_failure(&error, &headers, "account list failed"),
+    };
+    let next = if rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+        rows.last()
+            .map(|last| encode_time_cursor("admin-users", scope, last.created_at, last.id))
+    } else {
+        None
+    };
+    let items: Vec<_> = rows
+        .iter()
+        .map(|u| {
+            let origin = u.invitation_id.map(|invitation| {
+                json!({
+                    "organization_id": u.origin_organization_id.map(|id| id.to_string()),
+                    "invited_by_user_id": u.invited_by_user_id.map(|id| id.to_string()),
+                    "invitation_id": invitation.to_string(),
+                })
+            });
+            json!({
+                "id": u.id.to_string(),
+                "email": u.normalized_email,
+                "display_name": u.display_name,
+                "created_at": rfc3339(u.created_at),
+                "disabled": u.disabled_at.is_some(),
+                "email_verified": u.email_verified_at.is_some(),
+                "origin": origin,
             })
         })
         .collect();

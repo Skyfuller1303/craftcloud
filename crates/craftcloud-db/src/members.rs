@@ -127,8 +127,8 @@ pub enum RemoveOutcome {
 
 /// A membership transaction holding the organization row lock.
 pub struct OrgTx {
-    tx: Transaction<'static, Postgres>,
-    org_id: Uuid,
+    pub(crate) tx: Transaction<'static, Postgres>,
+    pub(crate) org_id: Uuid,
 }
 
 impl OrgTx {
@@ -182,7 +182,7 @@ impl OrgTx {
         Ok(role.as_deref().and_then(OrgRole::parse))
     }
 
-    fn check(&self, scope: &OrgScope, action: Action) -> Result<(), DbError> {
+    pub(crate) fn check(&self, scope: &OrgScope, action: Action) -> Result<(), DbError> {
         scope.require(action)?;
         if scope.org_id() == self.org_id {
             Ok(())
@@ -349,26 +349,31 @@ impl OrgTx {
         Ok(RemoveOutcome::Removed)
     }
 
-    /// Renames the organization if its version is still `expected_version`
-    /// (compare and set), under the same lock as membership changes.
+    /// Updates the organization's name and/or the workspace-admin invitation
+    /// setting if its version is still `expected_version` (compare and set),
+    /// under the same lock as membership changes.
     ///
     /// # Errors
     ///
     /// [`DbError::CheckViolation`] for an invalid name.
-    pub async fn update_name(
+    pub async fn update_settings(
         &mut self,
         scope: &OrgScope,
-        name: &str,
+        name: Option<&str>,
+        workspace_admin_invites_enabled: Option<bool>,
         expected_version: i64,
     ) -> Result<UpdateOutcome, DbError> {
         self.check(scope, Action::OrganizationUpdate)?;
         let updated = sqlx::query_as::<_, Organization>(
-            "UPDATE organizations SET name = $2, version = version + 1 \
-             WHERE id = $1 AND version = $3 \
-             RETURNING id, slug, name, owner_user_id, version, created_at",
+            "UPDATE organizations SET name = COALESCE($2, name), \
+                    workspace_admin_invites_enabled = COALESCE($3, workspace_admin_invites_enabled), \
+                    version = version + 1 \
+             WHERE id = $1 AND version = $4 \
+             RETURNING id, slug, name, owner_user_id, version, workspace_admin_invites_enabled, created_at",
         )
         .bind(self.org_id)
         .bind(name)
+        .bind(workspace_admin_invites_enabled)
         .bind(expected_version)
         .fetch_optional(&mut *self.tx)
         .await?;
@@ -384,6 +389,20 @@ impl OrgTx {
             Some(current_version) => UpdateOutcome::VersionMismatch { current_version },
             None => UpdateOutcome::Gone,
         })
+    }
+
+    /// The organization setting that lets workspace admins invite.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn workspace_admin_invites_enabled(&mut self) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT workspace_admin_invites_enabled FROM organizations WHERE id = $1",
+        )
+        .bind(self.org_id)
+        .fetch_one(&mut *self.tx)
+        .await?)
     }
 
     /// Commits the transaction and releases the lock.

@@ -13,6 +13,7 @@
 mod auth;
 mod client_ip;
 mod clock;
+mod invitations;
 mod orgs;
 mod pagination;
 mod ratelimit;
@@ -20,6 +21,7 @@ mod responses;
 mod services;
 mod session;
 mod setup;
+mod workspaces;
 
 pub use client_ip::ClientIp;
 pub use clock::{Clock, SystemClock};
@@ -118,7 +120,36 @@ pub fn router_with_services(
             "/api/v1/organizations/{org_id}/members/{user_id}",
             patch(orgs::change_role).delete(orgs::remove_member),
         )
+        .route(
+            "/api/v1/organizations/{org_id}/workspaces",
+            get(workspaces::list_workspaces).post(workspaces::create_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}",
+            get(workspaces::get_workspace).patch(workspaces::update_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/members",
+            get(workspaces::list_members).post(workspaces::add_member),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/members/{user_id}",
+            patch(workspaces::change_member_role).delete(workspaces::remove_member),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/invitations",
+            get(invitations::list_invitations).post(invitations::create_invitation),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/invitations/{invitation_id}",
+            delete(invitations::revoke_invitation),
+        )
+        .route(
+            "/api/v1/invitations/accept",
+            post(invitations::accept_invitation),
+        )
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
+        .route("/api/v1/admin/users", get(orgs::list_all_users))
         .route(
             "/api/v1/admin/users/{user_id}/disable",
             post(orgs::disable_user),

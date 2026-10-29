@@ -149,6 +149,8 @@ pub enum Action {
     OrganizationCreate,
     /// List organization metadata of the whole instance (operator).
     OrganizationListAll,
+    /// List the accounts of the instance (operator only; account metadata, no organization data).
+    UserListAll,
     /// List the members of an organization.
     MemberList,
     /// Add an existing user as member.
@@ -167,8 +169,26 @@ pub enum Action {
     PasswordResetVoid,
     /// Read a workspace.
     WorkspaceRead,
-    /// Manage a workspace.
+    /// Manage a workspace (rename).
     WorkspaceManage,
+    /// Create a workspace in an organization.
+    WorkspaceCreate,
+    /// List the workspaces of an organization that the actor can see.
+    WorkspaceList,
+    /// List the members of a workspace.
+    WorkspaceMemberList,
+    /// Add an organization member to a workspace.
+    WorkspaceMemberAdd,
+    /// Change a workspace member's role.
+    WorkspaceMemberChangeRole,
+    /// Remove a workspace member (or leave).
+    WorkspaceMemberRemove,
+    /// List the invitations of an organization.
+    InvitationList,
+    /// Create an invitation.
+    InvitationCreate,
+    /// Revoke an invitation.
+    InvitationRevoke,
 }
 
 impl Action {
@@ -180,8 +200,12 @@ impl Action {
             Self::OrganizationListOwn
             | Self::OrganizationRead
             | Self::OrganizationListAll
+            | Self::UserListAll
             | Self::MemberList
-            | Self::WorkspaceRead => false,
+            | Self::WorkspaceRead
+            | Self::WorkspaceList
+            | Self::WorkspaceMemberList
+            | Self::InvitationList => false,
             Self::OrganizationUpdate
             | Self::OrganizationCreate
             | Self::MemberAdd
@@ -191,17 +215,24 @@ impl Action {
             | Self::UserEnable
             | Self::PasswordResetIssue
             | Self::PasswordResetVoid
-            | Self::WorkspaceManage => true,
+            | Self::WorkspaceManage
+            | Self::WorkspaceCreate
+            | Self::WorkspaceMemberAdd
+            | Self::WorkspaceMemberChangeRole
+            | Self::WorkspaceMemberRemove
+            | Self::InvitationCreate
+            | Self::InvitationRevoke => true,
         }
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 25] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
         Action::OrganizationCreate,
         Action::OrganizationListAll,
+        Action::UserListAll,
         Action::MemberList,
         Action::MemberAdd,
         Action::MemberChangeRole,
@@ -212,6 +243,15 @@ impl Action {
         Action::PasswordResetVoid,
         Action::WorkspaceRead,
         Action::WorkspaceManage,
+        Action::WorkspaceCreate,
+        Action::WorkspaceList,
+        Action::WorkspaceMemberList,
+        Action::WorkspaceMemberAdd,
+        Action::WorkspaceMemberChangeRole,
+        Action::WorkspaceMemberRemove,
+        Action::InvitationList,
+        Action::InvitationCreate,
+        Action::InvitationRevoke,
     ];
 }
 
@@ -222,6 +262,28 @@ pub struct MemberTarget {
     pub user_id: Uuid,
     /// The member's current role.
     pub role: OrgRole,
+}
+
+/// The workspace member an action targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceMemberTarget {
+    /// The member's user id.
+    pub user_id: Uuid,
+    /// The member's current workspace role.
+    pub role: WorkspaceRole,
+}
+
+/// What an invitation grants (and who created it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvitationSpec {
+    /// Organization role granted (an invitation never grants `owner`).
+    pub org_role: OrgRole,
+    /// Workspace and workspace role granted, if any.
+    pub workspace: Option<(Uuid, WorkspaceRole)>,
+    /// The organization setting that lets workspace admins invite.
+    pub workspace_admin_invites_enabled: bool,
+    /// Who created the invitation (relevant for revoking).
+    pub created_by: Option<Uuid>,
 }
 
 /// What the action is applied to.
@@ -250,6 +312,25 @@ pub enum Resource {
         org_id: Uuid,
         /// The workspace.
         workspace_id: Uuid,
+    },
+    /// Membership data of a workspace.
+    WorkspaceMember {
+        /// The organization.
+        org_id: Uuid,
+        /// The workspace.
+        workspace_id: Uuid,
+        /// The existing member the action targets; `None` for adding, or if
+        /// the target is not a member.
+        target: Option<WorkspaceMemberTarget>,
+        /// The workspace role being assigned (add, change role).
+        role: Option<WorkspaceRole>,
+    },
+    /// Invitations of an organization. `spec` is `None` for listing.
+    Invitation {
+        /// The organization.
+        org_id: Uuid,
+        /// What the invitation grants.
+        spec: Option<InvitationSpec>,
     },
 }
 
@@ -316,6 +397,26 @@ fn role_in(actor: &Actor, org_id: Uuid) -> Option<OrgRole> {
         .map(|m| m.role)
 }
 
+/// Role of the actor in the given workspace, only if the loaded workspace
+/// membership is for that workspace.
+fn workspace_role_in(actor: &Actor, workspace_id: Uuid) -> Option<WorkspaceRole> {
+    actor
+        .workspace
+        .filter(|w| w.workspace_id == workspace_id)
+        .map(|w| w.role)
+}
+
+/// Who may manage a workspace's members.
+#[derive(Clone, Copy)]
+enum Manager {
+    /// Organization owner or admin.
+    Org,
+    /// Admin of this workspace.
+    Workspace,
+    /// Can see the workspace but not manage it.
+    None,
+}
+
 /// Decides whether `actor` may perform `action` on `resource`.
 ///
 /// Deny by default: a combination of action and resource kind that is not
@@ -329,6 +430,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
         (
             A::OrganizationCreate
             | A::OrganizationListAll
+            | A::UserListAll
             | A::UserDisable
             | A::UserEnable
             | A::PasswordResetIssue
@@ -463,6 +565,144 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                     Decision::Forbidden
                 }
                 (Some(OrgRole::Member), None) => Decision::Hidden,
+            }
+        }
+
+        // ---- workspace listing / creation ----
+        (A::WorkspaceList, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
+            Some(_) => allow(action, Some(*org_id)),
+            None => Decision::Hidden,
+        },
+        (A::WorkspaceCreate, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+            Some(OrgRole::Member) => Decision::Forbidden,
+            None => Decision::Hidden,
+        },
+
+        // ---- workspace members ----
+        (
+            A::WorkspaceMemberList
+            | A::WorkspaceMemberAdd
+            | A::WorkspaceMemberChangeRole
+            | A::WorkspaceMemberRemove,
+            Resource::WorkspaceMember {
+                org_id,
+                workspace_id,
+                target,
+                role,
+            },
+        ) => {
+            let ws_role = workspace_role_in(actor, *workspace_id);
+            let org_role = role_in(actor, *org_id);
+            // Visibility first: whoever cannot see the workspace gets 404.
+            let manager = match (org_role, ws_role) {
+                (None, _) | (Some(OrgRole::Member), None) => return Decision::Hidden,
+                (Some(OrgRole::Owner | OrgRole::Admin), _) => Manager::Org,
+                (Some(OrgRole::Member), Some(WorkspaceRole::Admin)) => Manager::Workspace,
+                (Some(OrgRole::Member), Some(_)) => Manager::None,
+            };
+            match action {
+                A::WorkspaceMemberList => allow(action, Some(*org_id)),
+                A::WorkspaceMemberAdd => match (manager, role) {
+                    (Manager::None, _) | (_, None) => Decision::Forbidden,
+                    (Manager::Org, Some(_)) => allow(action, Some(*org_id)),
+                    // A workspace admin assigns at most editor.
+                    (Manager::Workspace, Some(WorkspaceRole::Editor | WorkspaceRole::Viewer)) => {
+                        allow(action, Some(*org_id))
+                    }
+                    (Manager::Workspace, Some(WorkspaceRole::Admin)) => Decision::Forbidden,
+                },
+                A::WorkspaceMemberChangeRole => match (manager, target, role) {
+                    (Manager::None, _, _) => Decision::Forbidden,
+                    // Whether the target is a member is only revealed to managers.
+                    (_, None, _) => Decision::Hidden,
+                    (_, Some(_), None) => Decision::Forbidden,
+                    (Manager::Org, Some(_), Some(_)) => allow(action, Some(*org_id)),
+                    // Never touch workspace admins (also not oneself), never promote to admin.
+                    (Manager::Workspace, Some(t), Some(new_role)) => {
+                        if t.role != WorkspaceRole::Admin && *new_role != WorkspaceRole::Admin {
+                            allow(action, Some(*org_id))
+                        } else {
+                            Decision::Forbidden
+                        }
+                    }
+                },
+                A::WorkspaceMemberRemove => match (manager, target) {
+                    (Manager::None, None) => Decision::Forbidden,
+                    (Manager::None, Some(t)) => {
+                        // Leaving is allowed for everybody.
+                        if t.user_id == actor.user_id {
+                            allow(action, Some(*org_id))
+                        } else {
+                            Decision::Forbidden
+                        }
+                    }
+                    (_, None) => Decision::Hidden,
+                    (Manager::Org, Some(_)) => allow(action, Some(*org_id)),
+                    (Manager::Workspace, Some(t)) => {
+                        if t.role != WorkspaceRole::Admin || t.user_id == actor.user_id {
+                            allow(action, Some(*org_id))
+                        } else {
+                            Decision::Forbidden
+                        }
+                    }
+                },
+                _ => Decision::Forbidden,
+            }
+        }
+
+        // ---- invitations ----
+        (A::InvitationList, Resource::Invitation { org_id, .. }) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+            Some(OrgRole::Member) => Decision::Forbidden,
+            None => Decision::Hidden,
+        },
+        (A::InvitationCreate, Resource::Invitation { org_id, spec }) => {
+            let Some(spec) = spec else {
+                return Decision::Forbidden;
+            };
+            let org_role = role_in(actor, *org_id);
+            match org_role {
+                None => Decision::Hidden,
+                // Nobody invites an owner.
+                Some(_) if spec.org_role == OrgRole::Owner => Decision::Forbidden,
+                Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+                Some(OrgRole::Member) => {
+                    // A workspace admin of exactly the invited workspace, if the
+                    // organization allows it, inviting plain members up to editor.
+                    let allowed = spec.workspace_admin_invites_enabled
+                        && spec.org_role == OrgRole::Member
+                        && spec.workspace.is_some_and(|(ws, ws_role)| {
+                            workspace_role_in(actor, ws) == Some(WorkspaceRole::Admin)
+                                && matches!(ws_role, WorkspaceRole::Editor | WorkspaceRole::Viewer)
+                        });
+                    if allowed {
+                        allow(action, Some(*org_id))
+                    } else {
+                        Decision::Forbidden
+                    }
+                }
+            }
+        }
+        (A::InvitationRevoke, Resource::Invitation { org_id, spec }) => {
+            match (role_in(actor, *org_id), spec) {
+                (None, _) => Decision::Hidden,
+                (Some(OrgRole::Owner | OrgRole::Admin), Some(_)) => allow(action, Some(*org_id)),
+                // Unknown invitation: managers learn that (404), others get 403.
+                (Some(OrgRole::Owner | OrgRole::Admin), None) => Decision::Hidden,
+                // A workspace admin revokes only invitations they created for their workspace.
+                (Some(OrgRole::Member), Some(spec)) => {
+                    let own = spec.created_by == Some(actor.user_id);
+                    let ws_admin = spec.workspace.is_some_and(|(ws, _)| {
+                        workspace_role_in(actor, ws) == Some(WorkspaceRole::Admin)
+                    });
+                    if own && ws_admin {
+                        allow(action, Some(*org_id))
+                    } else {
+                        Decision::Forbidden
+                    }
+                }
+                (Some(OrgRole::Member), None) => Decision::Forbidden,
             }
         }
 
@@ -670,6 +910,7 @@ mod tests {
         for action in [
             Action::OrganizationCreate,
             Action::OrganizationListAll,
+            Action::UserListAll,
             Action::UserDisable,
             Action::UserEnable,
             Action::PasswordResetIssue,
@@ -863,6 +1104,7 @@ mod tests {
             Action::OrganizationUpdate,
             Action::OrganizationCreate,
             Action::OrganizationListAll,
+            Action::UserListAll,
             Action::MemberList,
             Action::MemberAdd,
             Action::MemberChangeRole,
@@ -873,6 +1115,15 @@ mod tests {
             Action::PasswordResetVoid,
             Action::WorkspaceRead,
             Action::WorkspaceManage,
+            Action::WorkspaceCreate,
+            Action::WorkspaceList,
+            Action::WorkspaceMemberList,
+            Action::WorkspaceMemberAdd,
+            Action::WorkspaceMemberChangeRole,
+            Action::WorkspaceMemberRemove,
+            Action::InvitationList,
+            Action::InvitationCreate,
+            Action::InvitationRevoke,
         ]
         .into_iter()
         .collect();
@@ -884,6 +1135,7 @@ mod tests {
                 | Action::OrganizationUpdate
                 | Action::OrganizationCreate
                 | Action::OrganizationListAll
+                | Action::UserListAll
                 | Action::MemberList
                 | Action::MemberAdd
                 | Action::MemberChangeRole
@@ -893,7 +1145,16 @@ mod tests {
                 | Action::PasswordResetIssue
                 | Action::PasswordResetVoid
                 | Action::WorkspaceRead
-                | Action::WorkspaceManage => {}
+                | Action::WorkspaceManage
+                | Action::WorkspaceCreate
+                | Action::WorkspaceList
+                | Action::WorkspaceMemberList
+                | Action::WorkspaceMemberAdd
+                | Action::WorkspaceMemberChangeRole
+                | Action::WorkspaceMemberRemove
+                | Action::InvitationList
+                | Action::InvitationCreate
+                | Action::InvitationRevoke => {}
             }
             assert!(
                 covered.contains(&action),
@@ -912,8 +1173,12 @@ mod tests {
                 Action::OrganizationListOwn,
                 Action::OrganizationRead,
                 Action::OrganizationListAll,
+                Action::UserListAll,
                 Action::MemberList,
-                Action::WorkspaceRead
+                Action::WorkspaceRead,
+                Action::WorkspaceList,
+                Action::WorkspaceMemberList,
+                Action::InvitationList
             ]
         );
     }
@@ -933,5 +1198,380 @@ mod tests {
         assert_eq!(OrgRole::parse("god"), None);
         assert_eq!(OrgRole::parse("Owner"), None);
         assert_eq!(WorkspaceRole::parse(""), None);
+    }
+
+    // ---- workspaces and invitations (PR-007) ----
+
+    fn ws_actor(org: Option<OrgRole>, ws: Option<WorkspaceRole>) -> Actor {
+        let mut a = actor(org, false);
+        a.workspace = ws.map(|role| WorkspaceMembership {
+            workspace_id: WS,
+            role,
+        });
+        a
+    }
+
+    fn wm(target: Option<(Uuid, WorkspaceRole)>, role: Option<WorkspaceRole>) -> Resource {
+        Resource::WorkspaceMember {
+            org_id: ORG,
+            workspace_id: WS,
+            target: target.map(|(user_id, role)| WorkspaceMemberTarget { user_id, role }),
+            role,
+        }
+    }
+
+    #[test]
+    fn workspace_listing_and_creation() {
+        let org_res = Resource::Organization { org_id: ORG };
+        check(Action::WorkspaceList, org_res, [H, Y, Y, Y]);
+        check(Action::WorkspaceCreate, org_res, [H, F, Y, Y]);
+    }
+
+    #[test]
+    fn workspace_member_visibility_and_listing() {
+        use WorkspaceRole::{Admin, Editor, Viewer};
+        let list = wm(None, None);
+        // Org owner/admin see every workspace, plain members only their own, others 404.
+        for org in [OrgRole::Owner, OrgRole::Admin] {
+            assert!(
+                can(
+                    &ws_actor(Some(org), None),
+                    Action::WorkspaceMemberList,
+                    &list
+                )
+                .is_allow()
+            );
+        }
+        assert_eq!(
+            can(
+                &ws_actor(Some(OrgRole::Member), None),
+                Action::WorkspaceMemberList,
+                &list
+            ),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(&ws_actor(None, None), Action::WorkspaceMemberList, &list),
+            Decision::Hidden
+        );
+        for ws in [Admin, Editor, Viewer] {
+            assert!(
+                can(
+                    &ws_actor(Some(OrgRole::Member), Some(ws)),
+                    Action::WorkspaceMemberList,
+                    &list
+                )
+                .is_allow()
+            );
+        }
+        // A workspace role without organization membership grants nothing.
+        assert_eq!(
+            can(
+                &ws_actor(None, Some(Admin)),
+                Action::WorkspaceMemberList,
+                &list
+            ),
+            Decision::Hidden
+        );
+    }
+
+    #[test]
+    fn workspace_admins_assign_at_most_editor_and_never_touch_other_admins() {
+        use WorkspaceRole::{Admin, Editor, Viewer};
+        let org_manager = ws_actor(Some(OrgRole::Admin), None);
+        let ws_admin = ws_actor(Some(OrgRole::Member), Some(Admin));
+        let editor = ws_actor(Some(OrgRole::Member), Some(Editor));
+        let viewer = ws_actor(Some(OrgRole::Member), Some(Viewer));
+
+        for role in [Admin, Editor, Viewer] {
+            let add = wm(None, Some(role));
+            assert!(
+                can(&org_manager, Action::WorkspaceMemberAdd, &add).is_allow(),
+                "{role:?}"
+            );
+            assert_eq!(
+                can(&ws_admin, Action::WorkspaceMemberAdd, &add).is_allow(),
+                role != Admin,
+                "{role:?}"
+            );
+            assert_eq!(
+                can(&editor, Action::WorkspaceMemberAdd, &add),
+                Decision::Forbidden
+            );
+            assert_eq!(
+                can(&viewer, Action::WorkspaceMemberAdd, &add),
+                Decision::Forbidden
+            );
+        }
+        // Change role: org managers anything; ws admin only among editor/viewer targets.
+        for target in [Admin, Editor, Viewer] {
+            for new_role in [Admin, Editor, Viewer] {
+                let res = wm(Some((OTHER, target)), Some(new_role));
+                assert!(can(&org_manager, Action::WorkspaceMemberChangeRole, &res).is_allow());
+                let allowed = target != Admin && new_role != Admin;
+                assert_eq!(
+                    can(&ws_admin, Action::WorkspaceMemberChangeRole, &res).is_allow(),
+                    allowed,
+                    "{target:?}->{new_role:?}"
+                );
+                assert_eq!(
+                    can(&editor, Action::WorkspaceMemberChangeRole, &res),
+                    Decision::Forbidden
+                );
+            }
+        }
+        // A workspace admin cannot change their own role either.
+        let me = wm(Some((ME, Admin)), Some(Editor));
+        assert_eq!(
+            can(&ws_admin, Action::WorkspaceMemberChangeRole, &me),
+            Decision::Forbidden
+        );
+        // Unknown target: managers 404, non-managers 403.
+        let unknown = wm(None, Some(Editor));
+        assert_eq!(
+            can(&org_manager, Action::WorkspaceMemberChangeRole, &unknown),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(&ws_admin, Action::WorkspaceMemberChangeRole, &unknown),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(&editor, Action::WorkspaceMemberChangeRole, &unknown),
+            Decision::Forbidden
+        );
+        // Remove.
+        for target in [Editor, Viewer] {
+            let res = wm(Some((OTHER, target)), None);
+            assert!(can(&ws_admin, Action::WorkspaceMemberRemove, &res).is_allow());
+            assert_eq!(
+                can(&editor, Action::WorkspaceMemberRemove, &res),
+                Decision::Forbidden
+            );
+        }
+        let other_admin = wm(Some((OTHER, Admin)), None);
+        assert_eq!(
+            can(&ws_admin, Action::WorkspaceMemberRemove, &other_admin),
+            Decision::Forbidden
+        );
+        assert!(can(&org_manager, Action::WorkspaceMemberRemove, &other_admin).is_allow());
+        // Everybody may leave a workspace.
+        for (a, role) in [(&ws_admin, Admin), (&editor, Editor), (&viewer, Viewer)] {
+            assert!(
+                can(
+                    a,
+                    Action::WorkspaceMemberRemove,
+                    &wm(Some((ME, role)), None)
+                )
+                .is_allow()
+            );
+        }
+        assert_eq!(
+            can(&editor, Action::WorkspaceMemberRemove, &wm(None, None)),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(&org_manager, Action::WorkspaceMemberRemove, &wm(None, None)),
+            Decision::Hidden
+        );
+    }
+
+    fn inv(org_role: OrgRole, workspace: Option<WorkspaceRole>, enabled: bool) -> Resource {
+        Resource::Invitation {
+            org_id: ORG,
+            spec: Some(InvitationSpec {
+                org_role,
+                workspace: workspace.map(|r| (WS, r)),
+                workspace_admin_invites_enabled: enabled,
+                created_by: Some(ME),
+            }),
+        }
+    }
+
+    #[test]
+    fn invitation_rights() {
+        use WorkspaceRole::{Admin, Editor, Viewer};
+        let owner = ws_actor(Some(OrgRole::Owner), None);
+        let admin = ws_actor(Some(OrgRole::Admin), None);
+        let ws_admin = ws_actor(Some(OrgRole::Member), Some(Admin));
+        let editor = ws_actor(Some(OrgRole::Member), Some(Editor));
+        let outsider = ws_actor(None, None);
+
+        for org_role in [OrgRole::Admin, OrgRole::Member] {
+            for ws in [None, Some(Admin), Some(Editor), Some(Viewer)] {
+                for a in [&owner, &admin] {
+                    assert!(can(a, Action::InvitationCreate, &inv(org_role, ws, true)).is_allow());
+                    // The org setting only restricts workspace admins.
+                    assert!(can(a, Action::InvitationCreate, &inv(org_role, ws, false)).is_allow());
+                }
+            }
+        }
+        // Nobody invites an owner.
+        for a in [&owner, &admin, &ws_admin] {
+            assert_eq!(
+                can(
+                    a,
+                    Action::InvitationCreate,
+                    &inv(OrgRole::Owner, None, true)
+                ),
+                Decision::Forbidden
+            );
+        }
+        // Workspace admin: member + own workspace + at most editor + setting on.
+        assert!(
+            can(
+                &ws_admin,
+                Action::InvitationCreate,
+                &inv(OrgRole::Member, Some(Editor), true)
+            )
+            .is_allow()
+        );
+        assert!(
+            can(
+                &ws_admin,
+                Action::InvitationCreate,
+                &inv(OrgRole::Member, Some(Viewer), true)
+            )
+            .is_allow()
+        );
+        for denied in [
+            inv(OrgRole::Member, Some(Editor), false), // setting off
+            inv(OrgRole::Member, Some(Admin), true),   // workspace admin role
+            inv(OrgRole::Admin, Some(Editor), true),   // org admin role
+            inv(OrgRole::Member, None, true),          // org-only invitation
+        ] {
+            assert_eq!(
+                can(&ws_admin, Action::InvitationCreate, &denied),
+                Decision::Forbidden,
+                "{denied:?}"
+            );
+        }
+        // Invitations for a different workspace than the actor administers.
+        let elsewhere = Resource::Invitation {
+            org_id: ORG,
+            spec: Some(InvitationSpec {
+                org_role: OrgRole::Member,
+                workspace: Some((Uuid::from_u128(77), Editor)),
+                workspace_admin_invites_enabled: true,
+                created_by: Some(ME),
+            }),
+        };
+        assert_eq!(
+            can(&ws_admin, Action::InvitationCreate, &elsewhere),
+            Decision::Forbidden
+        );
+        // Editors/plain members cannot invite; outsiders do not exist.
+        assert_eq!(
+            can(
+                &editor,
+                Action::InvitationCreate,
+                &inv(OrgRole::Member, Some(Viewer), true)
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &ws_actor(Some(OrgRole::Member), None),
+                Action::InvitationCreate,
+                &inv(OrgRole::Member, None, true)
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &outsider,
+                Action::InvitationCreate,
+                &inv(OrgRole::Member, None, true)
+            ),
+            Decision::Hidden
+        );
+        // Listing: owner/admin only.
+        let list = Resource::Invitation {
+            org_id: ORG,
+            spec: None,
+        };
+        check(Action::InvitationList, list, [H, F, Y, Y]);
+        // Revoking: managers any; a workspace admin only their own invitation of their workspace.
+        let own = inv(OrgRole::Member, Some(Editor), true);
+        assert!(can(&owner, Action::InvitationRevoke, &own).is_allow());
+        assert!(can(&ws_admin, Action::InvitationRevoke, &own).is_allow());
+        let foreign = Resource::Invitation {
+            org_id: ORG,
+            spec: Some(InvitationSpec {
+                created_by: Some(OTHER),
+                ..match own {
+                    Resource::Invitation { spec: Some(s), .. } => s,
+                    _ => unreachable!(),
+                }
+            }),
+        };
+        assert_eq!(
+            can(&ws_admin, Action::InvitationRevoke, &foreign),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(&editor, Action::InvitationRevoke, &own),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &owner,
+                Action::InvitationRevoke,
+                &Resource::Invitation {
+                    org_id: ORG,
+                    spec: None
+                }
+            ),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(
+                &ws_admin,
+                Action::InvitationRevoke,
+                &Resource::Invitation {
+                    org_id: ORG,
+                    spec: None
+                }
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(&outsider, Action::InvitationRevoke, &own),
+            Decision::Hidden
+        );
+    }
+
+    #[test]
+    fn workspace_and_invitation_actions_do_not_cross_organizations() {
+        let mut a = ws_actor(Some(OrgRole::Owner), Some(WorkspaceRole::Admin));
+        a.membership = Some(OrgMembership {
+            org_id: OTHER_ORG,
+            role: OrgRole::Owner,
+        });
+        for (action, resource) in [
+            (
+                Action::WorkspaceCreate,
+                Resource::Organization { org_id: ORG },
+            ),
+            (
+                Action::WorkspaceList,
+                Resource::Organization { org_id: ORG },
+            ),
+            (Action::WorkspaceMemberList, wm(None, None)),
+            (
+                Action::WorkspaceMemberAdd,
+                wm(None, Some(WorkspaceRole::Viewer)),
+            ),
+            (
+                Action::InvitationList,
+                Resource::Invitation {
+                    org_id: ORG,
+                    spec: None,
+                },
+            ),
+            (Action::InvitationCreate, inv(OrgRole::Member, None, true)),
+        ] {
+            assert_eq!(can(&a, action, &resource), Decision::Hidden, "{action:?}");
+        }
     }
 }

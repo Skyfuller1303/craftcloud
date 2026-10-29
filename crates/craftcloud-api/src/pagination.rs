@@ -28,6 +28,33 @@ pub(crate) struct PageQuery {
     cursor: Option<String>,
 }
 
+/// Query parameters of the operator's account listing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UserListQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+    unverified: Option<String>,
+}
+
+impl UserListQuery {
+    /// Paging parameters and the `unverified` filter (`true` or `false`).
+    pub(crate) fn split(self) -> Result<(PageQuery, bool), PageError> {
+        let unverified = match self.unverified.as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err(PageError::Limit),
+        };
+        Ok((
+            PageQuery {
+                limit: self.limit,
+                cursor: self.cursor,
+            },
+            unverified,
+        ))
+    }
+}
+
 /// Why paging parameters were rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageError {

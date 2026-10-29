@@ -38,11 +38,32 @@ Rollen: `owner > admin > member` (genau eine Rolle je Nutzer und Organisation, k
 | Owner anfassen (Rolle ändern, entfernen) oder zu `owner` befördern | 404 | 404 | 403 | **403** | ja (letzter *aktivierter* Owner: 409) |
 | Mitglied entfernen | 404 | 404 | nur sich selbst (Austritt) | member/admin, auch sich selbst | alle (letzter Owner: 409) |
 | Konto deaktivieren/aktivieren, Reset-Link ausstellen/widerrufen | ja (nicht den Operator selbst) | 403 | 403 | 403 | 403 |
-| Workspace lesen / verwalten (Routen mit PR-007) | 404 | 404 | nur mit Workspace-Rolle (`admin` verwaltet) | ja | ja |
+| Workspace lesen / verwalten | siehe Abschnitt PR-007 | 404 | nur mit Workspace-Rolle | ja | ja |
 
 Der „letzte Owner“ zählt nur aktive Mitgliedschaften mit aktiviertem Konto; ein deaktivierter Owner zählt nicht. Das Deaktivieren eines Kontos wird bewusst nie durch diese Regel blockiert (Sicherheitsreaktion), der Operator erhält die Liste der betroffenen Organisationen, und der Hostbetreiber stellt einen Owner mit `craftcloud-server admin set-org-owner` wieder her (Break-glass, siehe `docs/06-operations/deployment.md`). Ein `OrgScope` merkt sich die erlaubte Aktion: schreibende Repository-Funktionen verweigern einen Scope aus einer Lese-Aktion.
 
 Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (Tabellentests über alle Aktionen und Rollen) und `crates/craftcloud-api/tests/orgs.rs` (Isolation, Rollenregeln, Letzter-Owner-Race, CSRF, Ablauf).
+
+## Umgesetzt (PR-007): Workspaces und Einladungen
+
+Workspace-Rollen: `admin > editor > viewer`. Organisations-Owner und -Admins verwalten jeden Workspace ihrer Organisation und dürfen jede Workspace-Rolle vergeben; alle anderen sehen nur Workspaces, in denen sie Mitglied sind. Alles Unsichtbare antwortet 404 (identisch zu unbekannten IDs, auch organisationsübergreifend). Nur aktive, aktivierte Organisationsmitglieder können Workspace-Mitglied werden; Workspaces haben in P1 keine Löschroute (Lücke).
+
+| Aktion | Nicht-Mitglied / Operator ohne Mitgliedschaft | Org-`member` ohne Workspace-Rolle | viewer | editor | WS-admin | Org-admin / -owner |
+|---|---|---|---|---|---|---|
+| Workspace anlegen | 404 | 403 | – | – | – | ja |
+| Workspace lesen, Mitglieder listen | 404 | 404 | ja | ja | ja | ja |
+| Workspace umbenennen (If-Match) | 404 | 404 | 403 | 403 | ja | ja |
+| Mitglied hinzufügen / Rolle ändern | 404 | 404 | 403 | 403 | nur `editor`/`viewer`; nie einen WS-admin (auch nicht sich selbst) | jede Rolle |
+| Mitglied entfernen | 404 | 404 | nur sich selbst | nur sich selbst | `editor`/`viewer` und sich selbst | alle |
+| Einladung anlegen | 404 | 403 | 403 | 403 | nur Rolle `member`, nur eigener Workspace, höchstens `editor`, nur wenn `workspace_admin_invites_enabled` | `admin`/`member` (nie `owner`), optional jeder Workspace und jede Workspace-Rolle |
+| Einladungen listen | 404 | 403 | 403 | 403 | 403 | ja |
+| Einladung widerrufen | 404 | 403 | 403 | 403 | nur eigene | ja |
+| `workspace_admin_invites_enabled` ändern (`PATCH /organizations/{id}`) | 404 | 403 | 403 | 403 | 403 | ja |
+| Konten der Instanz mit Herkunft listen (`GET /admin/users`) | nur Operator (sonst 403) | 403 | 403 | 403 | 403 | 403 |
+
+Einladungen annehmen (`POST /invitations/accept`) ist die Tokenbesitz-Aktion: wer den Link hält, beweist (bis SMTP existiert) den Besitz der Adresse. Bei der Annahme wird die Berechtigung des **Einladenden** mit seinen aktuellen Rollen erneut ausgewertet (gleiche Policy wie beim Anlegen); wurde er herabgestuft, deaktiviert, entfernt, ist der Workspace weg oder der Schalter ausgeschaltet, antwortet die Annahme einheitlich 400 und die Einladung wird als ungültig markiert. Eine Einladung ändert nie die Organisationsrolle eines bestehenden Mitglieds und senkt nie eine vorhandene Workspace-Rolle.
+
+Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (Tabellentests) und `crates/craftcloud-api/tests/workspaces_invites.rs` (`workspace_member_role_matrix_including_workspace_admin_limits`, `workspaces_never_cross_organizations_and_swapped_ids_find_nothing`, `who_may_invite_what`, `stale_invitations_of_demoted_or_disabled_inviters_and_changed_settings_are_refused`, ...).
 
 ## Negativtests
 

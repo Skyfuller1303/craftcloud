@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::organizations::{AfterKey, clamp_page};
 
 /// What login needs to know about an account.
 #[derive(Debug, Clone, FromRow)]
@@ -32,6 +33,55 @@ pub struct Account {
     pub instance_role: Option<String>,
     /// Time the account was disabled, if it is.
     pub disabled_at: Option<OffsetDateTime>,
+}
+
+/// Instance-level account metadata for the operator. Contains no credentials
+/// and no organization data beyond the provenance of invitation-created
+/// accounts.
+#[derive(Debug, Clone, FromRow)]
+pub struct AccountSummary {
+    /// Account identifier.
+    pub id: Uuid,
+    /// Normalized e-mail address.
+    pub normalized_email: String,
+    /// Display name.
+    pub display_name: String,
+    /// Creation time.
+    pub created_at: OffsetDateTime,
+    /// Time the account was disabled, if it is.
+    pub disabled_at: Option<OffsetDateTime>,
+    /// Time the address was verified; `NULL` until a verification flow exists.
+    pub email_verified_at: Option<OffsetDateTime>,
+    /// Organization of the invitation that created the account.
+    pub origin_organization_id: Option<Uuid>,
+    /// User who created that invitation.
+    pub invited_by_user_id: Option<Uuid>,
+    /// Invitation that created the account.
+    pub invitation_id: Option<Uuid>,
+}
+
+/// Lists all accounts ordered by `(created_at, id)`, one page after `after`;
+/// with `unverified_only` only accounts without a verified address.
+/// Operator-only by policy.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn list_all(
+    pool: &PgPool,
+    limit: u32,
+    after: Option<AfterKey>,
+    unverified_only: bool,
+) -> Result<Vec<AccountSummary>, DbError> {
+    Ok(sqlx::query_as::<_, AccountSummary>(
+        "SELECT u.id, u.normalized_email, u.display_name, u.created_at, u.disabled_at,                 u.email_verified_at, i.org_id AS origin_organization_id,                 i.created_by_user_id AS invited_by_user_id,                 u.created_via_invitation_id AS invitation_id          FROM users u LEFT JOIN invitations i ON i.id = u.created_via_invitation_id          WHERE ($4::boolean = false OR u.email_verified_at IS NULL)            AND ($1::timestamptz IS NULL OR (u.created_at, u.id) > ($1::timestamptz, $2::uuid))          ORDER BY u.created_at, u.id LIMIT $3",
+    )
+    .bind(after.map(|(at, _)| at))
+    .bind(after.map(|(_, id)| id))
+    .bind(clamp_page(limit))
+    .bind(unverified_only)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Looks up the login record for a normalized e-mail address.

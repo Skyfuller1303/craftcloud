@@ -15,6 +15,7 @@
 
 pub mod accounts;
 mod error;
+pub mod invitations;
 pub mod members;
 pub mod migrate;
 pub mod organizations;

@@ -181,6 +181,18 @@ mod tests {
                 }),
                 role: Some(OrgRole::Admin),
             },
+            craftcloud_core::policy::Action::WorkspaceMemberAdd
+            | craftcloud_core::policy::Action::WorkspaceMemberChangeRole
+            | craftcloud_core::policy::Action::WorkspaceMemberRemove
+            | craftcloud_core::policy::Action::WorkspaceMemberList => Resource::WorkspaceMember {
+                org_id,
+                workspace_id: Uuid::new_v4(),
+                target: Some(craftcloud_core::policy::WorkspaceMemberTarget {
+                    user_id: Uuid::new_v4(),
+                    role: craftcloud_core::policy::WorkspaceRole::Viewer,
+                }),
+                role: Some(craftcloud_core::policy::WorkspaceRole::Viewer),
+            },
             craftcloud_core::policy::Action::WorkspaceManage
             | craftcloud_core::policy::Action::WorkspaceRead => Resource::Workspace {
                 org_id,
@@ -266,7 +278,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5]
+            vec![1, 2, 3, 4, 5, 6]
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -289,14 +301,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            5,
+            6,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -310,7 +322,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(
             migrate::verify(&db.pool).await,
-            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3, 4, 5])))
+            Err(DbError::Schema(SchemaProblem::Pending(vec![2, 3, 4, 5, 6])))
         );
 
         let (scope, owner) = legacy_org(&db.pool, "acme").await;
@@ -318,7 +330,7 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3, 4, 5]
+            vec![2, 3, 4, 5, 6]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -341,7 +353,7 @@ mod tests {
         // New tables are usable after the upgrade.
         workspaces::create(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
@@ -402,7 +414,7 @@ mod tests {
         let (scope, _) = org(&db.pool, "acme").await;
         let ws = workspaces::create(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
@@ -410,7 +422,7 @@ mod tests {
         let outsider = user(&db.pool, "outsider@example.test").await;
         let err = workspaces::add_member(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceMemberAdd),
             ws.id,
             outsider.id,
             WorkspaceRole::Viewer,
@@ -432,7 +444,7 @@ mod tests {
         .unwrap();
         workspaces::add_member(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceMemberAdd),
             ws.id,
             outsider.id,
             WorkspaceRole::Viewer,
@@ -441,7 +453,7 @@ mod tests {
         .unwrap();
         let again = workspaces::add_member(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceMemberAdd),
             ws.id,
             outsider.id,
             WorkspaceRole::Editor,
@@ -459,7 +471,7 @@ mod tests {
         let (scope_b, owner_b) = org(&db.pool, "org-b").await;
         let ws_a = workspaces::create(
             &db.pool,
-            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
@@ -467,7 +479,10 @@ mod tests {
         // owner_b is an org-b member, but ws_a belongs to org-a.
         let err = workspaces::add_member(
             &db.pool,
-            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(
+                &scope_b,
+                craftcloud_core::policy::Action::WorkspaceMemberAdd,
+            ),
             ws_a.id,
             owner_b.id,
             WorkspaceRole::Admin,
@@ -496,14 +511,14 @@ mod tests {
         let (scope_b, _) = org(&db.pool, "org-b").await;
         workspaces::create(
             &db.pool,
-            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
         .unwrap();
         let dup = workspaces::create(
             &db.pool,
-            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
@@ -512,7 +527,7 @@ mod tests {
         assert_eq!(dup.constraint(), Some("workspaces_org_slug_unique"));
         workspaces::create(
             &db.pool,
-            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
@@ -560,7 +575,7 @@ mod tests {
         let (scope, _) = org(&db.pool, "acme").await;
         let negative = workspaces::create(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
             &NewWorkspace {
                 quota_bytes: Some(-1),
                 ..new_ws("neg")
@@ -571,7 +586,7 @@ mod tests {
         assert_eq!(negative.constraint(), Some("workspaces_quota_non_negative"));
         workspaces::create(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
             &NewWorkspace {
                 quota_bytes: Some(0),
                 ..new_ws("zero")
@@ -583,7 +598,7 @@ mod tests {
         for bad_slug in ["Upper", "-lead", "has space", "", &"a".repeat(64)] {
             let err = workspaces::create(
                 &db.pool,
-                &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+                &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
                 &new_ws(bad_slug),
             )
             .await
@@ -615,14 +630,14 @@ mod tests {
         let (scope_b, _) = org(&db.pool, "org-b").await;
         let ws_a = workspaces::create(
             &db.pool,
-            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope_a, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("a-one"),
         )
         .await
         .unwrap();
         let ws_b = workspaces::create(
             &db.pool,
-            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope_b, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("b-one"),
         )
         .await
@@ -690,14 +705,14 @@ mod tests {
         let (scope, owner) = org(&db.pool, "acme").await;
         let ws = workspaces::create(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
         .unwrap();
         workspaces::add_member(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceMemberAdd),
             ws.id,
             owner.id,
             WorkspaceRole::Admin,
@@ -900,29 +915,35 @@ mod tests {
             .await
             .unwrap();
         let (scope, _) = legacy_org(&db.pool, "acme").await;
-        let ws = workspaces::create(
-            &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
-            &new_ws("main"),
+        // Created with raw SQL: the repository functions target the current schema.
+        let ws_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workspaces (id, org_id, slug, name) VALUES ($1, $2, 'main', 'Main')",
         )
+        .bind(ws_id)
+        .bind(scope.org_id())
+        .execute(&db.pool)
         .await
         .unwrap();
 
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3, 4, 5]
+            vec![3, 4, 5, 6]
         );
         migrate::verify(&db.pool).await.unwrap();
-        assert!(
-            workspaces::get(&db.pool, &scope, ws.id)
-                .await
-                .unwrap()
-                .is_some()
+        let ws = workspaces::get(&db.pool, &scope, ws_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ws.version, 1,
+            "existing workspaces start at version 1 after migration 0006"
         );
-        // Existing organizations start at version 1 after migration 0005.
+        // Existing organizations start at version 1 (0005) with the invite setting on (0006).
         let upgraded = organizations::get(&db.pool, &scope).await.unwrap().unwrap();
         assert_eq!(upgraded.version, 1);
+        assert!(upgraded.workspace_admin_invites_enabled);
         assert!(!setup::is_completed(&db.pool).await.unwrap());
     }
 
@@ -1433,14 +1454,14 @@ mod tests {
         .unwrap();
         let ws = workspaces::create(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
             &new_ws("main"),
         )
         .await
         .unwrap();
         workspaces::add_member(
             &db.pool,
-            &sc(&scope, craftcloud_core::policy::Action::WorkspaceManage),
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceMemberAdd),
             ws.id,
             member.id,
             WorkspaceRole::Editor,
@@ -1981,7 +2002,11 @@ mod tests {
         let mut tx = OrgTx::begin(&db.pool, org_id).await.unwrap().unwrap();
         // A read permit drives no write ...
         assert!(tx.add(&read, stranger.id, OrgRole::Member).await.is_err());
-        assert!(tx.update_name(&read, "Renamed", 1).await.is_err());
+        assert!(
+            tx.update_settings(&read, Some("Renamed"), None, 1)
+                .await
+                .is_err()
+        );
         // ... and neither does the permit of another write action.
         assert!(
             tx.add(&remove_scope, stranger.id, OrgRole::Member)
@@ -1993,7 +2018,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(tx.update_name(&add_scope, "Renamed", 1).await.is_err());
+        assert!(
+            tx.update_settings(&add_scope, Some("Renamed"), None, 1)
+                .await
+                .is_err()
+        );
         assert!(tx.remove(&add_scope, stranger.id).await.is_err());
         drop(tx);
         assert!(
@@ -2028,9 +2057,14 @@ mod tests {
         );
         assert!(tx.remove(&remove_scope, stranger.id).await.is_ok());
         assert!(
-            tx.update_name(&sc(&base, Action::OrganizationUpdate), "Renamed", 1)
-                .await
-                .is_ok()
+            tx.update_settings(
+                &sc(&base, Action::OrganizationUpdate),
+                Some("Renamed"),
+                None,
+                1
+            )
+            .await
+            .is_ok()
         );
         tx.commit().await.unwrap();
         assert!(organizations::get(&db.pool, &read).await.unwrap().is_some());

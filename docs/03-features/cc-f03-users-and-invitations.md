@@ -1,6 +1,6 @@
 # CC-F03 — Benutzerverwaltung und Einladungen
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
+> **Status:** Einladungen lokal umgesetzt (PR-007, Review offen): Link-Einladung (72 h, einmalig, widerrufbar, nur SHA-256 gespeichert, kein E-Mail-Versand), Annahme mit neuem oder bestehendem Konto, Neubewertung der Rechte des Einladenden bei der Annahme, Limits und Ratenbegrenzung. E-Mail-Verifikation und Versand (SMTP) sind offen (Lücke). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

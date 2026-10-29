@@ -31,6 +31,7 @@ pub(crate) enum IpClass {
     Login,
     Setup,
     Reset,
+    Accept,
 }
 
 /// Session, cookie and rate limit settings.
@@ -58,6 +59,8 @@ pub struct AuthSettings {
     pub ip_limit: u32,
     /// Password change attempts per `rate_window` and user.
     pub pwchange_limit: u32,
+    /// Invitations a user may create per `rate_window`.
+    pub invite_limit: u32,
     /// Window of the request rate limits.
     pub rate_window: Duration,
     /// Maximum number of tracked keys in each request rate limit table.
@@ -85,6 +88,7 @@ impl Default for AuthSettings {
             cookie_secure: true,
             ip_limit: 10,
             pwchange_limit: 5,
+            invite_limit: 30,
             rate_window: Duration::from_secs(60),
             rate_max_entries: 10_000,
             failed_login_pair_limit: 5,
@@ -119,7 +123,9 @@ pub struct Services {
     login_ip: WindowLimiter,
     setup_ip: WindowLimiter,
     reset_ip: WindowLimiter,
+    accept_ip: WindowLimiter,
     pwchange: WindowLimiter,
+    invite_create: WindowLimiter,
     guard: Arc<AccountGuard>,
     last_cleanup: AtomicI64,
 }
@@ -146,7 +152,9 @@ impl Services {
             login_ip: WindowLimiter::new(cap),
             setup_ip: WindowLimiter::new(cap),
             reset_ip: WindowLimiter::new(cap),
+            accept_ip: WindowLimiter::new(cap),
             pwchange: WindowLimiter::new(cap),
+            invite_create: WindowLimiter::new(cap),
             guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
         }
@@ -192,6 +200,7 @@ impl Services {
             IpClass::Login => &self.login_ip,
             IpClass::Setup => &self.setup_ip,
             IpClass::Reset => &self.reset_ip,
+            IpClass::Accept => &self.accept_ip,
         };
         limiter
             .check(
@@ -214,6 +223,22 @@ impl Services {
                 &user_id.to_string(),
                 self.now_secs(),
                 self.settings.pwchange_limit,
+                self.window_secs(),
+            )
+            .map_err(|retry| Self::too_many(retry, headers))
+    }
+
+    /// Per-user rate limit for creating invitations; counts the request.
+    pub(crate) fn rate_limit_invite(
+        &self,
+        user_id: Uuid,
+        headers: &HeaderMap,
+    ) -> Result<(), Box<Response>> {
+        self.invite_create
+            .check(
+                &user_id.to_string(),
+                self.now_secs(),
+                self.settings.invite_limit,
                 self.window_secs(),
             )
             .map_err(|retry| Self::too_many(retry, headers))

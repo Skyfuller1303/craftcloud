@@ -76,11 +76,14 @@ pub struct Organization {
     pub owner_user_id: Uuid,
     /// Optimistic concurrency version, incremented on every update.
     pub version: i64,
+    /// Whether workspace admins may invite people into their workspace.
+    pub workspace_admin_invites_enabled: bool,
     /// Creation time (UTC).
     pub created_at: OffsetDateTime,
 }
 
-const COLUMNS: &str = "id, slug, name, owner_user_id, version, created_at";
+const COLUMNS: &str =
+    "id, slug, name, owner_user_id, version, workspace_admin_invites_enabled, created_at";
 
 /// Creates an organization without membership (low-level helper for tests
 /// and tooling; the API uses [`create_with_owner`]).

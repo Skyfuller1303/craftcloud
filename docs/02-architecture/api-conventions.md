@@ -50,3 +50,11 @@ Version conflict returns 412 and a safe current head identifier. **Proposal only
 - New fields additive when possible; unknown fields tolerated where safe. Unknown enum strings produce controlled fallback.
 - Security-related semantics (privileges, token scopes, data location) require explicit versioning and review.
 - Snapshot a golden OpenAPI artifact and compare breaking diffs in CI.
+
+## Workspaces und Einladungen (PR-007)
+
+- Workspaces: `ETag` ist `"ws-v<version>"` (analog `"org-v<version>"`); `PATCH /workspaces/{id}` verlangt `If-Match` (428 `PRECONDITION_REQUIRED` ohne, 412 `VERSION_CONFLICT` bei veraltetem Wert, die Antwort trägt den aktuellen ETag). Die Organisation wird immer aus der Workspace-Zeile bestimmt, nie aus einem Client-Parameter; unbekannte, fremde und nicht sichtbare Workspaces antworten identisch mit 404.
+- Neue Codes: `INVITATION_PENDING` (409; für diese Organisation und Adresse existiert eine offene Einladung), `INVITATION_LIMIT` (409; 1000 offene Einladungen je Organisation), `INVALID_INVITATION` (400; identisch für unbekannte, abgelaufene, benutzte, widerrufene, fehlerhafte und nicht mehr berechtigte Einladungen sowie deaktivierte Zielkonten), `LOGIN_REQUIRED` (401; die Adresse gehört zu einem bestehenden Konto, der Aufrufer ist nicht angemeldet), `INVITATION_EMAIL_MISMATCH` (403; angemeldet mit einem anderen Konto), `ALREADY_MEMBER` (409; auch bei Einladungen, die nur die Organisation betreffen, und bei Workspace-Mitgliedern).
+- `POST /invitations/accept` ist anonym zulässig (Origin-Prüfung wie beim Login, Ratenbegrenzung je Client-Adresse); mit Sitzungscookie gilt zusätzlich der CSRF-Header. Das Token liegt im Fragment des Einladungslinks und wird nur im Request-Body gesendet, nie in einer URL oder einem Log.
+- Listen: `GET /organizations/{id}/workspaces` (Erstellzeit, ID), `GET /workspaces/{id}/members` (Beitrittszeit, Nutzer-ID), `GET /organizations/{id}/invitations` (nur ID); Cursor enthalten wie bisher keine personenbezogenen Daten.
+- Operator account listing: `GET /admin/users` (creation time, id; cursor bound to the `unverified` filter) returns instance-level account metadata including `email_verified` and the invitation `origin`. The reply of an accepted invitation or of `LOGIN_REQUIRED` never reveals who created an account or from which organization.

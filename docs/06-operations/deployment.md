@@ -93,6 +93,14 @@ craftcloud-server admin set-org-owner --org <slug> --email <adresse>
 
 Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt oder befördert (eine vorhandene Zeile mit Status `invited`/`disabled` wird aktiviert). Der Befehl braucht `CRAFTCLOUD_DATABASE_URL_FILE` (Hostzugriff), prüft das Schema, schreibt ein Audit-Ereignis `org.break_glass_set_owner` mit Kennungen (keine E-Mail-Adresse) und gibt das Ergebnis auf stdout aus. Alternativ kann der ausgesperrte Owner mit `POST /api/v1/admin/users/{id}/enable` wieder aktiviert werden.
 
+## Einladungen ohne SMTP (PR-007)
+
+- Mitglieder ohne Konto werden per Link eingeladen: `POST /api/v1/organizations/{org_id}/invitations` liefert einmalig `invite_url` (`<CRAFTCLOUD_PUBLIC_URL>/invite#token=<token>`). Der Link wird **nicht per E-Mail versendet**, der Einladende gibt ihn selbst weiter. Er ist 72 Stunden gültig, einmalig verwendbar und widerrufbar (`DELETE /api/v1/organizations/{org_id}/invitations/{id}`); gespeichert wird nur der SHA-256 des Tokens. Ohne `CRAFTCLOUD_PUBLIC_URL` antwortet die Route 503 `AUTH_UNAVAILABLE`.
+- Wer den Link besitzt, kann die Einladung annehmen (bis eine E-Mail-Verifikation existiert, gilt Linkbesitz als Nachweis der Adresse). Link wie ein Passwort behandeln und nur über einen vertrauenswürdigen Kanal weitergeben. Für bestehende Konten muss der Annehmende als genau dieses Konto angemeldet sein.
+- Der Organisationsschalter `workspace_admin_invites_enabled` (Standard `true`, `PATCH /api/v1/organizations/{org_id}`, Owner/Admin) bestimmt, ob Workspace-Admins in ihren Workspace einladen dürfen. Höchstens 1000 offene Einladungen je Organisation; Anlegen ist je Nutzer ratenbegrenzt (Standard 30 je Fenster, Zähler im Speicher, eine Instanz).
+- **Account-Squatting (Restrisiko):** Wer einen Einladungslink für eine fremde Adresse erzeugt und selbst annimmt, legt ein Konto für diese Adresse an; die echte Person erhält später `LOGIN_REQUIRED`. Der Operator sieht Herkunft und Einlader mit `GET /api/v1/admin/users?unverified=true` (Organisation, einladender Nutzer, Einladung; `email_verified` ist bis zu einer Verifikation für alle Konten `false`) und im Audit-Log (`account.created_via_invitation`, nur IDs). Abhilfe: das Konto mit `POST /api/v1/admin/users/{user_id}/disable` sperren; anschließend mit der echten Person eine Wiederherstellung vereinbaren (Break-glass: Passwort-Reset-Link des Operators für das Konto, nachdem der Operator die Identität außerhalb des Systems geprüft hat, dann Konto wieder aktivieren). Vor einem Mehrmandanten-Produktivbetrieb ist E-Mail-Verifikation nötig.
+- Migration 0006 muss vor dem Start der neuen Version mit `craftcloud-server migrate` eingespielt werden (nur vorwärts).
+
 ## Setup-Runbook
 
 1. Host patchen, Docker/Podman gemäß Betreiberregel, DNS und TLS einrichten.

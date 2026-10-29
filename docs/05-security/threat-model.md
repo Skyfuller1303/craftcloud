@@ -37,9 +37,36 @@ Benutzeridentitäten, Session-/Device-Tokens, Org-/Workspace-Metadaten, private 
 6. Upload reservation bypasses quota with 10 parallel sessions.
 7. Raw `Authorization` logged via tracing middleware.
 8. Browser CSRF deletes a project. *Mitigation (PR-005):* every unsafe session request needs the CSRF header and a same-origin `Origin`; tests `csrf_header_and_origin_are_both_required_for_unsafe_methods`, `login_rejects_foreign_origins_and_cross_site_fetches`. Further session/auth tests: `invalid_sessions_are_401`, `idle_timeout_expires_sessions_and_activity_extends_them`, `absolute_timeout_ends_sessions_despite_activity`, `logout_revokes_the_session_and_logout_all_revokes_every_session_of_the_user`, `password_change_requires_the_current_password_and_revokes_other_sessions`, `password_reset_link_is_operator_only_single_use_and_expires`, `every_login_failure_looks_identical`, `account_rate_limit_is_per_email_and_returns_retry_after`, `secrets_never_reach_the_logs`, `only_failed_logins_count_and_block_per_account_and_address`, `flooding_with_fresh_addresses_cannot_evict_an_active_account_counter`, `ipv6_addresses_in_one_64_prefix_share_limits`, `verified_login_insert_waits_for_a_password_change_in_flight_and_then_refuses`, `issuing_a_link_revokes_the_sessions_of_that_account_immediately`.
-9. Reverse proxy trusts arbitrary `X-Forwarded-Host` to send invite tokens to attacker domain.
+9. Reverse proxy trusts arbitrary `X-Forwarded-Host` to send invite tokens to attacker domain. *Mitigation (PR-005/PR-007):* invitation and reset links are built only from the configured `CRAFTCLOUD_PUBLIC_URL`, never from `Host` or `X-Forwarded-*`; without a configured URL the route answers 503 `AUTH_UNAVAILABLE`. Tests: `who_may_invite_what` (link prefix `https://cloud.test/invite#token=`).
 10. Backup/restore replaces secrets or tenant pointers with inconsistent versions.
 
 ## Security gate
 
 No public beta before threat model reviewed by security owner, negative policy suite run, session handling independently reviewed, backup restore demonstrated, admin exposure restricted, transport encrypted, and documented incident reporting. `SECURITY.md` is a draft until official maintainers supply contacts.
+
+## Invitation abuse cases (PR-007, CC-F03)
+
+| Abuse case | Mitigation | Test |
+|---|---|---|
+| Token guessing or enumeration | 32 random bytes, only the SHA-256 is stored, uniform 400 `INVALID_INVITATION` for unknown, malformed, expired, used and revoked tokens, rate limit per client address | `accepting_creates_the_account_membership_workspace_role_and_a_session`, `accepting_is_rate_limited_per_address_and_invitation_creation_per_user` |
+| Replay or double acceptance, also in parallel | single consume `UPDATE ... WHERE accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now`, locked transaction; exactly one account and one membership | `concurrent_accepts_of_one_token_have_exactly_one_winner` |
+| Link leaks through logs, referrers or proxies | token in the URL fragment (never sent to servers), accepted only in the request body, never logged; audit lines carry ids only | `tokens_and_addresses_never_reach_the_logs` |
+| Stolen link used with another account | an existing account must be logged in as exactly the invited address (403 `INVITATION_EMAIL_MISMATCH`, anonymous 401 `LOGIN_REQUIRED`); link possession alone creates accounts only for addresses without account | `invitations_for_existing_accounts_need_that_account_logged_in` |
+| Privilege escalation through invitations | nobody invites `owner`; workspace admins only `member`, own workspace, at most `editor`, only if enabled; the inviter's rights are re-evaluated at acceptance; a demoted inviter's links die | `who_may_invite_what`, `stale_invitations_of_demoted_or_disabled_inviters_and_changed_settings_are_refused` |
+| Existing member upgrades their role through an invitation | organization role never changes, workspace role never lowered; org-only invitation for a member: 409 and stays open | `existing_members_keep_their_roles_and_workspace_roles_are_never_lowered` |
+| Spam or mailbox flooding, invitation table growth | one open invitation per organization and address (409 `INVITATION_PENDING`, also under concurrency), 1000 open invitations per organization, creation rate limit per user, no e-mail is sent in this phase | `one_open_invitation_per_address_listing_revocation_and_expiry`, `concurrent_invitations_for_one_address_yield_exactly_one` |
+| Cross-tenant invitation (workspace of another organization, IDOR) | composite foreign key `(org_id, workspace_id)`, workspace looked up inside the locked organization, 404 otherwise | `who_may_invite_what`, `workspaces_never_cross_organizations_and_swapped_ids_find_nothing` |
+| Login CSRF through the anonymous accept route | Origin check as for login; with a cookie also the CSRF header | `every_unsafe_workspace_and_invitation_route_needs_session_csrf_and_origin`, `accepting_creates_the_account_membership_workspace_role_and_a_session` |
+| Open (unverified) address claim | link possession is the proof until SMTP verification exists (ADR-0013); documented gap, links are short-lived (72 h), single use and revocable | see docs/gaps.md |
+
+### Account squatting through invitations (residual risk, PR-007)
+
+Until e-mail verification exists, link possession is the proof of an address (ADR-0013). An inviter who accepts their own link creates an instance-wide account for an address they may not own. The real owner of the address who is invited later by another organization receives `LOGIN_REQUIRED` (the account exists) and cannot take it over. This is a documented residual risk, not a fixed one; the full fix is e-mail verification and delivery.
+
+| Aspect | Handling | Test |
+|---|---|---|
+| Provenance | `users.email_verified_at` stays NULL for every account (also the setup operator) and `users.created_via_invitation_id` records the invitation; origin organization and inviter stay derivable | `invitation_created_accounts_record_provenance_and_the_operator_can_list_them` |
+| Detection | `GET /admin/users` (operator only, filter `?unverified=true`) lists accounts with origin; audit line `account.created_via_invitation` with account, invitation, organization and inviter ids | same test |
+| No information leak | the `LOGIN_REQUIRED` answer of another organization's invitation contains nothing about the existing account's origin | `invitations_for_existing_accounts_need_that_account_logged_in` |
+| Remedy | operator disables the squatted account (`POST /admin/users/{id}/disable`; sessions revoked, logins refused) and agrees a replacement with the real owner; break-glass steps in the deployment guide | same test |
+| Not before production | email verification is required before multi-tenant production use | docs/gaps.md |

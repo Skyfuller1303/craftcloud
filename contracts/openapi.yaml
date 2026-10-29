@@ -18,6 +18,7 @@ tags:
   - name: Members
   - name: Discovery
   - name: Workspaces
+  - name: Invitations
   - name: Files
 paths:
   /health/live:
@@ -525,7 +526,7 @@ paths:
         Owners may assign any role; admins only member and admin, never owner (403). Plain members: 403,
         non-members: 404. An unknown user id answers 404 only after the permission check passed (no user
         enumeration for others); an already active membership answers 409 ALREADY_MEMBER, a disabled account
-        409 ACCOUNT_DISABLED. An invited or disabled membership row is reactivated with the given role. Real onboarding by invitation follows with PR-007.
+        409 ACCOUNT_DISABLED. An invited or disabled membership row is reactivated with the given role. People without an account are onboarded by invitation (POST /organizations/{org_id}/invitations).
       requestBody:
         required: true
         content:
@@ -637,6 +638,39 @@ paths:
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List the accounts of the instance (operator only)
+      description: >-
+        Instance-level account metadata, no organization data: id, address, display name, creation time, disabled flag,
+        email_verified and, for accounts created by an invitation, the origin (organization, inviting user, invitation).
+        email_verified is false for every account until an e-mail verification flow exists (also for the setup
+        operator). Use `?unverified=true` to list accounts without verified address. This is the operator's tool
+        against account squatting: an inviter who accepts their own link creates an instance-wide account for an
+        address they may not own; the operator can see who created it and disable it
+        (POST /admin/users/{user_id}/disable); recovery for the real owner of the address is a manual operator
+        procedure (see the deployment guide). Keyset paginated
+        (creation time, id; the cursor is bound to the filter and contains no personal data). Other callers: 403.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - in: query
+          name: unverified
+          required: false
+          schema: {type: boolean, default: false}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminUserPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /admin/users/{user_id}/disable:
     post:
       tags: [Admin]
@@ -722,23 +756,382 @@ paths:
                       Additive field (PR-001). `development-prototype` marks a local, non-production
                       server. Clients must treat unknown values as a controlled fallback, not an error.
         '503': {$ref: '#/components/responses/Timeout'}
-  /workspaces:
+  /organizations/{org_id}/workspaces:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
     get:
       tags: [Workspaces]
-      summary: List only authorized workspaces
+      summary: List the workspaces of an organization the caller may see
+      description: >-
+        Organization owners and admins see every workspace of the organization, other members only the workspaces
+        they belong to (workspace_role is the caller's role there, null for managers without a grant). Keyset
+        paginated (creation time, id). Non-members and unknown organizations answer 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
       responses:
         '200':
-          description: Authorized workspaces only
+          description: One page
           content:
             application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items: {$ref: '#/components/schemas/Workspace'}
+              schema: {$ref: '#/components/schemas/WorkspacePage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Workspaces]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Create a workspace (organization owner and admin)
+      description: >-
+        Other members: 403, non-members and unknown organizations: 404. Invalid name/slug or a taken slug answer 422
+        VALIDATION_ERROR with details.fields. There is no workspace deletion in this phase (see docs/gaps.md).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateWorkspaceRequest'}
+      responses:
+        '201':
+          description: Created
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "ws-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workspace'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /workspaces/{workspace_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+    get:
+      tags: [Workspaces]
+      summary: Get a workspace (organization owner/admin or workspace member)
+      description: >-
+        The organization is taken from the workspace, never from the client. Unknown ids, workspaces of other
+        organizations and workspaces the caller may not see are indistinguishable: 404.
+      responses:
+        '200':
+          description: The workspace
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "ws-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workspace'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Workspaces]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Rename a workspace (workspace admin, organization owner and admin)
+      description: >-
+        Requires If-Match with the current ETag (428 PRECONDITION_REQUIRED without, 412 VERSION_CONFLICT with a stale
+        value; the response carries the current ETag). Workspace editors and viewers: 403; callers who cannot see
+        the workspace: 404.
+      parameters:
+        - in: header
+          name: If-Match
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateWorkspaceRequest'}
+      responses:
+        '200':
+          description: Updated; the new ETag is in the header
+          headers:
+            ETag: {schema: {type: string}, description: 'Strong ETag "ws-v<version>"'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workspace'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '412':
+          description: VERSION_CONFLICT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '428':
+          description: PRECONDITION_REQUIRED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /workspaces/{workspace_id}/members:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+    get:
+      tags: [Workspaces]
+      summary: List the members of a workspace (workspace members, organization owner and admin)
+      description: >-
+        Keyset paginated (join time, user id). Callers who cannot see the workspace answer 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkspaceMemberPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Workspaces]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Add an organization member to a workspace
+      description: >-
+        Organization owners and admins may assign any workspace role. A workspace admin may assign editor and viewer
+        only (403 for admin) and only in the own workspace. Editors and viewers: 403. The user must be an active,
+        enabled member of the workspace's organization; any other or unknown user id answers 404 (no enumeration).
+        An existing workspace membership answers 409 ALREADY_MEMBER.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AddWorkspaceMemberRequest'}
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkspaceMember'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: ALREADY_MEMBER
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /workspaces/{workspace_id}/members/{user_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - in: path
+        name: user_id
+        required: true
+        schema: {type: string, format: uuid}
+    patch:
+      tags: [Workspaces]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Change a workspace role
+      description: >-
+        Organization owners and admins may set any role. A workspace admin may set editor/viewer on editors and
+        viewers; it never touches workspace admins (including itself): 403. Editors and viewers: 403. An unknown
+        target is 404 for managers and 403 for editors and viewers.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChangeWorkspaceRoleRequest'}
+      responses:
+        '200':
+          description: Role changed (or already set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkspaceMember'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Workspaces]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Remove a workspace member or leave the workspace
+      description: >-
+        Same limits as the role change; every member may remove themselves (leave), including workspace admins.
+      responses:
+        '204': {description: Removed}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/invitations:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Invitations]
+      summary: List invitations (organization owner and admin)
+      description: >-
+        Status is pending, accepted, revoked, expired or invalid (the inviter lost the right to grant the roles
+        before acceptance). Neither tokens nor token hashes are ever returned. Keyset paginated (id only).
+        Workspace admins: 403; non-members: 404.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: One page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InvitationPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Invitations]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Invite a person by link (no e-mail is sent in this phase)
+      description: >-
+        Owners and admins may invite as admin or member (never owner), optionally with a workspace and any
+        workspace role. A workspace admin may invite only as member, only into the own workspace, with at most
+        editor, and only while the organization setting workspace_admin_invites_enabled is true (otherwise 403).
+        The response contains the one-time invite_url (`<PUBLIC_URL>/invite#token=<token>`; the token is in the URL
+        fragment and shown only here; only its SHA-256 is stored). The link is valid for 72 hours, single use and
+        revocable; possession of the link is the proof of the e-mail address until e-mail delivery exists. One open
+        invitation per organization and normalized address (409 INVITATION_PENDING), at most 1000 open invitations
+        per organization (409 INVITATION_LIMIT), rate limited per user (429). 503 AUTH_UNAVAILABLE when
+        CRAFTCLOUD_PUBLIC_URL is not configured. A workspace of another organization or an unknown workspace
+        answers 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateInvitationRequest'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreatedInvitation'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: INVITATION_PENDING or INVITATION_LIMIT
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/invitations/{invitation_id}:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+      - in: path
+        name: invitation_id
+        required: true
+        schema: {type: string, format: uuid}
+    delete:
+      tags: [Invitations]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      summary: Revoke an open invitation
+      description: >-
+        Organization owners and admins may revoke any open invitation, a workspace admin only invitations they
+        created. Unknown, foreign and already closed invitations answer 404.
+      responses:
+        '204': {description: Revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /invitations/accept:
+    post:
+      tags: [Invitations]
+      security: []
+      summary: Accept an invitation (token possession)
+      description: >-
+        Origin check like login; rate limited per client address (429). Every unusable token (unknown, malformed,
+        expired, used, revoked, inviter no longer entitled, disabled target) answers an identical 400
+        INVALID_INVITATION. For an address without account the body needs display_name and password (password policy
+        incl. the e-mail local part; 422 VALIDATION_ERROR with details.fields otherwise): the account, the
+        organization membership and the workspace role are created in one transaction and the caller is logged in
+        (session cookie and csrf_token like login). For an existing account the caller must be logged in as exactly
+        that account (anonymous: 401 LOGIN_REQUIRED; other account: 403 INVITATION_EMAIL_MISMATCH; with a cookie the
+        CSRF header is required). An existing active member accepting an organization-only invitation gets 409
+        ALREADY_MEMBER and the invitation stays open; with a workspace part the workspace role is added or raised,
+        never lowered, and the organization role never changes. At acceptance the inviter's current roles are
+        re-evaluated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AcceptInvitationRequest'}
+      responses:
+        '200':
+          description: Accepted; Set-Cookie only when an account was created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AcceptedInvitation'}
+        '400':
+          description: INVALID_INVITATION
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: LOGIN_REQUIRED (the address belongs to an existing account) or UNAUTHENTICATED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403':
+          description: INVITATION_EMAIL_MISMATCH or CSRF_FAILED
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: ALREADY_MEMBER
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /files/{file_id}:
     get:
       tags: [Files]
@@ -761,6 +1154,11 @@ components:
     OrgId:
       in: path
       name: org_id
+      required: true
+      schema: {type: string, format: uuid}
+    WorkspaceId:
+      in: path
+      name: workspace_id
       required: true
       schema: {type: string, format: uuid}
     Limit:
@@ -866,13 +1264,14 @@ components:
         expires_at: {type: string, format: date-time}
     Organization:
       type: object
-      required: [id, slug, name, role, version, created_at]
+      required: [id, slug, name, role, version, workspace_admin_invites_enabled, created_at]
       properties:
         id: {type: string, format: uuid}
         slug: {type: string}
         name: {type: string}
         role: {type: string, enum: [owner, admin, member], description: The caller's role}
         version: {type: integer, minimum: 1}
+        workspace_admin_invites_enabled: {type: boolean, description: Whether workspace admins may invite into their own workspace}
         created_at: {type: string, format: date-time}
     CreatedOrganization:
       type: object
@@ -939,9 +1338,10 @@ components:
     UpdateOrganizationRequest:
       type: object
       additionalProperties: false
-      required: [name]
+      minProperties: 1
       properties:
         name: {type: string, minLength: 1, maxLength: 100}
+        workspace_admin_invites_enabled: {type: boolean}
     AddMemberRequest:
       type: object
       additionalProperties: false
@@ -993,11 +1393,156 @@ components:
         expires_at: {type: string, format: date-time}
     Workspace:
       type: object
-      required: [id, name, organization_id]
+      required: [id, organization_id, slug, name, workspace_role, version, created_at]
       properties:
         id: {type: string, format: uuid}
-        name: {type: string}
         organization_id: {type: string, format: uuid}
+        slug: {type: string}
+        name: {type: string}
+        workspace_role: {type: [string, 'null'], enum: [admin, editor, viewer, null], description: "The caller's role in the workspace; null for organization managers without a grant"}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+    WorkspacePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/Workspace'}
+        next_cursor: {type: [string, 'null']}
+    CreateWorkspaceRequest:
+      type: object
+      additionalProperties: false
+      required: [name, slug]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        slug: {type: string, description: 'Lowercase letters, digits and hyphens; unique within the organization'}
+    UpdateWorkspaceRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+    WorkspaceMember:
+      type: object
+      required: [user_id, display_name, email, role, joined_at]
+      properties:
+        user_id: {type: string, format: uuid}
+        display_name: {type: string}
+        email: {type: string}
+        role: {type: string, enum: [admin, editor, viewer]}
+        joined_at: {type: string, format: date-time}
+    WorkspaceMemberPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/WorkspaceMember'}
+        next_cursor: {type: [string, 'null']}
+    AddWorkspaceMemberRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, role]
+      properties:
+        user_id: {type: string, format: uuid}
+        role: {type: string, enum: [admin, editor, viewer]}
+    ChangeWorkspaceRoleRequest:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: {type: string, enum: [admin, editor, viewer]}
+    AdminUser:
+      type: object
+      required: [id, email, display_name, created_at, disabled, email_verified, origin]
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string}
+        display_name: {type: string}
+        created_at: {type: string, format: date-time}
+        disabled: {type: boolean}
+        email_verified: {type: boolean}
+        origin:
+          description: Set for accounts created by accepting an invitation, otherwise null
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [organization_id, invited_by_user_id, invitation_id]
+              properties:
+                organization_id: {type: [string, 'null'], format: uuid}
+                invited_by_user_id: {type: [string, 'null'], format: uuid}
+                invitation_id: {type: string, format: uuid}
+    AdminUserPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/AdminUser'}
+        next_cursor: {type: [string, 'null']}
+    CreateInvitationRequest:
+      type: object
+      additionalProperties: false
+      required: [email, org_role]
+      properties:
+        email: {type: string, maxLength: 320}
+        org_role: {type: string, enum: [admin, member]}
+        workspace_id: {type: string, format: uuid, description: Requires workspace_role}
+        workspace_role: {type: string, enum: [admin, editor, viewer], description: Requires workspace_id}
+    CreatedInvitation:
+      type: object
+      required: [invitation_id, invite_url, expires_at]
+      properties:
+        invitation_id: {type: string, format: uuid}
+        invite_url:
+          type: string
+          description: Shown once. `<PUBLIC_URL>/invite#token=<token>`; treat as a secret.
+        expires_at: {type: string, format: date-time}
+    Invitation:
+      type: object
+      required: [id, email, org_role, workspace_id, workspace_role, status, created_by, created_at, expires_at]
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string}
+        org_role: {type: string, enum: [admin, member]}
+        workspace_id: {type: [string, 'null'], format: uuid}
+        workspace_role: {type: [string, 'null'], enum: [admin, editor, viewer, null]}
+        status: {type: string, enum: [pending, accepted, revoked, expired, invalid]}
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    InvitationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/Invitation'}
+        next_cursor: {type: [string, 'null']}
+    AcceptInvitationRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token: {type: string, writeOnly: true}
+        display_name: {type: string, minLength: 1, maxLength: 100, description: Required when no account exists for the address}
+        password: {type: string, writeOnly: true, description: Required when no account exists for the address}
+    AcceptedInvitation:
+      type: object
+      required: [user_id, organization_id, workspace_id, account_created, workspace_role_applied]
+      properties:
+        user_id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        workspace_id: {type: [string, 'null'], format: uuid}
+        account_created: {type: boolean}
+        workspace_role_applied: {type: boolean, description: False when an existing equal or higher workspace role was kept}
+        csrf_token: {type: string, description: Only when an account was created and logged in}
+        expires_at: {type: string, format: date-time, description: Session expiry, only when a session was issued}
     File:
       type: object
       required: [id, project_id, name]
@@ -1007,6 +1552,16 @@ components:
         name: {type: string}
         head_version_id: {type: [string, 'null'], format: uuid}
   responses:
+    ForbiddenOrCsrf:
+      description: FORBIDDEN (authenticated but not allowed) or CSRF_FAILED
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    InvalidCursor:
+      description: The cursor is malformed or belongs to another listing or scope (INVALID_CURSOR)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     PayloadTooLarge:
       description: Request body exceeds the configured limit (code PAYLOAD_TOO_LARGE)
       content:

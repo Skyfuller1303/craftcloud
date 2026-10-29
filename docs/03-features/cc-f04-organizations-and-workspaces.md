@@ -1,6 +1,6 @@
 # CC-F04 — Organisationen und Workspaces
 
-> **Status:** Organisationen und Mitgliedschaften lokal umgesetzt (PR-006, Review offen): Anlegen nur durch den Operator, Lesen/Umbenennen mit ETag, Mitglieder verwalten, Konten (de)aktivieren, Pagination. Workspace-Routen (`POST/GET /organizations/{id}/workspaces`, `PATCH /workspaces/{id}`) und Löschen/Soft-Delete von Organisationen sind offen (PR-007, Lücke dokumentiert). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
+> **Status:** Organisationen und Mitgliedschaften lokal umgesetzt (PR-006, Review offen): Anlegen nur durch den Operator, Lesen/Umbenennen mit ETag, Mitglieder verwalten, Konten (de)aktivieren, Pagination. Workspaces lokal umgesetzt (PR-007, Review offen): anlegen/listen/lesen/umbenennen (ETag `"ws-v<n>"`), Workspace-Mitglieder mit den Rollen admin/editor/viewer, Sichtbarkeit nur für Org-Owner/-Admins und Workspace-Mitglieder. Löschen/Soft-Delete von Workspaces und Organisationen ist offen (Lücke dokumentiert). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

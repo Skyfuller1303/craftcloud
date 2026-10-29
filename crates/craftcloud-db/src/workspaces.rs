@@ -1,35 +1,27 @@
-//! Tenant-scoped workspace repository. Every function filters by the
-//! `org_id` of the given [`OrgScope`] in SQL.
+//! Workspaces and workspace membership.
+//!
+//! Reads take an [`OrgScope`] and filter by its `org_id` in SQL. Changes made
+//! through the API run in an [`OrgTx`] (organization row lock, fresh roles,
+//! policy decision, change) via the `workspace_*` methods below; each requires
+//! the scope of exactly its own action. The pool-based `create` and
+//! `add_member` are low-level helpers for tests and tooling.
+//!
+//! The organization of a workspace request is resolved from the workspace row
+//! ([`org_of`]), never from a client supplied organization id.
 
+use craftcloud_core::policy::{Action, OrgRole};
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::members::OrgTx;
+use crate::organizations::{AfterKey, clamp_page};
 use crate::{DbError, OrgScope};
+
+pub use craftcloud_core::policy::WorkspaceRole;
 
 /// Hard upper bound for [`list`]; larger requested limits are clamped.
 pub const MAX_LIST_LIMIT: u32 = 200;
-
-/// Role inside a workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceRole {
-    /// Workspace administrator.
-    Admin,
-    /// Can edit content.
-    Editor,
-    /// Read-only.
-    Viewer,
-}
-
-impl WorkspaceRole {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::Editor => "editor",
-            Self::Viewer => "viewer",
-        }
-    }
-}
 
 /// Input for [`create`].
 #[derive(Debug, Clone)]
@@ -55,13 +47,43 @@ pub struct Workspace {
     pub name: String,
     /// Optional storage quota in bytes.
     pub quota_bytes: Option<i64>,
+    /// Optimistic concurrency version, incremented on every update.
+    pub version: i64,
     /// Creation time (UTC).
     pub created_at: OffsetDateTime,
 }
 
-const COLUMNS: &str = "id, org_id, slug, name, quota_bytes, created_at";
+const COLUMNS: &str = "id, org_id, slug, name, quota_bytes, version, created_at";
 
-/// Creates a workspace in the scoped organization.
+/// A member of a workspace.
+#[derive(Debug, Clone, FromRow)]
+pub struct WorkspaceMember {
+    /// User id.
+    pub user_id: Uuid,
+    /// Display name.
+    pub display_name: String,
+    /// Normalized e-mail address.
+    pub email: String,
+    /// Workspace role (`admin`, `editor`, `viewer`).
+    pub role: String,
+    /// When the user joined the workspace.
+    pub joined_at: OffsetDateTime,
+}
+
+impl WorkspaceMember {
+    /// The parsed role.
+    #[must_use]
+    pub fn workspace_role(&self) -> Option<WorkspaceRole> {
+        WorkspaceRole::parse(&self.role)
+    }
+}
+
+const MEMBER_SELECT: &str = "SELECT u.id AS user_id, u.display_name, u.normalized_email AS email, \
+     wm.role, wm.created_at AS joined_at \
+     FROM workspace_members wm JOIN users u ON u.id = wm.user_id";
+
+/// Creates a workspace in the scoped organization (low-level helper; the API
+/// uses [`OrgTx::workspace_create`]).
 ///
 /// # Errors
 ///
@@ -73,7 +95,7 @@ pub async fn create(
     scope: &OrgScope,
     new: &NewWorkspace,
 ) -> Result<Workspace, DbError> {
-    scope.require(craftcloud_core::policy::Action::WorkspaceManage)?;
+    scope.require(Action::WorkspaceCreate)?;
     Ok(sqlx::query_as::<_, Workspace>(&format!(
         "INSERT INTO workspaces (id, org_id, slug, name, quota_bytes) \
          VALUES ($1, $2, $3, $4, $5) RETURNING {COLUMNS}"
@@ -87,8 +109,56 @@ pub async fn create(
     .await?)
 }
 
-/// Fetches one workspace. A workspace of another organization is
-/// indistinguishable from a missing one (`None`).
+/// The organization a workspace belongs to, from the workspace row.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn org_of(pool: &PgPool, workspace_id: Uuid) -> Result<Option<Uuid>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT org_id FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+/// The user's active organization role and workspace role, for building the
+/// policy actor. Both `None` unless the user is an **active** member of the
+/// organization.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn roles(
+    pool: &PgPool,
+    org_id: Uuid,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> Result<(Option<OrgRole>, Option<WorkspaceRole>), DbError> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT m.role, \
+                (SELECT wm.role FROM workspace_members wm \
+                 WHERE wm.workspace_id = $2 AND wm.org_id = $1 AND wm.user_id = $3) \
+         FROM organization_members m \
+         WHERE m.org_id = $1 AND m.user_id = $3 AND m.status = 'active'",
+    )
+    .bind(org_id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((org_role, ws_role)) => (
+            OrgRole::parse(&org_role),
+            ws_role.as_deref().and_then(WorkspaceRole::parse),
+        ),
+        None => (None, None),
+    })
+}
+
+/// Fetches one workspace of the scoped organization. A workspace of another
+/// organization is indistinguishable from a missing one (`None`).
 ///
 /// # Errors
 ///
@@ -121,9 +191,75 @@ pub async fn list(pool: &PgPool, scope: &OrgScope, limit: u32) -> Result<Vec<Wor
     .await?)
 }
 
-/// Adds a workspace member. The user must already be a member of the
-/// organization and the workspace must belong to the scoped organization;
-/// both are enforced by composite foreign keys.
+/// Lists the workspaces of the scoped organization that the user may see:
+/// all of them if `only_member_of` is `None` (organization owners and admins),
+/// otherwise only workspaces the user belongs to. Keyset paginated by
+/// `(created_at, id)`.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn list_visible(
+    pool: &PgPool,
+    scope: &OrgScope,
+    only_member_of: Option<Uuid>,
+    limit: u32,
+    after: Option<AfterKey>,
+) -> Result<Vec<Workspace>, DbError> {
+    Ok(sqlx::query_as::<_, Workspace>(
+        "SELECT w.id, w.org_id, w.slug, w.name, w.quota_bytes, w.version, w.created_at \
+         FROM workspaces w \
+         WHERE w.org_id = $1 \
+           AND ($2::uuid IS NULL OR EXISTS ( \
+                 SELECT 1 FROM workspace_members wm \
+                 JOIN organization_members m ON m.org_id = wm.org_id AND m.user_id = wm.user_id \
+                 WHERE wm.workspace_id = w.id AND wm.user_id = $2 AND m.status = 'active')) \
+           AND ($3::timestamptz IS NULL OR (w.created_at, w.id) > ($3::timestamptz, $4::uuid)) \
+         ORDER BY w.created_at, w.id LIMIT $5",
+    )
+    .bind(scope.org_id())
+    .bind(only_member_of)
+    .bind(after.map(|(at, _)| at))
+    .bind(after.map(|(_, id)| id))
+    .bind(clamp_page(limit))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Lists the members of a workspace of the scoped organization (active
+/// organization members only) ordered by `(joined_at, user_id)`; the keyset
+/// contains no personal data.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn list_members(
+    pool: &PgPool,
+    scope: &OrgScope,
+    workspace_id: Uuid,
+    limit: u32,
+    after: Option<AfterKey>,
+) -> Result<Vec<WorkspaceMember>, DbError> {
+    Ok(sqlx::query_as::<_, WorkspaceMember>(&format!(
+        "{MEMBER_SELECT} \
+         JOIN organization_members m ON m.org_id = wm.org_id AND m.user_id = wm.user_id \
+         WHERE wm.org_id = $1 AND wm.workspace_id = $2 AND m.status = 'active' \
+           AND ($3::timestamptz IS NULL OR (wm.created_at, wm.user_id) > ($3::timestamptz, $4::uuid)) \
+         ORDER BY wm.created_at, wm.user_id LIMIT $5"
+    ))
+    .bind(scope.org_id())
+    .bind(workspace_id)
+    .bind(after.map(|(at, _)| at))
+    .bind(after.map(|(_, id)| id))
+    .bind(clamp_page(limit))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Adds a workspace member (low-level helper; the API uses
+/// [`OrgTx::workspace_member_add`]). The user must already be a member of the
+/// organization and the workspace must belong to the scoped organization; both
+/// are enforced by composite foreign keys.
 ///
 /// # Errors
 ///
@@ -137,7 +273,7 @@ pub async fn add_member(
     user_id: Uuid,
     role: WorkspaceRole,
 ) -> Result<(), DbError> {
-    scope.require(craftcloud_core::policy::Action::WorkspaceManage)?;
+    scope.require(Action::WorkspaceMemberAdd)?;
     sqlx::query(
         "INSERT INTO workspace_members (org_id, workspace_id, user_id, role) \
          VALUES ($1, $2, $3, $4)",
@@ -149,4 +285,272 @@ pub async fn add_member(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ---- transactional operations (API path) ------------------------------------
+
+/// Result of [`OrgTx::workspace_update_name`].
+#[derive(Debug, Clone)]
+pub enum WorkspaceUpdateOutcome {
+    /// Updated; carries the new state.
+    Updated(Workspace),
+    /// The stored version differs from the expected one.
+    VersionMismatch {
+        /// The current version.
+        current_version: i64,
+    },
+    /// The workspace does not exist in this organization.
+    Gone,
+}
+
+/// Result of [`OrgTx::workspace_member_add`].
+#[derive(Debug, Clone)]
+pub enum WorkspaceAddOutcome {
+    /// Added.
+    Added(WorkspaceMember),
+    /// Already a member of the workspace.
+    AlreadyMember,
+    /// The user is not an active, enabled member of the organization (or does
+    /// not exist; the two are indistinguishable).
+    NotOrgMember,
+    /// The workspace does not exist in this organization.
+    WorkspaceGone,
+}
+
+/// Result of [`OrgTx::workspace_member_set_role`].
+#[derive(Debug, Clone)]
+pub enum WorkspaceRoleOutcome {
+    /// Changed.
+    Changed(WorkspaceMember),
+    /// Already had that role.
+    Unchanged(WorkspaceMember),
+    /// Not a member of the workspace.
+    NotMember,
+}
+
+impl OrgTx {
+    /// Whether the workspace exists in this transaction's organization.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn workspace_exists(&mut self, workspace_id: Uuid) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM workspaces WHERE id = $1 AND org_id = $2)",
+        )
+        .bind(workspace_id)
+        .bind(self.org_id)
+        .fetch_one(&mut *self.tx)
+        .await?)
+    }
+
+    /// Fresh workspace role of a user (only while an active organization
+    /// member), read under the organization lock.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn workspace_role_of(
+        &mut self,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<WorkspaceRole>, DbError> {
+        let role: Option<String> = sqlx::query_scalar(
+            "SELECT wm.role FROM workspace_members wm \
+             JOIN organization_members m ON m.org_id = wm.org_id AND m.user_id = wm.user_id \
+             WHERE wm.org_id = $1 AND wm.workspace_id = $2 AND wm.user_id = $3 \
+               AND m.status = 'active'",
+        )
+        .bind(self.org_id)
+        .bind(workspace_id)
+        .bind(user_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        Ok(role.as_deref().and_then(WorkspaceRole::parse))
+    }
+
+    /// Creates a workspace in this organization.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::UniqueViolation`] for a duplicate slug, [`DbError::CheckViolation`]
+    /// for invalid values.
+    pub async fn workspace_create(
+        &mut self,
+        scope: &OrgScope,
+        new: &NewWorkspace,
+    ) -> Result<Workspace, DbError> {
+        self.check(scope, Action::WorkspaceCreate)?;
+        Ok(sqlx::query_as::<_, Workspace>(&format!(
+            "INSERT INTO workspaces (id, org_id, slug, name, quota_bytes) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING {COLUMNS}"
+        ))
+        .bind(Uuid::new_v4())
+        .bind(self.org_id)
+        .bind(&new.slug)
+        .bind(&new.name)
+        .bind(new.quota_bytes)
+        .fetch_one(&mut *self.tx)
+        .await?)
+    }
+
+    /// Renames a workspace if its version is still `expected_version`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::CheckViolation`] for an invalid name.
+    pub async fn workspace_update_name(
+        &mut self,
+        scope: &OrgScope,
+        workspace_id: Uuid,
+        name: &str,
+        expected_version: i64,
+    ) -> Result<WorkspaceUpdateOutcome, DbError> {
+        self.check(scope, Action::WorkspaceManage)?;
+        let updated = sqlx::query_as::<_, Workspace>(&format!(
+            "UPDATE workspaces SET name = $3, version = version + 1 \
+             WHERE id = $1 AND org_id = $2 AND version = $4 RETURNING {COLUMNS}"
+        ))
+        .bind(workspace_id)
+        .bind(self.org_id)
+        .bind(name)
+        .bind(expected_version)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        if let Some(workspace) = updated {
+            return Ok(WorkspaceUpdateOutcome::Updated(workspace));
+        }
+        let current: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM workspaces WHERE id = $1 AND org_id = $2")
+                .bind(workspace_id)
+                .bind(self.org_id)
+                .fetch_optional(&mut *self.tx)
+                .await?;
+        Ok(match current {
+            Some(current_version) => WorkspaceUpdateOutcome::VersionMismatch { current_version },
+            None => WorkspaceUpdateOutcome::Gone,
+        })
+    }
+
+    async fn workspace_member(
+        &mut self,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<WorkspaceMember>, DbError> {
+        Ok(sqlx::query_as::<_, WorkspaceMember>(&format!(
+            "{MEMBER_SELECT} WHERE wm.org_id = $1 AND wm.workspace_id = $2 AND wm.user_id = $3"
+        ))
+        .bind(self.org_id)
+        .bind(workspace_id)
+        .bind(user_id)
+        .fetch_optional(&mut *self.tx)
+        .await?)
+    }
+
+    /// Adds an active, enabled organization member to a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn workspace_member_add(
+        &mut self,
+        scope: &OrgScope,
+        workspace_id: Uuid,
+        user_id: Uuid,
+        role: WorkspaceRole,
+    ) -> Result<WorkspaceAddOutcome, DbError> {
+        self.check(scope, Action::WorkspaceMemberAdd)?;
+        if !self.workspace_exists(workspace_id).await? {
+            return Ok(WorkspaceAddOutcome::WorkspaceGone);
+        }
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM organization_members m JOIN users u ON u.id = m.user_id \
+             WHERE m.org_id = $1 AND m.user_id = $2 AND m.status = 'active' \
+               AND u.disabled_at IS NULL)",
+        )
+        .bind(self.org_id)
+        .bind(user_id)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if !eligible {
+            return Ok(WorkspaceAddOutcome::NotOrgMember);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO workspace_members (org_id, workspace_id, user_id, role) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, user_id) DO NOTHING",
+        )
+        .bind(self.org_id)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(role.as_str())
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Ok(WorkspaceAddOutcome::AlreadyMember);
+        }
+        match self.workspace_member(workspace_id, user_id).await? {
+            Some(member) => Ok(WorkspaceAddOutcome::Added(member)),
+            None => Err(DbError::Internal),
+        }
+    }
+
+    /// Changes a workspace member's role.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn workspace_member_set_role(
+        &mut self,
+        scope: &OrgScope,
+        workspace_id: Uuid,
+        user_id: Uuid,
+        role: WorkspaceRole,
+    ) -> Result<WorkspaceRoleOutcome, DbError> {
+        self.check(scope, Action::WorkspaceMemberChangeRole)?;
+        let Some(current) = self.workspace_member(workspace_id, user_id).await? else {
+            return Ok(WorkspaceRoleOutcome::NotMember);
+        };
+        if current.workspace_role() == Some(role) {
+            return Ok(WorkspaceRoleOutcome::Unchanged(current));
+        }
+        sqlx::query(
+            "UPDATE workspace_members SET role = $4 \
+             WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3",
+        )
+        .bind(self.org_id)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(role.as_str())
+        .execute(&mut *self.tx)
+        .await?;
+        match self.workspace_member(workspace_id, user_id).await? {
+            Some(member) => Ok(WorkspaceRoleOutcome::Changed(member)),
+            None => Err(DbError::Internal),
+        }
+    }
+
+    /// Removes a workspace member. Returns whether a row was removed.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn workspace_member_remove(
+        &mut self,
+        scope: &OrgScope,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, DbError> {
+        self.check(scope, Action::WorkspaceMemberRemove)?;
+        let removed = sqlx::query(
+            "DELETE FROM workspace_members WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3",
+        )
+        .bind(self.org_id)
+        .bind(workspace_id)
+        .bind(user_id)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        Ok(removed == 1)
+    }
 }
