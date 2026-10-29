@@ -120,6 +120,7 @@ Die `docs/`-Schreibweise ist bewusst **lowercase**, entsprechend den sichtbaren 
 - [Adr 0014 P2 Storage Defaults](09-decisions/adr-0014-p2-storage-defaults.md)
 - [Adr 0015 Admin Ui Language And Design](09-decisions/adr-0015-admin-ui-language-and-design.md)
 - [Adr 0016 P3 P4 Operations And Pilot](09-decisions/adr-0016-p3-p4-operations-and-pilot.md)
+- [Adr 0017 Email Verification Deferral](09-decisions/adr-0017-email-verification-deferral.md)
 - [Decision Log](09-decisions/decision-log.md)
 
 ### 10-community

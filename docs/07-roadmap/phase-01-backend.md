@@ -1,7 +1,7 @@
 # Phase 01 — Backend-Kern: Identität, Mandanten, Rechte
 
 > **Code:** P1. **Goal:** Make a securely bootstrapped API service.  
-> **Status:** Tickets CC-P01-01 bis -07 und -09 umgesetzt, unabhängig geprüft und gemerged (PR #1 bis #7; CC-P01-09 mit dem Vertragstest-PR), CC-P01-08 teilweise (Einladungen ja, E-Mail-Verifikation nein). Alle vier Exit-Gates sind mit Tests bzw. dem Smoke-Lauf belegt (siehe unten). P1 gilt erst als abgeschlossen, wenn CC-P01-08 geklärt ist (Verifikation umsetzen oder per ADR zurückstellen). Bekannte Lücken stehen je Ticket und in `docs/gaps.md`.
+> **Status:** Tickets CC-P01-01 bis -07 und -09 umgesetzt, unabhängig geprüft und gemerged (PR #1 bis #7; CC-P01-09 mit dem Vertragstest-PR), CC-P01-08 teilweise (Einladungen ja, E-Mail-Verifikation nein). Alle vier Exit-Gates sind mit Tests bzw. dem Smoke-Lauf belegt (siehe unten). P1 ist abgeschlossen (2026-10-29): Die E-Mail-Verifikation aus CC-P01-08 ist per [ADR-0017](../09-decisions/adr-0017-email-verification-deferral.md) auf den SMTP-PR verschoben. Bekannte Lücken stehen je Ticket und in `docs/gaps.md`.
 
 ## Eintrittsvoraussetzungen
 
@@ -31,7 +31,7 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
   - Status: umgesetzt, geprüft, gemerged (PR #6, erweitert in PR #7). Reine Funktion `craftcloud_core::policy::can` mit Tabellentests über alle 25 Aktionen und Rollen, `OrgScope` nur aus einem Permit; Negativ- und IDOR-Tests je Endpunktgruppe.
   - Lücken: Rollen werden pro Request aus der Datenbank gelesen (kein Cache, bewusst); fein granulare Projekt-/Datei-Aktionen kommen mit CC-F06.
 - [ ] **CC-P01-08** — Invite-/E-Mail-Verifikation und safe invite acceptance (CC-F03)
-  - Status: Einladungen umgesetzt, geprüft, gemerged (PR #7): Link-Einladungen (72 h, einmalig, widerrufbar, nur SHA-256 gespeichert), sichere Annahme mit Neubewertung der Rechte des Einladenden, Herkunft und Operator-Auflistung der Konten. **Nicht erfüllt:** E-Mail-Verifikation und -Versand; Linkbesitz gilt als Nachweis der Adresse (ADR-0013). Das Ticket bleibt offen.
+  - Status: Einladungen umgesetzt, geprüft, gemerged (PR #7): Link-Einladungen (72 h, einmalig, widerrufbar, nur SHA-256 gespeichert), sichere Annahme mit Neubewertung der Rechte des Einladenden, Herkunft und Operator-Auflistung der Konten. **Nicht erfüllt:** E-Mail-Verifikation und -Versand; Linkbesitz gilt als Nachweis der Adresse (ADR-0013). Die Verifikation ist per [ADR-0017](../09-decisions/adr-0017-email-verification-deferral.md) auf den SMTP-PR verschoben; das Ticket bleibt bis dahin offen.
   - Lücken: kein SMTP, keine Adressverifikation (Account-Squatting als Restrisiko, siehe Threat-Model); keine Browserseite `/invite`; keine Aufräumroutine für alte Einladungen.
 - [x] **CC-P01-09** — Info/Health/Request-ID/Error schema und OpenAPI-Snapshot
   - Status: umgesetzt mit diesem Vertrags-PR. `crates/craftcloud-api/tests/contract.rs` vergleicht `contracts/openapi.yaml` mit der Routentabelle `ROUTES` und sondiert den Router (jede gelistete Methode wird bedient, jede andere antwortet 405, undokumentierte Pfade 404), prüft den normalisierten Snapshot `contracts/openapi.snapshot` (`cargo xtask openapi-snapshot [--update]`), dass jede Fehlerantwort das gemeinsame `Error`-Schema nutzt, und echte Fehlerantworten (404, 405, 413, 415, 422, 401, 503) samt `x-request-id` gleich `request_id` und `Cache-Control: no-store`.
@@ -48,7 +48,7 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 - [x] Crash im Bootstrap hinterlässt keine teilfertigen Admins
   - Beleg: `failure_inside_the_transaction_leaves_nothing_behind` (`crates/craftcloud-api/tests/setup.rs`), `twenty_concurrent_requests_create_exactly_one_operator`, `concurrent_setups_produce_exactly_one_winner` (Datenbank-Integrationstest).
 
-Hinweis: Die Gates belegen die Backend-Fähigkeiten. Offen für den Phasenabschluss bleiben CC-P01-08 (E-Mail-Verifikation) sowie die Lücken je Ticket; der Phasenwechsel verlangt eine ausdrückliche Entscheidung dazu.
+Hinweis: Die Gates belegen die Backend-Fähigkeiten. Der Projektverantwortliche hat am 2026-10-29 den Phasenwechsel freigegeben und die E-Mail-Verifikation aus CC-P01-08 per ADR-0017 verschoben; die Lücken je Ticket bleiben in `docs/gaps.md` geführt.
 
 ## Test- und Review-Artefakte
 
