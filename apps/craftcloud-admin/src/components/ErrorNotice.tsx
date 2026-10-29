@@ -28,6 +28,7 @@ export function ErrorNotice({
   onRetry,
   onReload,
   overrides = {},
+  context,
 }: {
   error: unknown;
   /** Repeats the failed action. */
@@ -35,6 +36,8 @@ export function ErrorNotice({
   /** Re-reads the data shown (offered for stale-data errors). */
   onReload?: (() => void) | undefined;
   overrides?: Record<string, string>;
+  /** A sentence put in front of the message, inside the same alert (so that it is announced with it). */
+  context?: string | undefined;
 }) {
   const { t } = useI18n();
   const announce = useAnnounce();
@@ -65,7 +68,7 @@ export function ErrorNotice({
 
   return (
     <div className="error-notice">
-      <Alert>{text}</Alert>
+      <Alert>{context === undefined ? text : `${context} ${text}`}</Alert>
       {(staleData || canRetry) && (
         <div className="error-notice__actions">
           {staleData && onReload !== undefined && (

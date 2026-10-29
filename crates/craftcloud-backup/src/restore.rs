@@ -37,8 +37,9 @@
 //!
 //! **Unfinished uploads.** An upload that was in progress when the backup was
 //! taken has no bytes in the backup. Its session is set to `aborted`, its
-//! staged blob to `orphaned` (collected by the next maintenance run) and the
-//! quota reservations are reset to zero.
+//! staged blob to `orphaned` (collected by the next maintenance run, which also
+//! releases the bytes still reserved for those blobs); no other reservation
+//! remains.
 //!
 //! **Audit log timestamps.** The audit insert guard (migration 0012) rewrites
 //! `created_at`, `last_at` and `event_count` for every role except the table
@@ -582,12 +583,19 @@ async fn load_tables(
     sqlx::query("UPDATE blobs SET state = 'orphaned' WHERE state = 'staged'")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE workspaces SET reserved_bytes = 0 WHERE reserved_bytes <> 0")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE organizations SET reserved_bytes = 0 WHERE reserved_bytes <> 0")
-        .execute(&mut *tx)
-        .await?;
+    // No session holds a reservation any more; the orphaned blobs (their
+    // objects are missing and are collected by the next maintenance run) are
+    // the only reserved bytes, as the usage reconciliation derives them.
+    sqlx::query(
+        "UPDATE workspaces w SET reserved_bytes = COALESCE((SELECT sum(b.size_bytes) FROM blobs b          WHERE b.workspace_id = w.id AND b.state = 'orphaned'), 0)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE organizations o SET reserved_bytes = COALESCE((SELECT sum(w.reserved_bytes)          FROM workspaces w WHERE w.org_id = o.id), 0)",
+    )
+    .execute(&mut *tx)
+    .await?;
 
     let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
     audit::record_in(

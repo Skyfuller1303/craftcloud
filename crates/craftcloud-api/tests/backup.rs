@@ -462,7 +462,7 @@ mod tests {
         let backup_time = started.elapsed();
         assert!(created.audit_recorded);
         assert_eq!(created.blobs, 5, "{:?}", created.manifest.blobs);
-        assert_eq!(created.manifest.migration_version, 13);
+        assert_eq!(created.manifest.migration_version, 14);
 
         let report = craftcloud_backup::verify(&out, Some(&created.manifest_sha256)).unwrap();
         assert_eq!(report.blobs, 5);
@@ -796,9 +796,9 @@ mod tests {
 
         // Forged manifests with a matching checksum file: unknown versions.
         rewrite_manifest(&out, |m| m["migration_version"] = json!(99));
-        expect(&out, ErrorKind::Format, "only knows up to 13");
+        expect(&out, ErrorKind::Format, "only knows up to 14");
         rewrite_manifest(&out, |m| {
-            m["migration_version"] = json!(13);
+            m["migration_version"] = json!(14);
             m["format_version"] = json!(2);
         });
         expect(
@@ -962,8 +962,8 @@ mod tests {
         let w = W::new().await;
         let dir = TempDir::new("backup-older");
         let (out, _) = small_backup(&w, &dir).await;
-        // Migrations 0012 and 0013 change functions, triggers and an index,
-        // not tables, so a version 13 export is also a valid version 11 export. (No older
+        // Migrations 0012 to 0014 change functions, triggers, an index and data,
+        // not tables, so a version 14 export is also a valid version 11 export. (No older
         // server build exists here to produce a genuine one.)
         rewrite_manifest(&out, |m| m["migration_version"] = json!(11));
         craftcloud_backup::verify(&out, None).unwrap();
@@ -980,7 +980,7 @@ mod tests {
 
         // Restore, then migrate.
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 2);
+        assert_eq!(applied.len(), 3);
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         assert_eq!(
             dump(&w.env.pool, "users").await,
@@ -1225,17 +1225,18 @@ mod tests {
                 .await,
             0
         );
+        // Only the orphaned blob of the stored upload stays reserved until it is collected.
         assert_eq!(
             target
                 .count("SELECT COALESCE(sum(reserved_bytes), 0)::bigint FROM workspaces")
                 .await,
-            0
+            20_000
         );
         assert_eq!(
             target
                 .count("SELECT COALESCE(sum(reserved_bytes), 0)::bigint FROM organizations")
                 .await,
-            0
+            20_000
         );
         assert_eq!(
             target
@@ -1391,7 +1392,7 @@ mod tests {
         .unwrap();
         assert_eq!((row.0, row.1, row.2.as_str()), (None, None, "success"));
         assert_eq!(row.3["blobs"], 1);
-        assert_eq!(row.3["migration"], 13);
+        assert_eq!(row.3["migration"], 14);
 
         // The manifest holds no secrets: neither a connection string nor the
         // password of the database URL, and no names.

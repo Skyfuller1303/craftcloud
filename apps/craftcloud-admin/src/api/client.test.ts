@@ -28,15 +28,49 @@ describe("api client", () => {
     expect(client.hasCsrfToken()).toBe(false); // dropped after logout
   });
 
-  it("drops the CSRF token even when logout fails", async () => {
-    const { fetch } = mockFetch({
+  it("keeps the CSRF token when logout fails, so that it can be repeated", async () => {
+    let attempts = 0;
+    const { fetch, calls } = mockFetch({
       "GET /auth/session": { body: { csrf_token: "tok" } },
-      "POST /auth/logout": apiError(503, "AUTH_UNAVAILABLE"),
+      "POST /auth/logout": () => (++attempts === 1 ? apiError(503, "AUTH_UNAVAILABLE") : { status: 204 }),
     });
     const client = createApiClient({ fetchImpl: fetch });
     await client.session();
     expect(client.hasCsrfToken()).toBe(true);
     await expect(client.logout()).rejects.toBeInstanceOf(ApiError);
+    expect(client.hasCsrfToken()).toBe(true);
+    await client.logout();
+    expect(client.hasCsrfToken()).toBe(false);
+    const sent = calls.filter((c) => c.path === "/auth/logout").map((c) => c.headers["x-csrf-token"]);
+    expect(sent).toEqual(["tok", "tok"]);
+  });
+
+  it("keeps the CSRF token when logout cannot reach the server", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      if (String(input).endsWith("/auth/session")) {
+        return new Response(JSON.stringify({ csrf_token: "tok" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new TypeError("Failed to fetch");
+    }) as typeof fetch;
+    const client = createApiClient({ fetchImpl });
+    await client.session();
+    await expect(client.logout()).rejects.toBeDefined();
+    expect(client.hasCsrfToken()).toBe(true);
+  });
+
+  it("treats 401 on logout as done: the session is already gone", async () => {
+    const { fetch } = mockFetch({
+      "GET /auth/session": { body: { csrf_token: "tok" } },
+      "POST /auth/logout": apiError(401, "UNAUTHENTICATED"),
+    });
+    const client = createApiClient({ fetchImpl: fetch });
+    await client.session();
+    await expect(client.logout()).resolves.toBeUndefined();
     expect(client.hasCsrfToken()).toBe(false);
   });
 

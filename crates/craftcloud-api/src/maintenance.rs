@@ -1192,7 +1192,7 @@ impl Maintenance {
                     target: "craftcloud::maintenance",
                     org = %org_id,
                     blob = %blob_id,
-                    "a committed-bytes counter was smaller than the blob; clamped at zero"
+                    "a usage counter was smaller than the blob; clamped at zero"
                 );
                 report.add("counter_clamped", 1);
             }

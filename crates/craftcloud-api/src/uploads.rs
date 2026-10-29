@@ -37,7 +37,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::audit::{Change, commit_audited};
+use crate::audit::{Change, Denied, commit_audited};
 use crate::orgs::{
     Gate, audit, conflict, db_failure, gate, not_found, operator_gate, page_error, parse_id,
     rfc3339,
@@ -156,6 +156,28 @@ async fn fail_session(services: &Services, org_id: Uuid, id: Uuid) {
         }
         Ok(None) => {}
         Err(error) => tracing::error!(%error, "cannot fail upload session"),
+    }
+}
+
+/// Fails the session inside the open transaction. If that or the commit fails,
+/// the transaction is dropped (releasing the organization lock) and the session
+/// is failed in a new one, so a rejected upload never keeps its reservation.
+async fn fail_in_tx(
+    mut tx: OrgTx,
+    services: &Services,
+    org_id: Uuid,
+    id: Uuid,
+    now: time::OffsetDateTime,
+) {
+    let recorded = match tx.upload_fail(id, now).await {
+        Ok(_) => tx.commit().await.is_ok(),
+        Err(_) => {
+            drop(tx);
+            false
+        }
+    };
+    if !recorded {
+        fail_session(services, org_id, id).await;
     }
 }
 
@@ -626,6 +648,7 @@ struct Finish {
     size: u64,
     expected: Sha256Digest,
     user_id: Uuid,
+    login_session_id: Uuid,
     org_id: Uuid,
     workspace_id: Uuid,
     upload_id: Uuid,
@@ -635,7 +658,9 @@ struct Finish {
 
 /// Verifies and publishes the object, then records the blob only if
 /// everything still holds, judged with fresh roles under the organization
-/// lock (a revoked editor stores nothing). It runs in its own task, so a
+/// lock (a revoked editor stores nothing) and with the login session and the
+/// account re-checked in the same transaction (a disabled account or a
+/// revoked session stores nothing). It runs in its own task, so a
 /// cancelled request cannot leave a published object behind unaccounted.
 async fn finish_upload(finish: Finish) -> Response {
     let Finish {
@@ -644,6 +669,7 @@ async fn finish_upload(finish: Finish) -> Response {
         size,
         expected,
         user_id,
+        login_session_id,
         org_id,
         workspace_id,
         upload_id,
@@ -677,6 +703,46 @@ async fn finish_upload(finish: Finish) -> Response {
                 return *response;
             }
         };
+    // The request was authenticated when it started; the account may have been
+    // disabled or the session revoked while the body streamed in.
+    let now = services.clock.now();
+    match tx.session_valid(login_session_id, user_id, now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            fail_in_tx(tx, &services, org_id, upload_id, now).await;
+            guard.key = None;
+            delete_object(&services, &key).await;
+            audit(
+                &headers,
+                user_id,
+                "upload.content",
+                Some(org_id),
+                Some(upload_id),
+                "unauthenticated",
+            );
+            let mut response = error_response(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHENTICATED",
+                "Authentication is required.",
+                &headers,
+            );
+            // Stored as an aggregated `denied` audit row by `record_denials`.
+            response.extensions_mut().insert(Denied {
+                actor: user_id,
+                action: "upload.content".to_owned(),
+                org: Some(org_id),
+                target: Some(upload_id),
+            });
+            return response;
+        }
+        Err(error) => {
+            guard.key = None;
+            drop(tx);
+            delete_object(&services, &key).await;
+            fail_session(&services, org_id, upload_id).await;
+            return db_failure(&error, &headers, "session check failed");
+        }
+    }
     let decision = can(
         &actor,
         Action::UploadWrite,
@@ -696,9 +762,7 @@ async fn finish_upload(finish: Finish) -> Response {
     ) {
         Gate::Open(permit) => OrgScope::from_permit(&permit),
         Gate::Closed(response) => {
-            let now = services.clock.now();
-            let _ = tx.upload_fail(upload_id, now).await;
-            let _ = tx.commit().await;
+            fail_in_tx(tx, &services, org_id, upload_id, now).await;
             guard.key = None;
             delete_object(&services, &key).await;
             return response;
@@ -710,7 +774,6 @@ async fn finish_upload(finish: Finish) -> Response {
         fail_session(&services, org_id, upload_id).await;
         return internal(&headers);
     };
-    let now = services.clock.now();
     let stored = match tx.upload_store(&scope, upload_id, key.as_str(), now).await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -758,8 +821,7 @@ async fn finish_upload(finish: Finish) -> Response {
             }
         }
         StoreOutcome::FileDeleted | StoreOutcome::ProjectDeleted => {
-            let _ = tx.upload_fail(upload_id, now).await;
-            let _ = tx.commit().await;
+            fail_in_tx(tx, &services, org_id, upload_id, now).await;
             guard.key = None;
             delete_object(&services, &key).await;
             conflict(
@@ -789,9 +851,6 @@ pub(crate) async fn put_content(
         Err(response) => return *response,
     };
     let services = Arc::clone(&resolved.services);
-    if services.storage.is_none() {
-        return storage_unavailable(&headers);
-    }
     let org_id = resolved.org_id;
     let upload_id = resolved.id;
 
@@ -809,6 +868,10 @@ pub(crate) async fn put_content(
         Ok(opened) => opened,
         Err(response) => return *response,
     };
+    // Only an authorized caller learns about the server's storage state.
+    if services.storage.is_none() {
+        return storage_unavailable(&headers);
+    }
     let started_at = services.clock.now();
     let begun = match tx
         .upload_begin_receiving(&scope, upload_id, started_at)
@@ -947,6 +1010,7 @@ pub(crate) async fn put_content(
         size,
         expected,
         user_id: session.user_id,
+        login_session_id: session.session_id,
         org_id,
         workspace_id: resolved.workspace_id,
         upload_id,

@@ -333,6 +333,40 @@ describe("organization and workspace selectors", () => {
     expect(calls.find((c) => c.path === "/auth/logout")?.headers["x-csrf-token"]).toBe(SESSION.csrf_token);
   });
 
+  it("stays logged in, says so and retries when logout fails", async () => {
+    let attempts = 0;
+    const { fetch, calls } = mockFetch(
+      loggedInRoutes({
+        "POST /auth/logout": () => (++attempts === 1 ? apiError(503, "AUTH_UNAVAILABLE") : { status: 204 }),
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await user.click(await screen.findByRole("button", { name: "Log out" }));
+
+    // No login form: the session is still alive, and the page says so.
+    const alert = await screen.findByRole("alert");
+    // One alert carries both the sentence and the reason, so that it is announced together.
+    expect(alert.textContent).toContain("Logging out did not work. You are still logged in on this device.");
+    expect(alert.textContent).toContain("temporarily unavailable");
+    expect(screen.queryByRole("heading", { name: "Log in" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Log out" })).toBeTruthy();
+
+    // The retry reuses the CSRF token and ends the session.
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "Log in" })).toBeTruthy();
+    const logouts = calls.filter((c) => c.path === "/auth/logout");
+    expect(logouts.map((c) => c.headers["x-csrf-token"])).toEqual([SESSION.csrf_token, SESSION.csrf_token]);
+  });
+
+  it("shows the login form when logout answers 401 (the session was already gone)", async () => {
+    const { fetch } = mockFetch(loggedInRoutes({ "POST /auth/logout": apiError(401, "UNAUTHENTICATED") }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await user.click(await screen.findByRole("button", { name: "Log out" }));
+    expect(await screen.findByRole("heading", { name: "Log in" })).toBeTruthy();
+  });
+
   it("navigates placeholder sections and marks the current one", async () => {
     const { fetch } = mockFetch(loggedInRoutes());
     const user = userEvent.setup();

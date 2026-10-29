@@ -24,6 +24,11 @@ interface AuthValue {
   api: ApiClient;
   /** Re-reads setup status and session, for example after login. */
   refresh: () => Promise<void>;
+  /**
+   * Ends the session. Resolves only after the server confirmed it (or said the
+   * session was already gone); on failure it rejects and the state stays
+   * `authenticated`, so the caller can show the error and offer a retry.
+   */
   logout: () => Promise<void>;
 }
 
@@ -79,11 +84,7 @@ export function AuthProvider({
   }, [refresh]);
 
   const logout = useCallback(async () => {
-    try {
-      await api.logout();
-    } catch {
-      // The session is dropped locally either way; the server expires it on its own.
-    }
+    await api.logout();
     setState({ phase: "anonymous", sessionEnded: false });
   }, [api]);
 

@@ -165,8 +165,8 @@ mod tests {
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
             BACKUP_TABLES.len()
         );
-        assert_eq!(backup_tables_for(13).unwrap().len(), BACKUP_TABLES.len());
-        assert_eq!(excluded_tables_for(13), EXCLUDED_TABLES);
+        assert_eq!(backup_tables_for(14).unwrap().len(), BACKUP_TABLES.len());
+        assert_eq!(excluded_tables_for(14), EXCLUDED_TABLES);
         // Older schemas are refused with a clear reason.
         let error = backup_tables_for(MIN_BACKUP_MIGRATION - 1).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Format);
@@ -179,7 +179,7 @@ mod tests {
         let specs = [
             table("users", 1),
             table("audit_events", 11),
-            table("future_things", 14),
+            table("future_things", 15),
         ];
         let at = |version| {
             select(&specs, version)
@@ -187,8 +187,8 @@ mod tests {
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(at(13), ["users", "audit_events"]);
-        assert_eq!(at(14), ["users", "audit_events", "future_things"]);
+        assert_eq!(at(14), ["users", "audit_events"]);
+        assert_eq!(at(15), ["users", "audit_events", "future_things"]);
         assert_eq!(at(10), ["users"]);
     }
 }

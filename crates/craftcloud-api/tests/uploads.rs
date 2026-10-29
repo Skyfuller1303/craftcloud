@@ -1275,7 +1275,8 @@ mod tests {
         assert_eq!(shown.body["state"], "created");
         w.env.clock.advance(Duration::from_secs(11));
         let editor = w.relogin("editor").await;
-        // Reading closes it lazily; the reservation of both sessions is released and the blob orphaned.
+        // Reading closes it lazily; the reservation of the open session is released. The stored
+        // one keeps counting (its blob is orphaned but the object is still on disk).
         let shown = w.get(&editor, &format!("/api/v1/uploads/{open}")).await;
         assert_eq!(shown.body["state"], "expired");
         assert_status(
@@ -1289,7 +1290,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(closed, 0);
-        assert_eq!(w.reserved().await, (0, 0));
+        assert_eq!(w.reserved().await, (1000, 1000));
         let blob_state: String = sqlx::query_scalar("SELECT state FROM blobs")
             .fetch_one(&w.env.pool)
             .await
@@ -1314,7 +1315,7 @@ mod tests {
         let editor = w.relogin("editor").await;
         let _b = w.upload_id(&editor, c.file, &data).await;
         assert_eq!(w.state(a).await, "expired");
-        assert_eq!(w.reserved().await, (1000, 1000));
+        assert_eq!(w.reserved().await, (2000, 2000));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1341,7 +1342,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
-    async fn aborting_releases_the_reservation_and_orphans_a_stored_blob() {
+    async fn aborting_releases_a_created_reservation_and_keeps_a_stored_blob_counted() {
         let w = W::new().await;
         let c = cast(&w).await;
         let data = pattern(4000, 13);
@@ -1365,7 +1366,8 @@ mod tests {
                 StatusCode::NO_CONTENT
             );
         }
-        assert_eq!(w.reserved().await, (0, 0));
+        // Only the announced upload is released; the published object still occupies storage.
+        assert_eq!(w.reserved().await, (4000, 4000));
         let blob_state: String = sqlx::query_scalar("SELECT state FROM blobs")
             .fetch_one(&w.env.pool)
             .await
@@ -1930,5 +1932,173 @@ mod tests {
             return;
         }
         stream_upload(1024).await;
+    }
+
+    // ---- account disable and session revoke during the upload (SR-02) ----------------------------
+
+    /// Starts a PUT, runs `interfere`, then sends the rest of the body; the upload must end
+    /// unauthenticated with nothing stored and the reservation released.
+    async fn assert_nothing_stored_after(
+        w: &W,
+        who: &Session,
+        upload: Uuid,
+        data: &[u8],
+        interfere: impl std::future::Future<Output = ()>,
+    ) {
+        let (tx, put) = start_put(w, who, upload);
+        tx.send(Bytes::from(data[..data.len() / 2].to_vec()))
+            .await
+            .unwrap();
+        w.wait_for(upload, "receiving").await;
+        interfere.await;
+        tx.send(Bytes::from(data[data.len() / 2..].to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+        assert_status(
+            &put.await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHENTICATED",
+        );
+        assert_eq!(w.state(upload).await, "failed");
+        assert_eq!(
+            w.stored_objects(),
+            0,
+            "the published object is deleted again"
+        );
+        assert_eq!(w.count("SELECT count(*) FROM blobs").await, 0);
+        assert_eq!(w.reserved().await, (0, 0));
+        w.settled_no_temp().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn an_account_disabled_during_the_upload_stores_nothing() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let data = pattern(120_000, 21);
+        let id = w.upload_id(&c.editor.1, c.file, &data).await;
+        let members = w
+            .count("SELECT count(*) FROM organization_members WHERE status = 'active'")
+            .await;
+        let disable = async {
+            let r = w
+                .send(
+                    Req::new(
+                        "POST",
+                        &format!("/api/v1/admin/users/{}/disable", c.editor.0),
+                    )
+                    .session(&w.op),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        };
+        assert_nothing_stored_after(&w, &c.editor.1, id, &data, disable).await;
+        // The rejection is recorded as an aggregated denied event of the actor.
+        let mut denied = 0;
+        for _ in 0..200 {
+            denied = w
+                .count(
+                    "SELECT COALESCE(sum(event_count), 0)::bigint FROM audit_events                      WHERE action = 'upload.content' AND result = 'denied'",
+                )
+                .await;
+            if denied > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(denied, 1);
+        // The membership roles are untouched: only the account state stopped the upload.
+        assert_eq!(
+            w.count("SELECT count(*) FROM organization_members WHERE status = 'active'")
+                .await,
+            members
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn a_session_revoked_during_the_upload_stores_nothing() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let data = pattern(120_000, 22);
+        let id = w.upload_id(&c.editor.1, c.file, &data).await;
+        let logout = async {
+            let r = w
+                .send(Req::new("POST", "/api/v1/auth/logout").session(&c.editor.1))
+                .await;
+            assert!(r.status.is_success(), "{}", r.text);
+        };
+        assert_nothing_stored_after(&w, &c.editor.1, id, &data, logout).await;
+        // Another login of the same user is unaffected and can upload.
+        let again = w.relogin("editor").await;
+        let fresh = pattern(2000, 23);
+        let next = w.upload_id(&again, c.file, &fresh).await;
+        assert_eq!(w.put(&again, next, fresh).await.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn a_session_that_expires_absolutely_during_the_upload_stores_nothing() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let data = pattern(120_000, 24);
+        let id = w.upload_id(&c.editor.1, c.file, &data).await;
+        // The login ends (8 h absolute) well before the 24 h upload session.
+        let expire = async {
+            sqlx::query(
+                "UPDATE sessions SET created_at = created_at - interval '2 hours', \n                 absolute_expires_at = created_at - interval '1 hour'",
+            )
+                .execute(&w.env.pool)
+                .await
+                .unwrap();
+        };
+        assert_nothing_stored_after(&w, &c.editor.1, id, &data, expire).await;
+    }
+
+    // ---- no existence oracle through the storage state (SR-03) ----------------------------------
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn missing_storage_does_not_reveal_foreign_uploads() {
+        let w = W::from(TestEnv::without_storage().await).await;
+        let c = cast(&w).await;
+        // A session row of this organization (creating one through the API needs storage).
+        let project: Uuid = sqlx::query_scalar("SELECT project_id FROM files WHERE id = $1")
+            .bind(c.file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let foreign = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO upload_sessions (id, org_id, workspace_id, project_id, file_id,                  created_by_user_id, declared_size, declared_sha256, request_fingerprint,                  expires_at, created_at, updated_at)              VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 'x', now() + interval '1 day', now(), now())",
+        )
+        .bind(foreign)
+        .bind(c.org)
+        .bind(c.ws)
+        .bind(project)
+        .bind(c.file)
+        .bind(c.editor.0)
+        .bind(vec![0_u8; 32])
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        let unknown = Uuid::new_v4();
+        let a = w.put(&c.outsider.1, foreign, vec![1]).await;
+        let b = w.put(&c.outsider.1, unknown, vec![1]).await;
+        hidden(&a);
+        hidden(&b);
+        assert_eq!(a.body["error"]["message"], b.body["error"]["message"]);
+        // Authorized callers still learn that storage is missing.
+        assert_status(
+            &w.put(&c.editor.1, foreign, vec![1]).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "STORAGE_UNAVAILABLE",
+        );
+        assert_status(
+            &w.put(&c.viewer.1, foreign, vec![1]).await,
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+        );
     }
 }

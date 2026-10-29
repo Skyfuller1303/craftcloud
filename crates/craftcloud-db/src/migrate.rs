@@ -399,7 +399,7 @@ mod tests {
     fn embedded_migrations_are_ordered_and_complete() {
         assert_eq!(
             embedded_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
     }
 
@@ -407,6 +407,6 @@ mod tests {
     fn migrator_up_to_filters() {
         assert_eq!(migrator_up_to(1).iter().count(), 1);
         assert_eq!(migrator_up_to(0).iter().count(), 0);
-        assert_eq!(migrator_up_to(99).iter().count(), 13);
+        assert_eq!(migrator_up_to(99).iter().count(), 14);
     }
 }

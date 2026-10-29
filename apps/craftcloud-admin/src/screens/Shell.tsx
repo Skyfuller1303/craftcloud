@@ -53,6 +53,11 @@ export function Shell({
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const names = useRoleNames();
+  const [logoutError, setLogoutError] = useState<unknown>(null);
+  const attemptLogout = useCallback(() => {
+    setLogoutError(null);
+    logout().catch((error: unknown) => setLogoutError(error));
+  }, [logout]);
 
   const loadOrganizations = useCallback((cursor?: string) => api.listOrganizations(cursor), [api]);
   const organizations = usePagedList<Organization>(loadOrganizations);
@@ -144,7 +149,7 @@ export function Shell({
         <Preferences theme={theme} onThemeChange={onThemeChange} />
         <div className="shell__user">
           <span className="shell__user-name">{session.display_name}</span>
-          <Button className="button" onPress={() => void logout()}>
+          <Button className="button" onPress={attemptLogout}>
             {t("Log out")}
           </Button>
         </div>
@@ -169,6 +174,14 @@ export function Shell({
         </nav>
 
         <main id="main" className="shell__main" tabIndex={-1}>
+          {logoutError !== null && (
+            <ErrorNotice
+              error={logoutError}
+              context={t("Logging out did not work. You are still logged in on this device.")}
+              onRetry={attemptLogout}
+              onReload={() => window.location.reload()}
+            />
+          )}
           {notice !== undefined && <Alert tone="success">{notice}</Alert>}
           <ScreenHeading key={section}>{sectionLabel[section]}</ScreenHeading>
 

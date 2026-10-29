@@ -602,8 +602,8 @@ pub struct ClaimedBlob {
     pub object_key: String,
     /// Size in bytes.
     pub size_bytes: i64,
-    /// Whether the blob had been counted in `committed_bytes` (and was
-    /// subtracted by the claim).
+    /// Whether the blob had been counted in `committed_bytes` or, for an
+    /// `orphaned` blob, in `reserved_bytes` (and was subtracted by the claim).
     pub counted: bool,
     /// A counter was smaller than the blob and was clamped to zero instead of
     /// going negative; usage drift correction repairs the rest.
@@ -656,12 +656,48 @@ impl OrgTx {
         Ok(clamped)
     }
 
+    /// Subtracts reserved bytes, never below zero. Returns whether a counter
+    /// had to be clamped.
+    async fn sub_reserved(&mut self, workspace_id: Uuid, bytes: i64) -> Result<bool, DbError> {
+        let ws: Option<i64> = sqlx::query_scalar(
+            "SELECT reserved_bytes FROM workspaces WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        )
+        .bind(workspace_id)
+        .bind(self.org_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let org: i64 = sqlx::query_scalar("SELECT reserved_bytes FROM organizations WHERE id = $1")
+            .bind(self.org_id)
+            .fetch_one(&mut *self.tx)
+            .await?;
+        let clamped = ws.is_none_or(|current| current < bytes) || org < bytes;
+        sqlx::query(
+            "UPDATE workspaces SET reserved_bytes = GREATEST(reserved_bytes - $3, 0) \
+             WHERE id = $1 AND org_id = $2",
+        )
+        .bind(workspace_id)
+        .bind(self.org_id)
+        .bind(bytes)
+        .execute(&mut *self.tx)
+        .await?;
+        sqlx::query(
+            "UPDATE organizations SET reserved_bytes = GREATEST(reserved_bytes - $2, 0) WHERE id = $1",
+        )
+        .bind(self.org_id)
+        .bind(bytes)
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(clamped)
+    }
+
     /// Phase 1 of the garbage collection: claims one unreferenced blob.
     ///
     /// Under the organization lock the blob row is locked (`SKIP LOCKED`),
     /// checked again (state, age, no version, no open upload session), set to
     /// `deleting`, detached from closed sessions, and subtracted from the
-    /// committed counters if it was counted. The caller commits and then
+    /// committed counters if it was counted. An `orphaned` blob (an aborted or
+    /// expired stored upload) is subtracted from the reserved counters: its
+    /// bytes counted against the quota until now. The caller commits and then
     /// deletes the object and the row.
     ///
     /// # Errors
@@ -706,11 +742,11 @@ impl OrgTx {
             .bind(self.org_id)
             .execute(&mut *self.tx)
             .await?;
-        let counted = matches!(state.as_str(), "committed" | "corrupt");
-        let clamped = if counted {
-            self.sub_committed(workspace_id, size_bytes).await?
-        } else {
-            false
+        let counted = matches!(state.as_str(), "committed" | "corrupt" | "orphaned");
+        let clamped = match state.as_str() {
+            "committed" | "corrupt" => self.sub_committed(workspace_id, size_bytes).await?,
+            "orphaned" => self.sub_reserved(workspace_id, size_bytes).await?,
+            _ => false,
         };
         Ok(GcClaim::Claimed(ClaimedBlob {
             object_key,
@@ -832,7 +868,9 @@ pub async fn drifting_orgs(
         "WITH ws AS ( \
             SELECT w.org_id, w.reserved_bytes AS rb, w.committed_bytes AS cb, \
                 COALESCE((SELECT sum(s.declared_size)::bigint FROM upload_sessions s \
-                          WHERE s.workspace_id = w.id AND s.state IN {HOLDING}), 0) AS er, \
+                          WHERE s.workspace_id = w.id AND s.state IN {HOLDING}), 0) \
+                + COALESCE((SELECT sum(b.size_bytes)::bigint FROM blobs b \
+                          WHERE b.workspace_id = w.id AND b.state = 'orphaned'), 0) AS er, \
                 COALESCE((SELECT sum(b.size_bytes)::bigint FROM blobs b \
                           WHERE b.workspace_id = w.id AND b.state IN ('committed', 'corrupt')), 0) AS ec \
             FROM workspaces w WHERE w.org_id = ANY($2) AND w.org_id <> ALL($3)) \

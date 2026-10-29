@@ -322,12 +322,12 @@ mod tests {
             format_version: FORMAT_VERSION,
             created_at: "2026-10-29T12:00:00Z".to_owned(),
             server_version: "0.0.0".to_owned(),
-            migration_version: 13,
+            migration_version: 14,
             store: StoreInfo {
                 store_id: "0b2f6b5e-6d7b-4f5e-9d0a-3a5b3c1d2e4f".to_owned(),
                 epoch: 0,
             },
-            tables: crate::tables::backup_tables_for(13)
+            tables: crate::tables::backup_tables_for(14)
                 .unwrap()
                 .iter()
                 .map(|t| TableEntry {
@@ -349,7 +349,7 @@ mod tests {
         }
     }
 
-    const KNOWN: &[i64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+    const KNOWN: &[i64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
     fn parse(manifest: &Manifest) -> Result<Manifest, BackupError> {
         Manifest::parse(&manifest.to_bytes().unwrap(), KNOWN)
@@ -374,10 +374,10 @@ mod tests {
         m.format_version = 2;
         assert!(parse(&m).unwrap_err().message.contains("format version 2"));
         let mut m = sample();
-        m.migration_version = 14;
+        m.migration_version = 15;
         let error = parse(&m).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Format);
-        assert!(error.message.contains("only knows up to 13"), "{error}");
+        assert!(error.message.contains("only knows up to 14"), "{error}");
         let mut m = sample();
         m.migration_version = 0;
         assert!(parse(&m).unwrap_err().message.contains("does not know"));

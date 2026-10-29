@@ -470,8 +470,9 @@ mod tests {
         assert_eq!(counts.sessions, 2);
         assert_eq!(w.count("SELECT count(*) FROM projects").await, 0);
         assert_eq!(w.count("SELECT count(*) FROM upload_sessions").await, 0);
-        // The reservation is back; the committed bytes wait for the garbage collection.
-        assert_eq!(w.counters().await, (0, 64, 0, 64));
+        // The announced bytes wait for the garbage collection like the committed ones: the
+        // object of the stored upload is still on disk.
+        assert_eq!(w.counters().await, (300, 64, 300, 64));
         assert_eq!(w.blob_state(300).await, "orphaned");
         assert_eq!(w.blob_state(64).await, "committed");
         // A live project is never purged, whatever the cutoff.
@@ -608,6 +609,225 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "stored");
+    }
+
+    /// SR-01: aborting a stored upload must not free quota while the object is still on disk.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn aborting_stored_uploads_cannot_exceed_the_quota_until_the_gc_removes_the_object() {
+        let w = W::new().await;
+        let project = w.project("Quota").await;
+        let file = w.file(project, "quota.fig").await;
+        sqlx::query("UPDATE organizations SET quota_bytes = 1000")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let data = pattern(600, 1);
+        let create = |data: Vec<u8>| {
+            let w = &w;
+            async move {
+                w.post(
+                    &format!("/api/v1/files/{file}/uploads"),
+                    json!({"size_bytes": data.len(), "sha256": sha_hex(&data)}),
+                )
+                .await
+            }
+        };
+        let id = w.stored_upload(file, &data).await;
+        for _ in 0..2 {
+            // Aborting twice changes nothing.
+            let r = w.delete(&format!("/api/v1/uploads/{id}")).await;
+            assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text);
+        }
+        assert_eq!(w.blob_state(600).await, "orphaned");
+        assert_eq!(w.counters().await, (600, 0, 600, 0));
+        // The second upload does not fit next to the object that is still stored.
+        let refused = create(pattern(600, 2)).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            refused.text
+        );
+        assert_eq!(refused.code(), "QUOTA_EXCEEDED");
+        // A repeated store and abort cycle never exceeds the quota either.
+        let small = pattern(400, 3);
+        let second = w.stored_upload(file, &small).await;
+        let r = w.delete(&format!("/api/v1/uploads/{second}")).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text);
+        assert_eq!(w.counters().await, (1000, 0, 1000, 0));
+        assert_eq!(
+            create(pattern(1, 4)).await.status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(files_below(&w.objects_dir()), 2);
+
+        // Reconciliation derives the same numbers from the rows and corrects nothing.
+        let job = w.job().await;
+        let quiet = run(&job).await;
+        assert!(!quiet.has_errors(), "{quiet:?}");
+        assert_eq!(quiet.count("fix_usage", "orgs_corrected"), 0);
+        assert_eq!(w.counters().await, (1000, 0, 1000, 0));
+        // Young orphans are not collected, so the quota stays occupied.
+        assert_eq!(quiet.count("collect_blobs", "blobs_deleted"), 0);
+
+        // Damaged counters are repaired to include the orphaned bytes.
+        sqlx::query("UPDATE organizations SET reserved_bytes = 0")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspaces SET reserved_bytes = 0")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        let drift = tx.maint_fix_usage().await.unwrap().expect("drift");
+        tx.commit().await.unwrap();
+        assert_eq!(drift.reserved_delta, 1000);
+        assert_eq!(w.counters().await, (1000, 0, 1000, 0));
+
+        // After the grace period the GC deletes the objects and the quota is free again.
+        sqlx::query("UPDATE blobs SET created_at = created_at - interval '3 days'")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let old = run(&job).await;
+        assert!(!old.has_errors(), "{old:?}");
+        assert_eq!(old.count("collect_blobs", "blobs_deleted"), 2);
+        assert_eq!(files_below(&w.objects_dir()), 0);
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
+        assert_eq!(create(pattern(1000, 5)).await.status, StatusCode::CREATED);
+    }
+
+    /// M1: a database written by the old rule has orphaned blobs whose reservation was already
+    /// released. The migration recomputes the counters; without it, claims and releases must
+    /// still never violate the non-negative CHECK.
+    async fn pre_upgrade_state(w: &W) -> (Uuid, Uuid) {
+        let project = w.project("Upgrade").await;
+        let file = w.file(project, "up.fig").await;
+        let stored = w.stored_upload(file, &pattern(300, 1)).await;
+        w.delete(&format!("/api/v1/uploads/{stored}")).await;
+        let data = pattern(200, 2);
+        let created = w
+            .post(
+                &format!("/api/v1/files/{file}/uploads"),
+                json!({"size_bytes": data.len(), "sha256": sha_hex(&data)}),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let open = Uuid::parse_str(created.body["upload_id"].as_str().unwrap()).unwrap();
+        assert_eq!(w.counters().await, (500, 0, 500, 0));
+        // The old rule had released the 300 bytes of the aborted upload.
+        sqlx::query("UPDATE organizations SET reserved_bytes = 200 WHERE id = $1")
+            .bind(w.org)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspaces SET reserved_bytes = 200 WHERE id = $1")
+            .bind(w.ws)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let blob: Uuid = sqlx::query_scalar("SELECT id FROM blobs WHERE state = 'orphaned'")
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        (open, blob)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn migration_0014_recomputes_reservations_of_orphaned_blobs() {
+        let w = W::new().await;
+        let (open, blob) = pre_upgrade_state(&w).await;
+        let sql =
+            include_str!("../../craftcloud-db/migrations/0014_reserved_bytes_include_orphans.sql");
+        sqlx::raw_sql(sql).execute(&w.env.pool).await.unwrap();
+        assert_eq!(w.counters().await, (500, 0, 500, 0));
+        // Running it again changes nothing.
+        sqlx::raw_sql(sql).execute(&w.env.pool).await.unwrap();
+        assert_eq!(w.counters().await, (500, 0, 500, 0));
+        // The claim and the later abort release exactly what was reserved.
+        let before = w.env.clock.now() + Duration::from_secs(DAY);
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        let claim = tx.maint_gc_claim(blob, before).await.unwrap();
+        tx.commit().await.unwrap();
+        let dbm::GcClaim::Claimed(claimed) = claim else {
+            panic!("not claimed");
+        };
+        assert!(claimed.counted && !claimed.clamped);
+        assert_eq!(w.counters().await, (200, 0, 200, 0));
+        let r = w.delete(&format!("/api/v1/uploads/{open}")).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text);
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn releases_never_violate_the_check_when_a_counter_is_too_small() {
+        let w = W::new().await;
+        let (open, blob) = pre_upgrade_state(&w).await;
+        // No migration: the claim of the orphan finds 200 reserved for 300 bytes and clamps.
+        let before = w.env.clock.now() + Duration::from_secs(DAY);
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        let claim = tx.maint_gc_claim(blob, before).await.unwrap();
+        tx.commit().await.unwrap();
+        let dbm::GcClaim::Claimed(claimed) = claim else {
+            panic!("not claimed");
+        };
+        assert!(claimed.clamped);
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
+        // The open reservation is now unbacked: aborting it clamps instead of failing with a 500.
+        let r = w.delete(&format!("/api/v1/uploads/{open}")).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text);
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
+        // The usage reconciliation derives the right numbers from the rows.
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        assert_eq!(tx.maint_fix_usage().await.unwrap(), None);
+        tx.commit().await.unwrap();
+    }
+
+    /// SR-01: a crash between the claim and the object removal keeps counters consistent.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn an_orphaned_claim_releases_the_reservation_once_and_stays_consistent() {
+        let w = W::new().await;
+        let project = w.project("Orphan").await;
+        let file = w.file(project, "orphan.fig").await;
+        let id = w.stored_upload(file, &pattern(300, 1)).await;
+        w.delete(&format!("/api/v1/uploads/{id}")).await;
+        assert_eq!(w.counters().await, (300, 0, 300, 0));
+        let now = w.env.clock.now();
+        let before = now + Duration::from_secs(DAY);
+        let blob: Uuid = sqlx::query_scalar("SELECT id FROM blobs")
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        let claim = tx.maint_gc_claim(blob, before).await.unwrap();
+        tx.commit().await.unwrap();
+        let dbm::GcClaim::Claimed(claimed) = claim else {
+            panic!("the orphan was not claimed");
+        };
+        assert!(claimed.counted && !claimed.clamped);
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
+        // The claim crashed before the object removal: a second claim changes nothing.
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        assert_eq!(
+            tx.maint_gc_claim(blob, before).await.unwrap(),
+            dbm::GcClaim::Skipped
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
+        // Recomputing from the rows agrees (a `deleting` blob is not counted).
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        assert_eq!(tx.maint_fix_usage().await.unwrap(), None);
+        tx.commit().await.unwrap();
+        let job = w.job().await;
+        let report = run(&job).await;
+        assert_eq!(report.count("collect_blobs", "resumed"), 1);
+        assert_eq!(files_below(&w.objects_dir()), 0);
+        assert_eq!(w.counters().await, (0, 0, 0, 0));
     }
 
     #[tokio::test]

@@ -711,7 +711,8 @@ mod tests {
                 .status,
             StatusCode::NO_CONTENT
         );
-        assert_eq!(w.counters().await, (0, 0, 0, 0));
+        // The published object is still on disk, so its bytes stay reserved until the garbage collection.
+        assert_eq!(w.counters().await, (800, 0, 800, 0));
         // Removed from the workspace: the workspace is invisible (404).
         w.json(
             "PATCH",
@@ -835,8 +836,8 @@ mod tests {
         assert_status(&late, StatusCode::GONE, "UPLOAD_EXPIRED");
         assert_eq!(
             w.counters().await.0,
-            reserved_before - 50,
-            "expiry released this reservation"
+            reserved_before,
+            "an expired stored upload keeps counting until its blob is collected"
         );
     }
 
@@ -1803,5 +1804,301 @@ mod tests {
                 "UNAUTHENTICATED",
             );
         }
+    }
+
+    // ---- no existence oracle for foreign ids (SR-03) -----------------------------------------------
+
+    /// Everything a client can compare: status, error body without the request id, headers
+    /// without the per-request ones.
+    fn shape(resp: &Resp) -> (StatusCode, Value, Vec<(String, String)>) {
+        let mut body = resp.body.clone();
+        if let Some(error) = body.get_mut("error").and_then(Value::as_object_mut) {
+            error.remove("request_id");
+        }
+        let mut headers: Vec<(String, String)> = resp
+            .headers
+            .iter()
+            .filter(|(name, _)| {
+                !matches!(name.as_str(), "x-request-id" | "date" | "content-length")
+            })
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        headers.sort();
+        (resp.status, body, headers)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn foreign_and_unknown_objects_answer_identically_on_every_route() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        // The caller: an outsider with an organization and an upload of their own.
+        let mine_org = w.org("outsiders", c.outsider.0).await;
+        let mine_ws = w.ws(&c.outsider.1, mine_org, "out-main").await;
+        let mine_project = w.project(&c.outsider.1, mine_ws, "Mine").await;
+        let mine_file = w.file(&c.outsider.1, mine_project, "mine.fig").await;
+        let mine = w
+            .stored_upload(&c.outsider.1, mine_file, &pattern(64, 1))
+            .await;
+        // The foreign objects: a file with a version, a stored upload, a member.
+        let version = w.push(&c.owner.1, c.file, &pattern(128, 2)).await;
+        let other = w.file(&c.owner.1, c.project, "other.fig").await;
+        let upload = w.stored_upload(&c.owner.1, other, &pattern(256, 3)).await;
+        let foreign = [
+            ("{org}", c.org),
+            ("{ws}", c.ws),
+            ("{project}", c.project),
+            ("{file}", c.file),
+            ("{version}", version),
+            ("{upload}", upload),
+            ("{user}", c.editor.0),
+            ("{inv}", Uuid::new_v4()),
+            ("{mine}", mine),
+        ];
+        let unknown: Vec<(&str, Uuid)> = foreign
+            .iter()
+            .map(|(name, id)| {
+                (
+                    *name,
+                    if *name == "{mine}" || *name == "{inv}" {
+                        *id
+                    } else {
+                        Uuid::new_v4()
+                    },
+                )
+            })
+            .collect();
+        let fill = |text: &str, ids: &[(&str, Uuid)]| {
+            ids.iter().fold(text.to_owned(), |text, (name, id)| {
+                text.replace(name, &id.to_string())
+            })
+        };
+
+        let none = Value::Null;
+        let routes: Vec<(&str, &str, Vec<Value>)> = vec![
+            ("GET", "/api/v1/organizations/{org}", vec![none.clone()]),
+            (
+                "PATCH",
+                "/api/v1/organizations/{org}",
+                vec![json!({"name": "New"}), json!({"name": ""}), json!({})],
+            ),
+            (
+                "GET",
+                "/api/v1/organizations/{org}/members",
+                vec![none.clone()],
+            ),
+            (
+                "POST",
+                "/api/v1/organizations/{org}/members",
+                vec![json!({"user_id": "{user}", "role": "member"})],
+            ),
+            (
+                "PATCH",
+                "/api/v1/organizations/{org}/members/{user}",
+                vec![json!({"role": "admin"})],
+            ),
+            (
+                "DELETE",
+                "/api/v1/organizations/{org}/members/{user}",
+                vec![none.clone()],
+            ),
+            (
+                "GET",
+                "/api/v1/organizations/{org}/workspaces",
+                vec![none.clone()],
+            ),
+            (
+                "POST",
+                "/api/v1/organizations/{org}/workspaces",
+                vec![
+                    json!({"name": "W", "slug": "w-new"}),
+                    json!({"name": "", "slug": ""}),
+                ],
+            ),
+            (
+                "GET",
+                "/api/v1/organizations/{org}/invitations",
+                vec![none.clone()],
+            ),
+            (
+                "POST",
+                "/api/v1/organizations/{org}/invitations",
+                vec![json!({"email": "x@example.test", "org_role": "member"})],
+            ),
+            (
+                "DELETE",
+                "/api/v1/organizations/{org}/invitations/{inv}",
+                vec![none.clone()],
+            ),
+            (
+                "GET",
+                "/api/v1/organizations/{org}/usage",
+                vec![none.clone()],
+            ),
+            (
+                "GET",
+                "/api/v1/organizations/{org}/audit",
+                vec![none.clone()],
+            ),
+            (
+                "GET",
+                "/api/v1/organizations/{org}/audit/export",
+                vec![none.clone()],
+            ),
+            ("GET", "/api/v1/workspaces/{ws}", vec![none.clone()]),
+            (
+                "PATCH",
+                "/api/v1/workspaces/{ws}",
+                vec![json!({"name": "New"}), json!({"name": ""})],
+            ),
+            ("GET", "/api/v1/workspaces/{ws}/members", vec![none.clone()]),
+            (
+                "POST",
+                "/api/v1/workspaces/{ws}/members",
+                vec![json!({"user_id": "{user}", "role": "viewer"})],
+            ),
+            (
+                "PATCH",
+                "/api/v1/workspaces/{ws}/members/{user}",
+                vec![json!({"role": "editor"})],
+            ),
+            (
+                "DELETE",
+                "/api/v1/workspaces/{ws}/members/{user}",
+                vec![none.clone()],
+            ),
+            (
+                "PUT",
+                "/api/v1/workspaces/{ws}/quota",
+                vec![json!({"quota_bytes": 5}), json!({"quota_bytes": "x"})],
+            ),
+            (
+                "GET",
+                "/api/v1/workspaces/{ws}/projects",
+                vec![none.clone()],
+            ),
+            (
+                "POST",
+                "/api/v1/workspaces/{ws}/projects",
+                vec![json!({"name": "P"}), json!({"name": ""})],
+            ),
+            ("GET", "/api/v1/projects/{project}", vec![none.clone()]),
+            (
+                "PATCH",
+                "/api/v1/projects/{project}",
+                vec![json!({"name": "Q"}), json!({"name": ""})],
+            ),
+            (
+                "POST",
+                "/api/v1/projects/{project}/restore",
+                vec![none.clone()],
+            ),
+            (
+                "GET",
+                "/api/v1/projects/{project}/files",
+                vec![none.clone()],
+            ),
+            (
+                "POST",
+                "/api/v1/projects/{project}/files",
+                vec![
+                    json!({"name": "a.fig", "app": "figcraft", "format": "fig"}),
+                    json!({"name": "", "app": "x", "format": "y"}),
+                ],
+            ),
+            ("GET", "/api/v1/files/{file}", vec![none.clone()]),
+            (
+                "PATCH",
+                "/api/v1/files/{file}",
+                vec![json!({"name": "b.fig"}), json!({"name": ""})],
+            ),
+            ("POST", "/api/v1/files/{file}/restore", vec![none.clone()]),
+            (
+                "POST",
+                "/api/v1/files/{file}/uploads",
+                vec![
+                    json!({"size_bytes": 1, "sha256": "0".repeat(64)}),
+                    json!({"size_bytes": 1, "sha256": "bad"}),
+                ],
+            ),
+            ("GET", "/api/v1/files/{file}/versions", vec![none.clone()]),
+            (
+                "POST",
+                "/api/v1/files/{file}/versions",
+                vec![
+                    json!({"upload_id": "invalid"}),
+                    json!({"upload_id": "{upload}"}),
+                    json!({"upload_id": "{mine}"}),
+                ],
+            ),
+            (
+                "GET",
+                "/api/v1/files/{file}/versions/{version}",
+                vec![none.clone()],
+            ),
+            (
+                "POST",
+                "/api/v1/files/{file}/versions/{version}/restore",
+                vec![none.clone()],
+            ),
+            ("GET", "/api/v1/files/{file}/content", vec![none.clone()]),
+            (
+                "GET",
+                "/api/v1/files/{file}/versions/{version}/content",
+                vec![none.clone()],
+            ),
+            ("GET", "/api/v1/uploads/{upload}", vec![none.clone()]),
+            ("DELETE", "/api/v1/uploads/{upload}", vec![none.clone()]),
+            (
+                "PUT",
+                "/api/v1/uploads/{upload}/content",
+                vec![none.clone()],
+            ),
+        ];
+        let header_sets: [Option<(&str, &str)>; 3] = [
+            None,
+            Some(("If-Match", "\"x\"")),
+            Some(("If-None-Match", "*")),
+        ];
+        let mut compared = 0;
+        for (method, template, bodies) in &routes {
+            for body in bodies {
+                for extra in header_sets {
+                    let mut shapes = Vec::new();
+                    for ids in [&foreign[..], &unknown[..]] {
+                        let mut req = Req::new(method, &fill(template, ids)).session(&c.outsider.1);
+                        if let Some((name, value)) = extra {
+                            req = req.header(name, value);
+                        }
+                        if *method == "PUT" && template.ends_with("/content") {
+                            req = req.body(Body::from(vec![1_u8, 2, 3]));
+                        } else if !body.is_null() {
+                            req = req
+                                .json(serde_json::from_str(&fill(&body.to_string(), ids)).unwrap());
+                        }
+                        let resp = w.send(req).await;
+                        assert!(
+                            !resp.status.is_success(),
+                            "{method} {template} {body} succeeded: {}",
+                            resp.text
+                        );
+                        shapes.push(shape(&resp));
+                    }
+                    assert_eq!(
+                        shapes[0], shapes[1],
+                        "{method} {template} {body} {extra:?}: foreign and unknown ids differ"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 100, "only {compared} comparisons");
+        // The outsider changed nothing of the foreign tenant.
+        assert_eq!(w.head(&c.owner.1, c.file).await, Some(version));
     }
 }

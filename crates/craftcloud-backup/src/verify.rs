@@ -460,7 +460,7 @@ mod tests {
         fs::create_dir_all(dir.join(TABLES_DIR)).unwrap();
         fs::create_dir_all(dir.join(BLOBS_DIR)).unwrap();
         let mut tables = Vec::new();
-        for spec in backup_tables_for(13).unwrap() {
+        for spec in backup_tables_for(14).unwrap() {
             let content: &[u8] = if spec.name == "users" { b"row\n" } else { b"" };
             let file = table_file(spec.name);
             fs::write(dir.join(&file), content).unwrap();
@@ -494,7 +494,7 @@ mod tests {
             format_version: FORMAT_VERSION,
             created_at: "2026-10-29T12:00:00Z".to_owned(),
             server_version: "0.0.0".to_owned(),
-            migration_version: 13,
+            migration_version: 14,
             store: StoreInfo {
                 store_id: "x".to_owned(),
                 epoch: 0,

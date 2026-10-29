@@ -238,6 +238,11 @@ export interface ApiClient {
   setupComplete(body: SetupCompleteRequest): Promise<SetupCompleteResponse>;
   login(body: LoginRequest): Promise<LoginResponse>;
   session(): Promise<SessionInfo>;
+  /**
+   * Ends the session. The CSRF token is dropped only when the server confirmed
+   * it (success or 401); on any other failure the promise rejects and the token
+   * is kept so that the call can be repeated.
+   */
   logout(): Promise<void>;
   listOrganizations(cursor?: string): Promise<Page<Organization>>;
   listWorkspaces(orgId: string, cursor?: string): Promise<Page<Workspace>>;
@@ -438,10 +443,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     async logout() {
       try {
         await call<void>(ENDPOINTS.logout, { anonymous: true });
-      } finally {
-        // Whatever the answer was, this page must not keep acting as the session.
-        csrfToken = null;
+      } catch (error) {
+        // 401 means the session is already gone: that is what logging out wants.
+        // Any other failure leaves the session alive on the server, so the token
+        // stays and the caller can try again.
+        if (!isApiError(error) || error.status !== 401) {
+          throw error;
+        }
       }
+      csrfToken = null;
     },
     listOrganizations: (cursor) =>
       call(ENDPOINTS.listOrganizations, { query: { limit: "100", cursor } }),

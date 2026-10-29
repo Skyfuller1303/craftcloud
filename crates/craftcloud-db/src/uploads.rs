@@ -8,9 +8,13 @@
 //! - `organizations.reserved_bytes` / `workspaces.reserved_bytes` hold the
 //!   declared size of every session in the states `created`, `receiving` and
 //!   `stored` (a stored blob keeps its reservation until a version commit moves
-//!   it to `committed_bytes`);
-//! - a session that is aborted, fails or expires releases its reservation, and
-//!   its staged blob becomes `orphaned` (deleted later by the cleanup job);
+//!   it to `committed_bytes`), plus the size of every `orphaned` blob;
+//! - a session that is aborted, fails or expires releases its reservation if
+//!   it has no object yet. A `stored` session already has a published object:
+//!   its staged blob becomes `orphaned` and the bytes keep counting in
+//!   `reserved_bytes` until the cleanup job has claimed the blob for deletion
+//!   ([`OrgTx::maint_gc_claim`]), so aborting cannot be used to store more than
+//!   the quota allows;
 //! - the counters can be recomputed from the rows at any time
 //!   ([`OrgTx::recompute_usage`]).
 //!
@@ -294,7 +298,7 @@ pub enum StoreOutcome {
 /// Result of [`OrgTx::upload_abort`].
 #[derive(Debug, Clone)]
 pub enum AbortOutcome {
-    /// Aborted; the reservation is released.
+    /// Aborted; the reservation is released unless an object was published.
     Aborted(Box<UploadSession>),
     /// The session was already closed without a commit (nothing changed).
     Unchanged(Box<UploadSession>),
@@ -347,9 +351,34 @@ impl OrgTx {
         .await?)
     }
 
+    /// Gives reserved bytes back. A counter that is smaller than `bytes`
+    /// (drift, for example from a database written before migration 0014 or by
+    /// a bug) is clamped at zero instead of violating the non-negative CHECK,
+    /// which would fail the whole request; the drift is logged and the usage
+    /// reconciliation of the maintenance job repairs the counters from the rows.
     pub(crate) async fn release(&mut self, workspace_id: Uuid, bytes: i64) -> Result<(), DbError> {
+        let ws: Option<i64> = sqlx::query_scalar(
+            "SELECT reserved_bytes FROM workspaces WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        )
+        .bind(workspace_id)
+        .bind(self.org_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let org: i64 = sqlx::query_scalar("SELECT reserved_bytes FROM organizations WHERE id = $1")
+            .bind(self.org_id)
+            .fetch_one(&mut *self.tx)
+            .await?;
+        if ws.is_none_or(|current| current < bytes) || org < bytes {
+            tracing::warn!(
+                target: "craftcloud::uploads",
+                org = %self.org_id,
+                workspace = %workspace_id,
+                bytes,
+                "a reserved-bytes counter was smaller than the release; clamped at zero"
+            );
+        }
         sqlx::query(
-            "UPDATE workspaces SET reserved_bytes = reserved_bytes - $2 \
+            "UPDATE workspaces SET reserved_bytes = GREATEST(reserved_bytes - $2, 0) \
              WHERE id = $1 AND org_id = $3",
         )
         .bind(workspace_id)
@@ -357,11 +386,13 @@ impl OrgTx {
         .bind(self.org_id)
         .execute(&mut *self.tx)
         .await?;
-        sqlx::query("UPDATE organizations SET reserved_bytes = reserved_bytes - $2 WHERE id = $1")
-            .bind(self.org_id)
-            .bind(bytes)
-            .execute(&mut *self.tx)
-            .await?;
+        sqlx::query(
+            "UPDATE organizations SET reserved_bytes = GREATEST(reserved_bytes - $2, 0) WHERE id = $1",
+        )
+        .bind(self.org_id)
+        .bind(bytes)
+        .execute(&mut *self.tx)
+        .await?;
         Ok(())
     }
 
@@ -389,8 +420,10 @@ impl OrgTx {
         Ok(())
     }
 
-    /// Closes a session that holds a reservation: new state, reservation
-    /// released, staged blob orphaned.
+    /// Closes a session that holds a reservation: new state, staged blob
+    /// orphaned. The reservation is released at once unless a published object
+    /// exists: the bytes of an `orphaned` blob stay reserved until the cleanup
+    /// job removes it (see the module docs).
     pub(crate) async fn close_session(
         &mut self,
         session: &UploadSession,
@@ -407,15 +440,22 @@ impl OrgTx {
         .bind(now)
         .fetch_one(&mut *self.tx)
         .await?;
+        let mut kept = false;
         if let Some(blob_id) = session.blob_id {
-            sqlx::query("UPDATE blobs SET state = 'orphaned' WHERE id = $1 AND org_id = $2 AND state = 'staged'")
-                .bind(blob_id)
-                .bind(self.org_id)
-                .execute(&mut *self.tx)
+            kept = sqlx::query(
+                "UPDATE blobs SET state = 'orphaned' WHERE id = $1 AND org_id = $2 AND state = 'staged'",
+            )
+            .bind(blob_id)
+            .bind(self.org_id)
+            .execute(&mut *self.tx)
+            .await?
+            .rows_affected()
+                == 1;
+        }
+        if !kept {
+            self.release(session.workspace_id, session.declared_size)
                 .await?;
         }
-        self.release(session.workspace_id, session.declared_size)
-            .await?;
         Ok(updated)
     }
 
@@ -648,6 +688,42 @@ impl OrgTx {
         Ok(BeginOutcome::Started(Box::new(updated)))
     }
 
+    /// Whether the login session is still valid for a write that completes
+    /// now: the account is enabled, and the session is neither revoked nor past
+    /// its absolute expiry. The rows are locked (`FOR SHARE`, users row first
+    /// like `accounts::set_disabled`), so a concurrent account disable or
+    /// session revoke either finished before this read or waits until the
+    /// transaction ends. Idleness is not checked: the upload itself is activity.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn session_valid(
+        &mut self,
+        session_id: Uuid,
+        user_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let enabled: Option<bool> =
+            sqlx::query_scalar("SELECT disabled_at IS NULL FROM users WHERE id = $1 FOR SHARE")
+                .bind(user_id)
+                .fetch_optional(&mut *self.tx)
+                .await?;
+        if enabled != Some(true) {
+            return Ok(false);
+        }
+        let live: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL \
+             AND absolute_expires_at > $3 FOR SHARE",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(now)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        Ok(live.is_some())
+    }
+
     /// Records the published object as a staged blob and the session as
     /// `stored`. The caller has already decided with fresh roles that the
     /// actor may still write.
@@ -720,7 +796,9 @@ impl OrgTx {
         Ok(true)
     }
 
-    /// Aborts a session that is not receiving; its reservation is released.
+    /// Aborts a session that is not receiving. A `created` session releases
+    /// its reservation; a `stored` one keeps counting until its object is
+    /// deleted (see the module docs).
     ///
     /// # Errors
     ///
@@ -816,7 +894,9 @@ impl OrgTx {
         sqlx::query(&format!(
             "UPDATE workspaces w SET \
                 reserved_bytes = COALESCE((SELECT sum(declared_size) FROM upload_sessions s \
-                    WHERE s.workspace_id = w.id AND s.state IN {HOLDING}), 0), \
+                    WHERE s.workspace_id = w.id AND s.state IN {HOLDING}), 0) \
+                    + COALESCE((SELECT sum(size_bytes) FROM blobs b \
+                    WHERE b.workspace_id = w.id AND b.state = 'orphaned'), 0), \
                 committed_bytes = COALESCE((SELECT sum(size_bytes) FROM blobs b \
                     WHERE b.workspace_id = w.id AND b.state IN ('committed', 'corrupt')), 0) \
              WHERE w.org_id = $1"

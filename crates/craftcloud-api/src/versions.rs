@@ -194,14 +194,17 @@ pub(crate) async fn commit_version(
         Ok(Json(request)) => request,
         Err(rejection) => return rejection_response(&rejection, &headers),
     };
+    // The syntax of the body is checked before any file is looked up: a
+    // malformed `upload_id` must answer the same for existing, foreign and
+    // unknown files (no existence oracle).
+    let Some(upload_id) = parse_id(&request.upload_id) else {
+        return validation_failed(&["upload_id"], &headers);
+    };
     let resolved = match resolve_file(&state, &headers, &file_raw).await {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
     let services = Arc::clone(&resolved.services);
-    let Some(upload_id) = parse_id(&request.upload_id) else {
-        return validation_failed(&["upload_id"], &headers);
-    };
     // The upload must live in the same workspace as the file; anything else
     // looks like an unknown upload.
     let creator = match uploads::locate(&services.pool, upload_id).await {
