@@ -1,6 +1,8 @@
 # CC-F12 — Browser-Adminpanel und Setup-UX
 
 > **Status:** teilweise umgesetzt (lokal, ungeprüft): Gerüst, API-Client, Setup, Login, Einladung annehmen sowie Organisations-/Workspace-Auswahl (CC-P03-01/02, PR-014); Mitglieder, Einladungen, Projekte, Dateien mit Upload/Download/Versionen/Papierkorb, Passwort-Reset-Seite und die einheitliche Fehler-/Wiederholungsdarstellung (CC-P03-03/04, PR-015); Quota-, Audit-/Aktivitäts- und Einstellungsansichten sind geplant. **Zielphase:** P3 (Admin & Operations). **Priorität:** MVP/Blocker.  
+
+Gestaltung: verbindlich nach [Admin-UI-Designsystem](../11-design/README.md).
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen
