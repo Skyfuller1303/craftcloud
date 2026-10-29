@@ -1,7 +1,8 @@
 //! CraftCloud server binary: reads configuration, composes the router and
 //! serves it until a shutdown signal arrives.
 //!
-//! Usage: `craftcloud-server` (serve) or `craftcloud-server migrate`.
+//! Usage: `craftcloud-server` (serve), `craftcloud-server migrate` or
+//! `craftcloud-server admin ...` (offline tools, including one maintenance run).
 //!
 //! Exit codes: 0 clean shutdown, 1 runtime failure (including a database that
 //! is not migrated), 2 invalid configuration or usage.
@@ -13,22 +14,30 @@ mod server;
 use std::process::ExitCode;
 
 use config::{Config, DatabaseSettings, LogFormat};
-use craftcloud_api::{ApiConfig, AuthSettings, Services};
+use craftcloud_api::maintenance::{
+    Binding, Maintenance, MaintenanceSettings, RunOptions, RunOutcome, Trigger,
+    check_store_binding, rebind_store,
+};
+use craftcloud_api::{ApiConfig, AuthSettings, Services, SystemClock};
 use craftcloud_auth::{BootstrapToken, OpaqueToken, PASSWORD_RESET_TTL};
 use craftcloud_core::Capabilities;
 use craftcloud_core::NormalizedEmail;
 use craftcloud_db::PgPool;
+use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
 
-const USAGE: &str = "usage: craftcloud-server [migrate | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address>]\n\
+const USAGE: &str = "usage: craftcloud-server [migrate | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force]\n\
     \n\
     (no argument)                          start the HTTP server\n\
     migrate                                apply pending database migrations and exit\n\
     admin issue-password-reset --email E   print a one-hour password reset link for account E\n\
     admin set-org-owner --org SLUG --email E\n\
-                                           break glass: make the enabled account E an owner of organization SLUG\n";
+                                           break glass: make the enabled account E an owner of organization SLUG\n\
+    admin maintenance --once [--dry-run]   run the maintenance job once (retention purge, blob garbage collection,\n\
+                                           reconciliation, verification) and print counts; --dry-run changes nothing
+    admin storage-bind --force             deliberately (re)bind this database and CRAFTCLOUD_STORAGE_DIR to each other\n";
 
 /// A failure with the exit code it maps to.
 struct Failure {
@@ -57,6 +66,8 @@ enum Command {
     Migrate,
     IssuePasswordReset { email: String },
     SetOrgOwner { org: String, email: String },
+    Maintenance { dry_run: bool },
+    StorageBind,
     Help,
 }
 
@@ -82,6 +93,24 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 org: org.clone(),
                 email: email.clone(),
             })
+        }
+        [admin, action, once]
+            if admin == "admin" && action == "maintenance" && once == "--once" =>
+        {
+            Ok(Command::Maintenance { dry_run: false })
+        }
+        [admin, action, once, dry]
+            if admin == "admin"
+                && action == "maintenance"
+                && once == "--once"
+                && dry == "--dry-run" =>
+        {
+            Ok(Command::Maintenance { dry_run: true })
+        }
+        [admin, action, force]
+            if admin == "admin" && action == "storage-bind" && force == "--force" =>
+        {
+            Ok(Command::StorageBind)
         }
         [one] => Err(format!("unknown argument {one:?}")),
         _ => Err("too many arguments".to_owned()),
@@ -133,6 +162,8 @@ async fn main() -> ExitCode {
         Command::Serve => run(config).await,
         Command::IssuePasswordReset { email } => issue_password_reset(&config, &email).await,
         Command::SetOrgOwner { org, email } => set_org_owner(&config, &org, &email).await,
+        Command::Maintenance { dry_run } => maintenance_once(&config, dry_run).await,
+        Command::StorageBind => storage_bind(&config).await,
         Command::Help => Ok(()),
     };
     match result {
@@ -323,6 +354,146 @@ async fn set_org_owner(config: &Config, org_slug: &str, email: &str) -> Result<(
     Ok(())
 }
 
+fn maintenance_settings(config: &Config) -> MaintenanceSettings {
+    let mut settings = MaintenanceSettings::new(
+        config.trash_retention,
+        config.version_retention,
+        config.upload_ttl,
+        config.verify_bytes_per_run,
+    );
+    settings.quarantine_retention = config.quarantine_retention;
+    settings
+}
+
+/// Deliberately pairs the database with the store directory: the identity in
+/// the store marker (or a new one, if the store has none) is written to both.
+/// Prints the old and new identities. The operator must have verified that
+/// this database and this directory belong together; nothing else calls this.
+async fn storage_bind(config: &Config) -> Result<(), Failure> {
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "storage-bind requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    let Some(dir) = &config.storage_dir else {
+        return Err(Failure::config(
+            "storage-bind requires CRAFTCLOUD_STORAGE_DIR to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let store = craftcloud_storage::LocalStore::open(dir)
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?;
+    let bound = rebind_store(&pool, &store, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?;
+    fn show<T: std::fmt::Display>(id: Option<T>) -> String {
+        id.map_or_else(|| "none".to_owned(), |id| id.to_string())
+    }
+    println!("database binding was: {}", show(bound.old_database));
+    println!("store marker was:     {}", show(bound.old_marker));
+    println!(
+        "both are now:         {} (epoch {})",
+        bound.new, bound.epoch
+    );
+    tracing::warn!(
+        target: "craftcloud::audit",
+        action = "storage.rebind",
+        old_database = %show(bound.old_database),
+        old_marker = %show(bound.old_marker),
+        new = %bound.new,
+        "audit"
+    );
+    pool.close().await;
+    Ok(())
+}
+
+/// Runs the maintenance job once on the host (the same job as the loop inside
+/// the server, guarded by the same database lock). Prints counts only. Exit 1
+/// when another run is active or a step failed.
+async fn maintenance_once(config: &Config, dry_run: bool) -> Result<(), Failure> {
+    if !config.maintenance_enabled {
+        return Err(Failure::runtime(
+            "maintenance is switched off (CRAFTCLOUD_MAINTENANCE_ENABLED=false); nothing was done",
+        ));
+    }
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "maintenance requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let store = match &config.storage_dir {
+        Some(dir) => Some(
+            craftcloud_storage::LocalStore::open(dir)
+                .await
+                .map_err(|err| Failure::runtime(err.to_string()))?,
+        ),
+        None => {
+            eprintln!("Note: CRAFTCLOUD_STORAGE_DIR is not set; the storage steps are skipped.");
+            None
+        }
+    };
+    let job = Maintenance::new(
+        pool.clone(),
+        store,
+        std::sync::Arc::new(SystemClock),
+        maintenance_settings(config),
+    );
+    let (_keep_alive, stop) = watch::channel(false);
+    let outcome = job
+        .run_once(
+            RunOptions {
+                dry_run,
+                trigger: Trigger::Cli,
+            },
+            &stop,
+        )
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?;
+    pool.close().await;
+    match outcome {
+        RunOutcome::Skipped => Err(Failure::runtime(
+            "another maintenance run is active; nothing was done",
+        )),
+        RunOutcome::Completed(report) => {
+            println!(
+                "{}",
+                if dry_run {
+                    "maintenance dry run (nothing was changed):"
+                } else {
+                    "maintenance run finished:"
+                }
+            );
+            for (step, result) in &report.steps {
+                let counts: Vec<String> = result
+                    .counts
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect();
+                let counts = if counts.is_empty() {
+                    "nothing to do".to_owned()
+                } else {
+                    counts.join(" ")
+                };
+                match result.error {
+                    Some(code) => println!("  {step}: FAILED ({code}) {counts}"),
+                    None => println!("  {step}: {counts}"),
+                }
+            }
+            if report.has_errors() {
+                Err(Failure::runtime("one or more maintenance steps failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 async fn run(config: Config) -> Result<(), Failure> {
     // Validate the bootstrap secret first: a bad file is a configuration
     // error (exit 2) and must stop startup before anything is bound.
@@ -394,9 +565,70 @@ async fn run(config: Config) -> Result<(), Failure> {
         upload_ttl: config.upload_ttl,
         ..AuthSettings::default()
     };
+    // The maintenance job runs inside the server next to the HTTP stack; its
+    // advisory lock keeps a second server or the CLI from running it at once.
+    let (stop_maintenance, stop_rx) = watch::channel(false);
+    if !config.maintenance_enabled {
+        tracing::warn!(
+            "maintenance is switched off (CRAFTCLOUD_MAINTENANCE_ENABLED=false): no purge, no garbage collection, no reconciliation"
+        );
+    }
+    let maintenance_task = pool
+        .as_ref()
+        .filter(|_| config.maintenance_enabled)
+        .map(|pool| {
+            let job = std::sync::Arc::new(Maintenance::new(
+                pool.clone(),
+                object_store.clone(),
+                std::sync::Arc::new(SystemClock),
+                maintenance_settings(&config),
+            ));
+            tracing::info!(
+                interval_secs = config.maintenance_interval.as_secs(),
+                "maintenance job scheduled"
+            );
+            tokio::spawn(job.run_loop(config.maintenance_interval, stop_rx))
+        });
+    // Uploads and downloads use the store only while it belongs to this
+    // database; on a mismatch the routes answer 503 STORAGE_UNAVAILABLE and the
+    // maintenance job leaves the store alone.
+    let serving_store = match (&pool, &object_store) {
+        (Some(pool), Some(store)) => {
+            match check_store_binding(pool, store, time::OffsetDateTime::now_utc(), true).await {
+                Ok(Binding::Created(id)) => {
+                    tracing::info!(store = %id, "object store bound to this database");
+                    object_store.clone()
+                }
+                Ok(Binding::Matches(_)) => object_store.clone(),
+                Ok(Binding::EpochConflict(conflict)) => {
+                    // Serving is safe (it deletes nothing); maintenance will not delete.
+                    tracing::error!(
+                        ?conflict,
+                        "the database and the object store are out of step (restored database?): destructive maintenance is blocked \
+                         (verify the pairing, then run `craftcloud-server admin storage-bind --force`)"
+                    );
+                    object_store.clone()
+                }
+                Ok(Binding::Mismatch(reason)) => {
+                    tracing::error!(
+                        ?reason,
+                        "the object store does not belong to this database: file storage is disabled \
+                         (verify the pairing, then run `craftcloud-server admin storage-bind --force`)"
+                    );
+                    None
+                }
+                Err(err) => {
+                    return Err(Failure::runtime(format!(
+                        "cannot check the store binding: {err}"
+                    )));
+                }
+            }
+        }
+        _ => object_store.clone(),
+    };
     let services = pool.as_ref().map(|pool| {
         let services = Services::new(pool.clone(), bootstrap, auth_settings);
-        match object_store {
+        match serving_store {
             Some(store) => services.with_storage(store),
             None => services,
         }
@@ -412,7 +644,17 @@ async fn run(config: Config) -> Result<(), Failure> {
     );
     let outcome = server::serve(listener, router, shutdown_signal(), config.shutdown_grace)
         .await
-        .map_err(Failure::runtime)?;
+        .map_err(Failure::runtime);
+    // Stop the maintenance loop between items; a run in progress finishes its item.
+    let _ = stop_maintenance.send(true);
+    if let Some(task) = maintenance_task
+        && tokio::time::timeout(config.shutdown_grace, task)
+            .await
+            .is_err()
+    {
+        tracing::warn!("maintenance job did not stop within the grace period");
+    }
+    let outcome = outcome?;
     match outcome {
         server::Shutdown::Graceful => tracing::info!("shut down cleanly"),
         server::Shutdown::Forced => {
@@ -475,5 +717,29 @@ mod tests {
         assert!(matches!(parse_args(&args(&["--help"])), Ok(Command::Help)));
         assert!(parse_args(&args(&["nope"])).is_err());
         assert!(parse_args(&args(&["migrate", "extra"])).is_err());
+    }
+
+    #[test]
+    fn maintenance_arguments() {
+        assert!(matches!(
+            parse_args(&args(&["admin", "maintenance", "--once"])),
+            Ok(Command::Maintenance { dry_run: false })
+        ));
+        assert!(matches!(
+            parse_args(&args(&["admin", "maintenance", "--once", "--dry-run"])),
+            Ok(Command::Maintenance { dry_run: true })
+        ));
+        // `--once` is required and the order is fixed.
+        assert!(parse_args(&args(&["admin", "maintenance"])).is_err());
+        assert!(parse_args(&args(&["admin", "maintenance", "--dry-run"])).is_err());
+        assert!(parse_args(&args(&["admin", "maintenance", "--dry-run", "--once"])).is_err());
+        assert!(parse_args(&args(&["admin", "maintenance", "--once", "--force"])).is_err());
+        assert!(matches!(
+            parse_args(&args(&["admin", "storage-bind", "--force"])),
+            Ok(Command::StorageBind)
+        ));
+        // Rebinding is never implicit.
+        assert!(parse_args(&args(&["admin", "storage-bind"])).is_err());
+        assert!(parse_args(&args(&["admin", "storage-bind", "--yes"])).is_err());
     }
 }

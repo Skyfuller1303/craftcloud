@@ -1701,6 +1701,13 @@ mod tests {
             let want = if demote { "failed" } else { "stored" };
             w.wait_for(id, want).await;
             if demote {
+                // The session is marked failed first, the object is deleted right after.
+                for _ in 0..500 {
+                    if w.stored_objects() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
                 assert_eq!(w.stored_objects(), 0, "no object without a blob row");
                 assert_eq!(w.count("SELECT count(*) FROM blobs").await, 0);
                 assert_eq!(w.reserved().await, (0, 0));

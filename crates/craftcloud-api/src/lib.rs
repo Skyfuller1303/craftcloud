@@ -15,6 +15,7 @@ mod client_ip;
 mod clock;
 mod files;
 mod invitations;
+pub mod maintenance;
 mod orgs;
 mod pagination;
 mod projects;
@@ -148,6 +149,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/organizations/{org_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
+    ("/api/v1/admin/maintenance", &["GET"]),
     ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
     ("/api/v1/admin/users/{user_id}/enable", &["POST"]),
     ("/api/v1/auth/login", &["POST"]),
@@ -302,6 +304,7 @@ pub fn router_with_services(
         )
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
         .route("/api/v1/admin/users", get(orgs::list_all_users))
+        .route("/api/v1/admin/maintenance", get(maintenance::get_status))
         .route(
             "/api/v1/admin/users/{user_id}/disable",
             post(orgs::disable_user),

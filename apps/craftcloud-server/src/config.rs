@@ -40,6 +40,14 @@ const DEFAULT_DB_MAX_CONNECTIONS: u64 = 10;
 const DB_MAX_CONNECTIONS_RANGE: (u64, u64) = (1, 100);
 const DEFAULT_DB_CONNECT_TIMEOUT_SECS: u64 = 5;
 const DB_CONNECT_TIMEOUT_SECS_RANGE: (u64, u64) = (1, 60);
+const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 300;
+const MAINTENANCE_INTERVAL_SECS_RANGE: (u64, u64) = (10, 86_400);
+const DEFAULT_VERSION_RETENTION_DAYS: u64 = 30;
+const VERSION_RETENTION_DAYS_RANGE: (u64, u64) = (1, 3650);
+const DEFAULT_QUARANTINE_DAYS: u64 = 30;
+const QUARANTINE_DAYS_RANGE: (u64, u64) = (1, 3650);
+const DEFAULT_VERIFY_BYTES_PER_RUN: u64 = 1024 * 1024 * 1024;
+const VERIFY_BYTES_PER_RUN_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 
 /// Keys reserved for later milestones. They are rejected explicitly instead
 /// of being silently ignored.
@@ -50,7 +58,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 17] = [
+const SUPPORTED_KEYS: [&str; 22] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -68,6 +76,11 @@ const SUPPORTED_KEYS: [&str; 17] = [
     "DATABASE_URL_FILE",
     "DATABASE_MAX_CONNECTIONS",
     "DATABASE_CONNECT_TIMEOUT_SECS",
+    "MAINTENANCE_INTERVAL_SECS",
+    "VERSION_RETENTION_DAYS",
+    "VERIFY_BYTES_PER_RUN",
+    "QUARANTINE_DAYS",
+    "MAINTENANCE_ENABLED",
 ];
 
 /// Log output format.
@@ -158,6 +171,21 @@ pub struct Config {
     pub max_file_size_bytes: u64,
     /// How long an upload session stays open.
     pub upload_ttl: Duration,
+    /// Time between two runs of the maintenance job (purge, blob garbage
+    /// collection, reconciliation, verification).
+    pub maintenance_interval: Duration,
+    /// How long a superseded file version stays after its successor was
+    /// created (ADR-0014: 30 days by default).
+    pub version_retention: Duration,
+    /// Bytes the maintenance job re-reads per run to verify stored blobs.
+    pub verify_bytes_per_run: u64,
+    /// How long objects that reconciliation took out of service stay in the
+    /// quarantine before they are deleted.
+    pub quarantine_retention: Duration,
+    /// Whether the maintenance job runs at all (loop and command line).
+    /// Switch it off after restoring a database until the pairing with the
+    /// object store is verified.
+    pub maintenance_enabled: bool,
 }
 
 impl Config {
@@ -330,6 +358,36 @@ impl Config {
             parse_ranged(key, raw, UPLOAD_TTL_HOURS_RANGE)
         })
         .unwrap_or(DEFAULT_UPLOAD_TTL_HOURS);
+        let maintenance_interval_secs =
+            field(&mut errors, env, "MAINTENANCE_INTERVAL_SECS", |key, raw| {
+                parse_ranged(key, raw, MAINTENANCE_INTERVAL_SECS_RANGE)
+            })
+            .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_SECS);
+        let version_retention_days =
+            field(&mut errors, env, "VERSION_RETENTION_DAYS", |key, raw| {
+                parse_ranged(key, raw, VERSION_RETENTION_DAYS_RANGE)
+            })
+            .unwrap_or(DEFAULT_VERSION_RETENTION_DAYS);
+        let verify_bytes_per_run = field(&mut errors, env, "VERIFY_BYTES_PER_RUN", |key, raw| {
+            parse_ranged(key, raw, VERIFY_BYTES_PER_RUN_RANGE)
+        })
+        .unwrap_or(DEFAULT_VERIFY_BYTES_PER_RUN);
+        let quarantine_days = field(&mut errors, env, "QUARANTINE_DAYS", |key, raw| {
+            parse_ranged(key, raw, QUARANTINE_DAYS_RANGE)
+        })
+        .unwrap_or(DEFAULT_QUARANTINE_DAYS);
+        let maintenance_enabled =
+            field(
+                &mut errors,
+                env,
+                "MAINTENANCE_ENABLED",
+                |key, raw| match raw.trim() {
+                    "true" => Ok(true),
+                    "false" => Ok(false),
+                    _ => Err(ConfigError::new(key, "must be `true` or `false`")),
+                },
+            )
+            .unwrap_or(true);
         if session_idle_minutes > session_absolute_hours * 60 {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}SESSION_IDLE_TIMEOUT_MINUTES"),
@@ -373,6 +431,11 @@ impl Config {
                 storage_dir,
                 max_file_size_bytes,
                 upload_ttl: Duration::from_secs(upload_ttl_hours * 3600),
+                maintenance_interval: Duration::from_secs(maintenance_interval_secs),
+                version_retention: Duration::from_secs(version_retention_days * 24 * 3600),
+                verify_bytes_per_run,
+                quarantine_retention: Duration::from_secs(quarantine_days * 24 * 3600),
+                maintenance_enabled,
             })
         } else {
             Err(errors)
@@ -671,6 +734,59 @@ mod tests {
         assert_eq!(ttl.upload_ttl, Duration::from_secs(168 * 3600));
         for bad in ["0", "169", "x"] {
             let key = "CRAFTCLOUD_UPLOAD_TTL_HOURS";
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        assert_eq!(defaults.maintenance_interval, Duration::from_secs(300));
+        assert_eq!(
+            defaults.version_retention,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert_eq!(defaults.verify_bytes_per_run, 1024 * 1024 * 1024);
+        assert_eq!(
+            defaults.quarantine_retention,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert!(defaults.maintenance_enabled);
+        let off =
+            Config::from_env_map(&env(&[("CRAFTCLOUD_MAINTENANCE_ENABLED", "false")])).unwrap();
+        assert!(!off.maintenance_enabled);
+        for bad in ["", "yes", "1", "TRUE", "off"] {
+            let key = "CRAFTCLOUD_MAINTENANCE_ENABLED";
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        let quarantine =
+            Config::from_env_map(&env(&[("CRAFTCLOUD_QUARANTINE_DAYS", "3650")])).unwrap();
+        assert_eq!(
+            quarantine.quarantine_retention,
+            Duration::from_secs(3650 * 24 * 3600)
+        );
+        for bad in ["0", "3651", "x", "-1"] {
+            let key = "CRAFTCLOUD_QUARANTINE_DAYS";
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        let maintenance = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "10"),
+            ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "3650"),
+            ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1048576"),
+        ]))
+        .unwrap();
+        assert_eq!(maintenance.maintenance_interval, Duration::from_secs(10));
+        assert_eq!(
+            maintenance.version_retention,
+            Duration::from_secs(3650 * 24 * 3600)
+        );
+        assert_eq!(maintenance.verify_bytes_per_run, 1_048_576);
+        for (key, bad) in [
+            ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "9"),
+            ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "86401"),
+            ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "5m"),
+            ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "0"),
+            ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "3651"),
+            ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "-1"),
+            ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1048575"),
+            ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1099511627777"),
+            ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1GiB"),
+        ] {
             assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
         }
         assert_eq!(defaults.storage_dir, None);

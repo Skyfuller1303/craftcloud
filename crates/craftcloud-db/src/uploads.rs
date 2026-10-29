@@ -32,7 +32,7 @@ use crate::organizations::{AfterKey, clamp_page};
 use crate::{DbError, OrgScope};
 
 /// Session states that still hold a quota reservation.
-const HOLDING: &str = "('created', 'receiving', 'stored')";
+pub(crate) const HOLDING: &str = "('created', 'receiving', 'stored')";
 
 /// A stored upload session.
 #[derive(Debug, Clone, FromRow)]
@@ -71,7 +71,7 @@ pub struct UploadSession {
     pub version: i64,
 }
 
-const SESSION_COLUMNS: &str = "id, org_id, workspace_id, project_id, file_id, created_by_user_id, \
+pub(crate) const SESSION_COLUMNS: &str = "id, org_id, workspace_id, project_id, file_id, created_by_user_id, \
      declared_size, declared_sha256, idempotency_key, request_fingerprint, state, blob_id, \
      expires_at, created_at, updated_at, version";
 
@@ -389,7 +389,7 @@ impl OrgTx {
 
     /// Closes a session that holds a reservation: new state, reservation
     /// released, staged blob orphaned.
-    async fn close_session(
+    pub(crate) async fn close_session(
         &mut self,
         session: &UploadSession,
         state: &str,

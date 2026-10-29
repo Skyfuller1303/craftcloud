@@ -251,7 +251,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 4"));
         assert!(text(&out).contains("applied migration 5"));
         assert!(text(&out).contains("applied migration 9"));
-        assert!(text(&out).contains("applied 9 migration(s)"));
+        assert!(text(&out).contains("applied migration 10"));
+        assert!(text(&out).contains("applied 10 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));
@@ -739,5 +740,119 @@ mod tests {
         let again = cmd("acme", "rescue@example.test");
         assert_eq!(again.status.code(), Some(0));
         assert!(String::from_utf8_lossy(&again.stdout).contains("already an owner"));
+    }
+
+    #[test]
+    fn storage_bind_needs_force_a_database_and_a_storage_directory() {
+        for args in [
+            &["admin", "storage-bind"][..],
+            &["admin", "storage-bind", "--yes"][..],
+            &["admin", "storage-bind", "--force", "extra"][..],
+        ] {
+            let out = run(args, &[]);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(text(&out).contains("usage: craftcloud-server"));
+        }
+        let out = run(&["admin", "storage-bind", "--force"], &[]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+    }
+
+    #[test]
+    fn maintenance_needs_exact_arguments_and_a_database() {
+        for args in [
+            &["admin", "maintenance"][..],
+            &["admin", "maintenance", "--dry-run"][..],
+            &["admin", "maintenance", "--dry-run", "--once"][..],
+            &["admin", "maintenance", "--once", "--force"][..],
+        ] {
+            let out = run(args, &[]);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(text(&out).contains("usage: craftcloud-server"));
+        }
+        let out = run(&["admin", "maintenance", "--once"], &[]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+        // Switched off: the command line refuses as well.
+        let off = run(
+            &["admin", "maintenance", "--once"],
+            &[("CRAFTCLOUD_MAINTENANCE_ENABLED", "false")],
+        );
+        assert_eq!(off.status.code(), Some(1), "{}", text(&off));
+        assert!(text(&off).contains("switched off"));
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn maintenance_once_dry_run_changes_nothing_and_a_real_run_purges() {
+        let fx = Fixture::new();
+        let db_secret = fx.secret();
+        let storage = std::env::temp_dir().join(format!("craftcloud-cli-storage-{}", nanos()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let storage_text = storage.to_string_lossy().into_owned();
+        let env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", db_secret.as_str()),
+            ("CRAFTCLOUD_STORAGE_DIR", storage_text.as_str()),
+            ("CRAFTCLOUD_LOG_FORMAT", "json"),
+        ];
+        // Not migrated yet: refused with a hint.
+        let early = run(&["admin", "maintenance", "--once"], &env);
+        assert_eq!(early.status.code(), Some(1), "{}", text(&early));
+        assert!(text(&early).contains("migrate"));
+        assert_eq!(run(&["migrate"], &env).status.code(), Some(0));
+        fx.exec("INSERT INTO users (id, normalized_email, display_name) VALUES ('11111111-1111-1111-1111-111111111111', 'o@example.test', 'O')");
+        fx.exec("INSERT INTO organizations (id, slug, name, owner_user_id) VALUES ('33333333-3333-3333-3333-333333333333', 'acme', 'Acme', '11111111-1111-1111-1111-111111111111')");
+        fx.exec("INSERT INTO workspaces (id, org_id, slug, name) VALUES ('44444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', 'main', 'Main')");
+        fx.exec("INSERT INTO projects (id, org_id, workspace_id, name, name_key, created_by_user_id, created_at, updated_by_user_id, updated_at, deleted_at, deleted_by_user_id) VALUES ('55555555-5555-5555-5555-555555555555', '33333333-3333-3333-3333-333333333333', '44444444-4444-4444-4444-444444444444', 'Old', 'old', '11111111-1111-1111-1111-111111111111', now() - interval '90 days', '11111111-1111-1111-1111-111111111111', now() - interval '90 days', now() - interval '60 days', '11111111-1111-1111-1111-111111111111')");
+
+        let dry = run(&["admin", "maintenance", "--once", "--dry-run"], &env);
+        assert_eq!(dry.status.code(), Some(0), "{}", text(&dry));
+        let stdout = String::from_utf8_lossy(&dry.stdout).into_owned();
+        assert!(stdout.contains("nothing was changed"), "{stdout}");
+        assert!(stdout.contains("projects_due=1"), "{stdout}");
+        fx.assert_no_password(&dry);
+        assert_eq!(fx.scalar("SELECT count(*)::text FROM projects"), "1");
+        assert_eq!(
+            fx.scalar("SELECT count(*)::text FROM maintenance_runs"),
+            "0"
+        );
+
+        let real = run(&["admin", "maintenance", "--once"], &env);
+        assert_eq!(real.status.code(), Some(0), "{}", text(&real));
+        let stdout = String::from_utf8_lossy(&real.stdout).into_owned();
+        assert!(stdout.contains("purged_projects=1"), "{stdout}");
+        // Counts only: no names, no ids.
+        assert!(
+            !stdout.contains("Old") && !stdout.contains("5555"),
+            "{stdout}"
+        );
+        assert_eq!(fx.scalar("SELECT count(*)::text FROM projects"), "0");
+        assert_eq!(
+            fx.scalar("SELECT triggered_by FROM maintenance_runs"),
+            "cli"
+        );
+
+        // The first real run bound database and store to each other.
+        assert_eq!(fx.scalar("SELECT count(*)::text FROM storage_binding"), "1");
+        assert!(storage.join("craftcloud-store.json").exists());
+        // A database that lost the binding does not own the store: exit 1, no change.
+        fx.exec("DELETE FROM storage_binding");
+        let refused = run(&["admin", "maintenance", "--once"], &env);
+        assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+        let stdout = String::from_utf8_lossy(&refused.stdout).into_owned();
+        assert!(stdout.contains("STORE_BINDING_MISMATCH"), "{stdout}");
+        assert_eq!(fx.scalar("SELECT count(*)::text FROM storage_binding"), "0");
+        // Rebinding is deliberate and needs --force.
+        let no_force = run(&["admin", "storage-bind"], &env);
+        assert_eq!(no_force.status.code(), Some(2));
+        assert_eq!(fx.scalar("SELECT count(*)::text FROM storage_binding"), "0");
+        let bound = run(&["admin", "storage-bind", "--force"], &env);
+        assert_eq!(bound.status.code(), Some(0), "{}", text(&bound));
+        let stdout = String::from_utf8_lossy(&bound.stdout).into_owned();
+        assert!(stdout.contains("database binding was: none"), "{stdout}");
+        assert_eq!(fx.scalar("SELECT count(*)::text FROM storage_binding"), "1");
+        let again = run(&["admin", "maintenance", "--once"], &env);
+        assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+        let _ = std::fs::remove_dir_all(&storage);
     }
 }

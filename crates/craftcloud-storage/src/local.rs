@@ -66,12 +66,29 @@ async fn is_real_dir(path: &Path) -> io::Result<bool> {
     Ok(meta.is_dir() && !is_link(&meta))
 }
 
+/// Identity and epoch stored in the marker file of a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerInfo {
+    /// The store identity.
+    pub store_id: Uuid,
+    /// How many destructive maintenance runs have started (see the database
+    /// binding); a marker ahead of the database means the database is older.
+    pub epoch: u64,
+}
+
+/// Name of the marker file that identifies a store (see [`LocalStore::read_marker`]).
+pub const MARKER_FILE: &str = "craftcloud-store.json";
+
+/// Directory below the root that receives objects removed by reconciliation.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
 fn unsafe_tree() -> StorageError {
     StorageError::Io(io::Error::other("unsafe storage tree"))
 }
 
 #[derive(Debug)]
 struct Layout {
+    root: PathBuf,
     objects: PathBuf,
     tmp: PathBuf,
 }
@@ -142,6 +159,7 @@ impl LocalStore {
             .await
             .map_err(|e| fail(&format!("cannot be resolved ({e})")))?;
         let layout = Layout {
+            root: canonical.clone(),
             objects: canonical.join("objects"),
             tmp: canonical.join("tmp"),
         };
@@ -818,6 +836,209 @@ impl ObjectStore for LocalStore {
 }
 
 /// Makes a file writable so that it can be deleted on every platform.
+/// Marker, quarantine: the identity of a store and a holding area for objects
+/// that reconciliation took out of service.
+impl LocalStore {
+    /// The store identity from the marker file `craftcloud-store.json` in the
+    /// root, `None` if there is no marker.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Io`] if the marker exists but is not a regular file or
+    /// does not contain a valid identity.
+    pub async fn read_marker(&self) -> Result<Option<Uuid>, StorageError> {
+        Ok(self.read_marker_info().await?.map(|info| info.store_id))
+    }
+
+    /// Identity and epoch from the marker file (a marker without an epoch
+    /// counts as epoch 0).
+    ///
+    /// # Errors
+    ///
+    /// As [`LocalStore::read_marker`].
+    pub async fn read_marker_info(&self) -> Result<Option<MarkerInfo>, StorageError> {
+        let path = self.layout.root.join(MARKER_FILE);
+        match fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.is_file() && !is_link(&meta) => {}
+            Ok(_) => return Err(unsafe_tree()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(map_io_error(e)),
+        }
+        let text = fs::read_to_string(&path).await.map_err(map_io_error)?;
+        let invalid = || StorageError::Io(io::Error::other("invalid store marker"));
+        let store_id = text
+            .split("\"store_id\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').nth(1))
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(invalid)?;
+        let epoch = match text.split("\"epoch\"").nth(1) {
+            None => 0,
+            Some(rest) => rest
+                .trim_start()
+                .strip_prefix(':')
+                .map(|digits| {
+                    digits
+                        .trim_start()
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .ok_or_else(invalid)?,
+        };
+        Ok(Some(MarkerInfo { store_id, epoch }))
+    }
+
+    /// Writes the marker with epoch 0; see [`LocalStore::write_marker_info`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::AlreadyExists`] or an I/O error.
+    pub async fn write_marker(&self, id: Uuid, replace: bool) -> Result<(), StorageError> {
+        self.write_marker_info(
+            MarkerInfo {
+                store_id: id,
+                epoch: 0,
+            },
+            replace,
+        )
+        .await
+    }
+
+    /// Writes the marker atomically (a temporary file in `tmp`, read-only) and
+    /// publishes it: a hard link when it must not exist yet, a rename over the
+    /// old file with `replace` (there is no moment without a marker).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::AlreadyExists`] or an I/O error.
+    pub async fn write_marker_info(
+        &self,
+        info: MarkerInfo,
+        replace: bool,
+    ) -> Result<(), StorageError> {
+        let target = self.layout.root.join(MARKER_FILE);
+        let temp = self
+            .layout
+            .tmp
+            .join(format!("{}.marker", Uuid::new_v4().simple()));
+        let body = format!(
+            "{{\"store_id\":\"{}\",\"epoch\":{}}}\n",
+            info.store_id, info.epoch
+        );
+        let (target2, temp2) = (target.clone(), temp.clone());
+        let result = blocking(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp2)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            let mut permissions = std::fs::metadata(&temp2)?.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&temp2, permissions)?;
+            if replace {
+                // The old marker is read-only; a replacing rename needs it writable.
+                if let Ok(meta) = std::fs::metadata(&target2) {
+                    let mut old = meta.permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    old.set_readonly(false);
+                    let _ = std::fs::set_permissions(&target2, old);
+                }
+                std::fs::rename(&temp2, &target2)
+            } else {
+                std::fs::hard_link(&temp2, &target2)
+            }
+        })
+        .await;
+        // Never clear the read-only flag here: after a hard link the temporary
+        // name is the marker itself (std removes read-only links on its own).
+        let _ = fs::remove_file(&temp).await;
+        result.map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                StorageError::AlreadyExists
+            } else {
+                map_io_error(e)
+            }
+        })
+    }
+
+    /// Moves a published object out of `objects` into
+    /// `quarantine/<day>/<key>` (same file system, one rename). The object can
+    /// no longer be read as an object; an operator can move it back.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::NotFound`] if there is no such object, or an I/O error.
+    pub async fn quarantine(&self, key: &ObjectKey, day: &str) -> Result<(), StorageError> {
+        if !day_ok(day) {
+            return Err(StorageError::NotFound);
+        }
+        let (file, _meta) = self.open_object(key).await?;
+        drop(file);
+        let dir = self.layout.root.join(QUARANTINE_DIR).join(day);
+        fs::create_dir_all(&dir).await.map_err(map_io_error)?;
+        let target = dir.join(key.as_str());
+        fs::rename(self.layout.path_of(key), target)
+            .await
+            .map_err(map_io_error)
+    }
+
+    /// Deletes the quarantine day directories named before `before_day`
+    /// (`yyyymmdd`) and returns how many quarantined files that removed (or,
+    /// with `dry_run`, would remove).
+    ///
+    /// # Errors
+    ///
+    /// An I/O error.
+    pub async fn purge_quarantine(
+        &self,
+        before_day: &str,
+        dry_run: bool,
+    ) -> Result<u64, StorageError> {
+        let root = self.layout.root.join(QUARANTINE_DIR);
+        let mut entries = match fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(map_io_error(e)),
+        };
+        let mut removed = 0_u64;
+        while let Some(entry) = entries.next_entry().await.map_err(map_io_error)? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !day_ok(&name) || name.as_str() >= before_day {
+                continue;
+            }
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).await.map_err(map_io_error)?;
+            if !meta.is_dir() || is_link(&meta) {
+                continue;
+            }
+            let mut files = fs::read_dir(&path).await.map_err(map_io_error)?;
+            while let Some(file) = files.next_entry().await.map_err(map_io_error)? {
+                let file_path = file.path();
+                if dry_run {
+                    removed += 1;
+                    continue;
+                }
+                clear_readonly(&file_path).await;
+                fs::remove_file(&file_path).await.map_err(map_io_error)?;
+                removed += 1;
+            }
+            if !dry_run {
+                fs::remove_dir(&path).await.map_err(map_io_error)?;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// `yyyymmdd`: eight ASCII digits.
+fn day_ok(day: &str) -> bool {
+    day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit())
+}
+
 async fn clear_readonly(path: &Path) {
     if let Ok(meta) = fs::metadata(path).await {
         let mut permissions = meta.permissions();

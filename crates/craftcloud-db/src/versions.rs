@@ -468,6 +468,18 @@ impl OrgTx {
         let (Some(blob_id), size) = (session.blob_id, session.declared_size) else {
             return Ok(CommitOutcome::Closed(session.state));
         };
+        // The blob of a stored upload is `staged`. Garbage collection never
+        // claims a blob of an open session; this lock-and-check keeps a version
+        // from ever pointing at a blob that is being deleted, whatever happens.
+        let blob_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM blobs WHERE id = $1 AND org_id = $2 FOR UPDATE")
+                .bind(blob_id)
+                .bind(self.org_id)
+                .fetch_optional(&mut *self.tx)
+                .await?;
+        if blob_state.as_deref() != Some("staged") {
+            return Ok(CommitOutcome::Closed(session.state));
+        }
         let version = self
             .insert_version(
                 NewVersion {
@@ -532,7 +544,7 @@ impl OrgTx {
         let old: Option<(Uuid, i64, Vec<u8>, String)> = sqlx::query_as(
             "SELECT v.blob_id, v.size_bytes, v.sha256, b.state FROM file_versions v \
              JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
-             WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3",
+             WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3 FOR SHARE OF b",
         )
         .bind(self.org_id)
         .bind(file_id)
@@ -545,6 +557,8 @@ impl OrgTx {
         if !precondition.holds(head) {
             return Ok(RestoreOutcome::PreconditionFailed { current: head });
         }
+        // Only a committed blob can be referenced again; `corrupt` and (never
+        // expected here) `deleting` blobs are refused.
         if blob_state != "committed" {
             return Ok(RestoreOutcome::BlobCorrupt);
         }

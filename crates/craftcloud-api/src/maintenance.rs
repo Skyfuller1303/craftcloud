@@ -1,0 +1,1669 @@
+//! The maintenance job (CC-F10, CC-P02-06, CC-P02-07) and its operator
+//! status route.
+//!
+//! One run does, in this order, with bounded batches per step:
+//!
+//! 1. `expire_uploads`: expires due upload sessions of all organizations
+//!    (reservations released, staged blobs orphaned);
+//! 2. `purge_trash`: permanently deletes files and projects that have been in
+//!    the trash longer than the retention;
+//! 3. `trim_versions`: deletes old non-head versions (version retention);
+//! 4. `collect_blobs`: two-phase blob garbage collection;
+//! 5. `reconcile_storage`: removes stray objects and abandoned temporary files
+//!    older than the grace period;
+//! 6. `verify_blobs`: re-hashes a bounded number of blobs, oldest verification
+//!    first;
+//! 7. `fix_usage`: corrects quota counters that differ from the rows.
+//!
+//! **Safety rails.** The object store is bound to the database: a store id in
+//! `storage_binding` and a marker file `craftcloud-store.json` in the store
+//! directory must agree, otherwise the storage steps (garbage collection,
+//! reconciliation, verification) do nothing and report `STORE_BINDING_MISMATCH`
+//! (a wrong or fresh database must never make reconciliation wipe a store).
+//! Reconciliation never deletes a stray object directly: it moves it to
+//! `quarantine/<yyyymmdd>/` and purges old quarantine days later; a brake aborts
+//! the step (`RECONCILE_BRAKE`) when too many objects look unknown. If the
+//! application clock and the database clock differ by more than five minutes the
+//! destructive steps are skipped (`CLOCK_DRIFT`). A failing item never blocks
+//! the other items of its step.
+//!
+//! A step that fails is logged and reported with an error code; the other
+//! steps still run. Only one run exists at a time across all processes (a
+//! PostgreSQL advisory lock; a run that cannot get it is skipped). A run is
+//! bounded in time and stops between items when the server shuts down. All
+//! decisions use the injected [`Clock`]; only the run's time budget uses the
+//! monotonic clock. Logs and reports carry counts, ids and error codes, never
+//! names, paths or hashes.
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
+
+use axum::{
+    Json,
+    extract::State,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+};
+use craftcloud_core::policy::Action;
+use craftcloud_db::maintenance::{self as db, GcClaim, VerifyResult};
+use craftcloud_db::members::OrgTx;
+use craftcloud_db::{DbError, PgPool};
+use craftcloud_storage::{
+    LocalStore, MarkerInfo, ObjectInfo, ObjectKey, ObjectStore, StorageError,
+};
+use serde_json::{Value, json};
+use time::OffsetDateTime;
+use tokio::sync::watch;
+use uuid::Uuid;
+
+use crate::orgs::{db_failure, operator_gate, rfc3339};
+use crate::responses::unavailable;
+use crate::session::AuthenticatedSession;
+use crate::{ApiState, Clock};
+
+/// Extra time on top of the upload TTL before an object or blob without
+/// owner is considered abandoned.
+const GRACE_EXTRA: Duration = Duration::from_secs(3600);
+
+/// Largest accepted difference between the application clock and the database clock.
+const DEFAULT_MAX_CLOCK_DRIFT: Duration = Duration::from_secs(300);
+
+/// Reconciliation brake: it aborts when at least this many objects older than
+/// the grace period are unknown ...
+const BRAKE_MIN_UNKNOWN: usize = 100;
+/// ... and they are more than one in `BRAKE_RATIO` of all objects older than the grace period.
+const BRAKE_RATIO: usize = 10;
+/// Small stores: the brake also applies when at least this many objects are
+/// unknown and they are more than half of the objects older than the grace period.
+const BRAKE_SMALL_MIN_UNKNOWN: usize = 10;
+
+/// An item that failed is left alone for this long ...
+const FAILED_ITEM_TTL: time::Duration = time::Duration::hours(24);
+/// ... and at most this many failed items are remembered (oldest forgotten first).
+const FAILED_ITEM_MAX: usize = 10_000;
+
+/// Limits of a maintenance run.
+#[derive(Debug, Clone)]
+pub struct MaintenanceSettings {
+    /// How long trashed projects and files stay (same value as the restore window).
+    pub trash_retention: Duration,
+    /// How long a superseded version stays after its successor was created.
+    pub version_retention: Duration,
+    /// Lifetime of an upload session; the grace period for blobs and stray
+    /// objects is this plus one hour.
+    pub upload_ttl: Duration,
+    /// Most items a step handles per run (and per batch).
+    pub batch_size: u32,
+    /// Bytes the verification step re-reads per run (the first blob is always
+    /// verified, so a blob larger than the budget is not skipped forever).
+    pub verify_bytes_per_run: u64,
+    /// Most storage entries the reconciliation lists per run.
+    pub scan_limit: usize,
+    /// Time budget of one run; the run stops between items when it is used up.
+    pub max_run: Duration,
+    /// How long quarantined objects are kept before they are deleted.
+    pub quarantine_retention: Duration,
+    /// Largest accepted difference between the application clock and the
+    /// database clock; above it the destructive steps are skipped. `None`
+    /// disables the check (tests with a manual clock).
+    pub max_clock_drift: Option<Duration>,
+    /// Organizations examined per run by the steps that walk them in windows.
+    pub org_window: u32,
+}
+
+impl MaintenanceSettings {
+    /// Settings with the given retention windows and the default batch limits.
+    #[must_use]
+    pub fn new(
+        trash_retention: Duration,
+        version_retention: Duration,
+        upload_ttl: Duration,
+        verify_bytes_per_run: u64,
+    ) -> Self {
+        Self {
+            trash_retention,
+            version_retention,
+            upload_ttl,
+            batch_size: 500,
+            verify_bytes_per_run,
+            scan_limit: 10_000,
+            max_run: Duration::from_secs(120),
+            quarantine_retention: Duration::from_secs(30 * 24 * 3600),
+            max_clock_drift: Some(DEFAULT_MAX_CLOCK_DRIFT),
+            org_window: 50,
+        }
+    }
+
+    fn grace(&self) -> Duration {
+        self.upload_ttl.saturating_add(GRACE_EXTRA)
+    }
+
+    fn batch(&self) -> i64 {
+        i64::from(self.batch_size.max(1))
+    }
+}
+
+/// Who started a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The loop inside the server.
+    Scheduled,
+    /// `craftcloud-server admin maintenance`.
+    Cli,
+}
+
+impl Trigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+/// Options of one run.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOptions {
+    /// Count what would happen without changing anything (database or storage).
+    pub dry_run: bool,
+    /// Who started the run.
+    pub trigger: Trigger,
+}
+
+/// Counts of one step and its error code, if it failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepReport {
+    /// What the step did, by name.
+    pub counts: BTreeMap<&'static str, u64>,
+    /// `DATABASE_ERROR`, `STORAGE_ERROR`, `STORE_BINDING_MISMATCH`,
+    /// `RECONCILE_BRAKE` or `CLOCK_DRIFT` if the step failed or was held back.
+    pub error: Option<&'static str>,
+}
+
+impl StepReport {
+    fn add(&mut self, key: &'static str, amount: u64) {
+        let slot = self.counts.entry(key).or_default();
+        *slot = slot.saturating_add(amount);
+    }
+}
+
+/// The result of a finished run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunReport {
+    /// Whether this was a dry run.
+    pub dry_run: bool,
+    /// Per step, by name.
+    pub steps: BTreeMap<&'static str, StepReport>,
+}
+
+impl RunReport {
+    /// A count of a step (0 if absent).
+    #[must_use]
+    pub fn count(&self, step: &str, key: &str) -> u64 {
+        self.steps
+            .get(step)
+            .and_then(|s| s.counts.get(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether any step failed or counted an error (`*_errors`).
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.steps.values().any(|s| {
+            s.error.is_some()
+                || s.counts
+                    .iter()
+                    .any(|(name, value)| name.ends_with("_errors") && *value > 0)
+        })
+    }
+
+    /// Counts and error codes as JSON (the stored and published form).
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        let steps: serde_json::Map<String, Value> = self
+            .steps
+            .iter()
+            .map(|(name, step)| {
+                (
+                    (*name).to_owned(),
+                    json!({ "counts": step.counts, "error_code": step.error }),
+                )
+            })
+            .collect();
+        json!({ "dry_run": self.dry_run, "steps": steps })
+    }
+}
+
+/// What [`Maintenance::run_once`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Another run holds the advisory lock; nothing was done.
+    Skipped,
+    /// The run finished.
+    Completed(RunReport),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreState {
+    /// No object store configured.
+    Absent,
+    /// Bound and in agreement with the database.
+    Ready,
+    /// Marker and database disagree: no storage step may touch anything.
+    Mismatch,
+    /// The binding could not be checked.
+    Unavailable,
+    /// The epochs show a restored database or marker: no destructive step may run.
+    EpochConflict(EpochConflict),
+}
+
+struct Ctx<'a> {
+    now: OffsetDateTime,
+    dry: bool,
+    deadline: tokio::time::Instant,
+    stop: &'a watch::Receiver<bool>,
+    /// The application clock and the database clock differ too much.
+    drift: bool,
+    store: StoreState,
+}
+
+impl Ctx<'_> {
+    /// Whether another item may be started.
+    fn go(&self) -> bool {
+        !*self.stop.borrow() && tokio::time::Instant::now() < self.deadline
+    }
+}
+
+/// `now - span`, saturating at the epoch (so that nothing counts as old).
+fn minus(now: OffsetDateTime, span: Duration) -> OffsetDateTime {
+    time::Duration::try_from(span)
+        .ok()
+        .and_then(|span| now.checked_sub(span))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn count_of(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// `yyyymmdd` of a time (UTC), the name of a quarantine day directory.
+fn day_name(time: OffsetDateTime) -> String {
+    format!(
+        "{:04}{:02}{:02}",
+        time.year(),
+        u8::from(time.month()),
+        time.day()
+    )
+}
+
+/// Logs and counts an item that failed; the step goes on with the next item.
+fn item_failed(report: &mut StepReport, what: &str, id: Uuid, error: &DbError) {
+    tracing::error!(
+        target: "craftcloud::maintenance",
+        item = %id,
+        %error,
+        "{what} failed; continuing with the next item"
+    );
+    report.add("item_errors", 1);
+}
+
+/// Items that failed recently, per step. They are left out of the next
+/// selections for a day so that a poisoned head of the queue cannot starve the
+/// items behind it; the memory is bounded and lives in the process.
+#[derive(Default)]
+struct FailedItems {
+    map: HashMap<(&'static str, Uuid), OffsetDateTime>,
+    order: VecDeque<(&'static str, Uuid)>,
+}
+
+impl FailedItems {
+    fn record(&mut self, step: &'static str, id: Uuid, now: OffsetDateTime) {
+        if self.map.insert((step, id), now).is_none() {
+            self.order.push_back((step, id));
+        }
+        while self.map.len() > FAILED_ITEM_MAX {
+            match self.order.pop_front() {
+                Some(key) => {
+                    self.map.remove(&key);
+                }
+                None => break,
+            }
+        }
+        // Forgotten entries leave stale keys in the queue; compact now and then.
+        if self.order.len() > FAILED_ITEM_MAX.saturating_mul(2) {
+            self.order.retain(|key| self.map.contains_key(key));
+        }
+    }
+
+    fn active(&mut self, step: &'static str, now: OffsetDateTime) -> Vec<Uuid> {
+        self.map.retain(|_, at| now - *at < FAILED_ITEM_TTL);
+        self.map
+            .keys()
+            .filter(|(name, _)| *name == step)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+}
+
+// ---- store binding -------------------------------------------------------------
+
+/// Why a store does not belong to the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingMismatch {
+    /// The database is bound but the store directory has no marker.
+    MarkerMissing,
+    /// The store directory has a marker but the database is not bound.
+    DatabaseUnbound,
+    /// Both exist and name different stores.
+    DifferentIds,
+}
+
+/// The epochs of database and marker disagree: one of them was restored from
+/// an older state, so what the database says may be stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochConflict {
+    /// The marker is ahead: the database is older than the store.
+    DatabaseOlder,
+    /// The database is more than one ahead of the marker: the marker is older.
+    MarkerOlder,
+}
+
+impl EpochConflict {
+    fn code(self) -> &'static str {
+        match self {
+            Self::DatabaseOlder => "DATABASE_OLDER_THAN_STORE",
+            Self::MarkerOlder => "MARKER_OLDER_THAN_DATABASE",
+        }
+    }
+}
+
+/// Result of checking (or establishing) the pairing of database and store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// First use: marker and database binding were created.
+    Created(Uuid),
+    /// Marker and database agree.
+    Matches(Uuid),
+    /// They do not; the store must not be used.
+    Mismatch(BindingMismatch),
+    /// Same store, but the epochs show a restore: serving is fine, destructive
+    /// maintenance must not run.
+    EpochConflict(EpochConflict),
+}
+
+/// The binding could not be checked.
+#[derive(Debug)]
+pub enum BindingError {
+    /// Database failure.
+    Database(DbError),
+    /// Storage failure (including an unreadable marker).
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for BindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(f, "{error}"),
+            Self::Storage(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for BindingError {}
+
+impl From<DbError> for BindingError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<StorageError> for BindingError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+/// Checks that `store` belongs to the database. When neither has an identity
+/// yet (first use) and `create` is set, both are created; there is no other
+/// automatic repair. Any other disagreement is reported as a mismatch.
+///
+/// # Errors
+///
+/// [`BindingError`] if the database or the marker cannot be read or written.
+pub async fn check_store_binding(
+    pool: &PgPool,
+    store: &LocalStore,
+    now: OffsetDateTime,
+    create: bool,
+) -> Result<Binding, BindingError> {
+    let database = db::store_binding_epoch(pool).await?;
+    let marker = store.read_marker_info().await?;
+    match (database, marker) {
+        (Some((id, epoch)), Some(info)) if id == info.store_id => {
+            let epoch = u64::try_from(epoch).unwrap_or(0);
+            if epoch == info.epoch {
+                Ok(Binding::Matches(id))
+            } else if epoch == info.epoch.saturating_add(1) {
+                // The database was bumped, then the process died before the
+                // marker followed: finish that step.
+                if create {
+                    store
+                        .write_marker_info(
+                            MarkerInfo {
+                                store_id: id,
+                                epoch,
+                            },
+                            true,
+                        )
+                        .await?;
+                }
+                Ok(Binding::Matches(id))
+            } else if info.epoch > epoch {
+                Ok(Binding::EpochConflict(EpochConflict::DatabaseOlder))
+            } else {
+                Ok(Binding::EpochConflict(EpochConflict::MarkerOlder))
+            }
+        }
+        (Some(_), Some(_)) => Ok(Binding::Mismatch(BindingMismatch::DifferentIds)),
+        (Some(_), None) => Ok(Binding::Mismatch(BindingMismatch::MarkerMissing)),
+        (None, Some(_)) => Ok(Binding::Mismatch(BindingMismatch::DatabaseUnbound)),
+        (None, None) => {
+            let id = Uuid::new_v4();
+            if !create {
+                return Ok(Binding::Created(id));
+            }
+            match store
+                .write_marker_info(
+                    MarkerInfo {
+                        store_id: id,
+                        epoch: 0,
+                    },
+                    false,
+                )
+                .await
+            {
+                Ok(()) => {}
+                // Another process is binding right now; check again next time.
+                Err(StorageError::AlreadyExists) => {
+                    return Ok(Binding::Mismatch(BindingMismatch::DatabaseUnbound));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if db::bind_store_if_unbound(pool, id, now).await? {
+                Ok(Binding::Created(id))
+            } else {
+                Ok(Binding::Mismatch(BindingMismatch::DifferentIds))
+            }
+        }
+    }
+}
+
+/// What a forced rebinding found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebound {
+    /// The identity the database had, if any.
+    pub old_database: Option<Uuid>,
+    /// The identity in the store marker, if any.
+    pub old_marker: Option<Uuid>,
+    /// The identity both have now.
+    pub new: Uuid,
+    /// The epoch both have now (the marker's: the operator accepts the
+    /// database as authoritative).
+    pub epoch: u64,
+}
+
+/// Operator decision (`craftcloud-server admin storage-bind --force`): makes
+/// database and store agree. The marker of the store wins (identity and
+/// epoch); a store without a marker gets a new identity at epoch 0. This is
+/// also how a restored older database is accepted. The caller must have
+/// verified that this database and this store directory belong together.
+///
+/// # Errors
+///
+/// [`BindingError`] if the database or the marker cannot be read or written.
+pub async fn rebind_store(
+    pool: &PgPool,
+    store: &LocalStore,
+    now: OffsetDateTime,
+) -> Result<Rebound, BindingError> {
+    let marker = store.read_marker_info().await?;
+    let (new, epoch) = match marker {
+        Some(info) => (info.store_id, info.epoch),
+        None => {
+            let id = Uuid::new_v4();
+            store
+                .write_marker_info(
+                    MarkerInfo {
+                        store_id: id,
+                        epoch: 0,
+                    },
+                    false,
+                )
+                .await?;
+            (id, 0)
+        }
+    };
+    let old_database =
+        db::rebind_store(pool, new, i64::try_from(epoch).unwrap_or(i64::MAX), now).await?;
+    Ok(Rebound {
+        old_database,
+        old_marker: marker.map(|info| info.store_id),
+        new,
+        epoch,
+    })
+}
+
+/// The maintenance job. Cheap to share; hold it in an `Arc` for the loop.
+pub struct Maintenance {
+    pool: PgPool,
+    store: Option<LocalStore>,
+    clock: Arc<dyn Clock>,
+    settings: MaintenanceSettings,
+    /// Where the reconciliation continues its walk through the object store.
+    cursor: Mutex<Option<ObjectKey>>,
+    /// Where the version retention and the drift check continue their walk
+    /// through the organizations.
+    trim_cursor: Mutex<Option<Uuid>>,
+    drift_cursor: Mutex<Option<Uuid>>,
+    /// Items that failed recently (left out of the next selections).
+    failed: Mutex<FailedItems>,
+}
+
+impl Maintenance {
+    /// Creates the job. Without a store the storage steps are skipped.
+    #[must_use]
+    pub fn new(
+        pool: PgPool,
+        store: Option<LocalStore>,
+        clock: Arc<dyn Clock>,
+        settings: MaintenanceSettings,
+    ) -> Self {
+        Self {
+            pool,
+            store,
+            clock,
+            settings,
+            cursor: Mutex::new(None),
+            trim_cursor: Mutex::new(None),
+            drift_cursor: Mutex::new(None),
+            failed: Mutex::new(FailedItems::default()),
+        }
+    }
+
+    /// Items of `step` that failed within the last day; counted in the report.
+    fn excluded(
+        &self,
+        step: &'static str,
+        now: OffsetDateTime,
+        report: &mut StepReport,
+    ) -> Vec<Uuid> {
+        let ids = self
+            .failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active(step, now);
+        if !ids.is_empty() {
+            report.add("excluded_items", count_of(ids.len()));
+        }
+        ids
+    }
+
+    /// Remembers a failed item and logs it.
+    fn fail_item(
+        &self,
+        ctx: &Ctx<'_>,
+        step: &'static str,
+        report: &mut StepReport,
+        what: &str,
+        id: Uuid,
+        error: &DbError,
+    ) {
+        self.failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(step, id, ctx.now);
+        item_failed(report, what, id, error);
+    }
+
+    /// Runs the job every `interval` until `stop` turns true (or its sender
+    /// is dropped). A run in progress stops between items.
+    pub async fn run_loop(self: Arc<Self>, interval: Duration, mut stop: watch::Receiver<bool>) {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                changed = stop.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+            if *stop.borrow() {
+                break;
+            }
+            let options = RunOptions {
+                dry_run: false,
+                trigger: Trigger::Scheduled,
+            };
+            match self.run_once(options, &stop).await {
+                Ok(RunOutcome::Completed(report)) => {
+                    tracing::info!(
+                        target: "craftcloud::maintenance",
+                        report = %report.to_json(),
+                        "maintenance run finished"
+                    );
+                }
+                Ok(RunOutcome::Skipped) => {
+                    tracing::info!(
+                        target: "craftcloud::maintenance",
+                        "maintenance run skipped: another run is active"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(target: "craftcloud::maintenance", %error, "maintenance run failed");
+                }
+            }
+        }
+        tracing::info!(target: "craftcloud::maintenance", "maintenance loop stopped");
+    }
+
+    /// Runs the job once, unless another run holds the lock.
+    ///
+    /// # Errors
+    ///
+    /// Database failures while taking the lock; failures inside a step are
+    /// reported in the [`RunReport`].
+    pub async fn run_once(
+        &self,
+        options: RunOptions,
+        stop: &watch::Receiver<bool>,
+    ) -> Result<RunOutcome, DbError> {
+        // The run lock holds one connection for the whole run; the steps need others.
+        if self.pool.options().get_max_connections() < 2 {
+            tracing::error!(
+                target: "craftcloud::maintenance",
+                "maintenance needs a database pool of at least 2 connections"
+            );
+            return Err(DbError::Internal);
+        }
+        let Some(lock) = db::try_lock(&self.pool).await? else {
+            return Ok(RunOutcome::Skipped);
+        };
+        let started = tokio::time::Instant::now();
+        let now = self.clock.now();
+        let drift = match self.settings.max_clock_drift {
+            None => false,
+            Some(max) => {
+                let database_now = db::db_now(&self.pool).await?;
+                let difference = (now - database_now).unsigned_abs();
+                let drifting = difference > max;
+                if drifting {
+                    tracing::error!(
+                        target: "craftcloud::maintenance",
+                        drift_secs = difference.as_secs(),
+                        "the application clock differs from the database clock; destructive steps are skipped"
+                    );
+                }
+                drifting
+            }
+        };
+        let store = match &self.store {
+            None => StoreState::Absent,
+            Some(store) => {
+                match check_store_binding(&self.pool, store, now, !options.dry_run).await {
+                    Ok(Binding::Created(id)) => {
+                        if !options.dry_run {
+                            tracing::info!(target: "craftcloud::maintenance", store = %id, "object store bound to this database");
+                        }
+                        StoreState::Ready
+                    }
+                    Ok(Binding::Matches(_)) => StoreState::Ready,
+                    Ok(Binding::EpochConflict(conflict)) => {
+                        tracing::error!(
+                            target: "craftcloud::maintenance",
+                            ?conflict,
+                            "the database and the object store are out of step (a restored database or marker?); \
+                             destructive steps are skipped (verify the pairing, then run `craftcloud-server admin storage-bind --force`)"
+                        );
+                        StoreState::EpochConflict(conflict)
+                    }
+                    Ok(Binding::Mismatch(reason)) => {
+                        tracing::error!(
+                            target: "craftcloud::maintenance",
+                            ?reason,
+                            "the object store does not belong to this database; storage steps are skipped \
+                             (verify the pairing, then run `craftcloud-server admin storage-bind --force`)"
+                        );
+                        StoreState::Mismatch
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "craftcloud::maintenance", %error, "cannot check the store binding");
+                        StoreState::Unavailable
+                    }
+                }
+            }
+        };
+        // A run that may delete something first raises the epoch in the
+        // database, then copies it to the marker. A database restored from an
+        // older state is then behind the marker and is noticed.
+        let store = match (&self.store, store) {
+            (Some(store_handle), StoreState::Ready) if !options.dry_run && !drift => {
+                self.advance_epoch(store_handle).await
+            }
+            (_, state) => state,
+        };
+        let ctx = Ctx {
+            now,
+            dry: options.dry_run,
+            deadline: started + self.settings.max_run,
+            stop,
+            drift,
+            store,
+        };
+        let mut report = RunReport {
+            dry_run: options.dry_run,
+            steps: BTreeMap::new(),
+        };
+        for step in STEPS {
+            let mut step_report = StepReport::default();
+            if *ctx.stop.borrow() {
+                step_report.add("skipped_shutdown", 1);
+            } else if step.destructive() && ctx.drift {
+                step_report.add("skipped_clock_drift", 1);
+                step_report.error = Some("CLOCK_DRIFT");
+            } else if let (true, StoreState::EpochConflict(conflict)) =
+                (step.destructive(), ctx.store)
+            {
+                step_report.add("skipped_epoch_conflict", 1);
+                step_report.error = Some(conflict.code());
+            } else if step.needs_store() && ctx.store == StoreState::Mismatch {
+                step_report.add("skipped_store_mismatch", 1);
+                step_report.error = Some("STORE_BINDING_MISMATCH");
+            } else if step.needs_store() && ctx.store == StoreState::Unavailable {
+                step_report.add("skipped_store_unavailable", 1);
+                step_report.error = Some("STORAGE_ERROR");
+            } else if let Err(error) = self.run_step(step, &ctx, &mut step_report).await {
+                tracing::error!(
+                    target: "craftcloud::maintenance",
+                    step = step.name(),
+                    %error,
+                    "maintenance step failed"
+                );
+                step_report.error = Some("DATABASE_ERROR");
+            }
+            if step_report.error.is_none() {
+                let count = |key: &str| step_report.counts.get(key).copied().unwrap_or(0);
+                if count("storage_errors") > 0 {
+                    step_report.error = Some("STORAGE_ERROR");
+                } else if count("item_errors") > 0 || count("db_errors") > 0 {
+                    step_report.error = Some("DATABASE_ERROR");
+                }
+            }
+            report.steps.insert(step.name(), step_report);
+        }
+        if !options.dry_run {
+            let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let recorded = db::record_run(
+                &self.pool,
+                options.trigger.as_str(),
+                ctx.now,
+                self.clock.now(),
+                duration_ms,
+                &report.to_json().to_string(),
+            )
+            .await;
+            if let Err(error) = recorded {
+                tracing::error!(target: "craftcloud::maintenance", %error, "cannot record the maintenance run");
+            }
+        }
+        if let Err(error) = lock.release().await {
+            tracing::warn!(target: "craftcloud::maintenance", %error, "cannot release the maintenance lock");
+        }
+        Ok(RunOutcome::Completed(report))
+    }
+
+    /// Raises the epoch in the database, then in the marker (in this order: a
+    /// crash in between leaves the database one ahead, which the next check repairs).
+    async fn advance_epoch(&self, store: &LocalStore) -> StoreState {
+        let info = match store.read_marker_info().await {
+            Ok(Some(info)) => info,
+            Ok(None) | Err(_) => return StoreState::Unavailable,
+        };
+        match db::bump_binding_epoch(&self.pool, info.store_id).await {
+            Ok(Some(epoch)) => {
+                let marker = MarkerInfo {
+                    store_id: info.store_id,
+                    epoch: u64::try_from(epoch).unwrap_or(0),
+                };
+                match store.write_marker_info(marker, true).await {
+                    Ok(()) => StoreState::Ready,
+                    Err(error) => {
+                        tracing::error!(target: "craftcloud::maintenance", %error, "cannot update the store marker");
+                        StoreState::Unavailable
+                    }
+                }
+            }
+            Ok(None) => StoreState::Mismatch,
+            Err(error) => {
+                tracing::error!(target: "craftcloud::maintenance", %error, "cannot raise the binding epoch");
+                StoreState::Unavailable
+            }
+        }
+    }
+
+    async fn run_step(
+        &self,
+        step: Step,
+        ctx: &Ctx<'_>,
+        report: &mut StepReport,
+    ) -> Result<(), DbError> {
+        match step {
+            Step::ExpireUploads => self.expire_uploads(ctx, report).await,
+            Step::PurgeTrash => self.purge_trash(ctx, report).await,
+            Step::TrimVersions => self.trim_versions(ctx, report).await,
+            Step::CollectBlobs => self.collect_blobs(ctx, report).await,
+            Step::ReconcileStorage => self.reconcile_storage(ctx, report).await,
+            Step::VerifyBlobs => self.verify_blobs(ctx, report).await,
+            Step::FixUsage => self.fix_usage(ctx, report).await,
+        }
+    }
+
+    // ---- 1. upload sessions -------------------------------------------------
+
+    async fn expire_one(&self, org_id: Uuid, now: OffsetDateTime) -> Result<u64, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(0);
+        };
+        let expired = tx.expire_due(now).await?;
+        tx.commit().await?;
+        Ok(expired)
+    }
+
+    async fn expire_uploads(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        if ctx.dry {
+            let due = db::count_due_sessions(&self.pool, ctx.now).await?;
+            report.add("would_expire", u64::try_from(due).unwrap_or(0));
+            return Ok(());
+        }
+        // Each organization handles up to 500 due sessions per round; an
+        // organization that fails is skipped for the rest of the run.
+        let excluded = self.excluded("expire_uploads", ctx.now, report);
+        let mut failed: HashSet<Uuid> = HashSet::new();
+        for _ in 0..10 {
+            if !ctx.go() {
+                break;
+            }
+            let orgs = db::orgs_with_due_sessions(&self.pool, ctx.now, &excluded, 1000).await?;
+            let mut progress = 0;
+            for org_id in orgs {
+                if failed.contains(&org_id) {
+                    continue;
+                }
+                if !ctx.go() {
+                    break;
+                }
+                match self.expire_one(org_id, ctx.now).await {
+                    Ok(expired) => {
+                        report.add("expired_sessions", expired);
+                        progress += expired;
+                    }
+                    Err(error) => {
+                        self.fail_item(
+                            ctx,
+                            "expire_uploads",
+                            report,
+                            "expiring upload sessions",
+                            org_id,
+                            &error,
+                        );
+                        failed.insert(org_id);
+                    }
+                }
+            }
+            if progress == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- 2. trash retention -------------------------------------------------
+
+    async fn purge_file_item(
+        &self,
+        org_id: Uuid,
+        file_id: Uuid,
+        cutoff: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<db::PurgeCounts>, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(None);
+        };
+        let counts = tx.maint_purge_file(file_id, cutoff, now).await?;
+        tx.commit().await?;
+        Ok(Some(counts))
+    }
+
+    async fn purge_project_item(
+        &self,
+        org_id: Uuid,
+        project_id: Uuid,
+        cutoff: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<Option<db::PurgeCounts>, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(None);
+        };
+        let counts = tx.maint_purge_project(project_id, cutoff, now, 100).await?;
+        tx.commit().await?;
+        Ok(Some(counts))
+    }
+
+    async fn purge_trash(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        let cutoff = minus(ctx.now, self.settings.trash_retention);
+        let batch = self.settings.batch();
+        let excluded_files = self.excluded("purge_files", ctx.now, report);
+        let excluded_projects = self.excluded("purge_projects", ctx.now, report);
+        let files = db::trashed_files_due(&self.pool, cutoff, &excluded_files, batch).await?;
+        let projects =
+            db::trashed_projects_due(&self.pool, cutoff, &excluded_projects, batch).await?;
+        if ctx.dry {
+            report.add("files_due", count_of(files.len()));
+            report.add("projects_due", count_of(projects.len()));
+            return Ok(());
+        }
+        for (org_id, file_id) in files {
+            if !ctx.go() {
+                break;
+            }
+            match self.purge_file_item(org_id, file_id, cutoff, ctx.now).await {
+                Ok(Some(counts)) => add_purged(report, counts),
+                Ok(None) => {}
+                Err(error) => self.fail_item(
+                    ctx,
+                    "purge_files",
+                    report,
+                    "purging a file",
+                    file_id,
+                    &error,
+                ),
+            }
+        }
+        for (org_id, project_id) in projects {
+            // A project with many files is emptied over several short transactions.
+            for _ in 0..50 {
+                if !ctx.go() {
+                    break;
+                }
+                match self
+                    .purge_project_item(org_id, project_id, cutoff, ctx.now)
+                    .await
+                {
+                    Ok(Some(counts)) => {
+                        add_purged(report, counts);
+                        if counts.projects == 1 || counts.files == 0 {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        self.fail_item(
+                            ctx,
+                            "purge_projects",
+                            report,
+                            "purging a project",
+                            project_id,
+                            &error,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---- 3. version retention -----------------------------------------------
+
+    /// The next window of organizations for a step that walks them; `advance`
+    /// moves the cursor (wrapping to the start after the last window).
+    async fn next_orgs(
+        &self,
+        cursor: &Mutex<Option<Uuid>>,
+        advance: bool,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let after = *cursor.lock().unwrap_or_else(PoisonError::into_inner);
+        let window = i64::from(self.settings.org_window.max(1));
+        let orgs = db::org_window(&self.pool, after, window).await?;
+        if advance {
+            let next = if i64::try_from(orgs.len()).unwrap_or(i64::MAX) < window {
+                None
+            } else {
+                orgs.last().copied()
+            };
+            *cursor.lock().unwrap_or_else(PoisonError::into_inner) = next;
+        }
+        Ok(orgs)
+    }
+
+    async fn trim_item(
+        &self,
+        org_id: Uuid,
+        file_id: Uuid,
+        cutoff: OffsetDateTime,
+    ) -> Result<u64, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(0);
+        };
+        let deleted = tx.maint_trim_versions(file_id, cutoff).await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    async fn trim_versions(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        let cutoff = minus(ctx.now, self.settings.version_retention);
+        let excluded = self.excluded("trim_versions", ctx.now, report);
+        let orgs = self.next_orgs(&self.trim_cursor, !ctx.dry).await?;
+        let files = db::files_with_old_versions(
+            &self.pool,
+            cutoff,
+            &orgs,
+            &excluded,
+            self.settings.batch(),
+        )
+        .await?;
+        if ctx.dry {
+            report.add("files_with_old_versions", count_of(files.len()));
+            return Ok(());
+        }
+        for (org_id, file_id) in files {
+            if !ctx.go() {
+                break;
+            }
+            match self.trim_item(org_id, file_id, cutoff).await {
+                Ok(0) => {}
+                Ok(deleted) => {
+                    report.add("trimmed_files", 1);
+                    report.add("deleted_versions", deleted);
+                }
+                Err(error) => self.fail_item(
+                    ctx,
+                    "trim_versions",
+                    report,
+                    "trimming versions",
+                    file_id,
+                    &error,
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    // ---- 4. blob garbage collection -----------------------------------------
+
+    async fn collect_blobs(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        let Some(store) = &self.store else {
+            report.add("skipped_no_storage", 1);
+            return Ok(());
+        };
+        let created_before = minus(ctx.now, self.settings.grace());
+        let batch = self.settings.batch();
+        let excluded = self.excluded("collect_blobs", ctx.now, report);
+        let deleting = db::gc_deleting(&self.pool, batch).await?;
+        let candidates = db::gc_candidates(&self.pool, created_before, &excluded, batch).await?;
+        if ctx.dry {
+            report.add("would_resume", count_of(deleting.len()));
+            report.add("candidates", count_of(candidates.len()));
+            return Ok(());
+        }
+        // Finish what an earlier run (or crash) left half done.
+        for (_org_id, blob_id, object_key) in deleting {
+            if !ctx.go() {
+                break;
+            }
+            report.add("resumed", 1);
+            self.finish_blob(store, report, blob_id, &object_key).await;
+        }
+        for (org_id, blob_id) in candidates {
+            if !ctx.go() {
+                break;
+            }
+            let claim = match self.claim_item(org_id, blob_id, created_before).await {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.fail_item(
+                        ctx,
+                        "collect_blobs",
+                        report,
+                        "claiming a blob",
+                        blob_id,
+                        &error,
+                    );
+                    continue;
+                }
+            };
+            let GcClaim::Claimed(claimed) = claim else {
+                report.add("skipped", 1);
+                continue;
+            };
+            report.add("claimed", 1);
+            if claimed.counted {
+                report.add(
+                    "released_bytes",
+                    u64::try_from(claimed.size_bytes).unwrap_or(0),
+                );
+            }
+            if claimed.clamped {
+                tracing::warn!(
+                    target: "craftcloud::maintenance",
+                    org = %org_id,
+                    blob = %blob_id,
+                    "a committed-bytes counter was smaller than the blob; clamped at zero"
+                );
+                report.add("counter_clamped", 1);
+            }
+            self.finish_blob(store, report, blob_id, &claimed.object_key)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn claim_item(
+        &self,
+        org_id: Uuid,
+        blob_id: Uuid,
+        created_before: OffsetDateTime,
+    ) -> Result<GcClaim, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(GcClaim::Skipped);
+        };
+        let claim = tx.maint_gc_claim(blob_id, created_before).await?;
+        tx.commit().await?;
+        Ok(claim)
+    }
+
+    /// Phase 2: deletes the object, then the row. A failure leaves the blob
+    /// `deleting`; the next run retries (on Windows an object that a download
+    /// still holds open cannot be deleted).
+    async fn finish_blob(
+        &self,
+        store: &LocalStore,
+        report: &mut StepReport,
+        blob_id: Uuid,
+        object_key: &str,
+    ) {
+        let Ok(key) = ObjectKey::parse(object_key) else {
+            tracing::error!(target: "craftcloud::maintenance", blob = %blob_id, "blob has an invalid object key");
+            report.add("storage_errors", 1);
+            return;
+        };
+        match store.delete(&key).await {
+            Ok(()) => report.add("objects_deleted", 1),
+            Err(StorageError::NotFound) => report.add("objects_already_gone", 1),
+            Err(error) => {
+                tracing::warn!(
+                    target: "craftcloud::maintenance",
+                    blob = %blob_id,
+                    %error,
+                    "object could not be deleted; the blob stays in state deleting and is retried"
+                );
+                report.add("storage_errors", 1);
+                return;
+            }
+        }
+        match db::gc_finish(&self.pool, blob_id).await {
+            Ok(true) => report.add("blobs_deleted", 1),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(target: "craftcloud::maintenance", blob = %blob_id, %error, "cannot delete the blob row");
+                report.add("db_errors", 1);
+            }
+        }
+    }
+
+    // ---- 5. reconciliation ---------------------------------------------------
+
+    fn take_cursor(&self) -> Option<ObjectKey> {
+        self.cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    fn put_cursor(&self, cursor: Option<ObjectKey>) {
+        *self.cursor.lock().unwrap_or_else(PoisonError::into_inner) = cursor;
+    }
+
+    async fn reconcile_storage(
+        &self,
+        ctx: &Ctx<'_>,
+        report: &mut StepReport,
+    ) -> Result<(), DbError> {
+        let Some(store) = &self.store else {
+            report.add("skipped_no_storage", 1);
+            return Ok(());
+        };
+        let old_before = minus(ctx.now, self.settings.grace());
+        let is_old = |modified: Option<SystemTime>| {
+            modified.is_some_and(|time| OffsetDateTime::from(time) < old_before)
+        };
+        let page = 500;
+
+        // Phase A: find the objects without a blob row (nothing is moved yet).
+        // The walk continues where the last run stopped and wraps around at the
+        // end of the store.
+        let original = self.take_cursor();
+        let mut cursor = original.clone();
+        let mut scanned = 0_usize;
+        let mut old_total = 0_usize;
+        let mut strays: Vec<ObjectKey> = Vec::new();
+        let mut failure = None;
+        while ctx.go() && scanned < self.settings.scan_limit {
+            let items = match store.list_objects(cursor.as_ref(), page).await {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::warn!(target: "craftcloud::maintenance", %error, "cannot list stored objects");
+                    report.add("storage_errors", 1);
+                    break;
+                }
+            };
+            if items.is_empty() {
+                cursor = None;
+                break;
+            }
+            scanned += items.len();
+            report.add("scanned_objects", count_of(items.len()));
+            let old: Vec<&ObjectInfo> = items.iter().filter(|o| is_old(o.modified)).collect();
+            old_total += old.len();
+            let keys: Vec<String> = old.iter().map(|o| o.key.as_str().to_owned()).collect();
+            let known = if keys.is_empty() {
+                HashSet::new()
+            } else {
+                match db::known_object_keys(&self.pool, &keys).await {
+                    Ok(known) => known,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            };
+            strays.extend(
+                old.iter()
+                    .filter(|o| !known.contains(o.key.as_str()))
+                    .map(|o| o.key.clone()),
+            );
+            let last = items.last().map(|o| o.key.clone());
+            if items.len() < page {
+                cursor = None;
+                break;
+            }
+            cursor = last;
+        }
+        if let Some(error) = failure {
+            self.put_cursor(original);
+            return Err(error);
+        }
+        // The brake: a database that does not know a large share of the old
+        // objects is much more likely the wrong database than a pile of strays.
+        let unknown = strays.len();
+        let braking = (unknown >= BRAKE_MIN_UNKNOWN && unknown * BRAKE_RATIO > old_total)
+            || (unknown >= BRAKE_SMALL_MIN_UNKNOWN && unknown * 2 > old_total);
+        if braking {
+            tracing::warn!(
+                target: "craftcloud::maintenance",
+                unknown = strays.len(),
+                old_objects = old_total,
+                "reconciliation brake: too many objects are unknown to the database; nothing was moved"
+            );
+            report.add("unknown_objects", count_of(strays.len()));
+            report.error = Some("RECONCILE_BRAKE");
+            self.put_cursor(original);
+            return Ok(());
+        }
+        self.put_cursor(if ctx.dry { original } else { cursor });
+
+        // Phase B: quarantine the strays, purge old quarantine days.
+        let day = day_name(ctx.now);
+        if !ctx.dry && !strays.is_empty() {
+            tracing::warn!(
+                target: "craftcloud::maintenance",
+                count = strays.len(),
+                "moving objects that the database does not know to the quarantine"
+            );
+        }
+        for key in &strays {
+            if ctx.dry {
+                report.add("would_quarantine_objects", 1);
+                continue;
+            }
+            if !ctx.go() {
+                break;
+            }
+            match store.quarantine(key, &day).await {
+                Ok(()) => report.add("quarantined_objects", 1),
+                Err(StorageError::NotFound) => {}
+                Err(error) => {
+                    tracing::warn!(target: "craftcloud::maintenance", %error, "cannot quarantine a stray object");
+                    report.add("storage_errors", 1);
+                }
+            }
+        }
+        let purge_before = day_name(minus(ctx.now, self.settings.quarantine_retention));
+        match store.purge_quarantine(&purge_before, ctx.dry).await {
+            Ok(0) => {}
+            Ok(removed) => report.add(
+                if ctx.dry {
+                    "would_purge_quarantine"
+                } else {
+                    "purged_quarantine"
+                },
+                removed,
+            ),
+            Err(error) => {
+                tracing::warn!(target: "craftcloud::maintenance", %error, "cannot purge the quarantine");
+                report.add("storage_errors", 1);
+            }
+        }
+
+        // Temporary files of uploads that died.
+        let mut after: Option<String> = None;
+        let mut scanned = 0_usize;
+        while ctx.go() && scanned < self.settings.scan_limit {
+            let items = match store.list_temp(after.as_deref(), page).await {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::warn!(target: "craftcloud::maintenance", %error, "cannot list temporary objects");
+                    report.add("storage_errors", 1);
+                    break;
+                }
+            };
+            scanned += items.len();
+            for temp in &items {
+                if !is_old(temp.modified) {
+                    continue;
+                }
+                if ctx.dry {
+                    report.add("would_remove_temp", 1);
+                    continue;
+                }
+                match store.remove_temp(&temp.id).await {
+                    Ok(()) => report.add("removed_temp", 1),
+                    Err(StorageError::NotFound) => {}
+                    Err(error) => {
+                        tracing::warn!(target: "craftcloud::maintenance", %error, "cannot remove a temporary object");
+                        report.add("storage_errors", 1);
+                    }
+                }
+            }
+            if items.len() < page {
+                break;
+            }
+            after = items.last().map(|t| t.id.clone());
+        }
+        Ok(())
+    }
+
+    // ---- 6. integrity verification -------------------------------------------
+
+    async fn verify_blobs(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        let Some(store) = &self.store else {
+            report.add("skipped_no_storage", 1);
+            return Ok(());
+        };
+        let candidates = db::verify_candidates(&self.pool, self.settings.batch()).await?;
+        let mut bytes = 0_u64;
+        for (handled, blob) in candidates.into_iter().enumerate() {
+            if !ctx.go() {
+                break;
+            }
+            // The first blob is always verified, whatever its size.
+            if handled > 0 && bytes >= self.settings.verify_bytes_per_run {
+                break;
+            }
+            let size = u64::try_from(blob.size_bytes).unwrap_or(0);
+            bytes = bytes.saturating_add(size);
+            if ctx.dry {
+                report.add("would_verify", 1);
+                continue;
+            }
+            let (Ok(key), Ok(sha)) = (
+                ObjectKey::parse(&blob.object_key),
+                <[u8; 32]>::try_from(blob.sha256.as_slice()),
+            ) else {
+                tracing::error!(target: "craftcloud::maintenance", blob = %blob.id, "blob record is malformed");
+                report.add("invalid_records", 1);
+                continue;
+            };
+            let result = match store.verify(&key, &sha).await {
+                Ok(()) => VerifyResult::Intact,
+                Err(StorageError::ChecksumMismatch) => VerifyResult::Mismatch,
+                Err(StorageError::NotFound) => VerifyResult::Missing,
+                Err(error) => {
+                    tracing::warn!(target: "craftcloud::maintenance", blob = %blob.id, %error, "blob could not be read for verification");
+                    report.add("storage_errors", 1);
+                    continue;
+                }
+            };
+            let recorded = match db::record_verification(&self.pool, blob.id, result, ctx.now).await
+            {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    self.fail_item(
+                        ctx,
+                        "verify_blobs",
+                        report,
+                        "recording a verification",
+                        blob.id,
+                        &error,
+                    );
+                    continue;
+                }
+            };
+            if recorded.is_none() {
+                // Claimed by garbage collection meanwhile.
+                continue;
+            }
+            let was_corrupt = blob.state == "corrupt";
+            match result {
+                VerifyResult::Intact => {
+                    report.add("verified_bytes", size);
+                    report.add(if was_corrupt { "repaired" } else { "verified" }, 1);
+                    if was_corrupt {
+                        tracing::info!(target: "craftcloud::maintenance", blob = %blob.id, "blob matches its checksum again");
+                    }
+                }
+                VerifyResult::Mismatch => {
+                    report.add("verified_bytes", size);
+                    if was_corrupt {
+                        report.add("still_corrupt", 1);
+                    } else {
+                        tracing::error!(target: "craftcloud::maintenance", blob = %blob.id, "blob content differs from its checksum; marked corrupt");
+                        report.add("newly_corrupt", 1);
+                    }
+                }
+                VerifyResult::Missing => {
+                    tracing::error!(target: "craftcloud::maintenance", blob = %blob.id, state = %blob.state, "object of a stored blob is missing; state unchanged");
+                    report.add("missing_objects", 1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---- 7. usage drift ------------------------------------------------------
+
+    async fn fix_one(&self, org_id: Uuid) -> Result<Option<db::UsageDrift>, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(None);
+        };
+        let drift = tx.maint_fix_usage().await?;
+        tx.commit().await?;
+        Ok(drift)
+    }
+
+    async fn fix_usage(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        let excluded = self.excluded("fix_usage", ctx.now, report);
+        let window = self.next_orgs(&self.drift_cursor, !ctx.dry).await?;
+        let orgs = db::drifting_orgs(
+            &self.pool,
+            &window,
+            &excluded,
+            self.settings.batch().min(100),
+        )
+        .await?;
+        if ctx.dry {
+            report.add("orgs_with_drift", count_of(orgs.len()));
+            return Ok(());
+        }
+        for org_id in orgs {
+            if !ctx.go() {
+                break;
+            }
+            match self.fix_one(org_id).await {
+                Ok(Some(drift)) => {
+                    tracing::warn!(
+                        target: "craftcloud::maintenance",
+                        org = %org_id,
+                        reserved_delta = drift.reserved_delta,
+                        committed_delta = drift.committed_delta,
+                        workspaces = drift.workspaces,
+                        "usage counters differed from the rows and were corrected"
+                    );
+                    report.add("orgs_corrected", 1);
+                }
+                Ok(None) => {}
+                Err(error) => self.fail_item(
+                    ctx,
+                    "fix_usage",
+                    report,
+                    "correcting usage counters",
+                    org_id,
+                    &error,
+                ),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn add_purged(report: &mut StepReport, counts: db::PurgeCounts) {
+    report.add("purged_files", counts.files);
+    report.add("purged_versions", counts.versions);
+    report.add("purged_sessions", counts.sessions);
+    report.add("purged_projects", counts.projects);
+}
+
+#[derive(Clone, Copy)]
+enum Step {
+    ExpireUploads,
+    PurgeTrash,
+    TrimVersions,
+    CollectBlobs,
+    ReconcileStorage,
+    VerifyBlobs,
+    FixUsage,
+}
+
+const STEPS: [Step; 7] = [
+    Step::ExpireUploads,
+    Step::PurgeTrash,
+    Step::TrimVersions,
+    Step::CollectBlobs,
+    Step::ReconcileStorage,
+    Step::VerifyBlobs,
+    Step::FixUsage,
+];
+
+impl Step {
+    /// Steps that delete or move data (skipped when the clocks disagree).
+    fn destructive(self) -> bool {
+        matches!(
+            self,
+            Self::ExpireUploads
+                | Self::PurgeTrash
+                | Self::TrimVersions
+                | Self::CollectBlobs
+                | Self::ReconcileStorage
+        )
+    }
+
+    /// Steps that read or change the object store.
+    fn needs_store(self) -> bool {
+        matches!(
+            self,
+            Self::CollectBlobs | Self::ReconcileStorage | Self::VerifyBlobs
+        )
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ExpireUploads => "expire_uploads",
+            Self::PurgeTrash => "purge_trash",
+            Self::TrimVersions => "trim_versions",
+            Self::CollectBlobs => "collect_blobs",
+            Self::ReconcileStorage => "reconcile_storage",
+            Self::VerifyBlobs => "verify_blobs",
+            Self::FixUsage => "fix_usage",
+        }
+    }
+}
+
+// ---- GET /admin/maintenance ------------------------------------------------------
+
+/// The newest finished run in its published form: times, duration, counts per
+/// step and the error codes of failed steps. No tenant data.
+fn run_json(record: &db::RunRecord) -> Value {
+    let report: Value = serde_json::from_str(&record.report).unwrap_or(Value::Null);
+    let steps = report.get("steps").cloned().unwrap_or_else(|| json!({}));
+    let mut error_codes: Vec<String> = steps
+        .as_object()
+        .map(|steps| {
+            steps
+                .values()
+                .filter_map(|step| step.get("error_code").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    error_codes.sort();
+    error_codes.dedup();
+    json!({
+        "trigger": record.trigger,
+        "started_at": rfc3339(record.started_at),
+        "finished_at": rfc3339(record.finished_at),
+        "duration_ms": record.duration_ms,
+        "steps": steps,
+        "error_codes": error_codes,
+    })
+}
+
+/// Operator only: when the maintenance job last ran and what it did.
+pub(crate) async fn get_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(response) = operator_gate(
+        &services,
+        &session,
+        Action::MaintenanceRead,
+        "maintenance.read",
+        None,
+        &headers,
+    )
+    .await
+    {
+        return *response;
+    }
+    match db::last_run(&services.pool).await {
+        Ok(record) => {
+            let last_run = record.as_ref().map(run_json);
+            Json(json!({ "last_run": last_run })).into_response()
+        }
+        Err(error) => db_failure(&error, &headers, "maintenance status failed"),
+    }
+}

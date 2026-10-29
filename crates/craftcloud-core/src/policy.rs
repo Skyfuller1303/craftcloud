@@ -237,6 +237,8 @@ pub enum Action {
     VersionCommit,
     /// Create a new version from an older one.
     VersionRestore,
+    /// Read the status of the maintenance job (operator).
+    MaintenanceRead,
 }
 
 impl Action {
@@ -249,6 +251,7 @@ impl Action {
             | Self::OrganizationRead
             | Self::OrganizationListAll
             | Self::UserListAll
+            | Self::MaintenanceRead
             | Self::MemberList
             | Self::WorkspaceRead
             | Self::WorkspaceList
@@ -298,7 +301,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 49] = [
+    pub const ALL: [Action; 50] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -348,6 +351,7 @@ impl Action {
         Action::FileDownload,
         Action::VersionCommit,
         Action::VersionRestore,
+        Action::MaintenanceRead,
     ];
 }
 
@@ -536,6 +540,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             A::OrganizationCreate
             | A::OrganizationListAll
             | A::UserListAll
+            | A::MaintenanceRead
             | A::OrganizationQuotaSet
             | A::UserDisable
             | A::UserEnable
@@ -1156,6 +1161,7 @@ mod tests {
             Action::OrganizationCreate,
             Action::OrganizationListAll,
             Action::UserListAll,
+            Action::MaintenanceRead,
             Action::OrganizationQuotaSet,
             Action::UserDisable,
             Action::UserEnable,
@@ -1394,6 +1400,7 @@ mod tests {
             Action::FileDownload,
             Action::VersionCommit,
             Action::VersionRestore,
+            Action::MaintenanceRead,
         ]
         .into_iter()
         .collect();
@@ -1448,7 +1455,8 @@ mod tests {
                 | Action::VersionRead
                 | Action::FileDownload
                 | Action::VersionCommit
-                | Action::VersionRestore => {}
+                | Action::VersionRestore
+                | Action::MaintenanceRead => {}
             }
             assert!(
                 covered.contains(&action),
@@ -1481,7 +1489,8 @@ mod tests {
                 Action::UsageRead,
                 Action::VersionList,
                 Action::VersionRead,
-                Action::FileDownload
+                Action::FileDownload,
+                Action::MaintenanceRead
             ]
         );
     }

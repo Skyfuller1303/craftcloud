@@ -60,6 +60,7 @@ Workspace-Rollen: `admin > editor > viewer`. Organisations-Owner und -Admins ver
 | Einladung widerrufen | 404 | 403 | 403 | 403 | nur eigene | ja |
 | `workspace_admin_invites_enabled` ändern (`PATCH /organizations/{id}`) | 404 | 403 | 403 | 403 | 403 | ja |
 | Konten der Instanz mit Herkunft listen (`GET /admin/users`) | nur Operator (sonst 403) | 403 | 403 | 403 | 403 | 403 |
+| Status des Wartungsjobs lesen (`GET /admin/maintenance`, Aktion `MaintenanceRead`) | nur Operator (sonst 403) | 403 | 403 | 403 | 403 | 403 |
 
 Einladungen annehmen (`POST /invitations/accept`) ist die Tokenbesitz-Aktion: wer den Link hält, beweist (bis SMTP existiert) den Besitz der Adresse. Bei der Annahme wird die Berechtigung des **Einladenden** mit seinen aktuellen Rollen erneut ausgewertet (gleiche Policy wie beim Anlegen); wurde er herabgestuft, deaktiviert, entfernt, ist der Workspace weg oder der Schalter ausgeschaltet, antwortet die Annahme einheitlich 400 und die Einladung wird als ungültig markiert. Eine Einladung ändert nie die Organisationsrolle eines bestehenden Mitglieds und senkt nie eine vorhandene Workspace-Rolle.
 

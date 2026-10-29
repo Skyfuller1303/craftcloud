@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — PR-012 (rest of CC-P02-06, CC-P02-07) implemented locally: maintenance job (in-process loop with `CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS` plus `craftcloud-server admin maintenance --once [--dry-run]`, one runner via PostgreSQL advisory lock) with retention purge of trashed files and projects, version retention (`CRAFTCLOUD_VERSION_RETENTION_DAYS`), two-phase blob garbage collection (new blob state `deleting`), reconciliation of stray objects and temporary files, integrity verification (`CRAFTCLOUD_VERIFY_BYTES_PER_RUN`), usage drift correction, run log table and `GET /api/v1/admin/maintenance` (operator), migration 0010, policy action `MaintenanceRead`. Not reviewed or merged.
+
 2026-10-29 — PR-011 (CC-P02-04, CC-P02-05) implemented locally: immutable file versions with compare-and-set commit (412 VERSION_CONFLICT, content ETag `"version:<uuid>"`), idempotent commit by upload id, restore, version listing, download with ACL re-check, safe headers, single byte ranges, `Repr-Digest` and integrity-checked streaming, migration 0009. Not reviewed or merged.
 
 2026-10-29 — PR-010 (CC-P02-02, quota part of CC-P02-06) implemented locally: upload sessions with quota reservation, streamed content with SHA-256 and length verification into the local object store, idempotency, caps, expiry, quota and usage routes, migration 0008. Staged (uncommitted) blobs only. Not reviewed or merged.

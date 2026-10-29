@@ -26,7 +26,7 @@ pub use error::{StorageError, StoreSetupError, map_io_error};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use faults::{FaultKind, FaultPlan};
 pub use key::{KeyError, ObjectKey};
-pub use local::{LocalStore, ObjectReader, TempObject};
+pub use local::{LocalStore, MARKER_FILE, MarkerInfo, ObjectReader, QUARANTINE_DIR, TempObject};
 
 use std::time::SystemTime;
 

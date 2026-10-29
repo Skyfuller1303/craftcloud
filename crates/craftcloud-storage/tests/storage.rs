@@ -11,8 +11,8 @@ mod tests {
     use std::time::Instant;
 
     use craftcloud_storage::{
-        ByteRange, CHUNK_BYTES, FaultKind, FaultPlan, LocalStore, ObjectKey, ObjectStore,
-        ReadSource, Sha256Digest, StorageError, WriteSink,
+        ByteRange, CHUNK_BYTES, FaultKind, FaultPlan, LocalStore, MarkerInfo, ObjectKey,
+        ObjectStore, ReadSource, Sha256Digest, StorageError, WriteSink,
     };
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
@@ -774,5 +774,144 @@ mod tests {
             "large test: 1 GiB written+finalized in {written:?}, total with read+verify {:?}, largest chunk {largest} bytes",
             started.elapsed()
         );
+    }
+
+    // ---- marker and quarantine ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_marker_is_written_once_atomically_and_read_only() {
+        let root = TempRoot::new();
+        let store = LocalStore::open(root.path()).await.unwrap();
+        assert_eq!(store.read_marker().await.unwrap(), None);
+        let id = Uuid::new_v4();
+        store.write_marker(id, false).await.unwrap();
+        assert_eq!(store.read_marker().await.unwrap(), Some(id));
+        let path = root.path().join("craftcloud-store.json");
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        // Never overwritten without `replace`.
+        assert!(matches!(
+            store.write_marker(Uuid::new_v4(), false).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(store.read_marker().await.unwrap(), Some(id));
+        let other = Uuid::new_v4();
+        store.write_marker(other, true).await.unwrap();
+        assert_eq!(store.read_marker().await.unwrap(), Some(other));
+        // No leftovers in tmp.
+        assert!(store.list_temp(None, 10).await.unwrap().is_empty());
+        // A damaged marker is an error, not "no marker".
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(store.read_marker().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn quarantine_moves_objects_out_of_service_and_purges_old_days() {
+        let root = TempRoot::new();
+        let store = LocalStore::open(root.path()).await.unwrap();
+        let (a, b) = (put(&store, b"alpha").await, put(&store, b"beta").await);
+        store.quarantine(&a, "20260101").await.unwrap();
+        store.quarantine(&b, "20260201").await.unwrap();
+        // Not an object any more: no read, no listing.
+        assert!(matches!(
+            store.open_read(&a, None).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(store.list_objects(None, 10).await.unwrap().is_empty());
+        let kept = root
+            .path()
+            .join("quarantine")
+            .join("20260101")
+            .join(a.as_str());
+        assert_eq!(std::fs::read(&kept).unwrap(), b"alpha");
+        // Missing objects and bad day names.
+        assert!(matches!(
+            store.quarantine(&a, "20260101").await,
+            Err(StorageError::NotFound)
+        ));
+        let c = put(&store, b"gamma").await;
+        assert!(store.quarantine(&c, "../x").await.is_err());
+        assert!(store.quarantine(&c, "2026").await.is_err());
+        assert_eq!(store.head(&c).await.unwrap().len, 5);
+
+        // Purge: only day directories strictly before the given day.
+        assert_eq!(store.purge_quarantine("20260101", false).await.unwrap(), 0);
+        assert_eq!(store.purge_quarantine("20260201", true).await.unwrap(), 1);
+        assert!(kept.exists());
+        assert_eq!(store.purge_quarantine("20260201", false).await.unwrap(), 1);
+        assert!(!kept.exists());
+        assert!(
+            root.path()
+                .join("quarantine")
+                .join("20260201")
+                .join(b.as_str())
+                .exists()
+        );
+        // Nothing to purge without a quarantine directory.
+        let empty = TempRoot::new();
+        let other = LocalStore::open(empty.path()).await.unwrap();
+        assert_eq!(other.purge_quarantine("29991231", false).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_marker_epoch_round_trips_and_replacing_keeps_it_read_only() {
+        let root = TempRoot::new();
+        let store = LocalStore::open(root.path()).await.unwrap();
+        let id = Uuid::new_v4();
+        store
+            .write_marker_info(
+                MarkerInfo {
+                    store_id: id,
+                    epoch: 0,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        for epoch in [1_u64, 2, 40] {
+            store
+                .write_marker_info(
+                    MarkerInfo {
+                        store_id: id,
+                        epoch,
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+            let info = store.read_marker_info().await.unwrap().unwrap();
+            assert_eq!(
+                info,
+                MarkerInfo {
+                    store_id: id,
+                    epoch
+                }
+            );
+        }
+        let path = root.path().join("craftcloud-store.json");
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        // A marker from before epochs counts as epoch 0.
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        std::fs::write(&path, format!("{{\"store_id\":\"{id}\"}}\n")).unwrap();
+        assert_eq!(
+            store.read_marker_info().await.unwrap(),
+            Some(MarkerInfo {
+                store_id: id,
+                epoch: 0
+            })
+        );
+        // A broken epoch is an error, not zero.
+        std::fs::write(&path, format!("{{\"store_id\":\"{id}\",\"epoch\":x}}\n")).unwrap();
+        assert!(store.read_marker_info().await.is_err());
     }
 }

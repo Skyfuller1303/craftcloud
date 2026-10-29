@@ -642,6 +642,25 @@ paths:
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/maintenance:
+    get:
+      tags: [Admin]
+      summary: Status of the maintenance job (operator only)
+      description: >-
+        The newest finished maintenance run: trigger (`scheduled` for the loop inside the server, `cli` for
+        `craftcloud-server admin maintenance`), start and end time, duration, the counts per step and the error codes
+        of steps that failed (`DATABASE_ERROR`). `last_run` is null until a run has finished; dry runs are not recorded.
+        The report contains counts and error codes only: no organization, file, user or storage data. Other callers: 403.
+      responses:
+        '200':
+          description: The status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MaintenanceStatus'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /admin/users:
     get:
       tags: [Admin]
@@ -2607,6 +2626,40 @@ components:
                 organization_id: {type: [string, 'null'], format: uuid}
                 invited_by_user_id: {type: [string, 'null'], format: uuid}
                 invitation_id: {type: string, format: uuid}
+    MaintenanceStatus:
+      type: object
+      required: [last_run]
+      properties:
+        last_run:
+          oneOf:
+            - {type: 'null'}
+            - {$ref: '#/components/schemas/MaintenanceRun'}
+    MaintenanceRun:
+      type: object
+      required: [trigger, started_at, finished_at, duration_ms, steps, error_codes]
+      properties:
+        trigger: {type: string, enum: [scheduled, cli]}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        duration_ms: {type: integer, format: int64, minimum: 0}
+        steps:
+          type: object
+          description: >-
+            By step name (`expire_uploads`, `purge_trash`, `trim_versions`, `collect_blobs`, `reconcile_storage`,
+            `verify_blobs`, `fix_usage`).
+          additionalProperties:
+            type: object
+            required: [counts, error_code]
+            properties:
+              counts:
+                type: object
+                description: What the step did, by counter name.
+                additionalProperties: {type: integer, format: int64, minimum: 0}
+              error_code: {type: [string, 'null'], description: 'DATABASE_ERROR if the step stopped on a database failure.'}
+        error_codes:
+          type: array
+          maxItems: 16
+          items: {type: string}
     AdminUserPage:
       type: object
       required: [items, next_cursor]
