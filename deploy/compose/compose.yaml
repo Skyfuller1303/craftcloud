@@ -1,0 +1,235 @@
+# CraftCloud Docker Compose stack (CC-P03-07): PostgreSQL, a one-shot role
+# setup, a one-shot migration, the nonroot CraftCloud server and a Caddy proxy
+# with automatic TLS. Development prototype: read docs/06-operations/deployment.md
+# before exposing it.
+#
+#   cargo xtask compose-secrets --domain cloud.example.org   # writes .env (secrets, 0600)
+#   docker compose -f compose.yaml -f compose.setup.yaml up -d --build
+#
+# Secrets never appear in this file or in a container's environment. Compose
+# reads them from the gitignored .env and gives them to the one-shot
+# `secrets-init` service only, which writes them as files (mode 0400, owned by
+# the reading user) into the `secrets` volume. Every other service mounts just
+# its own subdirectory read-only at /run/secrets and reads *_FILE variables.
+# The server only gets the runtime database URL; the owner URL exists only in `migrate`.
+
+name: craftcloud
+
+x-postgres-image: &postgres-image postgres:18.6@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: "no"
+
+services:
+  # Distributes the secrets (see secrets-init.sh). The only service that is not
+  # read-only (compose cannot inject secrets into a read-only root filesystem)
+  # and the only one that sees every secret: it has no network at all and
+  # runs for about a second.
+  secrets-init:
+    <<: *hardening
+    read_only: false
+    image: *postgres-image
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/secrets-init.sh"]
+    network_mode: none
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    secrets:
+      - db_superuser_password
+      - db_owner_password
+      - db_runtime_password
+      - bootstrap_token
+      - metrics_token
+    volumes:
+      - ./secrets-init.sh:/secrets-init.sh:ro
+      - secrets:/out
+    healthcheck: {disable: true}
+    mem_limit: 64m
+
+  db:
+    <<: *hardening
+    restart: unless-stopped
+    image: *postgres-image
+    environment:
+      POSTGRES_DB: craftcloud
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --data-checksums"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      # Read by the image entrypoint while it still runs as root.
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: db}
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    # The entrypoint starts as root to fix ownership of the data directory and
+    # then drops to the postgres user; it needs exactly these capabilities.
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "craftcloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [backend]
+    mem_limit: 1g
+    pids_limit: 200
+    stop_grace_period: 60s
+
+  # Creates (or refreshes the passwords of) the two application roles. Safe to
+  # run again; also the way to rotate the database passwords.
+  db-init:
+    <<: *hardening
+    image: *postgres-image
+    user: "999:999"
+    entrypoint: ["/bin/sh", "/db-init.sh"]
+    environment:
+      PGHOST: db
+      PGDATABASE: craftcloud
+    volumes:
+      - ./db-init.sh:/db-init.sh:ro
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: db-init}
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck: {disable: true}
+    networks: [backend]
+    mem_limit: 128m
+
+  # Applies pending migrations with the owner role and grants the runtime role
+  # its data privileges. Runs on every `up`; the server never migrates implicitly.
+  migrate:
+    <<: *hardening
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    user: "65532:65532"
+    command: ["migrate"]
+    environment:
+      CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE: /run/secrets/db_owner_url
+      CRAFTCLOUD_DATABASE_URL_FILE: /run/secrets/db_runtime_url
+      CRAFTCLOUD_DATABASE_RUNTIME_ROLE: craftcloud_runtime
+    volumes:
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: migrate}
+    depends_on:
+      db: {condition: service_healthy}
+      db-init: {condition: service_completed_successfully}
+    healthcheck: {disable: true}
+    networks: [backend]
+    mem_limit: 256m
+
+  server:
+    <<: *hardening
+    restart: unless-stopped
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    user: "65532:65532"
+    environment:
+      CRAFTCLOUD_PUBLIC_URL: ${CRAFTCLOUD_PUBLIC_URL:?run `cargo xtask compose-secrets` first}
+      # Only the proxy network: the address Caddy connects from.
+      CRAFTCLOUD_TRUSTED_PROXIES: ${CRAFTCLOUD_FRONTEND_SUBNET:-172.29.205.0/24}
+      CRAFTCLOUD_DATABASE_URL_FILE: /run/secrets/db_runtime_url
+      # CRAFTCLOUD_BIND, CRAFTCLOUD_ADMIN_DIR, CRAFTCLOUD_STORAGE_DIR and
+      # CRAFTCLOUD_LOG_FORMAT come from the image.
+    volumes:
+      - store:/var/lib/craftcloud/store
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: server}
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    # `craftcloud-server healthcheck` asks GET /health/ready on the container's
+    # own listener (the image has no shell and no curl).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/craftcloud-server", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [frontend, backend]
+    mem_limit: 1g
+    pids_limit: 512
+    stop_grace_period: 30s
+
+  caddy:
+    <<: *hardening
+    restart: unless-stopped
+    image: caddy:2.11-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    ports:
+      - "${CRAFTCLOUD_HTTP_PORT:-80}:80"
+      - "${CRAFTCLOUD_HTTPS_PORT:-443}:443"
+      - "${CRAFTCLOUD_HTTPS_PORT:-443}:443/udp"
+    environment:
+      CRAFTCLOUD_DOMAIN: ${CRAFTCLOUD_DOMAIN:?run `cargo xtask compose-secrets` first}
+      CRAFTCLOUD_TLS_MODE: ${CRAFTCLOUD_TLS_MODE:-acme}
+      CRAFTCLOUD_PUBLIC_URL: ${CRAFTCLOUD_PUBLIC_URL:?run `cargo xtask compose-secrets` first}
+    volumes:
+      - ./caddy:/etc/caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp
+    # Runs as root inside the container (the official image does), without any
+    # capability except binding ports 80 and 443; its root filesystem is read-only.
+    cap_add: [NET_BIND_SERVICE]
+    depends_on:
+      server: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks: [edge, frontend]
+    mem_limit: 256m
+    pids_limit: 200
+
+networks:
+  # Published ports and outbound access (ACME) live here; only Caddy is attached.
+  edge: {}
+  # Caddy <-> server. `internal`: no route to the outside world.
+  frontend:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${CRAFTCLOUD_FRONTEND_SUBNET:-172.29.205.0/24}
+  # Server, migrate and database. `internal`, and Caddy is not attached.
+  backend:
+    internal: true
+
+volumes:
+  pgdata: {}
+  # Secret files written by `secrets-init`, one directory per service.
+  secrets: {}
+  store: {}
+  caddy_data: {}
+  caddy_config: {}
+  # Reserved for the backup job (CC-P03-08): a backup service would mount
+  # `store` read-only, write here and nowhere else. Nothing mounts it yet.
+  backups: {}
+
+secrets:
+  db_superuser_password: {environment: CC_SECRET_DB_SUPERUSER_PASSWORD}
+  db_owner_password: {environment: CC_SECRET_DB_OWNER_PASSWORD}
+  db_runtime_password: {environment: CC_SECRET_DB_RUNTIME_PASSWORD}
+  bootstrap_token: {environment: CC_SECRET_BOOTSTRAP}
+  metrics_token: {environment: CC_SECRET_METRICS_TOKEN}

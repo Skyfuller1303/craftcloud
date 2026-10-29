@@ -36,6 +36,8 @@ CRAFTCLOUD_ADMIN_DIR=/abs/path/to/apps/craftcloud-admin/dist cargo run -p craftc
 
 For UI development run `npm run dev` in `apps/craftcloud-admin` (Vite proxies `/api` to `127.0.0.1:8080`); `npm test`, `npm run typecheck` and `npm run i18n:check` run single checks. New UI texts are English sources in code (`t("...")`) and must be added to every `src/locales/*.tsv`; a new language is a new file.
 
+**Docker Compose (CC-P03-07).** `deploy/compose/` runs PostgreSQL, a one-shot migration, the nonroot server (distroless, read-only root filesystem, no capabilities) and a Caddy proxy with automatic TLS. `cargo xtask compose-secrets --domain cloud.example.org` writes the gitignored `deploy/compose/.env` with random secrets, then `docker compose -f compose.yaml -f compose.setup.yaml up -d --build` starts everything and the setup is completed at `https://<domain>/admin`. Steps, hardening, volumes, upgrade and the two-role database setup: [docs/06-operations/deployment.md](docs/06-operations/deployment.md). It is a development prototype, not a released deployment.
+
 Invalid configuration prints every problem and exits with code 2 without binding a socket (runtime failures exit with 1); keys and rules are in [docs/06-operations/deployment.md](docs/06-operations/deployment.md) and [ADR-0011](docs/09-decisions/adr-0011-configuration-policy.md).
 
 The workspace declares `rust-version = "1.99"`, the locally installed toolchain, so every local build exercises the declared MSRV (ADR-0010). Roadmap: [ROADMAP.md](ROADMAP.md) and [docs/07-roadmap/phases.md](docs/07-roadmap/phases.md).
@@ -78,7 +80,7 @@ craftcloud/
 └── README.md
 ```
 
-> **Do not treat omitted files as finished implementation.** Only the PR-001 skeleton (see Status above) exists as code; there is still no executable deployment stack, no unapproved logos, and no copied upstream license texts.
+> **Do not treat omitted files as finished implementation.** Only the PR-001 skeleton (see Status above) exists as code; the Docker Compose stack in `deploy/compose` is a development prototype and not a released deployment, there are no unapproved logos, and no copied upstream license texts.
 
 ## Sequencing
 

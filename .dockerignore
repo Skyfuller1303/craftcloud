@@ -1,0 +1,25 @@
+# Build context for deploy/compose/Dockerfile: sources only. Nothing here may
+# carry secrets, local build output or version-control data into an image layer.
+.git
+.cargo
+.github
+.env
+.env.*
+**/.env
+**/.env.*
+**/secrets
+**/*.pem
+**/*.key
+target
+**/target
+**/node_modules
+**/dist
+plan
+docs
+deploy
+output
+*.log
+*.sqlite
+*.sqlite3
+.coverage
+.DS_Store

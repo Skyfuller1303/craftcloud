@@ -1,0 +1,17 @@
+# Optional Prometheus endpoint (GET /metrics, bearer token) on its own
+# listener. The port is only exposed to the internal compose networks; the
+# proxy never forwards /metrics and no port is published. A scraper must join
+# the `craftcloud_backend` network (for example another compose project that
+# declares it as external) and send `Authorization: Bearer <CC_SECRET_METRICS_TOKEN>`.
+#
+#   docker compose -f compose.yaml -f compose.metrics.yaml up -d
+services:
+  secrets-init:
+    environment:
+      COPY_METRICS_TOKEN: "1"
+  server:
+    environment:
+      CRAFTCLOUD_METRICS_ADDR: 0.0.0.0:9464
+      CRAFTCLOUD_METRICS_TOKEN_FILE: /run/secrets/metrics_token
+    expose:
+      - "9464"

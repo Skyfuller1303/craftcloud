@@ -22,7 +22,7 @@
 
 ## Nach P3 eingeplant
 
-- **Design-Durchgang Admin-Oberfläche** (Wunsch des Projektverantwortlichen, 2026-10-29): eigener PR direkt nach dem P3-Gate und vor P4. Orientierung am Craft-Launcher (`crates/ui-egui/src/theme.rs` und sein Erscheinungsbild): Typografie-Hierarchie, Abstände, Tabellen, Leer- und Ladezustände, Upload-Feedback, Navigation, Icons (eigene oder frei lizenzierte, keine Craft-Assets). Rahmen bleibt ADR-0015 (keine Logos, Schriften oder Bilder der Craft-Apps; übernommene Werte in `ATTRIBUTION.md`). Abnahme: Screenshots hell/dunkel, EN/DE, 360 px, axe ohne Verstöße.
+- **Design-Durchgang Admin-Oberfläche** (Wunsch des Projektverantwortlichen, 2026-10-29): eigener PR, auf Wunsch parallel zu P3 durch Codex umgesetzt (Branch `feat/admin-design`), Abnahme durch den Koordinator vor P4. Orientierung am Craft-Launcher (`crates/ui-egui/src/theme.rs` und sein Erscheinungsbild): Typografie-Hierarchie, Abstände, Tabellen, Leer- und Ladezustände, Upload-Feedback, Navigation, Icons (eigene oder frei lizenzierte, keine Craft-Assets). Rahmen bleibt ADR-0015 (keine Logos, Schriften oder Bilder der Craft-Apps; übernommene Werte in `ATTRIBUTION.md`). Abnahme: Screenshots hell/dunkel, EN/DE, 360 px, axe ohne Verstöße.
 
 ## Slice discipline
 

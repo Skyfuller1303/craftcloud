@@ -1,7 +1,8 @@
 //! CraftCloud server binary: reads configuration, composes the router and
 //! serves it until a shutdown signal arrives.
 //!
-//! Usage: `craftcloud-server` (serve), `craftcloud-server migrate` or
+//! Usage: `craftcloud-server` (serve), `craftcloud-server migrate`,
+//! `craftcloud-server healthcheck` (container healthcheck) or
 //! `craftcloud-server admin ...` (offline tools, including one maintenance run).
 //!
 //! Exit codes: 0 clean shutdown, 1 runtime failure (including a database that
@@ -9,6 +10,7 @@
 
 mod admin_ui;
 mod config;
+mod healthcheck;
 mod secret;
 mod server;
 
@@ -31,10 +33,11 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
 
-const USAGE: &str = "usage: craftcloud-server [migrate | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force]\n\
+const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force]\n\
     \n\
     (no argument)                          start the HTTP server\n\
     migrate                                apply pending database migrations and exit\n\
+    healthcheck                            exit 0 if GET /health/ready on the local listener answers 200 (container healthcheck)\n\
     admin issue-password-reset --email E   print a one-hour password reset link for account E\n\
     admin set-org-owner --org SLUG --email E\n\
                                            break glass: make the enabled account E an owner of organization SLUG\n\
@@ -67,6 +70,7 @@ impl Failure {
 enum Command {
     Serve,
     Migrate,
+    Healthcheck,
     IssuePasswordReset { email: String },
     SetOrgOwner { org: String, email: String },
     Maintenance { dry_run: bool },
@@ -78,6 +82,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Serve),
         [one] if one == "migrate" => Ok(Command::Migrate),
+        [one] if one == "healthcheck" => Ok(Command::Healthcheck),
         [one] if one == "--help" || one == "-h" => Ok(Command::Help),
         [admin, action, flag, email]
             if admin == "admin" && action == "issue-password-reset" && flag == "--email" =>
@@ -138,6 +143,17 @@ async fn main() -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        Ok(Command::Healthcheck) => {
+            // Before the configuration: the check only needs CRAFTCLOUD_BIND
+            // and must not read secrets or log.
+            return match healthcheck::run(std::env::var("CRAFTCLOUD_BIND").ok().as_deref()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("craftcloud-server healthcheck: {message}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(command) => command,
         Err(message) => {
             eprintln!("craftcloud-server: {message}\n{USAGE}");
@@ -175,7 +191,7 @@ async fn main() -> ExitCode {
         Command::SetOrgOwner { org, email } => set_org_owner(&config, &org, &email).await,
         Command::Maintenance { dry_run } => maintenance_once(&config, dry_run).await,
         Command::StorageBind => storage_bind(&config).await,
-        Command::Help => Ok(()),
+        Command::Help | Command::Healthcheck => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -873,6 +889,11 @@ mod tests {
             parse_args(&args(&["migrate"])),
             Ok(Command::Migrate)
         ));
+        assert!(matches!(
+            parse_args(&args(&["healthcheck"])),
+            Ok(Command::Healthcheck)
+        ));
+        assert!(parse_args(&args(&["healthcheck", "extra"])).is_err());
         assert!(matches!(parse_args(&args(&["--help"])), Ok(Command::Help)));
         assert!(parse_args(&args(&["nope"])).is_err());
         assert!(parse_args(&args(&["migrate", "extra"])).is_err());

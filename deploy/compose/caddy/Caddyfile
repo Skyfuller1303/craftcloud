@@ -1,0 +1,63 @@
+# Reverse proxy for CraftCloud (ADR-0016). One site: the admin UI under /admin
+# and the API under /api on the same origin as the server (ADR-0015).
+#
+# CRAFTCLOUD_DOMAIN and CRAFTCLOUD_TLS_MODE come from the compose environment:
+#   acme      public certificate from Let's Encrypt (needs DNS and ports 80/443 reachable)
+#   internal  certificate from Caddy's own CA, for local tests (browsers warn)
+
+{
+	# Not exposed: the admin API listens on loopback inside this container only.
+	admin localhost:2019
+}
+
+# Plain HTTP: redirect to the configured public URL, which keeps a non-default
+# HTTPS port (Caddy's automatic redirect would drop it). An explicit site
+# for the HTTP address replaces the automatic redirect. ACME HTTP challenges are
+# answered by Caddy before this block.
+http://{$CRAFTCLOUD_DOMAIN} {
+	redir {$CRAFTCLOUD_PUBLIC_URL}{uri} 308
+}
+
+{$CRAFTCLOUD_DOMAIN} {
+	import tls-{$CRAFTCLOUD_TLS_MODE}.caddy
+
+	# The server already sets Content-Security-Policy, X-Frame-Options, and so on
+	# on /admin and no-store on file bytes. The proxy only fills in the two generic
+	# headers where the server did not (the leading `?`). HSTS is added by
+	# tls-acme.caddy only: a test certificate must not pin the browser to HTTPS.
+	header {
+		?X-Content-Type-Options "nosniff"
+		?Referrer-Policy "same-origin"
+		-Server
+	}
+
+	# Metrics have their own internal listener and are never forwarded.
+	@metrics path /metrics /metrics/*
+	respond @metrics 404
+
+	# No `request_body { max_size ... }` here on purpose: uploads
+	# (PUT /api/v1/uploads/{id}/content) are streamed and the server enforces the
+	# declared size, the quota and a stall timeout. Caddy does not buffer request
+	# bodies unless asked to. The server's own limit still applies to all other routes.
+	reverse_proxy server:8080 {
+		# Pass response bytes on immediately (downloads stream, nothing is held back).
+		flush_interval -1
+
+		# Serve only while the server says it is ready (also 503 while draining).
+		health_uri /health/ready
+		health_status 200
+		health_interval 10s
+		health_timeout 3s
+
+		transport http {
+			dial_timeout 5s
+			# Time until the server starts answering; no limit on body transfer time.
+			response_header_timeout 60s
+		}
+	}
+
+	# No access log on purpose: a log of full URLs would keep query strings and
+	# invitation or reset parameters. If you need one, drop the query
+	# (`log { format filter { request>uri query { delete ... } } }`) and never write
+	# the Authorization and Cookie headers.
+}

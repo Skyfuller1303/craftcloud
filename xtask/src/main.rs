@@ -1,6 +1,7 @@
 //! Local developer tasks. `cargo xtask ci` runs the same checks a CI job
 //! would run, sequentially and failing fast.
 
+mod compose;
 mod db_test;
 mod docs_check;
 mod web;
@@ -18,6 +19,7 @@ fn main() -> ExitCode {
         },
         Some("web") if args.next().is_none() => web::run(&repo_root()),
         Some("db-test") if args.next().is_none() => db_test::run(&repo_root()),
+        Some("compose-secrets") => compose::run(&repo_root(), &args.collect::<Vec<_>>()),
         Some("openapi-snapshot") => match (args.next().as_deref(), args.next()) {
             (None, None) => openapi_snapshot(false),
             (Some("--update"), None) => openapi_snapshot(true),
@@ -28,7 +30,9 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: cargo xtask <ci [--skip-web]|web|db-test|openapi-snapshot [--update]>");
+    eprintln!(
+        "usage: cargo xtask <ci [--skip-web]|web|db-test|compose-secrets [<dir>] [--domain <name>] [--tls-internal] [--http-port <n>] [--https-port <n>]|openapi-snapshot [--update]>"
+    );
     ExitCode::from(2)
 }
 

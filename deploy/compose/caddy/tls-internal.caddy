@@ -1,0 +1,2 @@
+# Certificate from Caddy's internal CA (testing only).
+tls internal

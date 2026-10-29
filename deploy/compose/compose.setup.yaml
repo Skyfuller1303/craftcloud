@@ -1,0 +1,17 @@
+# First-time setup only: enables POST /api/v1/setup/complete by mounting the
+# bootstrap token. Use it for the first start, then drop it again:
+#
+#   docker compose -f compose.yaml -f compose.setup.yaml up -d
+#   ... complete the setup in the browser (https://<domain>/admin) ...
+#   docker compose up -d        # recreates the server without the token
+#
+# The token file is removed from the secrets volume by that second `up`
+# (secrets-init deletes files that no longer belong); you may also delete
+# CC_SECRET_BOOTSTRAP from .env.
+services:
+  secrets-init:
+    environment:
+      COPY_BOOTSTRAP_TOKEN: "1"
+  server:
+    environment:
+      CRAFTCLOUD_BOOTSTRAP_SECRET_FILE: /run/secrets/bootstrap_token
