@@ -1,7 +1,7 @@
 # Phase 03 — Web-Admin, Betrieb und Restore
 
 > **Code:** P3. **Goal:** A self-hosted service usable without CLI.  
-> **Status:** geplant / offen, keine abgeschlossenen Arbeiten behauptet.
+> **Status:** Tickets CC-P03-01 bis -08 umgesetzt, unabhängig geprüft und gemerged (PR #16 bis #21); CC-P03-09 Teil 1 (Sicherheitsreview) mit Fixes in PR #22. Zwei von vier Exit-Gates sind belegt. Offen: externer Betreiber-Test (Gate 1, durch den Projektverantwortlichen) und Prüfung von Tastatur und 360 px im echten Browser (Gate 3, mit dem Design-Durchgang). P3 ist **nicht** abgeschlossen (Stand 2026-10-29).
 
 ## Eintrittsvoraussetzungen
 
@@ -31,9 +31,13 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 ## Exit-Gates / Abnahme
 
 - [ ] Fresh external tester provisions server from docs and manages team via web
-- [ ] Backup restored on separate instance with ACL/version byte checks
+  - Offen: braucht eine Person außerhalb des Projekts, die nur mit `docs/06-operations/deployment.md` (Compose-Schnellstart) eine Instanz aufsetzt, die Ersteinrichtung abschließt und über die Weboberfläche Mitglieder einlädt, Rollen ändert und Dateien hochlädt. Vorbereitung: Compose-Stack von Ende zu Ende geprüft (PR-018). Ergebnis und gefundene Doku-Lücken werden hier eingetragen.
+- [x] Backup restored on separate instance with ACL/version byte checks
+  - Beleg (PR-019): `restore_drill_two_users_two_workspaces_and_a_version_history` (zeilengleiche Tabellen, bytegleiche Blobs jeder Version, Rechte über die API der wiederhergestellten Instanz: Außenstehende 404, Bearbeiter ohne Mitgliederverwaltung, alte Sitzung 401), `restore_never_overwrites_a_non_empty_target`, `a_backup_during_an_upload_is_consistent_and_the_restore_aborts_the_upload` (`crates/craftcloud-api/tests/backup.rs`, `cargo xtask db-test`); zusätzlich Compose-Probe mit zwei getrennten Projekten und anderer `PUBLIC_URL` (Logs unter `D:\ArtCraft\output\craftcloud-p0\pr-019\`, lokal).
 - [ ] Admin UI keyboard operable and responsive
-- [ ] No token leaks in logs/URLs/browser storage
+  - Teilweise belegt: Tastaturbedienung und Fokusführung in jsdom, axe in Englisch und Deutsch (`App.test.tsx` „switches organization and workspace with the keyboard“, „focuses the heading, then tabs through the form in reading order …“, `files.test.tsx` „is operable with the keyboard alone“, `activity.test.tsx` „is reachable and operable by keyboard“, `a11y.test.tsx`). Offen: echter Browser mit axe inklusive Kontrast sowie 1280 px und 360 px; erfolgt mit dem Design-Durchgang (`docs/11-design/`, Branch `feat/admin-design`).
+- [x] No token leaks in logs/URLs/browser storage
+  - Beleg: `logs_hold_no_secrets_or_personal_data_across_login_invite_reset_upload_download_and_errors` (`crates/craftcloud-api/tests/observability.rs`, PR-017); Einmal-Links tragen das Geheimnis im Fragment, das die Oberfläche vor API-Aufrufen per `history.replaceState` entfernt; im Browser-Speicher liegen nur Sprache und Thema (`apps/craftcloud-admin/src/preferences.ts`); statischer Sicherheitsreview ohne Befund zu diesem Punkt (CC-P03-09 Teil 1).
 
 ## Test- und Review-Artefakte
 
