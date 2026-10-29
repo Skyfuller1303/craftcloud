@@ -152,7 +152,13 @@ pub(crate) fn gate(
     target: Option<Uuid>,
 ) -> Gate {
     match decision {
-        Decision::Allow(permit) => Gate::Open(permit),
+        Decision::Allow(permit) => {
+            crate::observe::note_actor(actor);
+            if let Some(org_id) = permit.org_id() {
+                crate::observe::note_org(org_id);
+            }
+            Gate::Open(permit)
+        }
         Decision::Forbidden => {
             audit(headers, actor, action_name, org, target, "forbidden");
             let mut response = forbidden(headers);

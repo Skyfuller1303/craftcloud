@@ -15,9 +15,22 @@ import { FilesScreen } from "./FilesScreen.tsx";
 import { InvitationsScreen } from "./InvitationsScreen.tsx";
 import { MembersScreen } from "./MembersScreen.tsx";
 import { ProjectsScreen } from "./ProjectsScreen.tsx";
+import { SystemScreen } from "./SystemScreen.tsx";
 
-/** Dashboard sections. Settings follows with a later ticket and stays a placeholder. */
-const SECTIONS = ["overview", "projects", "files", "members", "invitations", "settings", "activity"] as const;
+/**
+ * Dashboard sections. Settings follows with a later ticket and stays a
+ * placeholder. "system" (CC-F15) is offered to the instance operator only.
+ */
+const SECTIONS = [
+  "overview",
+  "projects",
+  "files",
+  "members",
+  "invitations",
+  "settings",
+  "activity",
+  "system",
+] as const;
 type Section = (typeof SECTIONS)[number];
 
 export function Shell({
@@ -90,7 +103,10 @@ export function Shell({
     invitations: t("Invitations"),
     settings: t("Settings"),
     activity: t("Activity"),
+    system: t("System"),
   };
+  const isOperator = session.instance_role === "operator";
+  const visibleSections = SECTIONS.filter((key) => key !== "system" || isOperator);
 
   return (
     <div className="shell">
@@ -137,7 +153,7 @@ export function Shell({
       <div className="shell__body">
         <nav className="shell__nav" aria-label={t("Main navigation")}>
           <ul>
-            {SECTIONS.map((key) => (
+            {visibleSections.map((key) => (
               <li key={key}>
                 <button
                   type="button"
@@ -235,9 +251,11 @@ export function Shell({
             <ActivityScreen
               key={organizationId}
               scope={scope}
-              isOperator={session.instance_role === "operator"}
+              isOperator={isOperator}
               workspaces={workspaces.items}
             />
+          ) : section === "system" ? (
+            <SystemScreen isOperator={isOperator} />
           ) : (
             <p className="muted">{t("This view is not available yet.")}</p>
           )}

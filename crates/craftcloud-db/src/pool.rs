@@ -10,6 +10,17 @@ use sqlx::{
 
 use crate::DbError;
 
+/// Runs the cheapest possible query: proves that a connection can be taken
+/// from the pool and that the database answers. Callers add their own timeout.
+///
+/// # Errors
+///
+/// [`DbError`] if no connection is available or the query fails.
+pub async fn ping(pool: &PgPool) -> Result<(), DbError> {
+    sqlx::query("SELECT 1").execute(pool).await?;
+    Ok(())
+}
+
 /// Connects a pool to `url`.
 ///
 /// The URL contains credentials: it is never logged, and errors never echo

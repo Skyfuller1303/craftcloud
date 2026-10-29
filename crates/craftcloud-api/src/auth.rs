@@ -295,6 +295,7 @@ pub(crate) async fn login(
     if let Some(reservation) = reservation {
         reservation.record_success();
     }
+    crate::observe::note_actor(account.user_id);
 
     // Upgrade the stored hash if it uses outdated parameters (compare and
     // set on the verified hash, after the session insert that depends on it).

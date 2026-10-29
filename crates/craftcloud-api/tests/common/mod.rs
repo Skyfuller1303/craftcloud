@@ -11,7 +11,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use craftcloud_api::{ApiConfig, AuthSettings, Clock, Services, router_with_services};
+use craftcloud_api::{ApiConfig, AuthSettings, Clock, Metrics, Services, router_with_shared};
 use craftcloud_auth::hash_password;
 use craftcloud_core::Capabilities;
 use craftcloud_db::PgPool;
@@ -278,6 +278,10 @@ pub struct TestEnv {
     /// and exports): a test holds their permits to simulate pressure.
     pub audit_lossy: Arc<tokio::sync::Semaphore>,
     pub audit_important: Arc<tokio::sync::Semaphore>,
+    /// The metrics registry shared by the middleware and the services.
+    pub metrics: Arc<Metrics>,
+    /// The services behind the router (for the metrics listener tests).
+    pub services: Arc<Services>,
 }
 
 fn shared_hash() -> &'static str {
@@ -293,15 +297,26 @@ impl TestEnv {
     }
 
     pub async fn with(settings: AuthSettings, config: ApiConfig) -> Self {
-        Self::build(settings, config, true).await
+        Self::build(settings, config, true, false).await
     }
 
     /// Like `new` but without an object store (storage not configured).
     pub async fn without_storage() -> Self {
-        Self::build(settings(), ApiConfig::default(), false).await
+        Self::build(settings(), ApiConfig::default(), false, false).await
     }
 
-    async fn build(settings: AuthSettings, config: ApiConfig, storage: bool) -> Self {
+    /// A store is configured but was refused at startup (it belongs to another
+    /// database): file routes answer 503, readiness is degraded.
+    pub async fn with_refused_storage() -> Self {
+        Self::build(settings(), ApiConfig::default(), false, true).await
+    }
+
+    async fn build(
+        settings: AuthSettings,
+        config: ApiConfig,
+        storage: bool,
+        refused: bool,
+    ) -> Self {
         let url = std::env::var(ENV).expect("CC_TEST_DATABASE_URL must be set");
         let admin = PgConnectOptions::from_str(&url).unwrap();
         let name = format!("cc_test_{}", Uuid::new_v4().simple());
@@ -335,18 +350,25 @@ impl TestEnv {
             std::env::temp_dir().join(format!("cc-api-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&storage_dir).unwrap();
         let faults = Arc::new(FaultPlan::default());
-        let mut services = Services::new(pool.clone(), None, settings).with_clock(clock.clone());
+        let metrics = Arc::clone(&config.metrics);
+        let mut services = Services::new(pool.clone(), None, settings)
+            .with_clock(clock.clone())
+            .with_metrics(Arc::clone(&metrics));
         if storage {
             let store = LocalStore::open_with_faults(&storage_dir, faults.clone())
                 .await
                 .unwrap();
             services = services.with_storage(store);
         }
+        if refused {
+            services = services.with_storage_refused();
+        }
         let (audit_lossy, audit_important) = services.audit_semaphores();
-        let app = router_with_services(
+        let services = Arc::new(services);
+        let app = router_with_shared(
             Capabilities::development_defaults(),
             &config,
-            Some(services),
+            Some(Arc::clone(&services)),
         );
         Self {
             name,
@@ -359,6 +381,8 @@ impl TestEnv {
             storage_dir,
             audit_lossy,
             audit_important,
+            metrics,
+            services,
         }
     }
 
@@ -389,6 +413,18 @@ impl TestEnv {
                 .json(json!({"email": format!("{name}@example.test"), "password": PASSWORD})),
         )
         .await
+    }
+
+    /// Logs in `<name>@example.test` with an explicit password.
+    pub async fn login_ok_with(&self, name: &str, password: &str) -> Session {
+        let r = call(
+            &self.app,
+            Req::new("POST", "/api/v1/auth/login")
+                .json(json!({"email": format!("{name}@example.test"), "password": password})),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        session_from(&r)
     }
 
     pub async fn login_ok(&self, name: &str) -> Session {

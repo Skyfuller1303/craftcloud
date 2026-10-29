@@ -1,6 +1,7 @@
 import type {
   AcceptedInvitation,
   AcceptInvitationRequest,
+  AdminHealth,
   AuditEvent,
   AuditFilters,
   AuditSource,
@@ -61,6 +62,7 @@ export const ENDPOINTS = {
   listOrgAudit: { method: "GET", path: "/organizations/{org_id}/audit" },
   exportOrgAudit: { method: "GET", path: "/organizations/{org_id}/audit/export" },
   listInstanceAudit: { method: "GET", path: "/admin/audit" },
+  adminHealth: { method: "GET", path: "/admin/health" },
   exportInstanceAudit: { method: "GET", path: "/admin/audit/export" },
   listInvitations: { method: "GET", path: "/organizations/{org_id}/invitations" },
   createInvitation: { method: "POST", path: "/organizations/{org_id}/invitations" },
@@ -258,6 +260,8 @@ export interface ApiClient {
   ): Promise<WorkspaceMember>;
   removeWorkspaceMember(workspaceId: string, userId: string): Promise<void>;
 
+  /** Operator only: component status, pool, disk, uploads, maintenance, audit drops, version (CC-F15). */
+  getAdminHealth(): Promise<AdminHealth>;
   listAudit(source: AuditSource, filters: AuditFilters, cursor?: string): Promise<Page<AuditEvent>>;
   /** URL of the NDJSON export for a plain link; the browser streams the body, the page never holds it. */
   auditExportUrl(source: AuditSource, filters: AuditFilters): string;
@@ -487,6 +491,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         params: { workspace_id: workspaceId, user_id: userId },
       }),
 
+    getAdminHealth: () => call(ENDPOINTS.adminHealth),
     listAudit: (source, filters, cursor) =>
       call(source.kind === "organization" ? ENDPOINTS.listOrgAudit : ENDPOINTS.listInstanceAudit, {
         params: source.kind === "organization" ? { org_id: source.orgId } : {},

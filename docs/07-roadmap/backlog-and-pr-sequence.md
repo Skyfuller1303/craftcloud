@@ -20,6 +20,10 @@
 | PR-014 | audit & structured diagnostics | 006 | secrets redaction |
 | PR-015 | consistency backup/restore + Docker ops | 011/014 | independent restore proof |
 
+## Nach P3 eingeplant
+
+- **Design-Durchgang Admin-Oberfläche** (Wunsch des Projektverantwortlichen, 2026-10-29): eigener PR direkt nach dem P3-Gate und vor P4. Orientierung am Craft-Launcher (`crates/ui-egui/src/theme.rs` und sein Erscheinungsbild): Typografie-Hierarchie, Abstände, Tabellen, Leer- und Ladezustände, Upload-Feedback, Navigation, Icons (eigene oder frei lizenzierte, keine Craft-Assets). Rahmen bleibt ADR-0015 (keine Logos, Schriften oder Bilder der Craft-Apps; übernommene Werte in `ATTRIBUTION.md`). Abnahme: Screenshots hell/dunkel, EN/DE, 360 px, axe ohne Verstöße.
+
 ## Slice discipline
 
 Eine PR kann ein Problem inkl. Tests lösen, nicht das gesamte Dashboard. Keine zwei Auth-Architekturen in parallelen Branches. Cross-app PRs erst nach SDK-Vertrag; Integrationsänderung muss im jeweiligen App-Repo genehmigt werden. Der Backlog ist vorgeschlagen, keine gestarteten GitHub-Issues.

@@ -410,6 +410,149 @@ mod tests {
         assert!(text(&out).contains("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE"));
     }
 
+    fn http_get_bearer(port: u16, path: &str, token: Option<&str>) -> Option<String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        let auth = token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n"
+        )
+        .ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).ok()?;
+        Some(response)
+    }
+
+    const METRICS_TOKEN: &str = "cli-metrics-token-0123456789-abcdefghij";
+
+    #[test]
+    fn metrics_listener_settings_are_validated_before_anything_starts() {
+        let token = TempSecret::new("metrics", METRICS_TOKEN);
+        // Not loopback and no token: refused (exit 2) without echoing anything secret.
+        let out = run(&[], &[("CRAFTCLOUD_METRICS_ADDR", "0.0.0.0:9464")]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(
+            text(&out).contains("CRAFTCLOUD_METRICS_ADDR"),
+            "{}",
+            text(&out)
+        );
+        // A token without a listener has no effect and is refused.
+        let out = run(&[], &[("CRAFTCLOUD_METRICS_TOKEN_FILE", &token.path())]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        // A too short token is refused before the socket is bound.
+        let short = TempSecret::new("metrics-short", "short");
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:0"),
+                ("CRAFTCLOUD_METRICS_TOKEN_FILE", &short.path()),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_METRICS_TOKEN_FILE"));
+        assert!(!text(&out).contains(
+            "short
+"
+        ));
+        // A missing token file likewise.
+        let missing = std::env::temp_dir().join("craftcloud-cli-no-such-metrics-token");
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:0"),
+                ("CRAFTCLOUD_METRICS_TOKEN_FILE", &missing.to_string_lossy()),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    }
+
+    #[test]
+    fn metrics_are_served_on_a_separate_protected_listener_and_requests_are_logged_as_json() {
+        let token = TempSecret::new(
+            "metrics-ok",
+            &format!(
+                "{METRICS_TOKEN}
+"
+            ),
+        );
+        let port = free_port();
+        let metrics_port = free_port();
+        let bind = format!("127.0.0.1:{port}");
+        let metrics_addr = format!("127.0.0.1:{metrics_port}");
+        let env = [
+            ("CRAFTCLOUD_BIND", bind.as_str()),
+            ("CRAFTCLOUD_METRICS_ADDR", metrics_addr.as_str()),
+            ("CRAFTCLOUD_METRICS_TOKEN_FILE", &token.path()),
+            ("CRAFTCLOUD_LOG_FORMAT", "json"),
+        ];
+        let mut child = command(&[], &env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(wait_for_server(port), "server did not start");
+
+        // Public listener: no metrics; without a database it is not ready.
+        let public = http_get(port, "/metrics").unwrap();
+        assert!(public.starts_with("HTTP/1.1 404"), "{public}");
+        let ready = http_get(port, "/health/ready").unwrap();
+        assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
+        assert!(ready.contains("NOT_READY"), "{ready}");
+        let info = http_get(port, "/api/v1/info?access_token=QUERYSECRET-31337").unwrap();
+        assert!(info.starts_with("HTTP/1.1 200"), "{info}");
+
+        // Metrics listener: the bearer token is required.
+        let mut open = None;
+        for _ in 0..50 {
+            open = http_get_bearer(metrics_port, "/metrics", None);
+            if open.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let open = open.expect("metrics listener did not start");
+        assert!(open.starts_with("HTTP/1.1 401"), "{open}");
+        let wrong = http_get_bearer(metrics_port, "/metrics", Some("wrong-wrong-wrong")).unwrap();
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+        let ok = http_get_bearer(metrics_port, "/metrics", Some(METRICS_TOKEN)).unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("text/plain; version=0.0.4"), "{ok}");
+        assert!(
+            ok.contains(
+                "craftcloud_http_requests_total{route=\"/api/v1/info\",method=\"GET\",status_class=\"2xx\"} 1"
+            ),
+            "{ok}"
+        );
+        assert!(!ok.contains("QUERYSECRET"), "{ok}");
+        // The public listener has no route of that name on the metrics port either.
+        let other = http_get_bearer(metrics_port, "/api/v1/info", Some(METRICS_TOKEN)).unwrap();
+        assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+
+        child.kill().unwrap();
+        let output = child.wait_with_output().unwrap();
+        let log = text(&output);
+        for secret in [METRICS_TOKEN, "QUERYSECRET"] {
+            assert!(!log.contains(secret), "{secret} leaked into the log");
+        }
+        // Every line is one JSON object; the request line carries the route
+        // template, status, latency and the pseudonymous ids.
+        let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).expect(l))
+            .collect();
+        let request = lines
+            .iter()
+            .find(|l| l["target"] == "craftcloud::request" && l["span"]["route"] == "/api/v1/info")
+            .unwrap_or_else(|| panic!("no request line in {log}"));
+        assert_eq!(request["fields"]["status"], 200);
+        assert_eq!(request["span"]["method"], "GET");
+        assert!(request["fields"]["latency_ms"].is_u64());
+        assert_eq!(request["fields"]["actor_id"], "-");
+        assert_eq!(request["fields"]["org_id"], "-");
+        assert!(request["span"]["request_id"].as_str().is_some());
+    }
+
     fn http_post(port: u16, path: &str, body: &str) -> Option<String> {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
         stream

@@ -19,7 +19,9 @@ use craftcloud_api::maintenance::{
     Binding, Maintenance, MaintenanceSettings, RunOptions, RunOutcome, Trigger,
     check_store_binding, rebind_store,
 };
-use craftcloud_api::{ApiConfig, AuthSettings, Services, SystemClock};
+use craftcloud_api::{
+    ApiConfig, AuthSettings, Metrics, Services, SystemClock, metrics_router, router_with_shared,
+};
 use craftcloud_auth::{BootstrapToken, OpaqueToken, PASSWORD_RESET_TTL};
 use craftcloud_core::Capabilities;
 use craftcloud_core::NormalizedEmail;
@@ -282,6 +284,19 @@ fn load_bootstrap_token(config: &Config) -> Result<Option<BootstrapToken>, Failu
     BootstrapToken::new(secret.expose())
         .map(Some)
         .map_err(|err| Failure::config(format!("CRAFTCLOUD_BOOTSTRAP_SECRET_FILE: {err}")))
+}
+
+/// Loads the bearer token that protects the metrics listener (at least 32
+/// characters). Errors never contain the token.
+fn load_metrics_token(config: &Config) -> Result<Option<BootstrapToken>, Failure> {
+    let Some(path) = &config.metrics_token_file else {
+        return Ok(None);
+    };
+    let secret = secret::load_secret_file(path)
+        .map_err(|err| Failure::config(format!("CRAFTCLOUD_METRICS_TOKEN_FILE: {err}")))?;
+    BootstrapToken::new(secret.expose())
+        .map(Some)
+        .map_err(|err| Failure::config(format!("CRAFTCLOUD_METRICS_TOKEN_FILE: {err}")))
 }
 
 /// Offline recovery: prints a single-use reset link to stdout. The token is
@@ -563,6 +578,8 @@ async fn run(config: Config) -> Result<(), Failure> {
     // Validate the bootstrap secret first: a bad file is a configuration
     // error (exit 2) and must stop startup before anything is bound.
     let bootstrap = load_bootstrap_token(&config)?;
+    let metrics_token = load_metrics_token(&config)?;
+    let metrics = std::sync::Arc::new(Metrics::new());
     // Migrations are never applied implicitly: only verify the schema.
     let pool = connect_database(&config.database).await?;
     if let Some(pool) = &pool {
@@ -652,12 +669,15 @@ async fn run(config: Config) -> Result<(), Failure> {
         .as_ref()
         .filter(|_| config.maintenance_enabled)
         .map(|pool| {
-            let job = std::sync::Arc::new(Maintenance::new(
-                pool.clone(),
-                object_store.clone(),
-                std::sync::Arc::new(SystemClock),
-                maintenance_settings(&config),
-            ));
+            let job = std::sync::Arc::new(
+                Maintenance::new(
+                    pool.clone(),
+                    object_store.clone(),
+                    std::sync::Arc::new(SystemClock),
+                    maintenance_settings(&config),
+                )
+                .with_metrics(std::sync::Arc::clone(&metrics)),
+            );
             tracing::info!(
                 interval_secs = config.maintenance_interval.as_secs(),
                 "maintenance job scheduled"
@@ -701,22 +721,30 @@ async fn run(config: Config) -> Result<(), Failure> {
         }
         _ => object_store.clone(),
     };
+    let store_refused = object_store.is_some() && serving_store.is_none();
     let services = pool.as_ref().map(|pool| {
-        let services = Services::new(pool.clone(), bootstrap, auth_settings);
-        match serving_store {
+        let services = Services::new(pool.clone(), bootstrap, auth_settings)
+            .with_metrics(std::sync::Arc::clone(&metrics));
+        let services = match serving_store {
             Some(store) => services.with_storage(store),
             None => services,
-        }
+        };
+        std::sync::Arc::new(if store_refused {
+            services.with_storage_refused()
+        } else {
+            services
+        })
     });
     let api_config = ApiConfig {
         max_body_bytes: config.max_body_bytes,
         request_timeout: config.request_timeout,
         trusted_proxies: config.trusted_proxies.clone(),
+        metrics: std::sync::Arc::clone(&metrics),
     };
-    let router = craftcloud_api::router_with_services(
+    let router = router_with_shared(
         Capabilities::development_defaults(),
         &api_config,
-        services,
+        services.clone(),
     );
     let router = match admin_ui {
         Some(assets) => {
@@ -728,11 +756,56 @@ async fn run(config: Config) -> Result<(), Failure> {
         }
         None => router,
     };
-    let outcome = server::serve(listener, router, shutdown_signal(), config.shutdown_grace)
+    // The metrics listener is separate from the public one and off by default.
+    let metrics_task = match config.metrics_addr {
+        Some(addr) => {
+            let metrics_listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
+                Failure::runtime(format!("cannot bind metrics address {addr}: {err}"))
+            })?;
+            tracing::info!(
+                address = %addr,
+                token_required = metrics_token.is_some(),
+                "serving GET /metrics on the internal metrics listener"
+            );
+            let router = metrics_router(
+                std::sync::Arc::clone(&metrics),
+                services.clone(),
+                metrics_token,
+            );
+            let mut stop = stop_maintenance.subscribe();
+            Some(tokio::spawn(server::serve(
+                metrics_listener,
+                router,
+                async move {
+                    // Resolves when the main server has ended (or the sender is gone).
+                    let _ = stop.wait_for(|stopped| *stopped).await;
+                },
+                std::time::Duration::from_secs(2),
+            )))
+        }
+        None => None,
+    };
+    // On the shutdown signal readiness turns 503 at once, so a proxy stops
+    // sending new requests while the running ones drain.
+    let draining = services.clone();
+    let shutdown = async move {
+        shutdown_signal().await;
+        if let Some(services) = &draining {
+            services.begin_draining();
+        }
+    };
+    let outcome = server::serve(listener, router, shutdown, config.shutdown_grace)
         .await
         .map_err(Failure::runtime);
     // Stop the maintenance loop between items; a run in progress finishes its item.
     let _ = stop_maintenance.send(true);
+    if let Some(task) = metrics_task
+        && tokio::time::timeout(config.shutdown_grace, task)
+            .await
+            .is_err()
+    {
+        tracing::warn!("metrics listener did not stop within the grace period");
+    }
     if let Some(task) = maintenance_task
         && tokio::time::timeout(config.shutdown_grace, task)
             .await

@@ -239,6 +239,9 @@ pub enum Action {
     VersionRestore,
     /// Read the status of the maintenance job (operator).
     MaintenanceRead,
+    /// Read the operator health view: component status, pool, disk,
+    /// upload sessions and audit drop counters (operator).
+    HealthRead,
     /// Read and export the audit log of an organization (owner, admin).
     AuditRead,
     /// Read and export the instance-level audit log (operator).
@@ -256,6 +259,7 @@ impl Action {
             | Self::OrganizationListAll
             | Self::UserListAll
             | Self::MaintenanceRead
+            | Self::HealthRead
             | Self::AuditRead
             | Self::InstanceAuditRead
             | Self::MemberList
@@ -307,7 +311,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 52] = [
+    pub const ALL: [Action; 53] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -358,6 +362,7 @@ impl Action {
         Action::VersionCommit,
         Action::VersionRestore,
         Action::MaintenanceRead,
+        Action::HealthRead,
         Action::AuditRead,
         Action::InstanceAuditRead,
     ];
@@ -549,6 +554,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             | A::OrganizationListAll
             | A::UserListAll
             | A::MaintenanceRead
+            | A::HealthRead
             | A::InstanceAuditRead
             | A::OrganizationQuotaSet
             | A::UserDisable
@@ -1178,6 +1184,7 @@ mod tests {
             Action::OrganizationListAll,
             Action::UserListAll,
             Action::MaintenanceRead,
+            Action::HealthRead,
             Action::InstanceAuditRead,
             Action::OrganizationQuotaSet,
             Action::UserDisable,
@@ -1418,6 +1425,7 @@ mod tests {
             Action::VersionCommit,
             Action::VersionRestore,
             Action::MaintenanceRead,
+            Action::HealthRead,
             Action::AuditRead,
             Action::InstanceAuditRead,
         ]
@@ -1476,6 +1484,7 @@ mod tests {
                 | Action::VersionCommit
                 | Action::VersionRestore
                 | Action::MaintenanceRead
+                | Action::HealthRead
                 | Action::AuditRead
                 | Action::InstanceAuditRead => {}
             }
@@ -1512,6 +1521,7 @@ mod tests {
                 Action::VersionRead,
                 Action::FileDownload,
                 Action::MaintenanceRead,
+                Action::HealthRead,
                 Action::AuditRead,
                 Action::InstanceAuditRead
             ]

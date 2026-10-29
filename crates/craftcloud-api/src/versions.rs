@@ -894,11 +894,13 @@ async fn stream_object(
                 // Hold one chunk back so the last one waits for verification.
                 let ready = pending.replace(chunk);
                 if let Some(ready) = ready {
-                    sent = sent.saturating_add(ready.len() as u64);
+                    let len = ready.len() as u64;
+                    sent = sent.saturating_add(len);
                     if !matches!(give(&tx, Ok(Bytes::from(ready))).await, Ok(Ok(()))) {
                         tracing::warn!(blob = %blob_id, "download client stalled or gone; stopped");
                         return;
                     }
+                    services.metrics.add_downloaded(len);
                 }
             }
             Ok(None) => break,
@@ -926,7 +928,10 @@ async fn stream_object(
         }
     }
     if let Some(last) = pending {
-        let _ = give(&tx, Ok(Bytes::from(last))).await;
+        let len = last.len() as u64;
+        if matches!(give(&tx, Ok(Bytes::from(last))).await, Ok(Ok(()))) {
+            services.metrics.add_downloaded(len);
+        }
     }
 }
 

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::clock::{Clock, SystemClock};
 use crate::error_response;
+use crate::observe::Metrics;
 use crate::ratelimit::{AccountGuard, GuardConfig, Reservation, WindowLimiter, ip_key};
 
 /// Maximum number of concurrent password hash or verify operations (each uses
@@ -32,6 +33,18 @@ pub(crate) enum IpClass {
     Setup,
     Reset,
     Accept,
+}
+
+impl IpClass {
+    /// Label of the rate limit metric.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Setup => "setup",
+            Self::Reset => "reset",
+            Self::Accept => "accept",
+        }
+    }
 }
 
 /// Session, cookie and rate limit settings.
@@ -155,6 +168,14 @@ pub struct Services {
     guard: Arc<AccountGuard>,
     last_cleanup: AtomicI64,
     pub(crate) audit_budget: crate::audit::AuditBudget,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) health: crate::health::HealthCache,
+    pub(crate) started: std::time::Instant,
+    /// A store is configured but was refused at startup (it does not belong to
+    /// this database): readiness reports it instead of silently omitting it.
+    pub(crate) storage_unusable: bool,
+    /// Set when the shutdown signal arrived: readiness answers 503.
+    pub(crate) draining: std::sync::atomic::AtomicBool,
 }
 
 impl Services {
@@ -187,6 +208,11 @@ impl Services {
             guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
             audit_budget: crate::audit::AuditBudget::for_pool(pool_connections),
+            metrics: Arc::new(Metrics::new()),
+            health: crate::health::HealthCache::default(),
+            started: std::time::Instant::now(),
+            storage_unusable: false,
+            draining: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -196,6 +222,28 @@ impl Services {
     pub fn with_storage(mut self, store: craftcloud_storage::LocalStore) -> Self {
         self.storage = Some(store);
         self
+    }
+
+    /// Records that an object store is configured but refused (binding
+    /// mismatch): uploads and downloads answer 503, and readiness fails.
+    #[must_use]
+    pub fn with_storage_refused(mut self) -> Self {
+        self.storage_unusable = true;
+        self
+    }
+
+    /// Uses `metrics` for the counters of these services. The server passes
+    /// the registry that also sits in [`crate::ApiConfig`].
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The metrics registry these services count into.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// The two budgets of best-effort audit writes (denials and failed logins,
@@ -223,8 +271,9 @@ impl Services {
         i64::try_from(self.settings.rate_window.as_secs()).unwrap_or(60)
     }
 
-    /// The ready 429 response with `Retry-After`.
-    fn too_many(retry_after: u64, headers: &HeaderMap) -> Box<Response> {
+    /// The ready 429 response with `Retry-After`; counts the rejection.
+    fn too_many(&self, class: &str, retry_after: u64, headers: &HeaderMap) -> Box<Response> {
+        self.metrics.rate_limited(class);
         let mut response = error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
@@ -257,7 +306,7 @@ impl Services {
                 self.settings.ip_limit,
                 self.window_secs(),
             )
-            .map_err(|retry| Self::too_many(retry, headers))
+            .map_err(|retry| self.too_many(class.label(), retry, headers))
     }
 
     /// Per-user rate limit for password change attempts; counts the request.
@@ -273,7 +322,7 @@ impl Services {
                 self.settings.pwchange_limit,
                 self.window_secs(),
             )
-            .map_err(|retry| Self::too_many(retry, headers))
+            .map_err(|retry| self.too_many("pwchange", retry, headers))
     }
 
     /// Per-user rate limit for creating invitations; counts the request.
@@ -289,7 +338,7 @@ impl Services {
                 self.settings.invite_limit,
                 self.window_secs(),
             )
-            .map_err(|retry| Self::too_many(retry, headers))
+            .map_err(|retry| self.too_many("invite", retry, headers))
     }
 
     /// Checks the failed-login limits for `email` (the normalized address of
@@ -304,7 +353,7 @@ impl Services {
     ) -> Result<Reservation, Box<Response>> {
         self.guard
             .reserve(email, &ip_key(ip), self.now_secs())
-            .map_err(|retry| Self::too_many(retry, headers))
+            .map_err(|retry| self.too_many("failed_login", retry, headers))
     }
 
     /// True at most once per [`CLEANUP_INTERVAL_SECS`] per process.

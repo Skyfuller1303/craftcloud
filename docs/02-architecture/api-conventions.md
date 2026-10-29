@@ -49,7 +49,7 @@ Version conflict returns 412 and a safe current head identifier. **Proposal only
 - Feature discovery via `/info` rather than guessing server release numbers.
 - New fields additive when possible; unknown fields tolerated where safe. Unknown enum strings produce controlled fallback.
 - Security-related semantics (privileges, token scopes, data location) require explicit versioning and review.
-- Contract (implemented, CC-P01-09): `crates/craftcloud-api/tests/contract.rs` fails on drift between `contracts/openapi.yaml` and the served routes in both directions, checks that every error response uses the `Error` schema and that real errors carry `request_id` equal to the `x-request-id` header and `Cache-Control: no-store`. `contracts/openapi.snapshot` lists method, path, authentication, request/response schema and response codes per operation; after an intentional contract change run `cargo xtask openapi-snapshot --update` and commit the diff. There is no `/health/ready` yet (CC-F15).
+- Contract (implemented, CC-P01-09): `crates/craftcloud-api/tests/contract.rs` fails on drift between `contracts/openapi.yaml` and the served routes in both directions, checks that every error response uses the `Error` schema and that real errors carry `request_id` equal to the `x-request-id` header and `Cache-Control: no-store`. `contracts/openapi.snapshot` lists method, path, authentication, request/response schema and response codes per operation; after an intentional contract change run `cargo xtask openapi-snapshot --update` and commit the diff. `/health/ready` and `GET /admin/health` exist since PR-017 (CC-F15); `/metrics` is deliberately not part of the contract (it is served on a separate internal listener only).
 
 ## Workspaces und Einladungen (PR-007)
 

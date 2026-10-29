@@ -579,6 +579,8 @@ pub(crate) async fn accept_invitation(
             inviter_id,
             workspace_role_applied,
         }) => {
+            crate::observe::note_actor(user_id);
+            crate::observe::note_org(org_id);
             if account_created {
                 // Provenance of an account that no e-mail verification backs yet.
                 tracing::info!(

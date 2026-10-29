@@ -151,6 +151,21 @@ pub async fn count_due_sessions(pool: &PgPool, now: OffsetDateTime) -> Result<i6
     .await?)
 }
 
+/// Number of upload sessions that are open (created, receiving or stored but
+/// not yet committed), over all organizations. An instance-wide aggregate for
+/// the operator health view and the metrics; it carries no tenant data.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn count_open_sessions(pool: &PgPool) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM upload_sessions WHERE state IN {HOLDING}"
+    ))
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Files in the trash since before `cutoff`: `(org_id, file_id)`, oldest first.
 ///
 /// # Errors

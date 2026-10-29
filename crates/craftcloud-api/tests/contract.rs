@@ -176,7 +176,7 @@ mod tests {
         }
         // Undocumented paths do not exist.
         for path in [
-            "/health/ready",
+            "/health/metrics",
             "/metrics",
             "/api/v1/nope",
             "/api/v1/workspaces",
@@ -563,7 +563,8 @@ mod tests {
         assert_eq!(required, documented);
         assert_eq!(info.body["server_mode"], "development-prototype");
 
-        // There is no readiness endpoint yet (CC-F15); the contract must not claim one.
+        // Without a database the server is not ready; the answer is the common
+        // error shape and names nothing.
         let ready = send(
             &app,
             request("GET", "/health/ready")
@@ -571,7 +572,99 @@ mod tests {
                 .expect("r"),
         )
         .await;
-        assert_eq!(ready.status, StatusCode::NOT_FOUND);
-        assert!(doc["paths"].get("/health/ready").is_none());
+        assert_error_reply(
+            "not ready",
+            &ready,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NOT_READY",
+        );
+        assert!(doc["paths"].get("/health/ready").is_some());
+        let ready_ok = &doc["paths"]["/health/ready"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert_eq!(schema_name(ready_ok).as_deref(), Some("Readiness"));
+        assert_eq!(
+            doc["components"]["schemas"]["Readiness"]["properties"]["status"]["enum"],
+            serde_json::json!(["ready", "degraded"])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_health_view_is_documented_and_needs_a_session() {
+        let doc = openapi();
+        let op = &doc["paths"]["/admin/health"]["get"];
+        assert_eq!(
+            schema_name(&op["responses"]["200"]["content"]["application/json"]["schema"])
+                .as_deref(),
+            Some("AdminHealth")
+        );
+        for code in ["401", "403", "500", "503"] {
+            assert!(op["responses"].get(code).is_some(), "{code} documented");
+        }
+        // Operator-only: not public (no `security: []`).
+        assert!(op.get("security").is_none());
+        let app = router_with_services(
+            Capabilities::development_defaults(),
+            &ApiConfig::default(),
+            Some(lazy_services()),
+        );
+        let anonymous = send(
+            &app,
+            request("GET", "/api/v1/admin/health")
+                .body(Body::empty())
+                .expect("r"),
+        )
+        .await;
+        assert_error_reply(
+            "anonymous health",
+            &anonymous,
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHENTICATED",
+        );
+        // The metrics are never on the public router, with or without a session.
+        let metrics = send(
+            &app,
+            request("GET", "/metrics").body(Body::empty()).expect("r"),
+        )
+        .await;
+        assert_eq!(metrics.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_documented_health_schema_lists_exactly_the_served_fields() {
+        let doc = openapi();
+        let health = &doc["components"]["schemas"]["AdminHealth"];
+        let required: BTreeSet<&str> = health["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            required,
+            [
+                "status",
+                "checked_at",
+                "components",
+                "uploads",
+                "maintenance",
+                "audit",
+                "server",
+                "backup"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+        let properties: BTreeSet<&str> = health["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(properties, required);
+        // The backup age is a placeholder until CC-P03-08.
+        assert_eq!(
+            health["properties"]["backup"]["properties"]["last_success_age_seconds"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
     }
 }

@@ -252,3 +252,51 @@ export interface ResetPasswordRequest {
   token: string;
   new_password: string;
 }
+
+/** Condition of one component in the operator health view. */
+export type HealthLevel = "ok" | "degraded" | "down" | "not_configured";
+
+export type StorageBinding =
+  | "matches"
+  | "unbound"
+  | "epoch_conflict"
+  | "mismatch"
+  | "error"
+  | "unknown"
+  | "not_configured";
+
+/** The newest maintenance run as the server reports it (counts and codes only). */
+export interface MaintenanceRunSummary {
+  trigger: "scheduled" | "cli";
+  started_at: string;
+  finished_at: string;
+  duration_ms: number;
+  error_codes: string[];
+}
+
+/** `GET /admin/health` (operator only): numbers, flags and codes, no tenant data. */
+export interface AdminHealth {
+  status: HealthLevel;
+  checked_at: string;
+  components: {
+    database: {
+      status: HealthLevel;
+      pool: { size: number; idle: number; in_use: number; max: number };
+    };
+    migrations: { status: HealthLevel };
+    storage: { status: HealthLevel; binding: StorageBinding; free_bytes: number | null };
+  };
+  uploads: { open_sessions: number | null; overdue_sessions: number | null };
+  maintenance: {
+    last_run: MaintenanceRunSummary | null;
+    last_run_ok: boolean | null;
+    epoch_conflict: boolean;
+  };
+  audit: {
+    dropped_events_total: number;
+    dropped_events_lossy: number;
+    dropped_events_important: number;
+  };
+  server: { version: string; uptime_seconds: number };
+  backup: { last_success_age_seconds: number | null };
+}

@@ -1,6 +1,7 @@
 # Normalized view of contracts/openapi.yaml. Regenerate with `cargo xtask openapi-snapshot --update`.
 GET /api/v1/admin/audit auth=cookie req=- ok=AuditEventPage codes=200,400,401,403,422,500,503
 GET /api/v1/admin/audit/export auth=cookie req=- ok=- codes=200,400,401,403,422,500,503
+GET /api/v1/admin/health auth=cookie req=- ok=AdminHealth codes=200,401,403,500,503
 GET /api/v1/admin/maintenance auth=cookie req=- ok=MaintenanceStatus codes=200,401,403,500,503
 GET /api/v1/admin/organizations auth=cookie req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf req=QuotaRequest ok=QuotaResponse codes=200,401,403,404,413,415,422,500,503
@@ -67,11 +68,13 @@ GET /api/v1/workspaces/{workspace_id}/projects auth=cookie req=- ok=ProjectPage 
 POST /api/v1/workspaces/{workspace_id}/projects auth=cookie+csrf req=CreateProjectRequest ok=Project codes=201,401,403,404,409,413,415,422,500,503
 PUT /api/v1/workspaces/{workspace_id}/quota auth=cookie+csrf req=QuotaRequest ok=QuotaResponse codes=200,401,403,404,413,415,422,500,503
 GET /health/live auth=none req=- ok=- codes=200,503
+GET /health/ready auth=none req=- ok=Readiness codes=200,503
 # component schemas
 AcceptInvitationRequest
 AcceptedInvitation
 AddMemberRequest
 AddWorkspaceMemberRequest
+AdminHealth
 AdminUser
 AdminUserPage
 AuditEvent
@@ -91,6 +94,7 @@ CreatedOrganization
 Error
 File
 FilePage
+HealthLevel
 Invitation
 InvitationPage
 LoginRequest
@@ -106,6 +110,7 @@ Project
 ProjectPage
 QuotaRequest
 QuotaResponse
+Readiness
 ResetLinkResponse
 ResetPasswordRequest
 SessionInfo

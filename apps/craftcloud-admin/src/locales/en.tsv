@@ -363,3 +363,49 @@
 	Request ID	Request ID
 	{count} times, latest {time}	{count} times, latest {time}
 	System or unknown	System or unknown
+
+# System health (CC-F15)
+	Only the instance operator can see the system status.	Only the instance operator can see the system status.
+	Refresh	Refresh
+	Loading system status…	Loading system status…
+	OK	OK
+	Degraded	Degraded
+	Down	Down
+	Not configured	Not configured
+	Paired with this database	Paired with this database
+	Not paired yet (pairs on first use)	Not paired yet (pairs on first use)
+	Epoch conflict: a restore is suspected	Epoch conflict: a restore is suspected
+	Belongs to another database	Belongs to another database
+	Could not be checked	Could not be checked
+	Not checked (database unreachable)	Not checked (database unreachable)
+	{days} d {hours} h	{days} d {hours} h
+	{hours} h {minutes} min	{hours} h {minutes} min
+	{minutes} min	{minutes} min
+	Not available	Not available
+	At least one component is down. The server does not take traffic.	At least one component is down. The server does not take traffic.
+	The database and the object store disagree about their epoch, so a restore is suspected. Destructive maintenance is blocked. Verify the pairing, then run the storage-bind command described in the operations guide.	The database and the object store disagree about their epoch, so a restore is suspected. Destructive maintenance is blocked. Verify the pairing, then run the storage-bind command described in the operations guide.
+	Overall status	Overall status
+	Checked	Checked
+	Uptime	Uptime
+	Components	Components
+	Database	Database
+	Database connections	Database connections
+	{used} of {max} in use, {idle} idle	{used} of {max} in use, {idle} idle
+	Database schema	Database schema
+	Object storage	Object storage
+	Storage pairing	Storage pairing
+	Free disk space	Free disk space
+	Uploads	Uploads
+	Open upload sessions	Open upload sessions
+	Overdue upload sessions	Overdue upload sessions
+	Last run	Last run
+	No run recorded yet.	No run recorded yet.
+	Succeeded	Succeeded
+	Failed: {codes}	Failed: {codes}
+	Audit log	Audit log
+	Dropped events since start	Dropped events since start
+	{total} in total ({lossy} denials and failed sign-ins, {important} downloads and exports)	{total} in total ({lossy} denials and failed sign-ins, {important} downloads and exports)
+	Backups	Backups
+	Last backup	Last backup
+	Not reported yet. Backup monitoring is not part of this release.	Not reported yet. Backup monitoring is not part of this release.
+	System	System

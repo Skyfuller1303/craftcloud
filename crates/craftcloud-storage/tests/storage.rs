@@ -914,4 +914,48 @@ mod tests {
         std::fs::write(&path, format!("{{\"store_id\":\"{id}\",\"epoch\":x}}\n")).unwrap();
         assert!(store.read_marker_info().await.is_err());
     }
+    #[tokio::test]
+    async fn the_probe_leaves_nothing_behind_even_when_the_caller_gives_up() {
+        let (root, store) = store().await;
+        let tmp_files = || std::fs::read_dir(root.path().join("tmp")).unwrap().count();
+        store.probe().await.unwrap();
+        assert_eq!(tmp_files(), 0);
+        // Many callers that are cancelled right away: the blocking jobs still
+        // finish and remove their files.
+        for _ in 0..50 {
+            let probe = store.probe();
+            let _ = tokio::time::timeout(std::time::Duration::ZERO, probe).await;
+        }
+        for _ in 0..200 {
+            if tmp_files() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(tmp_files(), 0, "probe files remain");
+    }
+
+    #[tokio::test]
+    async fn stale_probe_files_are_swept_and_other_files_are_not() {
+        let (root, store) = store().await;
+        let tmp = root.path().join("tmp");
+        let probe = tmp.join(format!("{}.health", Uuid::new_v4().simple()));
+        let other = tmp.join(format!("{}.part", Uuid::new_v4().simple()));
+        std::fs::write(&probe, b"health").unwrap();
+        std::fs::write(&other, b"data").unwrap();
+        // Young probes stay; nothing but probes is touched.
+        let young = store
+            .sweep_health_probes(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(young, 0);
+        assert!(probe.exists());
+        let all = store
+            .sweep_health_probes(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(all, 1);
+        assert!(!probe.exists());
+        assert!(other.exists());
+    }
 }

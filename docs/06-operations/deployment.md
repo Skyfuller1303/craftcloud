@@ -40,6 +40,8 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_QUARANTINE_DAYS` | `30` | 1 bis 3650; so lange bleiben von der Abstimmung aus dem Betrieb genommene Objekte in `quarantine/` des Speicherverzeichnisses, bevor sie gelöscht werden |
 | `CRAFTCLOUD_MAINTENANCE_ENABLED` | `true` | `true` oder `false`; mit `false` läuft der Wartungsjob gar nicht (weder die Schleife im Server noch `admin maintenance`, das mit Exit 1 abbricht). Nach jedem Datenbank-Restore ausschalten, bis die Zuordnung geprüft ist (siehe Abschnitt Wartungsjob) |
 | `CRAFTCLOUD_ADMIN_DIR` | nicht gesetzt (keine Oberfläche, `/admin` antwortet 404) | absoluter Pfad des gebauten Admin-UI-Verzeichnisses (`apps/craftcloud-admin/dist`, Ergebnis von `cargo xtask web`). Muss `https://…`/loopback-URL **ohne Pfad** voraussetzen: ist `CRAFTCLOUD_PUBLIC_URL` mit Pfad gesetzt, lehnt die Konfiguration `CRAFTCLOUD_ADMIN_DIR` ab (Exit 2). Beim Start als Erstes (vor Datenbank, Speicher, Wartungsjob und Socket) geprüft und vollständig in den Arbeitsspeicher geladen: vorhanden, Verzeichnis, enthält `index.html`, höchstens 10000 Dateien, je Datei 16 MiB, insgesamt 64 MiB, keine Links aus dem Verzeichnis heraus; sonst Exit 2. Der Server liefert es unter `/admin/` auf derselben Origin wie die API aus (siehe Abschnitt Admin-Oberfläche) |
+| `CRAFTCLOUD_METRICS_ADDR` | nicht gesetzt (keine Metriken) | `<ip>:<port>` eines **eigenen, internen** Listeners, der nur `GET /metrics` beantwortet (siehe „Health, Logs und Metriken“); darf mit `CRAFTCLOUD_BIND` nicht dieselbe Adresse und nicht denselben Port teilen, auch nicht, wenn eine der beiden Adressen unspezifiziert ist (`0.0.0.0`, `::`; Exit 2); eine Adresse außerhalb von Loopback verlangt `CRAFTCLOUD_METRICS_TOKEN_FILE` |
+| `CRAFTCLOUD_METRICS_TOKEN_FILE` | nicht gesetzt | absoluter Pfad einer Secret-Datei mit dem Bearer-Token für `/metrics` (mindestens 32 Zeichen nach dem Trimmen); nur zusammen mit `CRAFTCLOUD_METRICS_ADDR` |
 | `CRAFTCLOUD_VERIFY_BYTES_PER_RUN` | `1073741824` (1 GiB) | 1048576 bis 1099511627776; so viele Bytes liest die Integritätsprüfung je Lauf höchstens neu ein |
 
 Die Datenbank-URL enthält ein Passwort und steht deshalb **nur** in der Secret-Datei (siehe ADR-0012); `CRAFTCLOUD_DATABASE_URL` selbst wird abgelehnt und verweist auf `CRAFTCLOUD_DATABASE_URL_FILE`. Für entfernte Datenbanken in der URL `sslmode=verify-full` verwenden (bei privater CA zusätzlich `sslrootcert`). Die URL wird nie geloggt.
@@ -182,6 +184,24 @@ Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt ode
 - **Backup und Restore:** Das Protokoll ist Teil der Datenbank. Ein Restore eines älteren Datenbankstands verliert die Ereignisse seit dem Backup; `storage.rebind` (Befehl `storage-bind --force`) und `organization.owner_recover` (Befehl `set-org-owner`) werden bei Host-Eingriffen ohne Akteur eingetragen.
 - Die Migrationen 0011 und 0012 müssen mit `craftcloud-server migrate` eingespielt werden (nur vorwärts).
 
+## Health, Logs und Metriken (PR-017)
+
+- **Healthchecks für Proxy und Container.** `GET /health/live` prüft nur, dass der Prozess antwortet (Neustart-Entscheidung; ein kurzer Datenbankausfall darf keinen Neustart auslösen). `GET /health/ready` entscheidet, ob Datenverkehr zugestellt wird: `200` mit `{"status":"ready"}` oder `{"status":"degraded"}` (Epochen-Konflikt, siehe Wartungsjob: Auslieferung ist sicher, zerstörende Wartung ist blockiert, der Betreiber muss prüfen), `503` mit `NOT_READY` bei Datenbank-, Schema- oder Speicherfehler. Ein Speicher, der beim Start als zu einer anderen Datenbank gehörig abgelehnt wurde, ist `degraded` (nur Upload und Download antworten 503). Nach `SIGTERM`/Ctrl-C antwortet `/health/ready` sofort mit 503 (Draining), damit der Proxy keine neuen Anfragen mehr schickt; `live` bleibt 200. Die Antwort nennt keine Komponenten. Das Ergebnis ist 3 s zwischengespeichert, häufige Abfragen belasten die Datenbank also nicht. Beispiel für einen Container-Healthcheck (die Compose-Vorlage folgt mit CC-P03-07): `curl --fail --silent http://127.0.0.1:8080/health/ready`; für den Proxy gilt: Upstream nur bei `200` bedienen, `live` für den Neustart des Containers verwenden. Der Healthcheck läuft auf dem Server-Listener (`CRAFTCLOUD_BIND`), nicht über die öffentliche Adresse.
+- **Operatoransicht.** `GET /api/v1/admin/health` (Anmeldung als Instanzbetreiber) und in der Oberfläche „System“ zeigen je Komponente den Status, Pool-Auslastung, freien Platz des Datenträgers, offene und überfällige Upload-Sitzungen, den letzten Wartungslauf samt Epochen-Konflikt, verworfene Audit-Ereignisse sowie Version und Laufzeit. Das Backup-Alter ist bis CC-P03-08 `null`. Der freie Platz kommt von `df -Pk`: im Image muss `df` vorhanden sein, sonst bleibt der Wert leer (kein Fehler).
+- **Logs.** `CRAFTCLOUD_LOG_FORMAT=json` für Log-Sammler, `text` (Standard) für die lokale Entwicklung. Jede Anfrage erzeugt genau eine Zeile `craftcloud::request` mit `request_id`, Methode, Routenvorlage, Status, `latency_ms`, `actor_id` und `org_id`; Gesundheitsabfragen stehen nur auf `debug`. Die Filter bleiben über `RUST_LOG` einstellbar (Standard `info,sqlx=warn`). Der Server loggt keine Header, Query-Strings, Bodies, E-Mail-Adressen oder Dateinamen. **Zugriffslogs des Reverse Proxys** sehen dagegen Query-Strings und Header: dort Query-Strings weglassen oder kürzen und `Authorization`/`Cookie` nicht schreiben.
+- **Metriken.** Standardmäßig aus. Aktivieren: `CRAFTCLOUD_METRICS_ADDR=127.0.0.1:9464` (Loopback; Scraper im selben Host oder Netz-Namespace) oder eine interne Adresse mit `CRAFTCLOUD_METRICS_TOKEN_FILE` (Secret-Datei, Berechtigungen wie bei den anderen Secret-Dateien: 0600 unter unix). Der Reverse Proxy leitet `/metrics` **nie** weiter, und der Metrik-Port wird nicht veröffentlicht. Prometheus-Beispiel:
+
+  ```yaml
+  scrape_configs:
+    - job_name: craftcloud
+      static_configs:
+        - targets: ["127.0.0.1:9464"]
+      # Mit Token-Datei: authorization: { type: Bearer, credentials_file: /run/secrets/craftcloud_metrics_token }
+  ```
+
+  Vorschläge für Alarme (noch nicht ausgeliefert): `craftcloud_ready == 0` für 2 Minuten, `craftcloud_storage_epoch_conflict == 1`, `craftcloud_storage_free_bytes` unter einer Schwelle, `craftcloud_upload_sessions_open` ungewöhnlich hoch, `time() - craftcloud_maintenance_last_run_timestamp_seconds` größer als das Dreifache des Wartungsintervalls (Zeit kommt aus der Datenbank, überlebt Neustarts; `craftcloud_maintenance_last_success_timestamp_seconds` ist nach einem Neustart 0, dann nur mit `craftcloud_maintenance_last_success_timestamp_seconds > 0 and ...` verwenden), `increase(craftcloud_audit_events_dropped_total[15m]) > 0`, `craftcloud_db_pool_connections - craftcloud_db_pool_idle_connections` nahe `craftcloud_db_pool_max_connections`.
+- Keine neue Migration; keine Änderung am Datenmodell.
+
 ## Setup-Runbook
 
 1. Host patchen, Docker/Podman gemäß Betreiberregel, DNS und TLS einrichten.
@@ -189,7 +209,7 @@ Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt ode
 3. DB secret und Bootstrap secret über sichere Dateien bereitstellen, keine Secrets im Repo.
 4. Mit einem nur lokal erreichbaren Admin-Setup starten, Tests durchführen, dann proxy remote freischalten.
 5. Ersten Admin über one-shot setup anlegen und bootstrap key vernichten.
-6. TLS cookie, CSRF, Host/proxy, upload limits, readiness, logs und Backup prüfen.
+6. TLS cookie, CSRF, Host/proxy, upload limits, readiness (`/health/ready` aus dem Container und über den Proxy-Upstream), logs (JSON, keine Tokens) und Backup prüfen; Metriken nur auf dem internen Listener.
 7. Backup/Restore-Test auf separatem Host durchführen, bevor Produktivdaten aufgenommen werden.
 
 ## Self-hosted vs managed

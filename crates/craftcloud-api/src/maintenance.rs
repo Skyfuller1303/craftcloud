@@ -575,6 +575,8 @@ pub struct Maintenance {
     drift_cursor: Mutex<Option<Uuid>>,
     /// Items that failed recently (left out of the next selections).
     failed: Mutex<FailedItems>,
+    /// Where finished runs are counted for the metrics endpoint.
+    metrics: Option<Arc<crate::Metrics>>,
 }
 
 impl Maintenance {
@@ -595,7 +597,15 @@ impl Maintenance {
             trim_cursor: Mutex::new(None),
             drift_cursor: Mutex::new(None),
             failed: Mutex::new(FailedItems::default()),
+            metrics: None,
         }
+    }
+
+    /// Counts finished runs (ok or failed) in `metrics`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<crate::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Items of `step` that failed within the last day; counted in the report.
@@ -759,6 +769,17 @@ impl Maintenance {
             }
             (_, state) => state,
         };
+        if let (Some(store_handle), StoreState::Ready, false) =
+            (&self.store, store, options.dry_run)
+        {
+            // Readiness probes that a crash left behind in `tmp`.
+            if let Err(error) = store_handle
+                .sweep_health_probes(Duration::from_secs(3600))
+                .await
+            {
+                tracing::warn!(target: "craftcloud::maintenance", %error, "cannot sweep stale health probes");
+            }
+        }
         let ctx = Ctx {
             now,
             dry: options.dry_run,
@@ -807,6 +828,11 @@ impl Maintenance {
                 }
             }
             report.steps.insert(step.name(), step_report);
+        }
+        if !options.dry_run
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.maintenance_finished(!report.has_errors(), self.clock.now().unix_timestamp());
         }
         if !options.dry_run {
             let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -1671,7 +1697,7 @@ impl Step {
 
 /// The newest finished run in its published form: times, duration, counts per
 /// step and the error codes of failed steps. No tenant data.
-fn run_json(record: &db::RunRecord) -> Value {
+pub(crate) fn run_json(record: &db::RunRecord) -> Value {
     let report: Value = serde_json::from_str(&record.report).unwrap_or(Value::Null);
     let steps = report.get("steps").cloned().unwrap_or_else(|| json!({}));
     let mut error_codes: Vec<String> = steps

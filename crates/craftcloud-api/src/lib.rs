@@ -15,8 +15,10 @@ mod auth;
 mod client_ip;
 mod clock;
 mod files;
+mod health;
 mod invitations;
 pub mod maintenance;
+mod observe;
 mod orgs;
 mod pagination;
 mod projects;
@@ -31,6 +33,8 @@ mod workspaces;
 
 pub use client_ip::ClientIp;
 pub use clock::{Clock, SystemClock};
+pub use health::metrics_router;
+pub use observe::Metrics;
 pub use services::{AuthSettings, Services};
 pub use session::{AuthRejection, AuthenticatedSession, CSRF_HEADER};
 
@@ -51,7 +55,6 @@ use tower_http::{
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     set_header::SetResponseHeaderLayer,
-    trace::TraceLayer,
 };
 use uuid::Uuid;
 
@@ -71,6 +74,9 @@ pub struct ApiConfig {
     pub request_timeout: Duration,
     /// Reverse proxies whose `X-Forwarded-For` is trusted. Empty trusts nobody.
     pub trusted_proxies: Vec<IpNet>,
+    /// Counters and histograms of the request middleware. Give the same
+    /// registry to [`Services::with_metrics`] and to the metrics listener.
+    pub metrics: Arc<Metrics>,
 }
 
 impl Default for ApiConfig {
@@ -79,6 +85,7 @@ impl Default for ApiConfig {
             max_body_bytes: 64 * 1024,
             request_timeout: Duration::from_secs(10),
             trusted_proxies: Vec::new(),
+            metrics: Arc::new(Metrics::new()),
         }
     }
 }
@@ -90,6 +97,7 @@ impl Default for ApiConfig {
 /// a `.route(` that is not listed here.
 pub const ROUTES: &[(&str, &[&str])] = &[
     ("/health/live", &["GET"]),
+    ("/health/ready", &["GET"]),
     ("/api/v1/info", &["GET"]),
     ("/api/v1/setup/status", &["GET"]),
     ("/api/v1/setup/complete", &["POST"]),
@@ -151,6 +159,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
     ("/api/v1/admin/maintenance", &["GET"]),
+    ("/api/v1/admin/health", &["GET"]),
     ("/api/v1/organizations/{org_id}/audit", &["GET"]),
     ("/api/v1/organizations/{org_id}/audit/export", &["GET"]),
     ("/api/v1/admin/audit", &["GET"]),
@@ -189,13 +198,30 @@ pub fn router_with_services(
     config: &ApiConfig,
     services: Option<Services>,
 ) -> Router {
+    router_with_shared(
+        capabilities,
+        config,
+        services.map(|s| Arc::new(s.with_metrics(Arc::clone(&config.metrics)))),
+    )
+}
+
+/// Like [`router_with_services`] for services the caller keeps a handle to
+/// (the server shares them with the internal metrics listener). Create them
+/// with [`Services::with_metrics`] and the registry of `config`, otherwise
+/// the counters of the services and of the request middleware are separate.
+pub fn router_with_shared(
+    capabilities: Capabilities,
+    config: &ApiConfig,
+    services: Option<Arc<Services>>,
+) -> Router {
     let state = ApiState {
         capabilities,
-        services: services.map(Arc::new),
+        services,
     };
     let audit_services = state.services.clone();
     let routes = Router::new()
         .route("/health/live", get(health_live))
+        .route("/health/ready", get(health::health_ready))
         .route("/api/v1/info", get(info))
         .route("/api/v1/setup/status", get(setup::status))
         .route("/api/v1/setup/complete", post(setup::complete))
@@ -311,6 +337,7 @@ pub fn router_with_services(
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
         .route("/api/v1/admin/users", get(orgs::list_all_users))
         .route("/api/v1/admin/maintenance", get(maintenance::get_status))
+        .route("/api/v1/admin/health", get(health::get_health))
         .route(
             "/api/v1/organizations/{org_id}/audit",
             get(audit::list_org_audit),
@@ -417,23 +444,13 @@ pub fn with_request_context(router: Router, config: &ApiConfig) -> Router {
             Arc::new(config.trusted_proxies.clone()),
             client_ip::resolve_client_ip,
         ))
-        // Only method, path (no query string) and request id are logged;
-        // never headers, cookies or authorization data.
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
-                let request_id = request
-                    .headers()
-                    .get(REQUEST_ID_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("-");
-                tracing::info_span!(
-                    "request",
-                    method = %request.method(),
-                    path = %request.uri().path(),
-                    request_id = %request_id,
-                )
-            }),
-        )
+        // Request span, metrics and the request log line. Only the route
+        // template, method, status, latency and identifiers are logged; never
+        // the path, query string, headers, cookies or bodies (see `observe`).
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&config.metrics),
+            observe::observe,
+        ))
         .layer(PropagateRequestIdLayer::new(HeaderName::from_static(
             REQUEST_ID_HEADER,
         )))

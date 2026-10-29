@@ -929,6 +929,7 @@ pub(crate) async fn put_content(
         };
         if let Ok(data) = frame.into_data() {
             received = received.saturating_add(data.len() as u64);
+            services.metrics.add_uploaded(data.len() as u64);
             if let Err(error) = temp.write(&data).await {
                 guard.armed = false;
                 fail_session(&services, org_id, upload_id).await;

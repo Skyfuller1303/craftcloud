@@ -35,7 +35,7 @@ pub mod versions;
 pub mod workspaces;
 
 pub use error::{DbError, SchemaProblem};
-pub use pool::connect;
+pub use pool::{connect, ping};
 pub use scope::OrgScope;
 
 pub use sqlx::PgPool;

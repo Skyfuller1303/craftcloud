@@ -37,6 +37,35 @@ paths:
       responses:
         '200': {description: Process is alive}
         '503': {$ref: '#/components/responses/Timeout'}
+  /health/ready:
+    get:
+      tags: [Health]
+      security: []
+      summary: Readiness for the reverse proxy and container health checks; no dependency details
+      description: >-
+        Path is relative to the server root, not /api/v1 (see CC-F15). Checks, with a short timeout each and a result
+        cached for a few seconds: the database answers a query, the schema is migrated, and, when an object store is
+        configured, a file can be written and read in it and it belongs to this database. 200 `ready`: send traffic.
+        200 `degraded`: serving works, but database and object store disagree about their epoch (a restore is
+        suspected) and destructive maintenance is blocked, or the object store was refused because it belongs to
+        another database (only file uploads and downloads answer 503); the operator must look at `/admin/health`.
+        During shutdown the answer is 503 at once (draining). 503 `NOT_READY`
+        in the common error shape: do not send traffic. The body never names components, errors, counts or versions.
+        Liveness (`/health/live`) does not depend on any of this, so a transient database outage never restarts the
+        process.
+      servers:
+        - url: https://craftcloud.example.invalid
+      responses:
+        '200':
+          description: Ready or degraded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+        '503':
+          description: NOT_READY
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
   /setup/status:
     get:
       tags: [Setup]
@@ -658,6 +687,28 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MaintenanceStatus'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/health:
+    get:
+      tags: [Admin]
+      summary: Detailed health of the instance (operator only)
+      description: >-
+        Status per component (database with pool usage, migrations, object store with binding state and free bytes
+        of its volume), open and overdue upload sessions, the last maintenance run and whether an epoch conflict
+        blocks destructive maintenance, the audit events dropped under load (counters of this process), server
+        version and uptime, and the age of the last backup (always null until the backup tooling of CC-P03-08
+        exists). Numbers, flags and error codes only: no organization, user, file or storage path. `free_bytes` is
+        null when it cannot be measured (the server asks `df`; not available on Windows or in an image without it).
+        Other callers: 403; anonymous callers: 401. Not cached.
+      responses:
+        '200':
+          description: The health view
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminHealth'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -2828,6 +2879,94 @@ components:
                 organization_id: {type: [string, 'null'], format: uuid}
                 invited_by_user_id: {type: [string, 'null'], format: uuid}
                 invitation_id: {type: string, format: uuid}
+    Readiness:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [ready, degraded]}
+    HealthLevel:
+      type: string
+      enum: [ok, degraded, down, not_configured]
+    AdminHealth:
+      type: object
+      required: [status, checked_at, components, uploads, maintenance, audit, server, backup]
+      properties:
+        status: {$ref: '#/components/schemas/HealthLevel'}
+        checked_at: {type: string, format: date-time}
+        components:
+          type: object
+          required: [database, migrations, storage]
+          properties:
+            database:
+              type: object
+              required: [status, pool]
+              properties:
+                status: {$ref: '#/components/schemas/HealthLevel'}
+                pool:
+                  type: object
+                  required: [size, idle, in_use, max]
+                  properties:
+                    size: {type: integer, minimum: 0, description: Connections currently open.}
+                    idle: {type: integer, minimum: 0}
+                    in_use: {type: integer, minimum: 0}
+                    max: {type: integer, minimum: 1, description: Configured pool size.}
+            migrations:
+              type: object
+              required: [status]
+              properties:
+                status: {$ref: '#/components/schemas/HealthLevel'}
+            storage:
+              type: object
+              required: [status, binding, free_bytes]
+              properties:
+                status: {$ref: '#/components/schemas/HealthLevel'}
+                binding:
+                  type: string
+                  enum: [matches, unbound, epoch_conflict, mismatch, error, unknown, not_configured]
+                free_bytes:
+                  type: [integer, 'null']
+                  format: int64
+                  minimum: 0
+                  description: Free bytes on the volume of the object store; null if it cannot be measured.
+        uploads:
+          type: object
+          required: [open_sessions, overdue_sessions]
+          properties:
+            open_sessions: {type: [integer, 'null'], minimum: 0, description: 'Created, receiving or stored; null if the query failed.'}
+            overdue_sessions: {type: [integer, 'null'], minimum: 0, description: 'Open and past their expiry (the maintenance job expires them).'}
+        maintenance:
+          type: object
+          required: [last_run, last_run_ok, epoch_conflict]
+          properties:
+            last_run:
+              oneOf:
+                - {type: 'null'}
+                - {$ref: '#/components/schemas/MaintenanceRun'}
+            last_run_ok: {type: [boolean, 'null'], description: 'Null until a run has finished; false if any step reported an error code.'}
+            epoch_conflict: {type: boolean, description: True while the database and the object store disagree about their epoch.}
+        audit:
+          type: object
+          required: [dropped_events_total, dropped_events_lossy, dropped_events_important]
+          description: Best-effort audit events dropped under load since this process started.
+          properties:
+            dropped_events_total: {type: integer, format: int64, minimum: 0}
+            dropped_events_lossy: {type: integer, format: int64, minimum: 0}
+            dropped_events_important: {type: integer, format: int64, minimum: 0}
+        server:
+          type: object
+          required: [version, uptime_seconds]
+          properties:
+            version: {type: string}
+            uptime_seconds: {type: integer, format: int64, minimum: 0}
+        backup:
+          type: object
+          required: [last_success_age_seconds]
+          properties:
+            last_success_age_seconds:
+              type: [integer, 'null']
+              format: int64
+              minimum: 0
+              description: Always null until the backup tooling of CC-P03-08 reports.
     MaintenanceStatus:
       type: object
       required: [last_run]

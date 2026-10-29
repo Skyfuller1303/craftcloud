@@ -361,3 +361,49 @@
 	Request ID	Anfrage-ID
 	{count} times, latest {time}	{count}-mal, zuletzt {time}
 	System or unknown	System oder unbekannt
+
+# System health (CC-F15)
+	Only the instance operator can see the system status.	Nur der Instanzbetreiber kann den Systemstatus sehen.
+	Refresh	Aktualisieren
+	Loading system status…	Systemstatus wird geladen…
+	OK	OK
+	Degraded	Eingeschränkt
+	Down	Ausgefallen
+	Not configured	Nicht eingerichtet
+	Paired with this database	Mit dieser Datenbank gekoppelt
+	Not paired yet (pairs on first use)	Noch nicht gekoppelt (wird bei der ersten Nutzung gekoppelt)
+	Epoch conflict: a restore is suspected	Epochen-Konflikt: Eine Wiederherstellung wird vermutet
+	Belongs to another database	Gehört zu einer anderen Datenbank
+	Could not be checked	Konnte nicht geprüft werden
+	Not checked (database unreachable)	Nicht geprüft (Datenbank nicht erreichbar)
+	{days} d {hours} h	{days} T {hours} Std.
+	{hours} h {minutes} min	{hours} Std. {minutes} Min.
+	{minutes} min	{minutes} Min.
+	Not available	Nicht verfügbar
+	At least one component is down. The server does not take traffic.	Mindestens eine Komponente ist ausgefallen. Der Server nimmt keinen Datenverkehr an.
+	The database and the object store disagree about their epoch, so a restore is suspected. Destructive maintenance is blocked. Verify the pairing, then run the storage-bind command described in the operations guide.	Datenbank und Objektspeicher widersprechen sich bei ihrer Epoche, daher wird eine Wiederherstellung vermutet. Zerstörende Wartung ist blockiert. Prüfe die Zuordnung und führe dann den Befehl storage-bind aus der Betriebsanleitung aus.
+	Overall status	Gesamtstatus
+	Checked	Geprüft
+	Uptime	Laufzeit
+	Components	Komponenten
+	Database	Datenbank
+	Database connections	Datenbankverbindungen
+	{used} of {max} in use, {idle} idle	{used} von {max} belegt, {idle} frei
+	Database schema	Datenbankschema
+	Object storage	Objektspeicher
+	Storage pairing	Speicherkopplung
+	Free disk space	Freier Speicherplatz
+	Uploads	Uploads
+	Open upload sessions	Offene Upload-Sitzungen
+	Overdue upload sessions	Überfällige Upload-Sitzungen
+	Last run	Letzter Lauf
+	No run recorded yet.	Noch kein Lauf aufgezeichnet.
+	Succeeded	Erfolgreich
+	Failed: {codes}	Fehlgeschlagen: {codes}
+	Audit log	Audit-Protokoll
+	Dropped events since start	Verworfene Ereignisse seit dem Start
+	{total} in total ({lossy} denials and failed sign-ins, {important} downloads and exports)	{total} insgesamt ({lossy} Ablehnungen und fehlgeschlagene Anmeldungen, {important} Downloads und Exporte)
+	Backups	Backups
+	Last backup	Letztes Backup
+	Not reported yet. Backup monitoring is not part of this release.	Noch nicht gemeldet. Die Backup-Überwachung gehört nicht zu dieser Version.
+	System	System

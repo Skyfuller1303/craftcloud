@@ -66,6 +66,18 @@ async fn is_real_dir(path: &Path) -> io::Result<bool> {
     Ok(meta.is_dir() && !is_link(&meta))
 }
 
+/// File name suffix of the readiness probe files in `tmp`.
+const HEALTH_SUFFIX: &str = ".health";
+
+/// Removes its file when dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Identity and epoch stored in the marker file of a store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkerInfo {
@@ -214,6 +226,93 @@ impl LocalStore {
             layout: Arc::new(layout),
             faults,
         })
+    }
+
+    /// The canonical root directory of the store (for disk usage queries).
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.layout.root
+    }
+
+    /// Health probe: proves that a small file can still be created, written,
+    /// read back and removed in `tmp`, and that `objects` and `tmp` are still
+    /// plain directories. Leaves nothing behind on success; a failed probe
+    /// removes its file on a best-effort basis. Used by the readiness check.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] describing why the store cannot be used right now.
+    pub async fn probe(&self) -> Result<(), StorageError> {
+        for dir in [&self.layout.objects, &self.layout.tmp] {
+            if !is_real_dir(dir).await.map_err(map_io_error)? {
+                return Err(unsafe_tree());
+            }
+        }
+        let path = self
+            .layout
+            .tmp
+            .join(format!("{}{HEALTH_SUFFIX}", Uuid::new_v4().simple()));
+        // Everything, including the removal, runs inside the blocking job: if
+        // the caller is cancelled while the job runs, the job still cleans up
+        // (the guard removes the file on every exit path).
+        blocking(move || {
+            let guard = RemoveOnDrop(path);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&guard.0)?;
+            file.write_all(b"health")?;
+            file.sync_all()?;
+            drop(file);
+            if std::fs::read(&guard.0)? == b"health" {
+                Ok(())
+            } else {
+                Err(io::Error::other("health probe read back differently"))
+            }
+        })
+        .await
+        .map_err(map_io_error)
+    }
+
+    /// Removes health probe files in `tmp` that are older than `max_age`
+    /// (a probe killed by a crash or an abort can leave one behind). Returns
+    /// how many were removed. Never touches other files.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError`] if `tmp` cannot be listed.
+    pub async fn sweep_health_probes(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<u64, StorageError> {
+        let tmp = self.layout.tmp.clone();
+        blocking(move || {
+            let mut removed = 0;
+            for entry in std::fs::read_dir(&tmp)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !name.ends_with(HEALTH_SUFFIX) {
+                    continue;
+                }
+                let meta = entry.metadata()?;
+                let old = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age >= max_age);
+                if meta.is_file()
+                    && !is_link(&meta)
+                    && old
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })
+        .await
+        .map_err(map_io_error)
     }
 
     /// Creates the shard directories of `key`, refusing links.

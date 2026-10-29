@@ -201,6 +201,8 @@ pub(crate) struct AuditBudget {
     pub(crate) lossy: Arc<Semaphore>,
     pub(crate) important: Arc<Semaphore>,
     dropped: Arc<AtomicU64>,
+    dropped_lossy: Arc<AtomicU64>,
+    dropped_important: Arc<AtomicU64>,
 }
 
 /// Longest wait of an important audit write for a free slot.
@@ -215,11 +217,28 @@ impl AuditBudget {
             lossy: Arc::new(Semaphore::new(lossy)),
             important: Arc::new(Semaphore::new(important)),
             dropped: Arc::new(AtomicU64::new(0)),
+            dropped_lossy: Arc::new(AtomicU64::new(0)),
+            dropped_important: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Events dropped so far as `(lossy, important)`. Counters of this
+    /// process; they start at zero after a restart.
+    pub(crate) fn dropped_counts(&self) -> (u64, u64) {
+        (
+            self.dropped_lossy.load(Ordering::Relaxed),
+            self.dropped_important.load(Ordering::Relaxed),
+        )
     }
 
     fn note_drop(&self, event: &NewEvent<'_>, class: &str) {
         let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        let by_class = if class == "important" {
+            &self.dropped_important
+        } else {
+            &self.dropped_lossy
+        };
+        by_class.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             action = %event.action,
             class,

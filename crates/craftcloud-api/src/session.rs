@@ -152,6 +152,7 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
             }
         };
 
+        crate::observe::note_actor(record.user_id);
         if !is_safe_method(&parts.method) && !csrf_ok(&parts.headers, &services.settings, &token) {
             return Err(AuthRejection::new(Kind::CsrfFailed, parts));
         }

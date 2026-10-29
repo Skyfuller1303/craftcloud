@@ -60,7 +60,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 27] = [
+const SUPPORTED_KEYS: [&str; 29] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -88,6 +88,8 @@ const SUPPORTED_KEYS: [&str; 27] = [
     "AUDIT_DOWNLOADS",
     "MIGRATE_DATABASE_URL_FILE",
     "DATABASE_RUNTIME_ROLE",
+    "METRICS_ADDR",
+    "METRICS_TOKEN_FILE",
 ];
 
 /// Log output format.
@@ -208,6 +210,14 @@ pub struct Config {
     pub audit_retention_days: u32,
     /// Whether file downloads are recorded as audit events.
     pub audit_downloads: bool,
+    /// Address of the separate internal listener that serves `GET /metrics`
+    /// (`CRAFTCLOUD_METRICS_ADDR`). `None`: metrics are switched off. The
+    /// metrics are never served on the public listener.
+    pub metrics_addr: Option<SocketAddr>,
+    /// Secret file with a bearer token that scrapers must send
+    /// (`CRAFTCLOUD_METRICS_TOKEN_FILE`). Required when the listener is not
+    /// bound to a loopback address.
+    pub metrics_token_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -448,6 +458,32 @@ impl Config {
             }
         })
         .unwrap_or(true);
+        let metrics_addr = field(&mut errors, env, "METRICS_ADDR", |key, raw| {
+            raw.trim().parse::<SocketAddr>().map_err(|err| {
+                ConfigError::new(
+                    key,
+                    format!(
+                        "invalid value {raw:?}: {err}; expected <ip>:<port>, e.g. 127.0.0.1:9090"
+                    ),
+                )
+            })
+        });
+        let metrics_token_file = field(&mut errors, env, "METRICS_TOKEN_FILE", parse_absolute_path);
+        match (metrics_addr, &metrics_token_file) {
+            (Some(addr), _) if listeners_overlap(addr, bind) => errors.push(ConfigError::new(
+                &format!("{PREFIX}METRICS_ADDR"),
+                "must not share a port with CRAFTCLOUD_BIND on the same or an unspecified address: metrics are never served on the public listener",
+            )),
+            (Some(addr), None) if !addr.ip().is_loopback() => errors.push(ConfigError::new(
+                &format!("{PREFIX}METRICS_ADDR"),
+                "a non-loopback address requires CRAFTCLOUD_METRICS_TOKEN_FILE (or bind 127.0.0.1 and scrape from the host or a sidecar)",
+            )),
+            (None, Some(_)) => errors.push(ConfigError::new(
+                &format!("{PREFIX}METRICS_TOKEN_FILE"),
+                "has no effect without CRAFTCLOUD_METRICS_ADDR",
+            )),
+            _ => {}
+        }
         let admin_dir = field(&mut errors, env, "ADMIN_DIR", |key, raw| {
             let path = PathBuf::from(raw.trim());
             if raw.trim().is_empty() || !path.is_absolute() {
@@ -523,11 +559,22 @@ impl Config {
                 admin_dir,
                 audit_retention_days: u32::try_from(audit_retention_days).unwrap_or(u32::MAX),
                 audit_downloads,
+                metrics_addr,
+                metrics_token_file,
             })
         } else {
             Err(errors)
         }
     }
+}
+
+/// Whether two listen addresses would compete for the same socket: the same
+/// non-zero port and the same address, or either address is unspecified
+/// (`0.0.0.0` or `::`, which also covers the other family on dual-stack hosts).
+fn listeners_overlap(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 fn parse_absolute_path(key: &str, raw: &str) -> Result<PathBuf, ConfigError> {
@@ -995,6 +1042,78 @@ mod tests {
         let errors = errors_of(&[("CRAFTCLOUD_DATABASE_URL", "postgres://u:pw0rd@h/db")]);
         assert!(errors[0].message.contains("CRAFTCLOUD_DATABASE_URL_FILE"));
         assert!(!errors[0].to_string().contains("pw0rd"));
+    }
+
+    #[test]
+    fn metrics_listener_is_off_by_default_and_never_shares_the_public_address() {
+        let defaults = Config::from_env_map(&BTreeMap::new()).unwrap();
+        assert_eq!(defaults.metrics_addr, None);
+        assert_eq!(defaults.metrics_token_file, None);
+        // Loopback needs no token.
+        let local =
+            Config::from_env_map(&env(&[("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:9090")])).unwrap();
+        assert_eq!(local.metrics_addr, Some("127.0.0.1:9090".parse().unwrap()));
+        // Anything else needs the token file.
+        let token = if cfg!(windows) {
+            "C:/secrets/metrics"
+        } else {
+            "/run/secrets/metrics"
+        };
+        let remote = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_METRICS_ADDR", "0.0.0.0:9090"),
+            ("CRAFTCLOUD_METRICS_TOKEN_FILE", token),
+        ]))
+        .unwrap();
+        assert!(remote.metrics_token_file.is_some());
+        // Different ports, or different concrete addresses, are fine.
+        for (bind, metrics) in [
+            ("0.0.0.0:8080", "127.0.0.1:9090"),
+            ("127.0.0.1:8080", "127.0.0.2:8080"),
+            ("127.0.0.1:8080", "127.0.0.1:0"),
+        ] {
+            assert!(
+                Config::from_env_map(&env(&[
+                    ("CRAFTCLOUD_BIND", bind),
+                    ("CRAFTCLOUD_METRICS_ADDR", metrics),
+                ]))
+                .is_ok(),
+                "{bind} {metrics}"
+            );
+        }
+        for pairs in [
+            // non-loopback without a token
+            vec![("CRAFTCLOUD_METRICS_ADDR", "10.0.0.5:9090")],
+            // same socket as the public listener
+            vec![
+                ("CRAFTCLOUD_BIND", "127.0.0.1:9090"),
+                ("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:9090"),
+            ],
+            // same port, one side unspecified (either direction, either family)
+            vec![
+                ("CRAFTCLOUD_BIND", "0.0.0.0:9090"),
+                ("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:9090"),
+            ],
+            vec![
+                ("CRAFTCLOUD_BIND", "127.0.0.1:9090"),
+                ("CRAFTCLOUD_METRICS_ADDR", "[::]:9090"),
+                ("CRAFTCLOUD_METRICS_TOKEN_FILE", token),
+            ],
+            vec![
+                ("CRAFTCLOUD_BIND", "[::]:9090"),
+                ("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:9090"),
+            ],
+            // a token without a listener
+            vec![("CRAFTCLOUD_METRICS_TOKEN_FILE", token)],
+            // malformed values
+            vec![("CRAFTCLOUD_METRICS_ADDR", "localhost")],
+            vec![("CRAFTCLOUD_METRICS_ADDR", "")],
+            vec![
+                ("CRAFTCLOUD_METRICS_ADDR", "127.0.0.1:9090"),
+                ("CRAFTCLOUD_METRICS_TOKEN_FILE", "relative/path"),
+            ],
+        ] {
+            assert!(!errors_of(&pairs).is_empty(), "{pairs:?}");
+        }
     }
 
     #[test]

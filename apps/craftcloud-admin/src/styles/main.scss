@@ -710,3 +710,23 @@ a.button {
     width: 100%;
   }
 }
+
+.status {
+  font-weight: 600;
+
+  &--ok {
+    color: var(--good);
+  }
+
+  &--degraded {
+    color: var(--warn);
+  }
+
+  &--down {
+    color: var(--bad);
+  }
+
+  &--not_configured {
+    color: var(--muted);
+  }
+}
