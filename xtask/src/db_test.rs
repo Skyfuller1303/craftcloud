@@ -121,7 +121,7 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
     let url = format!("postgres://postgres:{password}@127.0.0.1:{port}/postgres");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     println!(
-        "==> cargo test -p craftcloud-db -p craftcloud-api -p craftcloud-server --features craftcloud-server/fault-injection -- --ignored"
+        "==> cargo test -p craftcloud-db -p craftcloud-api -p craftcloud-backup -p craftcloud-server --features craftcloud-server/fault-injection -- --ignored"
     );
     let status = Command::new(&cargo)
         .args([
@@ -132,6 +132,8 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
             "craftcloud-server",
             "-p",
             "craftcloud-api",
+            "-p",
+            "craftcloud-backup",
             // The crash tests need a server binary that can abort itself.
             "--features",
             "craftcloud-server/fault-injection",

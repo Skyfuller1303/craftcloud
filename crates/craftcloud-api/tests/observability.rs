@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(h["audit"]["dropped_events_total"], 0);
         assert!(h["server"]["version"].as_str().is_some());
         assert!(h["server"]["uptime_seconds"].as_u64().is_some());
-        // Reserved for the backup tooling of CC-P03-08.
+        // No backup recorded yet (see tests/backup.rs for the age after one).
         assert_eq!(h["backup"]["last_success_age_seconds"], Value::Null);
         assert_eq!(first.headers[header::CACHE_CONTROL], "no-store");
 

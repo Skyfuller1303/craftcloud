@@ -958,4 +958,49 @@ mod tests {
         assert!(!probe.exists());
         assert!(other.exists());
     }
+
+    // ---- publishing under a chosen key (restore of a backup) --------------------------
+
+    #[tokio::test]
+    async fn finalize_as_publishes_under_the_given_key_and_never_overwrites() {
+        let (root, store) = store().await;
+        let data = pattern(70_000, 3);
+        let key = ObjectKey::generate();
+
+        let mut temp = store.begin_write(u64::MAX).await.unwrap();
+        temp.write(&data).await.unwrap();
+        let published = store
+            .finalize_as(temp, key.clone(), data.len() as u64, &sha(&data))
+            .await
+            .unwrap();
+        assert_eq!(published, key);
+        assert_eq!(read_all(&store, &key, None).await, data);
+
+        // The same key again: refused, the first object is untouched, nothing is left over.
+        let mut temp = store.begin_write(u64::MAX).await.unwrap();
+        temp.write(b"other").await.unwrap();
+        assert!(matches!(
+            store
+                .finalize_as(temp, key.clone(), 5, &sha(b"other"))
+                .await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(read_all(&store, &key, None).await, data);
+        assert_eq!(count_files(&root.path().join("tmp")), 0);
+
+        // A wrong checksum publishes nothing under the requested key.
+        let other_key = ObjectKey::generate();
+        let mut temp = store.begin_write(u64::MAX).await.unwrap();
+        temp.write(b"bytes").await.unwrap();
+        assert!(matches!(
+            store
+                .finalize_as(temp, other_key.clone(), 5, &sha(b"different"))
+                .await,
+            Err(StorageError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            store.head(&other_key).await,
+            Err(StorageError::NotFound)
+        ));
+    }
 }

@@ -4,6 +4,7 @@ members = [
     "apps/craftcloud-server",
     "crates/craftcloud-core",
     "crates/craftcloud-api",
+    "crates/craftcloud-backup",
     "crates/craftcloud-auth",
     "crates/craftcloud-db",
     "crates/craftcloud-storage",
@@ -20,6 +21,7 @@ publish = false
 [workspace.dependencies]
 craftcloud-core = { path = "crates/craftcloud-core" }
 craftcloud-api = { path = "crates/craftcloud-api" }
+craftcloud-backup = { path = "crates/craftcloud-backup" }
 craftcloud-db = { path = "crates/craftcloud-db" }
 craftcloud-auth = { path = "crates/craftcloud-auth" }
 craftcloud-storage = { path = "crates/craftcloud-storage" }

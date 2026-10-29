@@ -1,0 +1,25 @@
+[package]
+name = "craftcloud-backup"
+description = "CraftCloud consistent database and blob backup, verification and restore (CC-F14)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+craftcloud-db.workspace = true
+craftcloud-storage.workspace = true
+sqlx.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

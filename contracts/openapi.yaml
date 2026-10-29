@@ -699,8 +699,8 @@ paths:
         Status per component (database with pool usage, migrations, object store with binding state and free bytes
         of its volume), open and overdue upload sessions, the last maintenance run and whether an epoch conflict
         blocks destructive maintenance, the audit events dropped under load (counters of this process), server
-        version and uptime, and the age of the last backup (always null until the backup tooling of CC-P03-08
-        exists). Numbers, flags and error codes only: no organization, user, file or storage path. `free_bytes` is
+        version and uptime, and the age of the last successful backup (from the audit event `backup.created` written
+        by `craftcloud-server admin backup create`; null if there is none). Numbers, flags and error codes only: no organization, user, file or storage path. `free_bytes` is
         null when it cannot be measured (the server asks `df`; not available on Windows or in an image without it).
         Other callers: 403; anonymous callers: 401. Not cached.
       responses:
@@ -2966,7 +2966,8 @@ components:
               type: [integer, 'null']
               format: int64
               minimum: 0
-              description: Always null until the backup tooling of CC-P03-08 reports.
+              description: >-
+                Seconds since the newest successful `backup.created` audit event; null if there is none or it cannot be read.
     MaintenanceStatus:
       type: object
       required: [last_run]

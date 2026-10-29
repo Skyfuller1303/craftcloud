@@ -1,6 +1,6 @@
 # CC-F14 — Backup, Restore und Upgrade-Sicherheit
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P3 (Admin & Operations). **Priorität:** MVP/Blocker.  
+> **Status:** lokal umgesetzt (PR-019, CC-P03-08), noch nicht reviewt und nicht gemerged: `craftcloud-server admin backup create | verify | restore` (Crate `craftcloud-backup`), Betreiber-Runbook in [docs/06-operations/backup-upgrade-runbook.md](../06-operations/backup-upgrade-runbook.md), Restore-Drill im Test `crates/craftcloud-api/tests/backup.rs`. Offen: Verschlüsselung, Signatur, inkrementelle Backups, S3, Messung mit großen Beständen und auf einem Linux-Host (siehe `docs/gaps.md`). **Zielphase:** P3 (Admin & Operations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

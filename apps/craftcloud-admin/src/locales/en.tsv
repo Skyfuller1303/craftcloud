@@ -407,5 +407,5 @@
 	{total} in total ({lossy} denials and failed sign-ins, {important} downloads and exports)	{total} in total ({lossy} denials and failed sign-ins, {important} downloads and exports)
 	Backups	Backups
 	Last backup	Last backup
-	Not reported yet. Backup monitoring is not part of this release.	Not reported yet. Backup monitoring is not part of this release.
+	No successful backup recorded yet.	No successful backup recorded yet.
 	System	System

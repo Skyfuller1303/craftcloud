@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 craftcloud-api.workspace = true
 craftcloud-auth.workspace = true
+craftcloud-backup.workspace = true
 craftcloud-core.workspace = true
 time.workspace = true
 craftcloud-db.workspace = true

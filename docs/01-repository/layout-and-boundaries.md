@@ -10,6 +10,7 @@ crates/craftcloud-api/         HTTP contract, handlers and middleware
 crates/craftcloud-auth/        login, tokens, sessions, permission checks
 crates/craftcloud-db/          tenant-scoped repository interfaces + PostgreSQL impl.
 crates/craftcloud-storage/     FS, optional S3, streaming, integrity
+crates/craftcloud-backup/      backup/verify/restore of database tables and blobs (depends on db + storage only)
 crates/craftcloud-client/      typed Rust client; optional wasm-safe transport
 xtask/                        local dev, contract checks, lint/test aggregations
 packaging/                    Docker, reverse proxy examples, manifests

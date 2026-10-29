@@ -134,6 +134,74 @@ services:
     networks: [backend]
     mem_limit: 256m
 
+  # One-shot backup tools (CC-P03-08), not started by `up` (profile `tools`):
+  #
+  #   docker compose run --rm backup admin backup create --out /backups/$(date -u +%Y%m%dT%H%M%SZ)
+  #   docker compose run --rm backup admin backup verify /backups/<name>
+  #
+  # Runs with the runtime database role (read access to every table, plus the
+  # audit event) and the `store` volume. The store is opened for writing only
+  # because the store check creates and removes a probe file; objects are read,
+  # never changed. The default command prints the usage.
+  backup:
+    <<: *hardening
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    user: "65532:65532"
+    profiles: [tools]
+    command: ["--help"]
+    environment:
+      CRAFTCLOUD_DATABASE_URL_FILE: /run/secrets/db_runtime_url
+    volumes:
+      - store:/var/lib/craftcloud/store
+      - backups:/backups
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: server}
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck: {disable: true}
+    networks: [backend]
+    mem_limit: 512m
+
+  # Restores a backup into an EMPTY database and an EMPTY `store` volume, for
+  # example on a new host or in a second project (`docker compose -p
+  # craftcloud-restore ...`). Needs the owner role: it creates the schema when the
+  # database is empty. Start it before the first `up` of the server (a started
+  # server binds the store, and a bound store is not empty):
+  #
+  #   docker compose run --rm db-init
+  #   docker compose run --rm restore admin backup restore /backups/<name>
+  #   docker compose up -d
+  restore:
+    <<: *hardening
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    user: "65532:65532"
+    profiles: [tools]
+    command: ["--help"]
+    environment:
+      CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE: /run/secrets/db_owner_url
+      CRAFTCLOUD_DATABASE_URL_FILE: /run/secrets/db_runtime_url
+      CRAFTCLOUD_DATABASE_RUNTIME_ROLE: craftcloud_runtime
+    volumes:
+      - store:/var/lib/craftcloud/store
+      - type: volume
+        source: backups
+        target: /backups
+        read_only: true
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: migrate}
+    depends_on:
+      db: {condition: service_healthy}
+      db-init: {condition: service_completed_successfully}
+    healthcheck: {disable: true}
+    networks: [backend]
+    mem_limit: 512m
+
   server:
     <<: *hardening
     restart: unless-stopped
@@ -223,8 +291,9 @@ volumes:
   store: {}
   caddy_data: {}
   caddy_config: {}
-  # Reserved for the backup job (CC-P03-08): a backup service would mount
-  # `store` read-only, write here and nowhere else. Nothing mounts it yet.
+  # Backups written by the `backup` tool (CC-P03-08) and read by `restore`.
+  # Nothing else mounts it. Backups hold every password hash, e-mail address and
+  # file: copy them off the host encrypted (docs/06-operations/backup-upgrade-runbook.md).
   backups: {}
 
 secrets:

@@ -452,6 +452,22 @@ pub(crate) async fn get_health(
     } else {
         None
     };
+    // The newest successful `backup.created` event (written by
+    // `craftcloud-server admin backup create`); unknown (null) if there is none
+    // or it cannot be read.
+    let backup_age_seconds = if database_up {
+        match timeout(
+            CHECK_TIMEOUT,
+            craftcloud_db::audit::latest_success_at(&services.pool, "backup.created"),
+        )
+        .await
+        {
+            Ok(Ok(Some(at))) => Some(u64::try_from((now - at).whole_seconds().max(0)).unwrap_or(0)),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (dropped_lossy, dropped_important) = services.audit_budget.dropped_counts();
     let pool = &services.pool;
     let size = pool.size();
@@ -499,8 +515,7 @@ pub(crate) async fn get_health(
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": services.started.elapsed().as_secs(),
         },
-        // Filled in by the backup tooling of CC-P03-08.
-        "backup": { "last_success_age_seconds": null },
+        "backup": { "last_success_age_seconds": backup_age_seconds },
     }))
     .into_response()
 }

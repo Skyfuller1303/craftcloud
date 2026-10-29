@@ -284,8 +284,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 5"));
         assert!(text(&out).contains("applied migration 9"));
         assert!(text(&out).contains("applied migration 10"));
-        assert!(text(&out).contains("applied migration 12"));
-        assert!(text(&out).contains("applied 12 migration(s)"));
+        assert!(text(&out).contains("applied migration 13"));
+        assert!(text(&out).contains("applied 13 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));
@@ -1043,5 +1043,173 @@ mod tests {
         let again = run(&["admin", "maintenance", "--once"], &env);
         assert_eq!(again.status.code(), Some(0), "{}", text(&again));
         let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    #[test]
+    fn backup_commands_need_exact_arguments_and_configuration() {
+        for args in [
+            &["admin", "backup"][..],
+            &["admin", "backup", "create"][..],
+            &["admin", "backup", "create", "--out"][..],
+            &["admin", "backup", "create", "dir"][..],
+            &["admin", "backup", "create", "--out", "a", "b"][..],
+            &["admin", "backup", "verify"][..],
+            &["admin", "backup", "verify", "a", "b"][..],
+            &["admin", "backup", "verify", "a", "--manifest-sha256"][..],
+            &["admin", "backup", "restore"][..],
+            &["admin", "backup", "restore", "a", "--force"][..],
+            &["admin", "backup", "export", "a"][..],
+        ] {
+            let out = run(args, &[]);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(text(&out).contains("usage: craftcloud-server"));
+        }
+        // create and restore need a database and a store directory.
+        let out = run(&["admin", "backup", "create", "--out", "somewhere"], &[]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+        let out = run(&["admin", "backup", "restore", "somewhere"], &[]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
+        // verify is offline: it needs no configuration at all.
+        let missing = std::env::temp_dir().join(format!("craftcloud-no-backup-{}", nanos()));
+        let missing_text = missing.to_string_lossy().into_owned();
+        let out = run(&["admin", "backup", "verify", missing_text.as_str()], &[]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(text(&out).contains("cannot read the backup directory"));
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn backup_create_verify_and_restore_through_the_command_line() {
+        let source = Fixture::new();
+        let source_secret = source.secret();
+        let source_store = std::env::temp_dir().join(format!("craftcloud-cli-bk-src-{}", nanos()));
+        std::fs::create_dir_all(&source_store).unwrap();
+        let source_store_text = source_store.to_string_lossy().into_owned();
+        let source_env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", source_secret.as_str()),
+            ("CRAFTCLOUD_STORAGE_DIR", source_store_text.as_str()),
+        ];
+        assert_eq!(run(&["migrate"], &source_env).status.code(), Some(0));
+        source.exec("INSERT INTO users (id, normalized_email, display_name) VALUES ('11111111-1111-1111-1111-111111111111', 'o@example.test', 'O')");
+        source.exec("INSERT INTO organizations (id, slug, name, owner_user_id) VALUES ('33333333-3333-3333-3333-333333333333', 'acme', 'Acme', '11111111-1111-1111-1111-111111111111')");
+        source.exec("INSERT INTO workspaces (id, org_id, slug, name) VALUES ('44444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', 'main', 'Main')");
+        // Not bound yet: the backup refuses an unpaired store.
+        let backups = std::env::temp_dir().join(format!("craftcloud-cli-bk-out-{}", nanos()));
+        let out_dir = backups.join("b1");
+        let out_text = out_dir.to_string_lossy().into_owned();
+        let create_args = ["admin", "backup", "create", "--out", out_text.as_str()];
+        let early = run(&create_args, &source_env);
+        assert_eq!(early.status.code(), Some(1), "{}", text(&early));
+        assert!(text(&early).contains("not bound"));
+        assert!(!out_dir.exists());
+        assert_eq!(
+            run(&["admin", "storage-bind", "--force"], &source_env)
+                .status
+                .code(),
+            Some(0)
+        );
+
+        let created = run(&create_args, &source_env);
+        assert_eq!(created.status.code(), Some(0), "{}", text(&created));
+        source.assert_no_password(&created);
+        let stdout = String::from_utf8_lossy(&created.stdout).into_owned();
+        assert!(stdout.contains("recovery point:"), "{stdout}");
+        let digest = stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("manifest sha256:"))
+            .map(|d| d.trim().to_owned())
+            .unwrap();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            source.scalar("SELECT count(*)::text FROM audit_events WHERE action = 'backup.created' AND result = 'success'"),
+            "1"
+        );
+        // A second backup into the same directory is refused.
+        let again = run(&create_args, &source_env);
+        assert_eq!(again.status.code(), Some(1), "{}", text(&again));
+        assert!(text(&again).contains("not empty"));
+
+        // Verify needs no configuration; a pinned digest must match.
+        let verified = run(&["admin", "backup", "verify", out_text.as_str()], &[]);
+        assert_eq!(verified.status.code(), Some(0), "{}", text(&verified));
+        assert!(String::from_utf8_lossy(&verified.stdout).contains("all checksums match"));
+        let pin = "--manifest-sha256";
+        let pinned = run(
+            &[
+                "admin",
+                "backup",
+                "verify",
+                out_text.as_str(),
+                pin,
+                digest.as_str(),
+            ],
+            &[],
+        );
+        assert_eq!(pinned.status.code(), Some(0), "{}", text(&pinned));
+        let wrong = "0".repeat(64);
+        let mismatch = run(
+            &[
+                "admin",
+                "backup",
+                "verify",
+                out_text.as_str(),
+                pin,
+                wrong.as_str(),
+            ],
+            &[],
+        );
+        assert_eq!(mismatch.status.code(), Some(1), "{}", text(&mismatch));
+
+        // Restore on a "separate instance": another database, another store.
+        let target = Fixture::new();
+        let target_secret = target.secret();
+        let target_store = std::env::temp_dir().join(format!("craftcloud-cli-bk-dst-{}", nanos()));
+        std::fs::create_dir_all(&target_store).unwrap();
+        let target_store_text = target_store.to_string_lossy().into_owned();
+        let target_env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", target_secret.as_str()),
+            ("CRAFTCLOUD_STORAGE_DIR", target_store_text.as_str()),
+        ];
+        let restore_args = [
+            "admin",
+            "backup",
+            "restore",
+            out_text.as_str(),
+            pin,
+            digest.as_str(),
+        ];
+        let restored = run(&restore_args, &target_env);
+        assert_eq!(restored.status.code(), Some(0), "{}", text(&restored));
+        target.assert_no_password(&restored);
+        assert!(String::from_utf8_lossy(&restored.stdout).contains("All sessions are invalid"));
+        for table in ["users", "organizations", "workspaces"] {
+            assert_eq!(
+                target.scalar(&format!("SELECT count(*)::text FROM {table}")),
+                source.scalar(&format!("SELECT count(*)::text FROM {table}")),
+                "{table}"
+            );
+        }
+        assert_eq!(
+            target
+                .scalar("SELECT count(*)::text FROM audit_events WHERE action = 'backup.restored'"),
+            "1"
+        );
+        assert!(target_store.join("craftcloud-store.json").exists());
+        // The restored pair is healthy (the maintenance job accepts the
+        // binding), and a second restore into it is refused.
+        assert_eq!(
+            run(&["admin", "maintenance", "--once"], &target_env)
+                .status
+                .code(),
+            Some(0)
+        );
+        let second = run(&restore_args, &target_env);
+        assert_eq!(second.status.code(), Some(1), "{}", text(&second));
+        assert!(text(&second).contains("already has"), "{}", text(&second));
+        for dir in [&source_store, &target_store, &backups] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

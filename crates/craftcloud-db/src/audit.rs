@@ -601,3 +601,25 @@ pub async fn count_expired(pool: &PgPool, retention_days: u32) -> Result<u64, Db
     .await?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
+
+/// The time of the newest successful instance-level event (no tenant) with
+/// exactly this `action`, on the database clock, or `None` if there is none. The admin
+/// health view uses it for the age of the last backup (`backup.created`).
+/// Events removed by the retention job are gone, so a retention shorter than
+/// the backup interval makes the age disappear.
+///
+/// # Errors
+///
+/// Database failures.
+pub async fn latest_success_at(
+    pool: &PgPool,
+    action: &str,
+) -> Result<Option<OffsetDateTime>, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT max(created_at) FROM audit_events \
+         WHERE action = $1 AND org_id IS NULL AND result = 'success'",
+    )
+    .bind(action)
+    .fetch_one(pool)
+    .await?)
+}

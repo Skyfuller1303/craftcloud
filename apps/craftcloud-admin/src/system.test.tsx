@@ -63,8 +63,8 @@ describe("system view", () => {
     expect(
       facts.getByText("5 in total (4 denials and failed sign-ins, 1 downloads and exports)"),
     ).toBeTruthy();
-    // Backup age is a placeholder until the backup tooling exists.
-    expect(facts.getByText(/Not reported yet/)).toBeTruthy();
+    // No backup recorded yet (the age comes from the audit event backup.created).
+    expect(facts.getByText(/No successful backup recorded yet/)).toBeTruthy();
     expect(calls.filter((call) => call.path === "/admin/health").length).toBe(1);
     // No alert while everything is fine.
     expect(screen.queryByRole("alert")).toBeNull();

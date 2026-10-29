@@ -623,44 +623,21 @@ fn temp_id_ok(id: &str) -> bool {
     is_hex32(id)
 }
 
-impl ObjectStore for LocalStore {
-    type Temp = TempObject;
-    type Reader = ObjectReader;
-
-    async fn begin_write(&self, max_bytes: u64) -> Result<TempObject, StorageError> {
-        let id = Uuid::new_v4().simple().to_string();
-        let path = self.layout.temp_path(&id);
-        // Created inline (one quick syscall, no await point): a cancelled
-        // future can then never leave a file that no TempObject owns.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options.open(&path).map_err(|e| {
-            tracing::error!(path = %path.display(), error = %e, "cannot create temporary object");
-            map_io_error(e)
-        })?;
-        Ok(TempObject {
-            file: Arc::new(Mutex::new(Some(file))),
-            path,
-            id,
-            buffer: Vec::with_capacity(CHUNK_BYTES),
-            hasher: Sha256::new(),
-            written: 0,
-            flushed: 0,
-            limit: max_bytes,
-            failed: false,
-            finished: false,
-            faults: Arc::clone(&self.faults),
-        })
-    }
-
-    async fn finalize(
+/// Publishing under a chosen key (restore of a backup).
+impl LocalStore {
+    /// Like [`ObjectStore::finalize`], but publishes the object under `key`
+    /// instead of a fresh random one. Used when a backup is restored, so that
+    /// the keys recorded in the database stay valid. Never overwrites: an
+    /// existing object under `key` is [`StorageError::AlreadyExists`] and the
+    /// temporary object is discarded.
+    ///
+    /// # Errors
+    ///
+    /// As [`ObjectStore::finalize`], plus [`StorageError::AlreadyExists`].
+    pub async fn finalize_as(
         &self,
         mut temp: TempObject,
+        key: ObjectKey,
         expected_len: u64,
         expected_sha256: &Sha256Digest,
     ) -> Result<ObjectKey, StorageError> {
@@ -705,7 +682,6 @@ impl ObjectStore for LocalStore {
             return Err(temp.die(error));
         }
 
-        let key = ObjectKey::generate();
         let publish = async {
             self.ensure_shards(&key).await?;
             let dest = self.layout.path_of(&key);
@@ -752,6 +728,52 @@ impl ObjectStore for LocalStore {
             }
             Err(error) => Err(temp.die(error)),
         }
+    }
+}
+
+impl ObjectStore for LocalStore {
+    type Temp = TempObject;
+    type Reader = ObjectReader;
+
+    async fn begin_write(&self, max_bytes: u64) -> Result<TempObject, StorageError> {
+        let id = Uuid::new_v4().simple().to_string();
+        let path = self.layout.temp_path(&id);
+        // Created inline (one quick syscall, no await point): a cancelled
+        // future can then never leave a file that no TempObject owns.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path).map_err(|e| {
+            tracing::error!(path = %path.display(), error = %e, "cannot create temporary object");
+            map_io_error(e)
+        })?;
+        Ok(TempObject {
+            file: Arc::new(Mutex::new(Some(file))),
+            path,
+            id,
+            buffer: Vec::with_capacity(CHUNK_BYTES),
+            hasher: Sha256::new(),
+            written: 0,
+            flushed: 0,
+            limit: max_bytes,
+            failed: false,
+            finished: false,
+            faults: Arc::clone(&self.faults),
+        })
+    }
+
+    async fn finalize(
+        &self,
+        temp: TempObject,
+        expected_len: u64,
+        expected_sha256: &Sha256Digest,
+    ) -> Result<ObjectKey, StorageError> {
+        self.finalize_as(temp, ObjectKey::generate(), expected_len, expected_sha256)
+            .await
     }
 
     async fn abort(&self, mut temp: TempObject) {
@@ -994,6 +1016,28 @@ impl LocalStore {
                 .ok_or_else(invalid)?,
         };
         Ok(Some(MarkerInfo { store_id, epoch }))
+    }
+
+    /// Removes the marker file (compensation when the database change that
+    /// goes with a new marker did not commit). A missing marker is fine.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error, or an unsafe tree if the marker is not a plain file.
+    pub async fn remove_marker(&self) -> Result<(), StorageError> {
+        let path = self.layout.root.join(MARKER_FILE);
+        match fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.is_file() && !is_link(&meta) => {}
+            Ok(_) => return Err(unsafe_tree()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(map_io_error(e)),
+        }
+        clear_readonly(&path).await;
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(map_io_error(e)),
+        }
     }
 
     /// Writes the marker with epoch 0; see [`LocalStore::write_marker_info`].

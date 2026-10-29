@@ -197,6 +197,7 @@ dependencies = [
  "base64",
  "bytes",
  "craftcloud-auth",
+ "craftcloud-backup",
  "craftcloud-core",
  "craftcloud-db",
  "craftcloud-storage",
@@ -230,6 +231,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftcloud-backup"
+version = "0.0.0"
+dependencies = [
+ "craftcloud-db",
+ "craftcloud-storage",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "craftcloud-core"
 version = "0.0.0"
 dependencies = [
@@ -258,6 +275,7 @@ dependencies = [
  "axum",
  "craftcloud-api",
  "craftcloud-auth",
+ "craftcloud-backup",
  "craftcloud-core",
  "craftcloud-db",
  "craftcloud-storage",

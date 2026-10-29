@@ -661,7 +661,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(properties, required);
-        // The backup age is a placeholder until CC-P03-08.
+        // The age of the last backup (null until a backup was recorded).
         assert_eq!(
             health["properties"]["backup"]["properties"]["last_success_age_seconds"]["type"],
             serde_json::json!(["integer", "null"])

@@ -3,7 +3,8 @@
 //!
 //! Usage: `craftcloud-server` (serve), `craftcloud-server migrate`,
 //! `craftcloud-server healthcheck` (container healthcheck) or
-//! `craftcloud-server admin ...` (offline tools, including one maintenance run).
+//! `craftcloud-server admin ...` (offline tools, including one maintenance run
+//! and backup, verify and restore).
 //!
 //! Exit codes: 0 clean shutdown, 1 runtime failure (including a database that
 //! is not migrated), 2 invalid configuration or usage.
@@ -33,7 +34,7 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
 
-const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force]\n\
+const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>]]\n\
     \n\
     (no argument)                          start the HTTP server\n\
     migrate                                apply pending database migrations and exit\n\
@@ -43,7 +44,10 @@ const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin iss
                                            break glass: make the enabled account E an owner of organization SLUG\n\
     admin maintenance --once [--dry-run]   run the maintenance job once (retention purge, blob garbage collection,\n\
                                            reconciliation, verification) and print counts; --dry-run changes nothing
-    admin storage-bind --force             deliberately (re)bind this database and CRAFTCLOUD_STORAGE_DIR to each other\n";
+    admin storage-bind --force             deliberately (re)bind this database and CRAFTCLOUD_STORAGE_DIR to each other\n\
+    admin backup create --out DIR          consistent backup of the database and all committed blobs into the new or empty DIR\n\
+    admin backup verify DIR                check every checksum of a backup (needs no database; --manifest-sha256 pins the manifest)\n\
+    admin backup restore DIR               load a verified backup into an EMPTY database and an EMPTY CRAFTCLOUD_STORAGE_DIR\n";
 
 /// A failure with the exit code it maps to.
 struct Failure {
@@ -75,6 +79,9 @@ enum Command {
     SetOrgOwner { org: String, email: String },
     Maintenance { dry_run: bool },
     StorageBind,
+    BackupCreate { out: String },
+    BackupVerify { dir: String, digest: Option<String> },
+    BackupRestore { dir: String, digest: Option<String> },
     Help,
 }
 
@@ -120,6 +127,49 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         {
             Ok(Command::StorageBind)
         }
+        [admin, backup, create, flag, out]
+            if admin == "admin" && backup == "backup" && create == "create" && flag == "--out" =>
+        {
+            Ok(Command::BackupCreate { out: out.clone() })
+        }
+        [admin, backup, verify, dir]
+            if admin == "admin" && backup == "backup" && verify == "verify" =>
+        {
+            Ok(Command::BackupVerify {
+                dir: dir.clone(),
+                digest: None,
+            })
+        }
+        [admin, backup, verify, dir, flag, digest]
+            if admin == "admin"
+                && backup == "backup"
+                && verify == "verify"
+                && flag == "--manifest-sha256" =>
+        {
+            Ok(Command::BackupVerify {
+                dir: dir.clone(),
+                digest: Some(digest.clone()),
+            })
+        }
+        [admin, backup, restore, dir]
+            if admin == "admin" && backup == "backup" && restore == "restore" =>
+        {
+            Ok(Command::BackupRestore {
+                dir: dir.clone(),
+                digest: None,
+            })
+        }
+        [admin, backup, restore, dir, flag, digest]
+            if admin == "admin"
+                && backup == "backup"
+                && restore == "restore"
+                && flag == "--manifest-sha256" =>
+        {
+            Ok(Command::BackupRestore {
+                dir: dir.clone(),
+                digest: Some(digest.clone()),
+            })
+        }
         [one] => Err(format!("unknown argument {one:?}")),
         _ => Err("too many arguments".to_owned()),
     }
@@ -151,6 +201,17 @@ async fn main() -> ExitCode {
                 Err(message) => {
                     eprintln!("craftcloud-server healthcheck: {message}");
                     ExitCode::FAILURE
+                }
+            };
+        }
+        Ok(Command::BackupVerify { dir, digest }) => {
+            // Offline: reads the backup directory only. No configuration,
+            // no database, no secrets.
+            return match backup_verify(&dir, digest.as_deref()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(failure) => {
+                    eprintln!("craftcloud-server: {}", failure.message);
+                    ExitCode::from(failure.code)
                 }
             };
         }
@@ -191,7 +252,11 @@ async fn main() -> ExitCode {
         Command::SetOrgOwner { org, email } => set_org_owner(&config, &org, &email).await,
         Command::Maintenance { dry_run } => maintenance_once(&config, dry_run).await,
         Command::StorageBind => storage_bind(&config).await,
-        Command::Help | Command::Healthcheck => Ok(()),
+        Command::BackupCreate { out } => backup_create(&config, &out).await,
+        Command::BackupRestore { dir, digest } => {
+            backup_restore(&config, &dir, digest.as_deref()).await
+        }
+        Command::Help | Command::Healthcheck | Command::BackupVerify { .. } => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -493,6 +558,167 @@ async fn storage_bind(config: &Config) -> Result<(), Failure> {
         "audit"
     );
     pool.close().await;
+    Ok(())
+}
+
+/// How long a backup waits for a running maintenance job before it gives up.
+const BACKUP_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn backup_failure(error: craftcloud_backup::BackupError) -> Failure {
+    Failure::runtime(error.to_string())
+}
+
+/// Prints what a verified, created or restored backup contains (counts only).
+fn print_backup_summary(manifest: &craftcloud_backup::Manifest) {
+    println!(
+        "  recovery point:     {} (snapshot time)",
+        manifest.created_at
+    );
+    println!(
+        "  made by:            server {} at migration {}",
+        manifest.server_version, manifest.migration_version
+    );
+    println!(
+        "  tables:             {} ({} rows)",
+        manifest.tables.len(),
+        manifest.tables.iter().map(|t| t.rows).sum::<u64>()
+    );
+    println!(
+        "  blobs:              {} ({} bytes)",
+        manifest.blobs.count, manifest.blobs.total_bytes
+    );
+}
+
+/// Offline check of every checksum of a backup directory.
+async fn backup_verify(dir: &str, digest: Option<&str>) -> Result<(), Failure> {
+    let (dir, digest) = (std::path::PathBuf::from(dir), digest.map(str::to_owned));
+    let report =
+        tokio::task::spawn_blocking(move || craftcloud_backup::verify(&dir, digest.as_deref()))
+            .await
+            .map_err(|_| Failure::runtime("the verification task failed"))?
+            .map_err(backup_failure)?;
+    println!("backup verified: all checksums match");
+    print_backup_summary(&report.manifest);
+    println!("  manifest sha256:    {}", report.manifest_sha256);
+    Ok(())
+}
+
+/// Consistent backup of the database and the committed blobs. The manifest
+/// digest goes to stdout so that the operator can store it away from the
+/// backup (it pins the manifest against tampering); nothing secret is printed.
+async fn backup_create(config: &Config, out: &str) -> Result<(), Failure> {
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "backup create requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    let Some(dir) = &config.storage_dir else {
+        return Err(Failure::config(
+            "backup create requires CRAFTCLOUD_STORAGE_DIR to be set",
+        ));
+    };
+    let store = craftcloud_storage::LocalStore::open(dir)
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?;
+    let report = craftcloud_backup::create(
+        &pool,
+        &store,
+        std::path::Path::new(out),
+        &craftcloud_backup::CreateOptions {
+            server_version: env!("CARGO_PKG_VERSION"),
+            lock_wait: BACKUP_LOCK_WAIT,
+            on_phase: None,
+        },
+    )
+    .await
+    .map_err(backup_failure)?;
+    pool.close().await;
+    println!("backup written to {out}");
+    print_backup_summary(&report.manifest);
+    println!("  manifest sha256:    {}", report.manifest_sha256);
+    println!(
+        "  took:               {:.1} s",
+        report.duration.as_secs_f64()
+    );
+    if report.manifest.unavailable_version_blobs > 0 {
+        eprintln!(
+            "WARNING: {} file version(s) reference blobs that were not committed (for example corrupt); their bytes are not in this backup.",
+            report.manifest.unavailable_version_blobs
+        );
+    }
+    eprintln!(
+        "Note: the backup holds password hashes, e-mail addresses and all file contents. Encrypt it before it leaves this host."
+    );
+    if !report.audit_recorded {
+        return Err(Failure::runtime(
+            "the backup is complete, but its audit event could not be stored",
+        ));
+    }
+    Ok(())
+}
+
+/// Restores a backup into an empty database and an empty store directory. Uses
+/// the owner role when `CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE` is set (the
+/// schema may have to be created, and the audit log keeps its timestamps).
+async fn backup_restore(config: &Config, dir: &str, digest: Option<&str>) -> Result<(), Failure> {
+    let settings = &config.database;
+    let pool = match (&settings.migrate_url_file, &settings.url_file) {
+        (Some(owner), _) => {
+            connect_url_file(settings, owner, "CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE").await?
+        }
+        (None, Some(runtime)) => {
+            connect_url_file(settings, runtime, "CRAFTCLOUD_DATABASE_URL_FILE").await?
+        }
+        (None, None) => {
+            return Err(Failure::config(
+                "backup restore requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+            ));
+        }
+    };
+    let Some(store_dir) = &config.storage_dir else {
+        return Err(Failure::config(
+            "backup restore requires CRAFTCLOUD_STORAGE_DIR to be set",
+        ));
+    };
+    let store = craftcloud_storage::LocalStore::open(store_dir)
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?;
+    let report = craftcloud_backup::restore(
+        &pool,
+        &store,
+        std::path::Path::new(dir),
+        &craftcloud_backup::RestoreOptions {
+            expected_manifest_sha256: digest,
+            runtime_role: settings.runtime_role.as_deref(),
+            on_phase: None,
+        },
+    )
+    .await
+    .map_err(backup_failure)?;
+    pool.close().await;
+    println!("backup restored from {dir}");
+    print_backup_summary(&report.manifest);
+    println!("  new store identity: {}", report.store_id);
+    println!(
+        "  restored:           {} rows, {} blobs ({} bytes)",
+        report.rows, report.blobs, report.blob_bytes
+    );
+    println!(
+        "  took:               {:.1} s (including verification)",
+        report.duration.as_secs_f64()
+    );
+    println!("All sessions are invalid: everybody has to log in again.");
+    if report.aborted_uploads > 0 {
+        println!(
+            "{} upload(s) that were unfinished at backup time were aborted.",
+            report.aborted_uploads
+        );
+    }
+    if report.needs_migration {
+        println!(
+            "The backup has an older schema than this server: run `craftcloud-server migrate` before starting the server."
+        );
+    }
     Ok(())
 }
 
@@ -897,6 +1123,39 @@ mod tests {
         assert!(matches!(parse_args(&args(&["--help"])), Ok(Command::Help)));
         assert!(parse_args(&args(&["nope"])).is_err());
         assert!(parse_args(&args(&["migrate", "extra"])).is_err());
+    }
+
+    #[test]
+    fn backup_arguments() {
+        assert!(matches!(
+            parse_args(&args(&["admin", "backup", "create", "--out", "/b/1"])),
+            Ok(Command::BackupCreate { out }) if out == "/b/1"
+        ));
+        assert!(matches!(
+            parse_args(&args(&["admin", "backup", "verify", "/b/1"])),
+            Ok(Command::BackupVerify { dir, digest: None }) if dir == "/b/1"
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "admin",
+                "backup",
+                "restore",
+                "/b/1",
+                "--manifest-sha256",
+                "ab"
+            ])),
+            Ok(Command::BackupRestore { dir, digest: Some(d) }) if dir == "/b/1" && d == "ab"
+        ));
+        for bad in [
+            &["admin", "backup"][..],
+            &["admin", "backup", "create"][..],
+            &["admin", "backup", "create", "/b/1"][..],
+            &["admin", "backup", "verify"][..],
+            &["admin", "backup", "restore", "/b/1", "--other", "x"][..],
+            &["admin", "backup", "wipe", "/b/1"][..],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

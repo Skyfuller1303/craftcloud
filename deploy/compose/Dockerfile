@@ -43,7 +43,7 @@ RUN cargo build --release --locked -p craftcloud-server \
 FROM ${DEBIAN_IMAGE} AS files
 # The store belongs to the runtime user from the start so that a fresh named
 # volume inherits the owner and mode 0700 (the server insists on a writable directory).
-RUN install -d -m 0700 -o 65532 -g 65532 /rootfs/var/lib/craftcloud/store \
+RUN install -d -m 0700 -o 65532 -g 65532 /rootfs/var/lib/craftcloud/store /rootfs/backups \
     && install -D -m 0755 /usr/bin/df /rootfs/usr/bin/df
 
 # ---- runtime ----------------------------------------------------------------
@@ -53,6 +53,7 @@ LABEL org.opencontainers.image.title="craftcloud-server" \
 # `df` backs the operator health view (free disk space); it needs only libc.
 COPY --from=files /rootfs/usr/bin/df /usr/bin/df
 COPY --from=files --chown=65532:65532 /rootfs/var/lib/craftcloud /var/lib/craftcloud
+COPY --from=files --chown=65532:65532 /rootfs/backups /backups
 COPY --from=server /out/craftcloud-server /usr/local/bin/craftcloud-server
 COPY --from=admin /src/apps/craftcloud-admin/dist /opt/craftcloud/admin
 # Stable layout of the image; deployment specifics (public URL, secrets,

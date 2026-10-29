@@ -234,7 +234,7 @@ function HealthView({ health }: { health: AdminHealth }) {
           <dt>{t("Last backup")}</dt>
           <dd>
             {health.backup.last_success_age_seconds === null
-              ? t("Not reported yet. Backup monitoring is not part of this release.")
+              ? t("No successful backup recorded yet.")
               : uptime(health.backup.last_success_age_seconds)}
           </dd>
         </dl>

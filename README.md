@@ -66,6 +66,7 @@ craftcloud/
 │   ├── craftcloud-auth/         # sessions, credentials, policy
 │   ├── craftcloud-db/           # queries, migrations
 │   ├── craftcloud-storage/      # fs/S3 backends
+│   ├── craftcloud-backup/       # consistent backup, verify and restore (CC-F14)
 │   └── craftcloud-client/       # Rust client SDK; wasm-safe core where possible
 ├── xtask/                       # tooling, CI helpers (later)
 ├── packaging/                   # docker, reverse proxy, systemd (later)
