@@ -321,3 +321,45 @@
 	Your password was changed. Log in with the new password.	Your password was changed. Log in with the new password.
 	Go to log in	Go to log in
 	This reset link is not valid any more. Ask for a new one.	This reset link is not valid any more. Ask for a new one.
+
+# Activity log (CC-F11)
+	Only organization owners and admins can see the activity log.	Only organization owners and admins can see the activity log.
+	Sign-in and sessions	Sign-in and sessions
+	Instance setup	Instance setup
+	Account status	Account status
+	Password resets	Password resets
+	Storage binding	Storage binding
+	Maintenance	Maintenance
+	Audit exports	Audit exports
+	Workspaces and workspace members	Workspaces and workspace members
+	Success	Success
+	Denied	Denied
+	Failed	Failed
+	Enter a valid user ID.	Enter a valid user ID.
+	The end date must not be before the start date.	The end date must not be before the start date.
+	Events contain identifiers and codes only, never names, e-mail addresses or file contents.	Events contain identifiers and codes only, never names, e-mail addresses or file contents.
+	Log	Log
+	This organization	This organization
+	Instance (operator)	Instance (operator)
+	Filters	Filters
+	Action	Action
+	All actions	All actions
+	Result	Result
+	All results	All results
+	All workspaces	All workspaces
+	Actor (user ID)	Actor (user ID)
+	From	From
+	To	To
+	Apply filters	Apply filters
+	Reset filters	Reset filters
+	Events	Events
+	Export as NDJSON	Export as NDJSON
+	There are no matching events.	There are no matching events.
+	Loading activity…	Loading activity…
+	Time	Time
+	Actor	Actor
+	Target	Target
+	Details	Details
+	Request ID	Request ID
+	{count} times, latest {time}	{count} times, latest {time}
+	System or unknown	System or unknown

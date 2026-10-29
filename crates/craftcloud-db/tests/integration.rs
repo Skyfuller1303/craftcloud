@@ -278,7 +278,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -301,14 +301,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            10,
+            12,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 12);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(
             migrate::verify(&db.pool).await,
             Err(DbError::Schema(SchemaProblem::Pending(vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
             ])))
         );
 
@@ -332,7 +332,7 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3, 4, 5, 6, 7, 8, 9, 10]
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -931,7 +931,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3, 4, 5, 6, 7, 8, 9, 10]
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         migrate::verify(&db.pool).await.unwrap();
         let ws = workspaces::get(&db.pool, &scope, ws_id)
@@ -2128,5 +2128,751 @@ mod tests {
                 .unwrap(),
             Some(OrgRole::Owner)
         );
+    }
+
+    // ---- audit events (CC-F11) -------------------------------------------------
+
+    mod audit_tests {
+        use super::*;
+        use craftcloud_core::policy::Action;
+        use craftcloud_db::audit::{
+            self, AggScope, AuditCtx, AuditFilter, AuditResult, Detail, NewEvent, record_aggregated,
+        };
+        use craftcloud_db::members::OrgTx;
+        use time::OffsetDateTime;
+
+        async fn rows(pool: &PgPool, sql: &str) -> i64 {
+            sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+        }
+
+        /// Seeds `n` events of the organization with one shared timestamp.
+        async fn seed_equal(pool: &PgPool, org: Uuid, n: i32, at: OffsetDateTime, action: &str) {
+            sqlx::query(
+                "INSERT INTO audit_events (id, org_id, action, result, created_at, last_at) \
+                 SELECT gen_random_uuid(), $1, $2, 'success', $3, $3 FROM generate_series(1, $4)",
+            )
+            .bind(org)
+            .bind(action)
+            .bind(at)
+            .bind(n)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn rows_cannot_be_updated_deleted_or_truncated() {
+            let db = migrated().await;
+            let ctx = AuditCtx::system();
+            audit::record(&db.pool, &ctx, &NewEvent::new("organization.create"))
+                .await
+                .unwrap();
+            for sql in [
+                "UPDATE audit_events SET action = 'member.add'",
+                "UPDATE audit_events SET result = 'failed'",
+                "UPDATE audit_events SET details = '{\"x\":1}'::jsonb",
+                "UPDATE audit_events SET event_count = event_count + 1",
+                "DELETE FROM audit_events",
+                "TRUNCATE audit_events",
+            ] {
+                let err = sqlx::query(sql).execute(&db.pool).await.unwrap_err();
+                let text = err.to_string();
+                assert!(
+                    text.contains("append-only")
+                        || text.contains("audit_purge")
+                        || text.contains("truncated"),
+                    "{sql}: {text}"
+                );
+            }
+            assert_eq!(rows(&db.pool, "SELECT count(*) FROM audit_events").await, 1);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn invalid_values_are_rejected_by_the_database() {
+            let db = migrated().await;
+            for (action, result) in [
+                ("Member.Add", "success"),
+                ("member add", "success"),
+                ("member.add", "maybe"),
+                ("", "success"),
+            ] {
+                let outcome = sqlx::query(
+                    "INSERT INTO audit_events (id, action, result) VALUES (gen_random_uuid(), $1, $2)",
+                )
+                .bind(action)
+                .bind(result)
+                .execute(&db.pool)
+                .await;
+                assert!(outcome.is_err(), "{action:?} {result:?}");
+            }
+            // A request id with odd characters is refused as well.
+            let outcome = sqlx::query(
+                "INSERT INTO audit_events (id, action, result, request_id) \
+                 VALUES (gen_random_uuid(), 'member.add', 'success', 'a b')",
+            )
+            .execute(&db.pool)
+            .await;
+            assert!(outcome.is_err());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn details_take_only_typed_values_with_plain_keys() {
+            let db = migrated().await;
+            let ctx = AuditCtx::system();
+            let bad_key = NewEvent::new("member.add").detail("E-Mail", Detail::Flag(true));
+            assert!(matches!(
+                audit::record(&db.pool, &ctx, &bad_key).await,
+                Err(DbError::CheckViolation { .. })
+            ));
+            let user_id = Uuid::new_v4();
+            let ok = NewEvent::new("member.add")
+                .detail("role", Detail::Code("admin"))
+                .detail("count", Detail::Count(3))
+                .detail("self_removal", Detail::Flag(false))
+                .detail("user_id", Detail::Id(user_id));
+            audit::record(&db.pool, &ctx, &ok).await.unwrap();
+            let details: String = sqlx::query_scalar("SELECT details::text FROM audit_events")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&details).unwrap();
+            assert_eq!(value["role"], "admin");
+            assert_eq!(value["count"], 3);
+            assert_eq!(value["self_removal"], false);
+            assert_eq!(value["user_id"], user_id.to_string());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn an_event_in_the_transaction_rolls_back_with_it() {
+            let db = migrated().await;
+            let (scope, owner) = org(&db.pool, "a1").await;
+            let ctx = AuditCtx {
+                actor_id: Some(owner.id),
+                request_id: Some("req-1".to_owned()),
+            };
+            // Rolled back: no event.
+            let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+                .await
+                .unwrap()
+                .unwrap();
+            tx.audit(&ctx, NewEvent::new("member.add").target("user", owner.id))
+                .await
+                .unwrap();
+            drop(tx);
+            assert_eq!(rows(&db.pool, "SELECT count(*) FROM audit_events").await, 0);
+            // Committed: exactly one event, bound to the transaction's organization.
+            let mut tx = OrgTx::begin(&db.pool, scope.org_id())
+                .await
+                .unwrap()
+                .unwrap();
+            tx.audit(&ctx, NewEvent::new("member.add").target("user", owner.id))
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let (org_id, actor, request): (Option<Uuid>, Option<Uuid>, Option<String>) =
+                sqlx::query_as("SELECT org_id, actor_id, request_id FROM audit_events")
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                (org_id, actor, request.as_deref()),
+                (Some(scope.org_id()), Some(owner.id), Some("req-1"))
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn aggregated_events_share_a_row_and_count_concurrent_writers() {
+            let db = migrated().await;
+            let pool = db.pool.clone();
+            let actor = Uuid::new_v4();
+            let mut tasks = Vec::new();
+            for _ in 0..20 {
+                let pool = pool.clone();
+                tasks.push(tokio::spawn(async move {
+                    let ctx = AuditCtx {
+                        actor_id: Some(actor),
+                        request_id: None,
+                    };
+                    record_aggregated(
+                        &pool,
+                        &ctx,
+                        &NewEvent::new("auth.login").result(AuditResult::Failed),
+                        AggScope::Actor,
+                    )
+                    .await
+                    .unwrap();
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let (n, count): (i64, i32) =
+                sqlx::query_as("SELECT count(*), max(event_count) FROM audit_events")
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!((n, count), (1, 20));
+            // The counter may only grow; no other column may change.
+            for sql in [
+                "UPDATE audit_events SET event_count = 1",
+                "UPDATE audit_events SET result = 'success'",
+            ] {
+                assert!(sqlx::query(sql).execute(&db.pool).await.is_err(), "{sql}");
+            }
+            // Another actor gets its own row.
+            record_aggregated(
+                &db.pool,
+                &AuditCtx {
+                    actor_id: Some(Uuid::new_v4()),
+                    request_id: None,
+                },
+                &NewEvent::new("auth.login").result(AuditResult::Failed),
+                AggScope::Actor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(rows(&db.pool, "SELECT count(*) FROM audit_events").await, 2);
+            // With the target in the key, the same actor and action split per target.
+            let ctx = AuditCtx {
+                actor_id: None,
+                request_id: None,
+            };
+            for target in [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()] {
+                for _ in 0..2 {
+                    record_aggregated(
+                        &db.pool,
+                        &ctx,
+                        &NewEvent::new("file.download").target("file_version", target),
+                        AggScope::Target,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            assert_eq!(
+                rows(
+                    &db.pool,
+                    "SELECT count(*) FROM audit_events WHERE action = 'file.download'"
+                )
+                .await,
+                3
+            );
+            // Without it, probing many targets stays one row.
+            for _ in 0..5 {
+                record_aggregated(
+                    &db.pool,
+                    &ctx,
+                    &NewEvent::new("member.change_role")
+                        .result(AuditResult::Denied)
+                        .target("user", Uuid::new_v4()),
+                    AggScope::Actor,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                rows(
+                    &db.pool,
+                    "SELECT count(*) FROM audit_events WHERE action = 'member.change_role'"
+                )
+                .await,
+                1
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn retention_purge_deletes_old_events_in_batches_only() {
+            let db = migrated().await;
+            let (scope, _) = org(&db.pool, "b1").await;
+            let org_id = scope.org_id();
+            let now = OffsetDateTime::now_utc();
+            seed_equal(
+                &db.pool,
+                org_id,
+                25,
+                now - time::Duration::days(400),
+                "file.purge",
+            )
+            .await;
+            seed_equal(
+                &db.pool,
+                org_id,
+                5,
+                now - time::Duration::days(100),
+                "file.purge",
+            )
+            .await;
+            seed_equal(&db.pool, org_id, 3, now, "file.purge").await;
+            assert_eq!(audit::count_expired(&db.pool, 365).await.unwrap(), 25);
+            assert_eq!(audit::purge(&db.pool, 365, 10).await.unwrap(), 10);
+            assert_eq!(audit::purge(&db.pool, 365, 10).await.unwrap(), 10);
+            assert_eq!(audit::purge(&db.pool, 365, 10).await.unwrap(), 5);
+            assert_eq!(audit::purge(&db.pool, 365, 10).await.unwrap(), 0);
+            assert_eq!(rows(&db.pool, "SELECT count(*) FROM audit_events").await, 8);
+            // The delete guard is lifted only inside the purge function.
+            assert!(
+                sqlx::query("DELETE FROM audit_events")
+                    .execute(&db.pool)
+                    .await
+                    .is_err()
+            );
+            // A shorter retention reaches the 100 day old events.
+            assert_eq!(audit::purge(&db.pool, 30, 100).await.unwrap(), 5);
+            assert_eq!(rows(&db.pool, "SELECT count(*) FROM audit_events").await, 3);
+            // Whatever cutoff is passed, nothing newer than 30 days goes.
+            let removed: i64 =
+                sqlx::query_scalar("SELECT audit_purge('infinity'::timestamptz, 1000)")
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(removed, 0);
+            assert_eq!(rows(&db.pool, "SELECT count(*) FROM audit_events").await, 3);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn paging_is_stable_under_equal_timestamps_and_filters_narrow() {
+            let db = migrated().await;
+            let (scope, _) = org(&db.pool, "c1").await;
+            let (other, _) = org(&db.pool, "c2").await;
+            let at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+            seed_equal(&db.pool, scope.org_id(), 25, at, "member.add").await;
+            seed_equal(&db.pool, scope.org_id(), 4, at, "workspace.member.add").await;
+            seed_equal(&db.pool, other.org_id(), 6, at, "member.add").await;
+            let read = sc(&scope, Action::AuditRead);
+
+            // Walk all pages of 7: every event once, strictly descending (time, id).
+            let mut seen = Vec::new();
+            let mut after = None;
+            loop {
+                // One more than the page size tells whether another page follows.
+                let page = audit::list(&db.pool, &read, &AuditFilter::default(), 8, after)
+                    .await
+                    .unwrap();
+                let more = page.len() > 7;
+                let take = page.len().min(7);
+                seen.extend(page.iter().take(take).map(|e| (e.created_at, e.id)));
+                if !more {
+                    break;
+                }
+                after = page.get(take - 1).map(|e| (e.created_at, e.id));
+            }
+            assert_eq!(seen.len(), 29, "only this organization's events");
+            let mut sorted = seen.clone();
+            sorted.sort_by(|a, b| b.cmp(a));
+            sorted.dedup();
+            assert_eq!(sorted, seen, "no repeats, descending order");
+
+            let prefix = AuditFilter {
+                action_prefix: Some("member".to_owned()),
+                ..AuditFilter::default()
+            };
+            assert_eq!(
+                audit::list(&db.pool, &read, &prefix, 100, None)
+                    .await
+                    .unwrap()
+                    .len(),
+                25,
+                "`member` does not match `workspace.member.add`"
+            );
+            let nested = AuditFilter {
+                action_prefix: Some("workspace".to_owned()),
+                ..AuditFilter::default()
+            };
+            assert_eq!(
+                audit::list(&db.pool, &read, &nested, 100, None)
+                    .await
+                    .unwrap()
+                    .len(),
+                4
+            );
+            // `_` in a prefix is no wildcard.
+            let underscore = AuditFilter {
+                action_prefix: Some("workspace.member_add".to_owned()),
+                ..AuditFilter::default()
+            };
+            assert!(
+                audit::list(&db.pool, &read, &underscore, 100, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let window = AuditFilter {
+                from: Some(at + time::Duration::seconds(1)),
+                ..AuditFilter::default()
+            };
+            assert!(
+                audit::list(&db.pool, &read, &window, 100, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let result = AuditFilter {
+                result: Some(AuditResult::Denied),
+                ..AuditFilter::default()
+            };
+            assert!(
+                audit::list(&db.pool, &read, &result, 100, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let bad = AuditFilter {
+                action_prefix: Some("a%".to_owned()),
+                ..AuditFilter::default()
+            };
+            assert!(audit::list(&db.pool, &read, &bad, 10, None).await.is_err());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn listing_needs_the_audit_scope_and_instance_events_stay_apart() {
+            let db = migrated().await;
+            let (scope, _) = org(&db.pool, "d1").await;
+            audit::record(
+                &db.pool,
+                &AuditCtx::system(),
+                &NewEvent::new("storage.rebind"),
+            )
+            .await
+            .unwrap();
+            audit::record(
+                &db.pool,
+                &AuditCtx::system(),
+                &NewEvent::new("file.purge").org(scope.org_id()),
+            )
+            .await
+            .unwrap();
+            // A scope of another action cannot read the log.
+            let wrong = sc(&scope, Action::MemberAdd);
+            assert!(
+                audit::list(&db.pool, &wrong, &AuditFilter::default(), 10, None)
+                    .await
+                    .is_err()
+            );
+            let read = sc(&scope, Action::AuditRead);
+            let own = audit::list(&db.pool, &read, &AuditFilter::default(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(own.len(), 1);
+            assert_eq!(own[0].action, "file.purge");
+            let instance = audit::list_instance(&db.pool, &AuditFilter::default(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(instance.len(), 1);
+            assert_eq!(instance[0].action, "storage.rebind");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn repository_changes_record_exactly_one_event_and_replays_none() {
+            use craftcloud_db::accounts;
+            use craftcloud_db::password_reset::{self, NewResetToken};
+            let db = migrated().await;
+            let user = user(&db.pool, "u1@example.test").await;
+            let ctx = AuditCtx {
+                actor_id: Some(Uuid::new_v4()),
+                request_id: Some("r-1".to_owned()),
+            };
+            let now = OffsetDateTime::now_utc();
+            // Disable: one event; the same state again: none.
+            for _ in 0..2 {
+                accounts::set_disabled_audited(&db.pool, user.id, true, now, &ctx)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                rows(
+                    &db.pool,
+                    "SELECT count(*) FROM audit_events WHERE action = 'user.disable'"
+                )
+                .await,
+                1
+            );
+            accounts::set_disabled_audited(&db.pool, user.id, false, now, &ctx)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows(
+                    &db.pool,
+                    "SELECT count(*) FROM audit_events WHERE action = 'user.enable'"
+                )
+                .await,
+                1
+            );
+            // A reset link: issue once, use once; a replay of the token records nothing.
+            let hash = [7_u8; 32];
+            password_reset::create_audited(
+                &db.pool,
+                &NewResetToken {
+                    user_id: user.id,
+                    token_hash: hash,
+                    created_by: None,
+                    now,
+                    expires_at: now + time::Duration::hours(1),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+            for _ in 0..2 {
+                password_reset::consume_audited(&db.pool, &hash, "hash-value", now, &ctx)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                rows(
+                    &db.pool,
+                    "SELECT count(*) FROM audit_events WHERE action IN ('password_reset.issue', 'password_reset.use')"
+                )
+                .await,
+                2
+            );
+            // Nothing sensitive reached the table.
+            let dump: String = sqlx::query_scalar(
+                "SELECT COALESCE(string_agg(row_to_json(a)::text, ' '), '') FROM audit_events a",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            for needle in ["example.test", "hash-value", "@"] {
+                assert!(!dump.contains(needle), "{needle} in {dump}");
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+        async fn the_runtime_role_cannot_bypass_the_audit_guard() {
+            let admin = PgConnectOptions::from_str(&std::env::var(ENV).unwrap()).unwrap();
+            let suffix = Uuid::new_v4().simple().to_string();
+            let (owner, runtime, other) = (
+                format!("cc_owner_{suffix}"),
+                format!("cc_runtime_{suffix}"),
+                format!("cc_other_{suffix}"),
+            );
+            let (member, sup, runtime2) = (
+                format!("cc_member_{suffix}"),
+                format!("cc_super_{suffix}"),
+                format!("cc_runtime2_{suffix}"),
+            );
+            let db_name = format!("cc_test_{suffix}");
+            let mut conn = PgConnection::connect_with(&admin).await.unwrap();
+            for sql in [
+                format!("CREATE ROLE \"{owner}\" LOGIN PASSWORD 'pw'"),
+                format!("CREATE ROLE \"{runtime}\" LOGIN PASSWORD 'pw'"),
+                format!("CREATE ROLE \"{other}\" LOGIN PASSWORD 'pw'"),
+                format!("CREATE ROLE \"{member}\" LOGIN PASSWORD 'pw'"),
+                format!("CREATE ROLE \"{sup}\" LOGIN SUPERUSER PASSWORD 'pw'"),
+                format!("CREATE ROLE \"{runtime2}\" LOGIN PASSWORD 'pw'"),
+                format!("CREATE DATABASE \"{db_name}\" OWNER \"{owner}\""),
+            ] {
+                sqlx::query(&sql).execute(&mut conn).await.unwrap();
+            }
+            let pool_of = |role: &str| {
+                let options = admin
+                    .clone()
+                    .username(role)
+                    .password("pw")
+                    .database(&db_name);
+                async move {
+                    PgPoolOptions::new()
+                        .max_connections(2)
+                        .acquire_timeout(Duration::from_secs(10))
+                        .connect_with(options)
+                        .await
+                        .unwrap()
+                }
+            };
+            let owner_pool = pool_of(&owner).await;
+            migrate::run(&owner_pool).await.unwrap();
+            migrate::grant_runtime_role(&owner_pool, &runtime)
+                .await
+                .unwrap();
+            // The grant step is repeatable and refuses odd role names.
+            migrate::grant_runtime_role(&owner_pool, &runtime)
+                .await
+                .unwrap();
+            assert!(
+                migrate::grant_runtime_role(&owner_pool, "x\"; DROP TABLE users; --")
+                    .await
+                    .is_err()
+            );
+            let rt = pool_of(&runtime).await;
+            let stranger = pool_of(&other).await;
+
+            // The server's role starts, reads and writes everything it needs.
+            migrate::verify(&rt).await.unwrap();
+            assert_eq!(
+                migrate::audit_guard_is_advisory(&rt).await.unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                migrate::audit_guard_is_advisory(&owner_pool).await.unwrap(),
+                Some(true)
+            );
+            let (scope, _) = org(&rt, "r1").await;
+            audit::record(
+                &rt,
+                &AuditCtx::system(),
+                &NewEvent::new("file.purge").org(scope.org_id()),
+            )
+            .await
+            .unwrap();
+            let now = OffsetDateTime::now_utc();
+            for (days, n) in [(400, 5), (100, 5)] {
+                seed_equal(
+                    &owner_pool,
+                    scope.org_id(),
+                    n,
+                    now - time::Duration::days(days),
+                    "file.purge",
+                )
+                .await;
+            }
+
+            // An insert cannot forge the time or the counter.
+            sqlx::query(
+                "INSERT INTO audit_events (id, action, result, created_at, last_at, event_count) \
+                 VALUES (gen_random_uuid(), 'file.purge', 'success', '2000-01-01', '2000-01-01', 99)",
+            )
+            .execute(&rt)
+            .await
+            .unwrap();
+            assert_eq!(
+                rows(&rt, "SELECT count(*) FROM audit_events WHERE created_at < '2001-01-01' OR event_count = 99").await,
+                0,
+                "the insert guard resets time and counter"
+            );
+
+            // ... but cannot touch the history of the log or the table itself.
+            for sql in [
+                "DELETE FROM audit_events",
+                "TRUNCATE audit_events",
+                "UPDATE audit_events SET action = 'member.add'",
+                "ALTER TABLE audit_events DISABLE TRIGGER ALL",
+                "ALTER TABLE audit_events DISABLE TRIGGER audit_events_no_update_delete",
+                "DROP TRIGGER audit_events_no_update_delete ON audit_events",
+                "DROP TABLE audit_events",
+                "SET session_replication_role = replica",
+                "DELETE FROM _sqlx_migrations",
+                "CREATE OR REPLACE FUNCTION audit_purge(timestamptz, integer) RETURNS bigint AS 'SELECT 0::bigint' LANGUAGE sql",
+            ] {
+                assert!(
+                    sqlx::query(sql).execute(&rt).await.is_err(),
+                    "the runtime role ran: {sql}"
+                );
+            }
+            // Setting the old session switch changes nothing for this role.
+            let mut one = rt.acquire().await.unwrap();
+            sqlx::query("SELECT set_config('craftcloud.audit_purge', 'on', false)")
+                .execute(&mut *one)
+                .await
+                .unwrap();
+            assert!(
+                sqlx::query("DELETE FROM audit_events")
+                    .execute(&mut *one)
+                    .await
+                    .is_err()
+            );
+            drop(one);
+            assert_eq!(rows(&rt, "SELECT count(*) FROM audit_events").await, 12);
+
+            // Retention goes through `audit_purge`, which never reaches below 30 days,
+            // whatever cutoff is passed.
+            let removed: i64 =
+                sqlx::query_scalar("SELECT audit_purge('infinity'::timestamptz, 1000)")
+                    .fetch_one(&rt)
+                    .await
+                    .unwrap();
+            assert_eq!(removed, 10);
+            assert_eq!(rows(&rt, "SELECT count(*) FROM audit_events").await, 2);
+            // A role without the grant cannot call it.
+            assert!(
+                sqlx::query("SELECT audit_purge('infinity'::timestamptz, 1)")
+                    .execute(&stranger)
+                    .await
+                    .is_err()
+            );
+            // Nor can it read or write the table (no grant at all).
+            assert!(
+                sqlx::query("SELECT 1 FROM audit_events")
+                    .execute(&stranger)
+                    .await
+                    .is_err()
+            );
+
+            // Roles that could undo the guard are refused, and the grant checks itself.
+            sqlx::query(&format!("GRANT \"{owner}\" TO \"{member}\""))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert!(matches!(
+                migrate::grant_runtime_role(&owner_pool, &member).await,
+                Err(migrate::GrantError::Privileged(_))
+            ));
+            assert!(matches!(
+                migrate::grant_runtime_role(&owner_pool, &sup).await,
+                Err(migrate::GrantError::Privileged(_))
+            ));
+            assert_eq!(
+                migrate::grant_runtime_role(&owner_pool, &owner).await,
+                Err(migrate::GrantError::SameAsOwner)
+            );
+            assert_eq!(
+                migrate::grant_runtime_role(&owner_pool, &format!("nobody_{suffix}")).await,
+                Err(migrate::GrantError::UnknownRole)
+            );
+            // The startup check: a member of the owner and a superuser are warned about.
+            let member_pool = pool_of(&member).await;
+            assert_eq!(
+                migrate::audit_guard_is_advisory(&member_pool)
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+            let sup_pool = pool_of(&sup).await;
+            assert_eq!(
+                migrate::audit_guard_is_advisory(&sup_pool).await.unwrap(),
+                Some(true)
+            );
+            // A migrating role that does not own the tables cannot grant: the
+            // statements only warn, so the check afterwards fails the call.
+            // (it has some rights on the objects, so PostgreSQL only warns)
+            for sql in [
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO PUBLIC".to_owned(),
+                "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO PUBLIC".to_owned(),
+            ] {
+                sqlx::query(&sql).execute(&owner_pool).await.unwrap();
+            }
+            sqlx::query("GRANT EXECUTE ON FUNCTION audit_purge(timestamptz, integer) TO PUBLIC")
+                .execute(&owner_pool)
+                .await
+                .unwrap();
+            assert!(matches!(
+                migrate::grant_runtime_role(&stranger, &runtime2).await,
+                Err(migrate::GrantError::PrivilegesNotApplied(_))
+            ));
+
+            for pool in [rt, stranger, owner_pool, member_pool, sup_pool] {
+                pool.close().await;
+            }
+            for sql in [
+                format!("DROP DATABASE \"{db_name}\" WITH (FORCE)"),
+                format!("DROP ROLE \"{owner}\""),
+                format!("DROP ROLE \"{runtime}\""),
+                format!("DROP ROLE \"{other}\""),
+                format!("DROP ROLE \"{member}\""),
+                format!("DROP ROLE \"{sup}\""),
+                format!("DROP ROLE \"{runtime2}\""),
+            ] {
+                sqlx::query(&sql).execute(&mut conn).await.unwrap();
+            }
+        }
     }
 }

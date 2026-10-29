@@ -23,6 +23,7 @@ use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::audit::{AuditCtx, Detail, NewEvent};
 use crate::members::OrgTx;
 use crate::organizations::{AfterKey, clamp_page};
 use crate::{DbError, OrgScope};
@@ -389,6 +390,34 @@ pub async fn accept(
     by: &AcceptBy,
     now: OffsetDateTime,
 ) -> Result<AcceptOutcome, DbError> {
+    accept_inner(pool, token_hash, by, now, None).await
+}
+
+/// Like [`accept`], and records the `invitation.accept` audit event (actor:
+/// the accepting account, which may be created by this very call) in the same
+/// transaction. An invitation that cannot be accepted records nothing, so a
+/// replayed acceptance never produces a second event.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert accepts nothing.
+pub async fn accept_audited(
+    pool: &PgPool,
+    token_hash: &[u8; 32],
+    by: &AcceptBy,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<AcceptOutcome, DbError> {
+    accept_inner(pool, token_hash, by, now, Some(audit)).await
+}
+
+async fn accept_inner(
+    pool: &PgPool,
+    token_hash: &[u8; 32],
+    by: &AcceptBy,
+    now: OffsetDateTime,
+    audit: Option<&AuditCtx>,
+) -> Result<AcceptOutcome, DbError> {
     // 1. Organization of the invitation (unlocked read), then the org lock.
     let head: Option<(Uuid, Uuid, String, Uuid)> = sqlx::query_as(
         "SELECT id, org_id, normalized_email, created_by_user_id FROM invitations WHERE token_hash = $1",
@@ -454,6 +483,21 @@ pub async fn accept(
             .bind(now)
             .execute(&mut *otx.tx)
             .await?;
+        if let Some(audit) = audit {
+            // The link died because its creator lost the right to invite: the
+            // state change is recorded (no actor: nobody acted on purpose).
+            otx.audit(
+                &AuditCtx {
+                    actor_id: None,
+                    request_id: audit.request_id.clone(),
+                },
+                NewEvent::new("invitation.invalidate")
+                    .target("invitation", invitation_id)
+                    .workspace_opt(invitation.workspace_id)
+                    .detail("inviter_id", Detail::Id(inviter_id)),
+            )
+            .await?;
+        }
         otx.commit().await?;
         return Ok(AcceptOutcome::Invalid);
     }
@@ -571,6 +615,24 @@ pub async fn accept(
         .bind(account)
         .execute(&mut *otx.tx)
         .await?;
+    if let Some(audit) = audit {
+        let by = AuditCtx {
+            actor_id: Some(account),
+            request_id: audit.request_id.clone(),
+        };
+        otx.audit(
+            &by,
+            NewEvent::new("invitation.accept")
+                .target("invitation", invitation_id)
+                .workspace_opt(workspace.map(|(id, _)| id))
+                .detail("account_created", Detail::Flag(created))
+                .detail(
+                    "workspace_role_applied",
+                    Detail::Flag(workspace_role_applied),
+                ),
+        )
+        .await?;
+    }
     otx.commit().await?;
     Ok(AcceptOutcome::Accepted {
         user_id: account,

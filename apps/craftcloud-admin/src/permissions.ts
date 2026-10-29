@@ -101,6 +101,11 @@ export function canRemoveWorkspaceMember(scope: Scope, target: WorkspaceMember):
   return effectiveWorkspaceRole(scope) === "admin" && target.role !== "admin";
 }
 
+/** The audit log of an organization: owners and admins (the server decides again). */
+export function canReadAudit(organization: Organization | null): boolean {
+  return isOrgManager(organization);
+}
+
 export function canListInvitations(organization: Organization | null): boolean {
   return isOrgManager(organization);
 }

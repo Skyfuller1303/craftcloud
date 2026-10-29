@@ -1,6 +1,9 @@
 import type {
   AcceptedInvitation,
   AcceptInvitationRequest,
+  AuditEvent,
+  AuditFilters,
+  AuditSource,
   CreateFileRequest,
   CreateInvitationRequest,
   CreatedInvitation,
@@ -55,6 +58,10 @@ export const ENDPOINTS = {
     path: "/workspaces/{workspace_id}/members/{user_id}",
   },
   removeWorkspaceMember: { method: "DELETE", path: "/workspaces/{workspace_id}/members/{user_id}" },
+  listOrgAudit: { method: "GET", path: "/organizations/{org_id}/audit" },
+  exportOrgAudit: { method: "GET", path: "/organizations/{org_id}/audit/export" },
+  listInstanceAudit: { method: "GET", path: "/admin/audit" },
+  exportInstanceAudit: { method: "GET", path: "/admin/audit/export" },
   listInvitations: { method: "GET", path: "/organizations/{org_id}/invitations" },
   createInvitation: { method: "POST", path: "/organizations/{org_id}/invitations" },
   revokeInvitation: {
@@ -251,6 +258,10 @@ export interface ApiClient {
   ): Promise<WorkspaceMember>;
   removeWorkspaceMember(workspaceId: string, userId: string): Promise<void>;
 
+  listAudit(source: AuditSource, filters: AuditFilters, cursor?: string): Promise<Page<AuditEvent>>;
+  /** URL of the NDJSON export for a plain link; the browser streams the body, the page never holds it. */
+  auditExportUrl(source: AuditSource, filters: AuditFilters): string;
+
   listInvitations(orgId: string, cursor?: string): Promise<Page<Invitation>>;
   createInvitation(orgId: string, body: CreateInvitationRequest): Promise<CreatedInvitation>;
   revokeInvitation(orgId: string, invitationId: string): Promise<void>;
@@ -311,6 +322,17 @@ export const etag = {
   project: (version: number) => `"prj-v${version}"`,
   content: (versionId: string) => `"version:${versionId}"`,
 };
+
+/** The non-empty filters as query parameters. */
+function auditQuery(filters: AuditFilters): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(filters)) {
+    if (typeof value === "string" && value !== "") {
+      out[key] = value;
+    }
+  }
+  return out;
+}
 
 export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   let csrfToken: string | null = null;
@@ -464,6 +486,25 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       call(ENDPOINTS.removeWorkspaceMember, {
         params: { workspace_id: workspaceId, user_id: userId },
       }),
+
+    listAudit: (source, filters, cursor) =>
+      call(source.kind === "organization" ? ENDPOINTS.listOrgAudit : ENDPOINTS.listInstanceAudit, {
+        params: source.kind === "organization" ? { org_id: source.orgId } : {},
+        query: { limit: "50", cursor, ...auditQuery(filters) },
+      }),
+    auditExportUrl(source, filters) {
+      const endpoint =
+        source.kind === "organization" ? ENDPOINTS.exportOrgAudit : ENDPOINTS.exportInstanceAudit;
+      const params = source.kind === "organization" ? { org_id: source.orgId } : {};
+      const search = new URLSearchParams();
+      for (const [key, value] of Object.entries(auditQuery(filters))) {
+        if (value !== undefined) {
+          search.set(key, value);
+        }
+      }
+      const query = search.toString();
+      return API_BASE + expandPath(endpoint.path, params) + (query === "" ? "" : `?${query}`);
+    },
 
     listInvitations: (orgId, cursor) =>
       call(ENDPOINTS.listInvitations, {

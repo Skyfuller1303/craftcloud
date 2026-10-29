@@ -12,6 +12,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 
 /// Result of [`set_org_owner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,7 @@ pub async fn set_org_owner(
     .bind(user_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let was_member = existing.is_some();
     let outcome = match existing {
         Some((role, status)) if role == "owner" && status == "active" => {
             return Ok(SetOwnerOutcome::AlreadyOwner { org_id, user_id });
@@ -112,6 +114,16 @@ pub async fn set_org_owner(
             SetOwnerOutcome::Added { org_id, user_id }
         }
     };
+    // Offline break-glass tool: the event has no actor and no request.
+    record_in(
+        &mut tx,
+        &AuditCtx::system(),
+        &NewEvent::new("organization.owner_recover")
+            .org(org_id)
+            .target("user", user_id)
+            .detail("was_member", Detail::Flag(was_member)),
+    )
+    .await?;
     tx.commit().await?;
     Ok(outcome)
 }

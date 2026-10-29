@@ -244,6 +244,7 @@ name = "craftcloud-db"
 version = "0.0.0"
 dependencies = [
  "craftcloud-core",
+ "serde_json",
  "sqlx",
  "time",
  "tokio",

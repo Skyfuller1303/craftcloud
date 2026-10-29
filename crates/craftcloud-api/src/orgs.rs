@@ -22,6 +22,7 @@ use craftcloud_core::policy::{
 };
 use craftcloud_core::{DisplayName, Slug};
 use craftcloud_db::accounts::DisableOutcome;
+use craftcloud_db::audit::Detail;
 use craftcloud_db::members::{AddOutcome, Member, OrgTx, RemoveOutcome, RoleOutcome};
 use craftcloud_db::organizations::{
     self, CreateOutcome, NewOrganization, Organization, UpdateOutcome,
@@ -32,6 +33,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+use crate::audit::{Change, Denied, commit_audited};
 use crate::pagination::{
     PageError, PageQuery, UserListQuery, decode_time_cursor, encode_time_cursor,
 };
@@ -153,7 +155,15 @@ pub(crate) fn gate(
         Decision::Allow(permit) => Gate::Open(permit),
         Decision::Forbidden => {
             audit(headers, actor, action_name, org, target, "forbidden");
-            Gate::Closed(forbidden(headers))
+            let mut response = forbidden(headers);
+            // Stored as an aggregated audit row by `audit::record_denials`.
+            response.extensions_mut().insert(Denied {
+                actor,
+                action: action_name.to_owned(),
+                org,
+                target,
+            });
+            Gate::Closed(response)
         }
         Decision::Hidden => {
             audit(headers, actor, action_name, org, target, "hidden");
@@ -395,6 +405,15 @@ pub(crate) async fn update_org(
     };
     // An unparsable value can never match the current version.
     let expected = if_match.to_str().ok().and_then(parse_etag).unwrap_or(-1);
+    // Read under the lock, so the audit event states what really changed.
+    let name_before = match tx.current_name().await {
+        Ok(value) => value,
+        Err(error) => return db_failure(&error, &headers, "organization update failed"),
+    };
+    let invites_before = match tx.workspace_admin_invites_enabled().await {
+        Ok(value) => value,
+        Err(error) => return db_failure(&error, &headers, "organization update failed"),
+    };
     match tx
         .update_settings(
             &scope,
@@ -405,17 +424,32 @@ pub(crate) async fn update_org(
         .await
     {
         Ok(UpdateOutcome::Updated(org)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "organization.update",
+                    org_id,
+                    Some(org_id),
+                )
+                .detail(
+                    "name_changed",
+                    Detail::Flag(name.as_ref().is_some_and(|n| n.as_str() != name_before)),
+                )
+                .detail(
+                    "invites_setting_changed",
+                    Detail::Flag(
+                        request
+                            .workspace_admin_invites_enabled
+                            .is_some_and(|value| value != invites_before),
+                    ),
+                ),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "organization update failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "organization.update",
-                Some(org_id),
-                None,
-                "success",
-            );
             let version = org.version;
             with_etag(Json(org_json(&org, role)).into_response(), version)
         }
@@ -600,17 +634,21 @@ pub(crate) async fn add_member(
     };
     match outcome {
         AddOutcome::Added(member) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "member.add",
+                    org_id,
+                    Some(user_id),
+                )
+                .detail("role", Detail::Code(role.as_str())),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "member add failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "member.add",
-                Some(org_id),
-                Some(user_id),
-                "success",
-            );
             (StatusCode::CREATED, Json(member_json(&member))).into_response()
         }
         AddOutcome::AlreadyMember => {
@@ -700,17 +738,25 @@ pub(crate) async fn change_role(
     };
     match tx.set_role(&scope, target_id, new_role).await {
         Ok(RoleOutcome::Changed(member)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "member.change_role",
+                    org_id,
+                    Some(target_id),
+                )
+                .detail("role", Detail::Code(new_role.as_str()))
+                .detail(
+                    "previous_role",
+                    Detail::Code(target_role.map_or("none", OrgRole::as_str)),
+                ),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "role change failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "member.change_role",
-                Some(org_id),
-                Some(target_id),
-                "success",
-            );
             Json(member_json(&member)).into_response()
         }
         Ok(RoleOutcome::Unchanged(member)) => Json(member_json(&member)).into_response(),
@@ -795,17 +841,25 @@ pub(crate) async fn remove_member(
     };
     match tx.remove(&scope, target_id).await {
         Ok(RemoveOutcome::Removed) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "member.remove",
+                    org_id,
+                    Some(target_id),
+                )
+                .detail(
+                    "role",
+                    Detail::Code(target_role.map_or("none", OrgRole::as_str)),
+                )
+                .detail("self_removal", Detail::Flag(target_id == session.user_id)),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "member removal failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "member.remove",
-                Some(org_id),
-                Some(target_id),
-                "success",
-            );
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(RemoveOutcome::NotMember) => not_found(&headers),
@@ -904,13 +958,14 @@ pub(crate) async fn create_org(
     let (Ok(name), Ok(slug), Some(owner_user_id)) = (name, slug, owner) else {
         return validation_failed(&invalid, &headers);
     };
-    let created = organizations::create_with_owner(
+    let created = organizations::create_with_owner_audited(
         &services.pool,
         &NewOrganization {
             slug: slug.as_str().to_owned(),
             name: name.as_str().to_owned(),
             owner_user_id,
         },
+        &crate::audit::ctx(&headers, Some(session.user_id)),
     )
     .await;
     match created {
@@ -1145,7 +1200,15 @@ async fn set_user_disabled(
     let Some(user_id) = parse_id(&user_raw) else {
         return not_found(&headers);
     };
-    match accounts::set_disabled(&services.pool, user_id, disable, services.clock.now()).await {
+    match accounts::set_disabled_audited(
+        &services.pool,
+        user_id,
+        disable,
+        services.clock.now(),
+        &crate::audit::ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
         Ok(DisableOutcome::Changed {
             orphaned_organizations,
         }) => {

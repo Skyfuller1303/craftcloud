@@ -24,6 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use craftcloud_core::policy::{Action, Actor, OrgMembership, Resource, WorkspaceMembership, can};
+use craftcloud_db::audit::Detail;
 use craftcloud_db::members::OrgTx;
 use craftcloud_db::uploads::{
     self, AbortOutcome, BeginOutcome, NewUpload, QuotaSetOutcome, StoreOutcome,
@@ -36,6 +37,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::audit::{Change, commit_audited};
 use crate::orgs::{
     Gate, audit, conflict, db_failure, gate, not_found, operator_gate, page_error, parse_id,
     rfc3339,
@@ -1028,20 +1030,28 @@ pub(crate) async fn set_org_quota(
         Ok(None) => return not_found(&headers),
         Err(error) => return db_failure(&error, &headers, "quota update failed"),
     };
-    if let Err(error) = tx.org_quota_set(quota).await {
+    let changed = match tx.org_quota_set(quota).await {
+        Ok(changed) => changed,
+        Err(error) => return db_failure(&error, &headers, "quota update failed"),
+    };
+    // Setting the value it already has changes nothing and records nothing.
+    let done = if changed {
+        let change = Change::new(
+            &headers,
+            session.user_id,
+            "organization.quota",
+            org_id,
+            Some(org_id),
+        )
+        .detail("unlimited", Detail::Flag(quota.is_none()))
+        .detail("quota_bytes", Detail::Count(quota.unwrap_or(0)));
+        commit_audited(tx, change).await
+    } else {
+        tx.commit().await
+    };
+    if let Err(error) = done {
         return db_failure(&error, &headers, "quota update failed");
     }
-    if let Err(error) = tx.commit().await {
-        return db_failure(&error, &headers, "quota update failed");
-    }
-    audit(
-        &headers,
-        session.user_id,
-        "organization.quota",
-        Some(org_id),
-        None,
-        "success",
-    );
     Json(json!({ "quota_bytes": quota })).into_response()
 }
 
@@ -1091,18 +1101,25 @@ pub(crate) async fn set_workspace_quota(
         return validation_failed(&["quota_bytes"], &headers);
     };
     match tx.workspace_quota_set(&scope, workspace_id, quota).await {
-        Ok(QuotaSetOutcome::Set) => {
-            if let Err(error) = tx.commit().await {
+        Ok(outcome @ (QuotaSetOutcome::Set | QuotaSetOutcome::Unchanged)) => {
+            let done = if outcome == QuotaSetOutcome::Set {
+                let change = Change::new(
+                    &headers,
+                    session.user_id,
+                    "workspace.quota",
+                    org_id,
+                    Some(workspace_id),
+                )
+                .workspace(workspace_id)
+                .detail("unlimited", Detail::Flag(quota.is_none()))
+                .detail("quota_bytes", Detail::Count(quota.unwrap_or(0)));
+                commit_audited(tx, change).await
+            } else {
+                tx.commit().await
+            };
+            if let Err(error) = done {
                 return db_failure(&error, &headers, "quota update failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "workspace.quota",
-                Some(org_id),
-                Some(workspace_id),
-                "success",
-            );
             Json(json!({ "quota_bytes": quota })).into_response()
         }
         Ok(QuotaSetOutcome::ExceedsOrganization) => validation_failed(&["quota_bytes"], &headers),

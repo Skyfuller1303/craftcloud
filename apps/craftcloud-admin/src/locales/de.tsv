@@ -319,3 +319,45 @@
 	Your password was changed. Log in with the new password.	Dein Passwort wurde geändert. Melde dich mit dem neuen Passwort an.
 	Go to log in	Zur Anmeldung
 	This reset link is not valid any more. Ask for a new one.	Dieser Rücksetzlink ist nicht mehr gültig. Bitte um einen neuen.
+
+# Activity log (CC-F11)
+	Only organization owners and admins can see the activity log.	Nur Inhaber und Admins der Organisation können das Aktivitätsprotokoll sehen.
+	Sign-in and sessions	Anmeldung und Sitzungen
+	Instance setup	Einrichtung der Instanz
+	Account status	Kontostatus
+	Password resets	Passwort-Zurücksetzungen
+	Storage binding	Speicherbindung
+	Maintenance	Wartung
+	Audit exports	Protokoll-Exporte
+	Workspaces and workspace members	Workspaces und Workspace-Mitglieder
+	Success	Erfolgreich
+	Denied	Abgelehnt
+	Failed	Fehlgeschlagen
+	Enter a valid user ID.	Gib eine gültige Nutzer-ID ein.
+	The end date must not be before the start date.	Das Enddatum darf nicht vor dem Startdatum liegen.
+	Events contain identifiers and codes only, never names, e-mail addresses or file contents.	Ereignisse enthalten nur IDs und Codes, nie Namen, E-Mail-Adressen oder Dateiinhalte.
+	Log	Protokoll
+	This organization	Diese Organisation
+	Instance (operator)	Instanz (Betreiber)
+	Filters	Filter
+	Action	Aktion
+	All actions	Alle Aktionen
+	Result	Ergebnis
+	All results	Alle Ergebnisse
+	All workspaces	Alle Workspaces
+	Actor (user ID)	Auslösende Person (Nutzer-ID)
+	From	Von
+	To	Bis
+	Apply filters	Filter anwenden
+	Reset filters	Filter zurücksetzen
+	Events	Ereignisse
+	Export as NDJSON	Als NDJSON exportieren
+	There are no matching events.	Es gibt keine passenden Ereignisse.
+	Loading activity…	Aktivität wird geladen…
+	Time	Zeit
+	Actor	Auslösende Person
+	Target	Ziel
+	Details	Details
+	Request ID	Anfrage-ID
+	{count} times, latest {time}	{count}-mal, zuletzt {time}
+	System or unknown	System oder unbekannt

@@ -1,4 +1,6 @@
 # Normalized view of contracts/openapi.yaml. Regenerate with `cargo xtask openapi-snapshot --update`.
+GET /api/v1/admin/audit auth=cookie req=- ok=AuditEventPage codes=200,400,401,403,422,500,503
+GET /api/v1/admin/audit/export auth=cookie req=- ok=- codes=200,400,401,403,422,500,503
 GET /api/v1/admin/maintenance auth=cookie req=- ok=MaintenanceStatus codes=200,401,403,500,503
 GET /api/v1/admin/organizations auth=cookie req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf req=QuotaRequest ok=QuotaResponse codes=200,401,403,404,413,415,422,500,503
@@ -32,6 +34,8 @@ GET /api/v1/organizations auth=cookie req=- ok=MyOrganizationPage codes=200,400,
 POST /api/v1/organizations auth=cookie+csrf req=CreateOrganizationRequest ok=CreatedOrganization codes=201,401,403,413,415,422,500,503
 GET /api/v1/organizations/{org_id} auth=cookie req=- ok=Organization codes=200,401,404,500,503
 PATCH /api/v1/organizations/{org_id} auth=cookie+csrf req=UpdateOrganizationRequest ok=Organization codes=200,401,403,404,412,413,415,422,428,500,503
+GET /api/v1/organizations/{org_id}/audit auth=cookie req=- ok=AuditEventPage codes=200,400,401,403,404,422,500,503
+GET /api/v1/organizations/{org_id}/audit/export auth=cookie req=- ok=- codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/invitations auth=cookie req=- ok=InvitationPage codes=200,400,401,403,404,422,500,503
 POST /api/v1/organizations/{org_id}/invitations auth=cookie+csrf req=CreateInvitationRequest ok=CreatedInvitation codes=201,401,403,404,409,413,415,422,429,500,503
 DELETE /api/v1/organizations/{org_id}/invitations/{invitation_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
@@ -70,6 +74,8 @@ AddMemberRequest
 AddWorkspaceMemberRequest
 AdminUser
 AdminUserPage
+AuditEvent
+AuditEventPage
 ChangePasswordRequest
 ChangeRoleRequest
 ChangeWorkspaceRoleRequest

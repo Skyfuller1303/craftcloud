@@ -58,6 +58,196 @@ pub async fn run(pool: &PgPool) -> Result<Vec<Applied>, DbError> {
     run_with(pool, &MIGRATOR).await
 }
 
+/// Whether `name` is usable as the runtime role name: a plain unquoted
+/// identifier (letters, digits, underscore; not starting with a digit).
+#[must_use]
+pub fn valid_role_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name.len() <= 63
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Why [`grant_runtime_role`] refused or failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantError {
+    /// Not a plain role name.
+    InvalidName,
+    /// The runtime role is the role that runs the migration: it would lose
+    /// (or keep) rights that belong to the owner.
+    SameAsOwner,
+    /// The role could undo the audit guard: superuser, a member of the table
+    /// owner or of the schema owner (which includes the database owner).
+    Privileged(&'static str),
+    /// The role does not exist.
+    UnknownRole,
+    /// After the grants the role lacks a needed privilege or still has a
+    /// forbidden one; most often the migrating role does not own the tables
+    /// (migrate once with the role that owns the schema, see the deployment guide).
+    PrivilegesNotApplied(String),
+    /// A database failure.
+    Db(DbError),
+}
+
+impl std::fmt::Display for GrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName => write!(f, "the runtime role name is not a plain identifier"),
+            Self::SameAsOwner => write!(
+                f,
+                "the runtime role is the role that runs the migration; use a separate owner role for CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE"
+            ),
+            Self::Privileged(why) => write!(f, "the runtime role must not be {why}"),
+            Self::UnknownRole => write!(f, "the runtime role does not exist"),
+            Self::PrivilegesNotApplied(what) => write!(
+                f,
+                "the grants did not take effect ({what}); the migrating role must own the tables and functions"
+            ),
+            Self::Db(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for GrantError {}
+
+impl From<sqlx::Error> for GrantError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(DbError::from(error))
+    }
+}
+
+/// Gives the runtime role the data privileges the server needs, and no more
+/// (run by the owner role after [`run`]; idempotent, safe to repeat):
+/// `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the application tables, `SELECT`
+/// only on the migration history, only `SELECT`/`INSERT`/`UPDATE` on
+/// `audit_events` (never `DELETE` or `TRUNCATE`, so old events can only go
+/// through `audit_purge`), sequence usage, and `EXECUTE` on `audit_purge`.
+/// The role is not made owner of anything.
+///
+/// Nothing is changed for a role that could undo the guard (superuser, member
+/// of the table or schema owner), for the migrating role itself, or for an
+/// unknown role. Afterwards the privileges are checked one by one; a missing
+/// needed or a present forbidden privilege fails the call.
+///
+/// # Errors
+///
+/// [`GrantError`].
+pub async fn grant_runtime_role(pool: &PgPool, role: &str) -> Result<(), GrantError> {
+    if !valid_role_name(role) {
+        return Err(GrantError::InvalidName);
+    }
+    let me: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(pool)
+        .await?;
+    if me == role {
+        return Err(GrantError::SameAsOwner);
+    }
+    let facts: Option<(bool, bool, bool)> = sqlx::query_as(
+        "SELECT r.rolsuper, \
+                COALESCE(pg_has_role(r.oid, c.relowner, 'MEMBER'), false), \
+                COALESCE(pg_has_role(r.oid, n.nspowner, 'MEMBER'), false) \
+         FROM pg_roles r \
+         LEFT JOIN pg_class c ON c.oid = to_regclass('public.audit_events') \
+         LEFT JOIN pg_namespace n ON n.nspname = 'public' \
+         WHERE r.rolname = $1",
+    )
+    .bind(role)
+    .fetch_optional(pool)
+    .await?;
+    match facts {
+        None => return Err(GrantError::UnknownRole),
+        Some((true, _, _)) => return Err(GrantError::Privileged("a superuser")),
+        Some((_, true, _)) => {
+            return Err(GrantError::Privileged(
+                "a member of the role that owns the audit log table",
+            ));
+        }
+        Some((_, _, true)) => {
+            return Err(GrantError::Privileged(
+                "a member of the role that owns the schema (or the database)",
+            ));
+        }
+        Some(_) => {}
+    }
+    let quoted = format!("\"{role}\"");
+    let statements = [
+        format!("GRANT USAGE ON SCHEMA public TO {quoted}"),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {quoted}"),
+        format!("REVOKE INSERT, UPDATE, DELETE ON _sqlx_migrations FROM {quoted}"),
+        format!("REVOKE DELETE, TRUNCATE ON audit_events FROM {quoted}"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {quoted}"),
+        format!("GRANT EXECUTE ON FUNCTION audit_purge(timestamptz, integer) TO {quoted}"),
+    ];
+    let mut tx = pool.begin().await?;
+    for statement in &statements {
+        sqlx::query(statement).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+
+    // A GRANT by a role that does not own the objects only warns; check.
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname || ':' || p \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         CROSS JOIN LATERAL unnest(CASE c.relname \
+             WHEN '_sqlx_migrations' THEN ARRAY['SELECT'] \
+             WHEN 'audit_events' THEN ARRAY['SELECT', 'INSERT', 'UPDATE'] \
+             ELSE ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE'] END) AS p \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' \
+           AND NOT has_table_privilege($1, c.oid, p) \
+         UNION ALL \
+         SELECT 'audit_purge:EXECUTE' \
+         WHERE NOT has_function_privilege($1, 'audit_purge(timestamptz, integer)', 'EXECUTE')",
+    )
+    .bind(role)
+    .fetch_all(pool)
+    .await?;
+    if !missing.is_empty() {
+        return Err(GrantError::PrivilegesNotApplied(format!(
+            "missing {}",
+            missing.join(", ")
+        )));
+    }
+    let forbidden: Vec<String> = sqlx::query_scalar(
+        "SELECT p FROM unnest(ARRAY['DELETE', 'TRUNCATE', 'TRIGGER', 'REFERENCES']) AS p \
+         WHERE has_table_privilege($1, 'public.audit_events', p) \
+         UNION ALL \
+         SELECT 'MODIFY MIGRATIONS' FROM unnest(ARRAY['INSERT', 'UPDATE', 'DELETE']) AS p \
+         WHERE has_table_privilege($1, 'public._sqlx_migrations', p)",
+    )
+    .bind(role)
+    .fetch_all(pool)
+    .await?;
+    if !forbidden.is_empty() {
+        return Err(GrantError::PrivilegesNotApplied(format!(
+            "still allowed: {}",
+            forbidden.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the append-only guard of `audit_events` is only advisory for the
+/// connected role: it owns the table, is a member of the table owner or of
+/// the schema owner (this includes the database owner), or is a superuser.
+/// `None` if the table does not exist yet.
+///
+/// # Errors
+///
+/// Database failures only.
+pub async fn audit_guard_is_advisory(pool: &PgPool) -> Result<Option<bool>, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(pg_has_role(current_user, c.relowner, 'MEMBER'), false) \
+             OR COALESCE(pg_has_role(current_user, n.nspowner, 'MEMBER'), false) \
+             OR COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) \
+         FROM pg_class c, pg_namespace n \
+         WHERE c.oid = to_regclass('public.audit_events') AND n.nspname = 'public'",
+    )
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// Like [`run`] with an explicit migrator (for upgrade tests).
 ///
 /// Holds sqlx's advisory lock for the whole run and releases it on every
@@ -207,13 +397,16 @@ mod tests {
 
     #[test]
     fn embedded_migrations_are_ordered_and_complete() {
-        assert_eq!(embedded_versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            embedded_versions(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
     }
 
     #[test]
     fn migrator_up_to_filters() {
         assert_eq!(migrator_up_to(1).iter().count(), 1);
         assert_eq!(migrator_up_to(0).iter().count(), 0);
-        assert_eq!(migrator_up_to(99).iter().count(), 10);
+        assert_eq!(migrator_up_to(99).iter().count(), 12);
     }
 }

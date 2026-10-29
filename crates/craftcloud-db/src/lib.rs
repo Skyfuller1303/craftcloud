@@ -14,6 +14,7 @@
 //! supplies the connection URL.
 
 pub mod accounts;
+pub mod audit;
 mod error;
 pub mod files;
 pub mod invitations;

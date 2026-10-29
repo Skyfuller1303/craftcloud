@@ -46,6 +46,8 @@ const DEFAULT_VERSION_RETENTION_DAYS: u64 = 30;
 const VERSION_RETENTION_DAYS_RANGE: (u64, u64) = (1, 3650);
 const DEFAULT_QUARANTINE_DAYS: u64 = 30;
 const QUARANTINE_DAYS_RANGE: (u64, u64) = (1, 3650);
+const DEFAULT_AUDIT_RETENTION_DAYS: u64 = 365;
+const AUDIT_RETENTION_DAYS_RANGE: (u64, u64) = (30, 3650);
 const DEFAULT_VERIFY_BYTES_PER_RUN: u64 = 1024 * 1024 * 1024;
 const VERIFY_BYTES_PER_RUN_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 
@@ -58,7 +60,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 23] = [
+const SUPPORTED_KEYS: [&str; 27] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -82,6 +84,10 @@ const SUPPORTED_KEYS: [&str; 23] = [
     "QUARANTINE_DAYS",
     "MAINTENANCE_ENABLED",
     "ADMIN_DIR",
+    "AUDIT_RETENTION_DAYS",
+    "AUDIT_DOWNLOADS",
+    "MIGRATE_DATABASE_URL_FILE",
+    "DATABASE_RUNTIME_ROLE",
 ];
 
 /// Log output format.
@@ -104,6 +110,13 @@ pub struct DatabaseSettings {
     pub max_connections: u32,
     /// Time allowed to establish a connection.
     pub connect_timeout: Duration,
+    /// Secret file with the URL of the **owner** role that `migrate` uses
+    /// (`CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE`). `None`: single-role mode,
+    /// `migrate` uses `url_file` and the audit guard is advisory.
+    pub migrate_url_file: Option<PathBuf>,
+    /// Name of the runtime role that `migrate` grants data privileges to
+    /// (`CRAFTCLOUD_DATABASE_RUNTIME_ROLE`); set exactly when `migrate_url_file` is.
+    pub runtime_role: Option<String>,
 }
 
 /// One configuration problem, tied to a key name.
@@ -190,6 +203,11 @@ pub struct Config {
     /// Directory with the built admin UI (`apps/craftcloud-admin/dist`), served
     /// under `/admin`. `None` serves no UI. Validated when the server starts.
     pub admin_dir: Option<PathBuf>,
+    /// Audit events older than this many days are deleted by the maintenance
+    /// job (ADR-0016: 365 days by default, at least 30).
+    pub audit_retention_days: u32,
+    /// Whether file downloads are recorded as audit events.
+    pub audit_downloads: bool,
 }
 
 impl Config {
@@ -300,6 +318,32 @@ impl Config {
                 Ok(path)
             }
         });
+        let migrate_url_file = field(&mut errors, env, "MIGRATE_DATABASE_URL_FILE", |key, raw| {
+            parse_absolute_path(key, raw)
+        });
+        let runtime_role = field(&mut errors, env, "DATABASE_RUNTIME_ROLE", |key, raw| {
+            let name = raw.trim();
+            if craftcloud_db::migrate::valid_role_name(name) {
+                Ok(name.to_owned())
+            } else {
+                Err(ConfigError::new(
+                    key,
+                    "must be a plain role name (letters, digits and underscore, at most 63 characters)",
+                ))
+            }
+        });
+        if migrate_url_file.is_some() != runtime_role.is_some() {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}DATABASE_RUNTIME_ROLE"),
+                "CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE and CRAFTCLOUD_DATABASE_RUNTIME_ROLE must be set together",
+            ));
+        }
+        if migrate_url_file.is_some() && db_url_file.is_none() {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}MIGRATE_DATABASE_URL_FILE"),
+                "requires CRAFTCLOUD_DATABASE_URL_FILE (the runtime role's URL)",
+            ));
+        }
         let db_max_connections = field(&mut errors, env, "DATABASE_MAX_CONNECTIONS", |key, raw| {
             parse_ranged(key, raw, DB_MAX_CONNECTIONS_RANGE)
         })
@@ -392,6 +436,18 @@ impl Config {
                 },
             )
             .unwrap_or(true);
+        let audit_retention_days = field(&mut errors, env, "AUDIT_RETENTION_DAYS", |key, raw| {
+            parse_ranged(key, raw, AUDIT_RETENTION_DAYS_RANGE)
+        })
+        .unwrap_or(DEFAULT_AUDIT_RETENTION_DAYS);
+        let audit_downloads = field(&mut errors, env, "AUDIT_DOWNLOADS", |key, raw| {
+            match raw.trim() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(ConfigError::new(key, "must be `true` or `false`")),
+            }
+        })
+        .unwrap_or(true);
         let admin_dir = field(&mut errors, env, "ADMIN_DIR", |key, raw| {
             let path = PathBuf::from(raw.trim());
             if raw.trim().is_empty() || !path.is_absolute() {
@@ -447,6 +503,8 @@ impl Config {
                     url_file: db_url_file,
                     max_connections: u32::try_from(db_max_connections).unwrap_or(u32::MAX),
                     connect_timeout: Duration::from_secs(db_connect_timeout_secs),
+                    migrate_url_file,
+                    runtime_role,
                 },
                 bootstrap_secret_file,
                 public_origin,
@@ -463,6 +521,8 @@ impl Config {
                 quarantine_retention: Duration::from_secs(quarantine_days * 24 * 3600),
                 maintenance_enabled,
                 admin_dir,
+                audit_retention_days: u32::try_from(audit_retention_days).unwrap_or(u32::MAX),
+                audit_downloads,
             })
         } else {
             Err(errors)
@@ -790,6 +850,69 @@ mod tests {
         for bad in ["0", "3651", "x", "-1"] {
             let key = "CRAFTCLOUD_QUARANTINE_DAYS";
             assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        // Audit retention (ADR-0016): one year by default, 30 days at least.
+        assert_eq!(defaults.audit_retention_days, 365);
+        assert!(defaults.audit_downloads);
+        let audit = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_AUDIT_RETENTION_DAYS", "30"),
+            ("CRAFTCLOUD_AUDIT_DOWNLOADS", "false"),
+        ]))
+        .unwrap();
+        assert_eq!(audit.audit_retention_days, 30);
+        assert!(!audit.audit_downloads);
+        for (key, bad) in [
+            ("CRAFTCLOUD_AUDIT_RETENTION_DAYS", "29"),
+            ("CRAFTCLOUD_AUDIT_RETENTION_DAYS", "3651"),
+            ("CRAFTCLOUD_AUDIT_RETENTION_DAYS", "1y"),
+            ("CRAFTCLOUD_AUDIT_DOWNLOADS", "yes"),
+            ("CRAFTCLOUD_AUDIT_DOWNLOADS", ""),
+        ] {
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        // Role separation: both keys together, and the runtime URL must exist.
+        let abs = if cfg!(windows) {
+            "C:/secrets/db"
+        } else {
+            "/run/secrets/db"
+        };
+        let roles = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+            ("CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE", abs),
+            ("CRAFTCLOUD_DATABASE_RUNTIME_ROLE", "craftcloud_app"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            roles.database.runtime_role.as_deref(),
+            Some("craftcloud_app")
+        );
+        assert!(roles.database.migrate_url_file.is_some());
+        assert!(defaults.database.migrate_url_file.is_none());
+        for set in [
+            vec![
+                ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+                ("CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE", abs),
+            ],
+            vec![
+                ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+                ("CRAFTCLOUD_DATABASE_RUNTIME_ROLE", "app"),
+            ],
+            vec![
+                ("CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE", abs),
+                ("CRAFTCLOUD_DATABASE_RUNTIME_ROLE", "app"),
+            ],
+            vec![
+                ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+                ("CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE", abs),
+                ("CRAFTCLOUD_DATABASE_RUNTIME_ROLE", "a\"b"),
+            ],
+            vec![
+                ("CRAFTCLOUD_DATABASE_URL_FILE", abs),
+                ("CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE", "relative"),
+                ("CRAFTCLOUD_DATABASE_RUNTIME_ROLE", "app"),
+            ],
+        ] {
+            assert!(Config::from_env_map(&env(&set)).is_err(), "{set:?}");
         }
         let maintenance = Config::from_env_map(&env(&[
             ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "10"),

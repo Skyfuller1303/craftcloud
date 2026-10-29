@@ -239,6 +239,10 @@ pub enum Action {
     VersionRestore,
     /// Read the status of the maintenance job (operator).
     MaintenanceRead,
+    /// Read and export the audit log of an organization (owner, admin).
+    AuditRead,
+    /// Read and export the instance-level audit log (operator).
+    InstanceAuditRead,
 }
 
 impl Action {
@@ -252,6 +256,8 @@ impl Action {
             | Self::OrganizationListAll
             | Self::UserListAll
             | Self::MaintenanceRead
+            | Self::AuditRead
+            | Self::InstanceAuditRead
             | Self::MemberList
             | Self::WorkspaceRead
             | Self::WorkspaceList
@@ -301,7 +307,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 50] = [
+    pub const ALL: [Action; 52] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -352,6 +358,8 @@ impl Action {
         Action::VersionCommit,
         Action::VersionRestore,
         Action::MaintenanceRead,
+        Action::AuditRead,
+        Action::InstanceAuditRead,
     ];
 }
 
@@ -541,6 +549,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             | A::OrganizationListAll
             | A::UserListAll
             | A::MaintenanceRead
+            | A::InstanceAuditRead
             | A::OrganizationQuotaSet
             | A::UserDisable
             | A::UserEnable
@@ -901,6 +910,13 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             None => Decision::Hidden,
         },
 
+        // ---- audit log ----
+        (A::AuditRead, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+            Some(OrgRole::Member) => Decision::Forbidden,
+            None => Decision::Hidden,
+        },
+
         // ---- invitations ----
         (A::InvitationList, Resource::Invitation { org_id, .. }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
@@ -1162,6 +1178,7 @@ mod tests {
             Action::OrganizationListAll,
             Action::UserListAll,
             Action::MaintenanceRead,
+            Action::InstanceAuditRead,
             Action::OrganizationQuotaSet,
             Action::UserDisable,
             Action::UserEnable,
@@ -1401,6 +1418,8 @@ mod tests {
             Action::VersionCommit,
             Action::VersionRestore,
             Action::MaintenanceRead,
+            Action::AuditRead,
+            Action::InstanceAuditRead,
         ]
         .into_iter()
         .collect();
@@ -1456,7 +1475,9 @@ mod tests {
                 | Action::FileDownload
                 | Action::VersionCommit
                 | Action::VersionRestore
-                | Action::MaintenanceRead => {}
+                | Action::MaintenanceRead
+                | Action::AuditRead
+                | Action::InstanceAuditRead => {}
             }
             assert!(
                 covered.contains(&action),
@@ -1490,7 +1511,9 @@ mod tests {
                 Action::VersionList,
                 Action::VersionRead,
                 Action::FileDownload,
-                Action::MaintenanceRead
+                Action::MaintenanceRead,
+                Action::AuditRead,
+                Action::InstanceAuditRead
             ]
         );
     }
@@ -1624,6 +1647,30 @@ mod tests {
             .map(|a| outcome(can(a, Action::UsageRead, &org_res)))
             .collect();
         assert_eq!(usage, [H, F, F, F, F, Y, Y]);
+        // The audit log: organization owners and admins; the operator has no
+        // implicit access to an organization's audit log.
+        let audit: Vec<Want> = cast
+            .iter()
+            .map(|a| outcome(can(a, Action::AuditRead, &org_res)))
+            .collect();
+        assert_eq!(audit, [H, F, F, F, F, Y, Y]);
+        assert_eq!(
+            can(
+                &actor(None, true),
+                Action::AuditRead,
+                &Resource::Organization { org_id: ORG }
+            ),
+            Decision::Hidden
+        );
+        // An organization action on the instance resource is denied.
+        assert_eq!(
+            can(
+                &actor(Some(OrgRole::Owner), true),
+                Action::AuditRead,
+                &Resource::Instance
+            ),
+            Decision::Forbidden
+        );
         // The organization quota is the operator's.
         assert_eq!(
             can(

@@ -13,7 +13,9 @@
 //!    older than the grace period;
 //! 6. `verify_blobs`: re-hashes a bounded number of blobs, oldest verification
 //!    first;
-//! 7. `fix_usage`: corrects quota counters that differ from the rows.
+//! 7. `fix_usage`: corrects quota counters that differ from the rows;
+//! 8. `purge_audit`: deletes audit events older than the audit retention
+//!    (CC-F11; database clock, no store involved, see the step).
 //!
 //! **Safety rails.** The object store is bound to the database: a store id in
 //! `storage_binding` and a marker file `craftcloud-store.json` in the store
@@ -110,6 +112,9 @@ pub struct MaintenanceSettings {
     pub max_clock_drift: Option<Duration>,
     /// Organizations examined per run by the steps that walk them in windows.
     pub org_window: u32,
+    /// Audit events older than this many days are deleted (ADR-0016: one
+    /// year by default; `CRAFTCLOUD_AUDIT_RETENTION_DAYS`).
+    pub audit_retention_days: u32,
 }
 
 impl MaintenanceSettings {
@@ -132,6 +137,7 @@ impl MaintenanceSettings {
             quarantine_retention: Duration::from_secs(30 * 24 * 3600),
             max_clock_drift: Some(DEFAULT_MAX_CLOCK_DRIFT),
             org_window: 50,
+            audit_retention_days: craftcloud_db::audit::DEFAULT_RETENTION_DAYS,
         }
     }
 
@@ -866,6 +872,7 @@ impl Maintenance {
             Step::ReconcileStorage => self.reconcile_storage(ctx, report).await,
             Step::VerifyBlobs => self.verify_blobs(ctx, report).await,
             Step::FixUsage => self.fix_usage(ctx, report).await,
+            Step::PurgeAudit => self.purge_audit(ctx, report).await,
         }
     }
 
@@ -1351,6 +1358,24 @@ impl Maintenance {
                 }
             }
         }
+        let quarantined = report
+            .counts
+            .get("quarantined_objects")
+            .copied()
+            .unwrap_or(0);
+        if quarantined > 0 {
+            // One summary event per run (the moves are not database changes).
+            let event = craftcloud_db::audit::NewEvent::new("maintenance.quarantine").detail(
+                "objects",
+                craftcloud_db::audit::Detail::Count(i64::try_from(quarantined).unwrap_or(i64::MAX)),
+            );
+            crate::audit::record_inline(
+                &self.pool,
+                &craftcloud_db::audit::AuditCtx::system(),
+                &event,
+            )
+            .await;
+        }
         let purge_before = day_name(minus(ctx.now, self.settings.quarantine_retention));
         match store.purge_quarantine(&purge_before, ctx.dry).await {
             Ok(0) => {}
@@ -1402,6 +1427,34 @@ impl Maintenance {
                 break;
             }
             after = items.last().map(|t| t.id.clone());
+        }
+        Ok(())
+    }
+
+    // ---- 8. audit retention ----------------------------------------------------
+
+    /// Deletes audit events older than the retention in bounded batches. The
+    /// cutoff is computed by the database clock inside `audit_purge`, so this
+    /// step does not depend on the application clock and is not held back by
+    /// a clock drift or an epoch conflict: it deletes no stored object, and a
+    /// restored older database only ever loses events that were due anyway.
+    async fn purge_audit(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
+        let days = self.settings.audit_retention_days;
+        if ctx.dry {
+            let due = craftcloud_db::audit::count_expired(&self.pool, days).await?;
+            report.add("events_due", due);
+            return Ok(());
+        }
+        let batch = self.settings.batch();
+        for _ in 0..20 {
+            if !ctx.go() {
+                break;
+            }
+            let removed = craftcloud_db::audit::purge(&self.pool, days, batch).await?;
+            report.add("purged_events", removed);
+            if i64::try_from(removed).unwrap_or(i64::MAX) < batch {
+                break;
+            }
         }
         Ok(())
     }
@@ -1565,9 +1618,10 @@ enum Step {
     ReconcileStorage,
     VerifyBlobs,
     FixUsage,
+    PurgeAudit,
 }
 
-const STEPS: [Step; 7] = [
+const STEPS: [Step; 8] = [
     Step::ExpireUploads,
     Step::PurgeTrash,
     Step::TrimVersions,
@@ -1575,6 +1629,7 @@ const STEPS: [Step; 7] = [
     Step::ReconcileStorage,
     Step::VerifyBlobs,
     Step::FixUsage,
+    Step::PurgeAudit,
 ];
 
 impl Step {
@@ -1607,6 +1662,7 @@ impl Step {
             Self::ReconcileStorage => "reconcile_storage",
             Self::VerifyBlobs => "verify_blobs",
             Self::FixUsage => "fix_usage",
+            Self::PurgeAudit => "purge_audit",
         }
     }
 }

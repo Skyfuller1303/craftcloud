@@ -28,9 +28,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::orgs::{
-    Gate, audit, conflict, db_failure, gate, not_found, page_error, parse_id, rfc3339,
-};
+use crate::audit::{Change, commit_audited};
+use crate::orgs::{Gate, conflict, db_failure, gate, not_found, page_error, parse_id, rfc3339};
 use crate::pagination::{PageQuery, TrashListQuery, decode_time_cursor, encode_time_cursor};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::session::AuthenticatedSession;
@@ -334,17 +333,21 @@ pub(crate) async fn create_project(
         .await
     {
         Ok(ProjectCreateOutcome::Created(project)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "project.create",
+                    resolved.org_id,
+                    Some(project.id),
+                )
+                .workspace(resolved.workspace_id),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "project creation failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "project.create",
-                Some(resolved.org_id),
-                Some(project.id),
-                "success",
-            );
             project_response(StatusCode::CREATED, &project)
         }
         Ok(ProjectCreateOutcome::NameTaken) => conflict(
@@ -506,17 +509,21 @@ pub(crate) async fn update_project(
         .await
     {
         Ok(ProjectRenameOutcome::Updated(project)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "project.update",
+                    resolved.org_id,
+                    Some(resolved.id),
+                )
+                .workspace(resolved.workspace_id),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "project update failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "project.update",
-                Some(resolved.org_id),
-                Some(resolved.id),
-                "success",
-            );
             project_response(StatusCode::OK, &project)
         }
         Ok(ProjectRenameOutcome::VersionMismatch { current_version }) => {
@@ -568,17 +575,21 @@ pub(crate) async fn delete_project(
         .await
     {
         Ok(ProjectDeleteOutcome::Deleted(_)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "project.delete",
+                    resolved.org_id,
+                    Some(resolved.id),
+                )
+                .workspace(resolved.workspace_id),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "project deletion failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "project.delete",
-                Some(resolved.org_id),
-                Some(resolved.id),
-                "success",
-            );
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(ProjectDeleteOutcome::Unchanged(_)) => StatusCode::NO_CONTENT.into_response(),
@@ -619,17 +630,21 @@ pub(crate) async fn restore_project(
         .await
     {
         Ok(ProjectRestoreOutcome::Restored(project)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "project.restore",
+                    resolved.org_id,
+                    Some(resolved.id),
+                )
+                .workspace(resolved.workspace_id),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "project restore failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "project.restore",
-                Some(resolved.org_id),
-                Some(resolved.id),
-                "success",
-            );
             project_response(StatusCode::OK, &project)
         }
         Ok(ProjectRestoreOutcome::Unchanged(project)) => project_response(StatusCode::OK, &project),

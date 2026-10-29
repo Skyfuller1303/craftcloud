@@ -24,6 +24,7 @@ tags:
   - name: Uploads
   - name: Versions
   - name: Quota
+  - name: Audit
 paths:
   /health/live:
     get:
@@ -659,6 +660,64 @@ paths:
               schema: {$ref: '#/components/schemas/MaintenanceStatus'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/audit:
+    get:
+      tags: [Audit]
+      summary: List the instance-level audit events (operator only)
+      description: >-
+        Events that belong to no organization (setup, logins and login failures, operator actions, storage binding, maintenance). Organization events are not included: the operator has no implicit access to tenant data. Append-only record of security-relevant actions: who (`actor_id`), what (`action`, a stable dotted code such as `member.add`), to which object (`target`), where (`workspace_id`), with which `result` (`success`, `denied`, `failed`) and the `request_id` of the request. Events contain identifiers and codes only: no names, e-mail addresses, tokens, passwords, file content or IP addresses (ADR-0016). Filters combine with AND: `action` matches the code and everything below it (`member` matches `member.add`), `from` is inclusive and `to` exclusive (RFC 3339). Keyset paginated by (time, id), newest first; equal timestamps keep a stable order; the cursor is bound to this listing. Denied requests and login failures are aggregated: one row per actor, action and 15-minute window with a `count`. Other callers: 403.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/AuditAction'}
+        - {$ref: '#/components/parameters/AuditActor'}
+        - {$ref: '#/components/parameters/AuditTarget'}
+        - {$ref: '#/components/parameters/AuditWorkspace'}
+        - {$ref: '#/components/parameters/AuditResult'}
+        - {$ref: '#/components/parameters/AuditFrom'}
+        - {$ref: '#/components/parameters/AuditTo'}
+      responses:
+        '200':
+          description: One page, newest first
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuditEventPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/audit/export:
+    get:
+      tags: [Audit]
+      summary: Export the instance-level audit events as NDJSON (operator only)
+      description: >-
+        Like the organization export, for the instance-level events. Other callers: 403.
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/AuditAction'}
+        - {$ref: '#/components/parameters/AuditActor'}
+        - {$ref: '#/components/parameters/AuditTarget'}
+        - {$ref: '#/components/parameters/AuditWorkspace'}
+        - {$ref: '#/components/parameters/AuditResult'}
+        - {$ref: '#/components/parameters/AuditFrom'}
+        - {$ref: '#/components/parameters/AuditTo'}
+      responses:
+        '200':
+          description: One NDJSON line per event, newest first
+          headers:
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Content-Disposition: {schema: {type: string}, description: 'attachment; filename="audit.ndjson"'}
+          content:
+            application/x-ndjson:
+              schema: {$ref: '#/components/schemas/AuditEvent'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /admin/users:
@@ -1588,6 +1647,70 @@ paths:
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/audit:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Audit]
+      summary: List the audit events of an organization (organization owner and admin)
+      description: >-
+        Append-only record of security-relevant actions: who (`actor_id`), what (`action`, a stable dotted code such as `member.add`), to which object (`target`), where (`workspace_id`), with which `result` (`success`, `denied`, `failed`) and the `request_id` of the request. Events contain identifiers and codes only: no names, e-mail addresses, tokens, passwords, file content or IP addresses (ADR-0016). Filters combine with AND: `action` matches the code and everything below it (`member` matches `member.add`), `from` is inclusive and `to` exclusive (RFC 3339). Keyset paginated by (time, id), newest first; equal timestamps keep a stable order; the cursor is bound to this listing. Denied requests and login failures are aggregated: one row per actor, action and 15-minute window with a `count`. Organization members without these roles: 403; non-members and other tenants: 404. The instance operator has no implicit access.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/AuditAction'}
+        - {$ref: '#/components/parameters/AuditActor'}
+        - {$ref: '#/components/parameters/AuditTarget'}
+        - {$ref: '#/components/parameters/AuditWorkspace'}
+        - {$ref: '#/components/parameters/AuditResult'}
+        - {$ref: '#/components/parameters/AuditFrom'}
+        - {$ref: '#/components/parameters/AuditTo'}
+      responses:
+        '200':
+          description: One page, newest first
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuditEventPage'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/audit/export:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Audit]
+      summary: Export the audit events of an organization as NDJSON (organization owner and admin)
+      description: >-
+        Streams the events selected by the same filters as the listing, one JSON object (the `AuditEvent` of the listing) per line, with bounded memory and at most 100000 events per request. If more match, the last line is a JSON object with `truncated: true` and a `next_cursor`; pass that cursor to continue. The export itself is recorded as an `audit.export` event (best-effort). Same access rules as the listing.
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/AuditAction'}
+        - {$ref: '#/components/parameters/AuditActor'}
+        - {$ref: '#/components/parameters/AuditTarget'}
+        - {$ref: '#/components/parameters/AuditWorkspace'}
+        - {$ref: '#/components/parameters/AuditResult'}
+        - {$ref: '#/components/parameters/AuditFrom'}
+        - {$ref: '#/components/parameters/AuditTo'}
+      responses:
+        '200':
+          description: One NDJSON line per event, newest first
+          headers:
+            X-Content-Type-Options: {schema: {type: string, enum: [nosniff]}}
+            Content-Disposition: {schema: {type: string}, description: 'attachment; filename="audit.ndjson"'}
+          content:
+            application/x-ndjson:
+              schema: {$ref: '#/components/schemas/AuditEvent'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /workspaces/{workspace_id}/quota:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -2158,6 +2281,46 @@ components:
       required: false
       schema: {type: string}
       description: Opaque cursor from next_cursor of the previous page; bound to the listing and scope (400 INVALID_CURSOR otherwise).
+    AuditAction:
+      in: query
+      name: action
+      required: false
+      schema: {type: string, pattern: '^[a-z0-9_.]{1,64}$'}
+      description: Action code prefix; matches the code itself and every code below it (`member` matches `member.add`).
+    AuditActor:
+      in: query
+      name: actor
+      required: false
+      schema: {type: string, format: uuid}
+      description: Only events of this acting user.
+    AuditTarget:
+      in: query
+      name: target
+      required: false
+      schema: {type: string, format: uuid}
+      description: Only events about this object id.
+    AuditWorkspace:
+      in: query
+      name: workspace
+      required: false
+      schema: {type: string, format: uuid}
+    AuditResult:
+      in: query
+      name: result
+      required: false
+      schema: {type: string, enum: [success, denied, failed]}
+    AuditFrom:
+      in: query
+      name: from
+      required: false
+      schema: {type: string, format: date-time}
+      description: Events at or after this time (inclusive).
+    AuditTo:
+      in: query
+      name: to
+      required: false
+      schema: {type: string, format: date-time}
+      description: Events before this time (exclusive); must be after `from`.
   securitySchemes:
     cookieAuth:
       type: apiKey
@@ -2182,6 +2345,45 @@ components:
       scheme: bearer
       description: PLACEHOLDER — not used until the desktop authorization flow (D13) has its own ADR.
   schemas:
+    AuditEvent:
+      type: object
+      required: [id, created_at, last_at, count, org_id, actor_id, action, target, workspace_id, result, request_id, details]
+      properties:
+        id: {type: string, format: uuid}
+        created_at: {type: string, format: date-time, description: When the event happened (first occurrence of an aggregated row).}
+        last_at: {type: string, format: date-time, description: Latest occurrence; equals created_at for ordinary events.}
+        count: {type: integer, minimum: 1, description: Occurrences folded into the row (aggregated denials and login failures).}
+        org_id: {type: [string, 'null'], format: uuid, description: null for instance-level events.}
+        actor_id: {type: [string, 'null'], format: uuid, description: null for the system (maintenance) and unknown accounts.}
+        action: {type: string, example: member.add}
+        target:
+          type: [object, 'null']
+          required: [type, id]
+          properties:
+            type: {type: [string, 'null'], example: user}
+            id: {type: string, format: uuid}
+        workspace_id: {type: [string, 'null'], format: uuid}
+        result: {type: string, enum: [success, denied, failed]}
+        request_id: {type: [string, 'null']}
+        details:
+          type: object
+          description: >-
+            Flat object of identifiers, fixed codes (such as a role), counters and flags. Never names, e-mail addresses,
+            tokens, passwords, file content or IP addresses.
+          additionalProperties:
+            oneOf:
+              - {type: string}
+              - {type: integer}
+              - {type: boolean}
+    AuditEventPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/AuditEvent'}
+        next_cursor: {type: [string, 'null']}
     Error:
       type: object
       required: [error]

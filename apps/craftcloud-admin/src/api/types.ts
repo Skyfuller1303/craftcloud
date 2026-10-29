@@ -112,6 +112,41 @@ export interface WorkspaceMember {
   joined_at: string;
 }
 
+export type AuditResult = "success" | "denied" | "failed";
+
+/** One audit event. Ids and codes only; the server never stores names or e-mail addresses in events. */
+export interface AuditEvent {
+  id: Uuid;
+  created_at: string;
+  last_at: string;
+  /** Occurrences folded into the row (repeated denials and login failures). */
+  count: number;
+  org_id: Uuid | null;
+  actor_id: Uuid | null;
+  action: string;
+  target: { type: string | null; id: Uuid } | null;
+  workspace_id: Uuid | null;
+  result: AuditResult;
+  request_id: string | null;
+  details: Record<string, string | number | boolean>;
+}
+
+/** Filters of the audit listing and export; empty or missing values do not filter. */
+export interface AuditFilters {
+  action?: string;
+  actor?: string;
+  target?: string;
+  workspace?: string;
+  result?: AuditResult;
+  /** RFC 3339, inclusive. */
+  from?: string;
+  /** RFC 3339, exclusive. */
+  to?: string;
+}
+
+/** Which audit log to read: one organization's, or the instance-level one (operator). */
+export type AuditSource = { kind: "organization"; orgId: string } | { kind: "instance" };
+
 export interface Invitation {
   id: Uuid;
   email: string;

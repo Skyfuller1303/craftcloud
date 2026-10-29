@@ -19,6 +19,7 @@ use craftcloud_core::policy::{
     WorkspaceRole, can,
 };
 use craftcloud_core::{DisplayName, Slug};
+use craftcloud_db::audit::Detail;
 use craftcloud_db::members::OrgTx;
 use craftcloud_db::workspaces::{
     self, NewWorkspace, Workspace, WorkspaceAddOutcome, WorkspaceMember, WorkspaceRoleOutcome,
@@ -29,9 +30,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::orgs::{
-    Gate, audit, conflict, db_failure, gate, not_found, page_error, parse_id, rfc3339,
-};
+use crate::audit::{Change, commit_audited};
+use crate::orgs::{Gate, conflict, db_failure, gate, not_found, page_error, parse_id, rfc3339};
 use crate::pagination::{PageQuery, decode_time_cursor, encode_time_cursor};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::session::AuthenticatedSession;
@@ -345,17 +345,21 @@ pub(crate) async fn create_workspace(
         .await;
     match created {
         Ok(workspace) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "workspace.create",
+                    org_id,
+                    Some(workspace.id),
+                )
+                .workspace(workspace.id),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "workspace creation failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "workspace.create",
-                Some(org_id),
-                Some(workspace.id),
-                "success",
-            );
             let version = workspace.version;
             with_etag(
                 (StatusCode::CREATED, Json(workspace_json(&workspace, None))).into_response(),
@@ -495,17 +499,21 @@ pub(crate) async fn update_workspace(
         .await
     {
         Ok(WorkspaceUpdateOutcome::Updated(workspace)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "workspace.update",
+                    org_id,
+                    Some(workspace_id),
+                )
+                .workspace(workspace_id),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "workspace update failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "workspace.update",
-                Some(org_id),
-                Some(workspace_id),
-                "success",
-            );
             let version = workspace.version;
             let role = actor.workspace.map(|w| w.role);
             with_etag(
@@ -684,17 +692,22 @@ pub(crate) async fn add_member(
         .await
     {
         Ok(WorkspaceAddOutcome::Added(member)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "workspace.member.add",
+                    org_id,
+                    Some(user_id),
+                )
+                .workspace(workspace_id)
+                .detail("role", Detail::Code(role.as_str())),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "workspace member add failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "workspace.member.add",
-                Some(org_id),
-                Some(user_id),
-                "success",
-            );
             (StatusCode::CREATED, Json(member_json(&member))).into_response()
         }
         Ok(WorkspaceAddOutcome::AlreadyMember) => conflict(
@@ -786,17 +799,22 @@ pub(crate) async fn change_member_role(
         .await
     {
         Ok(WorkspaceRoleOutcome::Changed(member)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "workspace.member.change_role",
+                    org_id,
+                    Some(target_id),
+                )
+                .workspace(workspace_id)
+                .detail("role", Detail::Code(new_role.as_str())),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "role change failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "workspace.member.change_role",
-                Some(org_id),
-                Some(target_id),
-                "success",
-            );
             Json(member_json(&member)).into_response()
         }
         Ok(WorkspaceRoleOutcome::Unchanged(member)) => Json(member_json(&member)).into_response(),
@@ -867,17 +885,22 @@ pub(crate) async fn remove_member(
         .await
     {
         Ok(true) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "workspace.member.remove",
+                    org_id,
+                    Some(target_id),
+                )
+                .workspace(workspace_id)
+                .detail("self_removal", Detail::Flag(target_id == session.user_id)),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "member removal failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "workspace.member.remove",
-                Some(org_id),
-                Some(target_id),
-                "success",
-            );
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => not_found(&headers),

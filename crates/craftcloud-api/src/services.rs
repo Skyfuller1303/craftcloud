@@ -57,6 +57,9 @@ pub struct AuthSettings {
     pub upload_idle_timeout: Duration,
     /// Longest wait for a download client to take the next chunk.
     pub download_idle_timeout: Duration,
+    /// Whether file downloads are recorded as audit events
+    /// (`CRAFTCLOUD_AUDIT_DOWNLOADS`, default on).
+    pub audit_downloads: bool,
     /// Operator-configured public URL without trailing slash; the only
     /// source for absolute URLs (never derived from request headers).
     pub public_url: Option<String>,
@@ -104,6 +107,7 @@ impl Default for AuthSettings {
             uploads_per_org: 200,
             upload_idle_timeout: Duration::from_secs(60),
             download_idle_timeout: Duration::from_secs(60),
+            audit_downloads: true,
             public_url: None,
             public_origin: None,
             cookie_secure: true,
@@ -150,6 +154,7 @@ pub struct Services {
     invite_create: WindowLimiter,
     guard: Arc<AccountGuard>,
     last_cleanup: AtomicI64,
+    pub(crate) audit_budget: crate::audit::AuditBudget,
 }
 
 impl Services {
@@ -159,6 +164,7 @@ impl Services {
     #[must_use]
     pub fn new(pool: PgPool, bootstrap: Option<BootstrapToken>, settings: AuthSettings) -> Self {
         let cap = settings.rate_max_entries;
+        let pool_connections = pool.options().get_max_connections();
         let guard = AccountGuard::new(GuardConfig {
             pair_limit: settings.failed_login_pair_limit,
             account_limit: settings.failed_login_account_limit,
@@ -180,6 +186,7 @@ impl Services {
             invite_create: WindowLimiter::new(cap),
             guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
+            audit_budget: crate::audit::AuditBudget::for_pool(pool_connections),
         }
     }
 
@@ -189,6 +196,16 @@ impl Services {
     pub fn with_storage(mut self, store: craftcloud_storage::LocalStore) -> Self {
         self.storage = Some(store);
         self
+    }
+
+    /// The two budgets of best-effort audit writes (denials and failed logins,
+    /// downloads and exports); tests hold their permits to simulate pressure.
+    #[must_use]
+    pub fn audit_semaphores(&self) -> (Arc<Semaphore>, Arc<Semaphore>) {
+        (
+            Arc::clone(&self.audit_budget.lossy),
+            Arc::clone(&self.audit_budget.important),
+        )
     }
 
     /// Replaces the clock (tests).

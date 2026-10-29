@@ -21,6 +21,7 @@ use craftcloud_auth::{
     verify_or_dummy,
 };
 use craftcloud_core::NormalizedEmail;
+use craftcloud_db::audit::{AggScope, AuditResult, NewEvent};
 use craftcloud_db::password_reset::IssueOutcome;
 use craftcloud_db::{DbError, accounts, password_reset, sessions};
 use serde::Deserialize;
@@ -29,6 +30,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::audit::{ctx as audit_ctx, record_lossy};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::services::{IpClass, Services};
 use crate::session::{
@@ -170,6 +172,24 @@ fn rejected(rejection: AuthRejection, services: &Services, headers: &HeaderMap) 
 
 // ---- POST /auth/login ------------------------------------------------------
 
+/// Records a failed login as an aggregated audit row: one row per attacked
+/// account and 15-minute window with a counter (all unknown addresses share one
+/// row, so the log never holds an e-mail address). Nobody is authenticated, so
+/// the row has no actor; the account is the target. Best-effort, in a task of
+/// its own: the answer to the client does not depend on it.
+fn record_login_failure(services: &Services, headers: &HeaderMap, user_id: Option<Uuid>) {
+    let mut event = NewEvent::new("auth.login").result(AuditResult::Failed);
+    if let Some(user_id) = user_id {
+        event = event.target("user", user_id);
+    }
+    record_lossy(
+        services,
+        &audit_ctx(headers, None),
+        &event,
+        Some(AggScope::Target),
+    );
+}
+
 pub(crate) async fn login(
     State(state): State<ApiState>,
     client_ip: Option<Extension<ClientIp>>,
@@ -228,12 +248,14 @@ pub(crate) async fn login(
         return internal(&headers);
     };
 
+    let known_user = record.as_ref().map(|r| r.user_id);
     let account = record.filter(|r| verified && !r.disabled);
     let (Some(account), Some(stored_hash)) = (account, stored) else {
         if let Some(reservation) = reservation {
             reservation.record_failure(services.now_secs());
         }
         tracing::info!("login failed");
+        record_login_failure(&services, &headers, known_user);
         return invalid_credentials(&headers);
     };
 
@@ -246,7 +268,7 @@ pub(crate) async fn login(
     };
     let now = services.clock.now();
     let absolute = now + services.settings.absolute_timeout;
-    let created = sessions::create_for_verified_login(
+    let created = sessions::create_for_verified_login_audited(
         &services.pool,
         &sessions::NewSession {
             user_id: account.user_id,
@@ -255,6 +277,7 @@ pub(crate) async fn login(
             absolute_expires_at: absolute,
         },
         &stored_hash,
+        &audit_ctx(&headers, Some(account.user_id)),
     )
     .await;
     match created {
@@ -264,6 +287,7 @@ pub(crate) async fn login(
                 reservation.record_failure(services.now_secs());
             }
             tracing::info!("login failed");
+            record_login_failure(&services, &headers, Some(account.user_id));
             return invalid_credentials(&headers);
         }
         Err(error) => return db_failure(&error, &headers, "session creation failed"),
@@ -391,7 +415,18 @@ pub(crate) async fn revoke_session(
         return not_found(&headers);
     };
     let now = services.clock.now();
-    match sessions::revoke_owned(&services.pool, target_id, session.user_id, now).await {
+    // Ending another session of the account is an audit event; ending the
+    // one in use (a logout) is not.
+    match sessions::revoke_owned_audited(
+        &services.pool,
+        target_id,
+        session.user_id,
+        now,
+        &audit_ctx(&headers, Some(session.user_id)),
+        target_id != session.session_id,
+    )
+    .await
+    {
         // Another user's, unknown and already revoked sessions look the same.
         Ok(false) => not_found(&headers),
         Ok(true) if target_id == session.session_id => with_cookie(
@@ -440,7 +475,14 @@ pub(crate) async fn logout_all(
         Err(rejection) => return rejected(rejection, &services, &headers),
     };
     let now = services.clock.now();
-    if let Err(error) = sessions::revoke_all_for_user(&services.pool, session.user_id, now).await {
+    if let Err(error) = sessions::revoke_all_for_user_audited(
+        &services.pool,
+        session.user_id,
+        now,
+        &audit_ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
         return db_failure(&error, &headers, "logout-all failed");
     }
     with_cookie(
@@ -525,13 +567,14 @@ pub(crate) async fn change_password(
         return internal(&headers);
     };
     let now = services.clock.now();
-    match accounts::change_password(
+    match accounts::change_password_audited(
         &services.pool,
         session.user_id,
         &verified_hash,
         &new_hash,
         session.session_id,
         now,
+        &audit_ctx(&headers, Some(session.user_id)),
     )
     .await
     {
@@ -620,7 +663,7 @@ pub(crate) async fn issue_password_reset(
     };
     let now = services.clock.now();
     let expires_at = now + PASSWORD_RESET_TTL;
-    let outcome = password_reset::create(
+    let outcome = password_reset::create_audited(
         &services.pool,
         &password_reset::NewResetToken {
             user_id,
@@ -629,6 +672,7 @@ pub(crate) async fn issue_password_reset(
             now,
             expires_at,
         },
+        &audit_ctx(&headers, Some(session.user_id)),
     )
     .await;
     match outcome {
@@ -677,7 +721,14 @@ pub(crate) async fn void_password_reset(
         Ok(id) => id,
         Err(response) => return *response,
     };
-    match password_reset::void_pending(&services.pool, user_id, services.clock.now()).await {
+    match password_reset::void_pending_audited(
+        &services.pool,
+        user_id,
+        services.clock.now(),
+        &audit_ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
         Ok(_) => {
             tracing::info!("pending password reset links voided");
             StatusCode::NO_CONTENT.into_response()
@@ -746,11 +797,12 @@ pub(crate) async fn reset_password(
         return internal(&headers);
     };
 
-    match password_reset::consume(
+    match password_reset::consume_audited(
         &services.pool,
         &token.hash(),
         &new_hash,
         services.clock.now(),
+        &audit_ctx(&headers, None),
     )
     .await
     {

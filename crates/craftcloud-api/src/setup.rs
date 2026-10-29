@@ -17,6 +17,9 @@
 //! 6. password hashing (blocking pool, bounded concurrency), then the single
 //!    setup transaction: 201, or 409 if a concurrent attempt won.
 //!
+//! The setup transaction also records the instance-level audit events
+//! `operator.create` and `organization.create` (no actor yet; ids only).
+//!
 //! Neither the token, the password nor any request value is logged or
 //! returned in errors. The parsed request struct and the hashing copy of the
 //! password are zeroized; the raw request body buffer and serde internals are
@@ -155,7 +158,8 @@ pub(crate) async fn complete(
         organization_name: fields.organization_name,
         organization_slug: fields.organization_slug,
     };
-    match db_setup::complete(&service.pool, &new).await {
+    match db_setup::complete_audited(&service.pool, &new, &crate::audit::ctx(&headers, None)).await
+    {
         Ok(created) => {
             tracing::info!("instance setup completed");
             (

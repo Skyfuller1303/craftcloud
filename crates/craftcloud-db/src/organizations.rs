@@ -10,6 +10,7 @@ use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 use crate::{DbError, OrgScope};
 
 pub use craftcloud_core::policy::OrgRole;
@@ -128,6 +129,28 @@ pub async fn create_with_owner(
     pool: &PgPool,
     new: &NewOrganization,
 ) -> Result<CreateOutcome, DbError> {
+    create_with_owner_inner(pool, new, None).await
+}
+
+/// Like [`create_with_owner`], and records the `organization.create` audit
+/// event (actor from `audit`) in the same transaction.
+///
+/// # Errors
+///
+/// As [`create_with_owner`]; a failing audit insert fails the creation.
+pub async fn create_with_owner_audited(
+    pool: &PgPool,
+    new: &NewOrganization,
+    audit: &AuditCtx,
+) -> Result<CreateOutcome, DbError> {
+    create_with_owner_inner(pool, new, Some(audit)).await
+}
+
+async fn create_with_owner_inner(
+    pool: &PgPool,
+    new: &NewOrganization,
+    audit: Option<&AuditCtx>,
+) -> Result<CreateOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let disabled: Option<bool> =
         sqlx::query_scalar("SELECT disabled_at IS NOT NULL FROM users WHERE id = $1 FOR SHARE")
@@ -157,6 +180,17 @@ pub async fn create_with_owner(
     .bind(new.owner_user_id)
     .execute(&mut *tx)
     .await?;
+    if let Some(audit) = audit {
+        record_in(
+            &mut tx,
+            audit,
+            &NewEvent::new("organization.create")
+                .org(org.id)
+                .target("organization", org.id)
+                .detail("owner_id", Detail::Id(new.owner_user_id)),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(CreateOutcome::Created(org))
 }

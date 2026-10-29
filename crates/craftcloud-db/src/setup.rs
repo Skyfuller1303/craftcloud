@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 
 /// Validated inputs for [`complete`]. The caller validates and normalizes
 /// every field and hashes the password beforehand.
@@ -94,6 +95,29 @@ pub async fn is_completed(pool: &PgPool) -> Result<bool, DbError> {
 /// [`SetupError::AlreadyCompleted`] if setup was done before (or a concurrent
 /// attempt won); [`SetupError::Db`] otherwise, with nothing persisted.
 pub async fn complete(pool: &PgPool, new: &NewInstance) -> Result<Created, SetupError> {
+    complete_inner(pool, new, None).await
+}
+
+/// Like [`complete`], and records the instance-level `operator.create` event
+/// and the `organization.create` event of the first organization (no actor:
+/// the operator did not exist before) in the same transaction.
+///
+/// # Errors
+///
+/// As [`complete`]; a failing audit insert fails the setup.
+pub async fn complete_audited(
+    pool: &PgPool,
+    new: &NewInstance,
+    audit: &AuditCtx,
+) -> Result<Created, SetupError> {
+    complete_inner(pool, new, Some(audit)).await
+}
+
+async fn complete_inner(
+    pool: &PgPool,
+    new: &NewInstance,
+    audit: Option<&AuditCtx>,
+) -> Result<Created, SetupError> {
     let user_id = Uuid::new_v4();
     let organization_id = Uuid::new_v4();
     let mut tx = pool.begin().await?;
@@ -143,6 +167,30 @@ pub async fn complete(pool: &PgPool, new: &NewInstance) -> Result<Created, Setup
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+
+    if let Some(audit) = audit {
+        let by = AuditCtx {
+            actor_id: Some(user_id),
+            request_id: audit.request_id.clone(),
+        };
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("operator.create").target("user", user_id),
+        )
+        .await
+        .map_err(SetupError::Db)?;
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("organization.create")
+                .org(organization_id)
+                .target("organization", organization_id)
+                .detail("owner_id", Detail::Id(user_id)),
+        )
+        .await
+        .map_err(SetupError::Db)?;
+    }
 
     // 3. Commit verifies the deferred operator reference.
     tx.commit().await?;

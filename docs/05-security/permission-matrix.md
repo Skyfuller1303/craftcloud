@@ -81,6 +81,15 @@ Ein Projekt im Papierkorb ist schreibgeschützt (Dateien lesbar, Schreibaktionen
 
 Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (`project_and_file_actions_follow_workspace_roles`) und `crates/craftcloud-api/tests/projects_files.rs` (`project_role_matrix`, `file_role_matrix_and_metadata_defaults`, `projects_and_files_never_cross_organizations_workspaces_or_kinds`).
 
+## Umgesetzt (PR-016): Audit-Log
+
+| Aktion | Operator (ohne Mitgliedschaft) | Nicht-Mitglied | member | admin | owner |
+|---|---|---|---|---|---|
+| Audit-Log der Organisation lesen und exportieren (`GET /organizations/{id}/audit`, `.../audit/export`, Aktion `AuditRead`) | 404 | 404 | 403 | ja | ja |
+| Instanz-Audit-Log lesen und exportieren (`GET /admin/audit`, `.../export`, Aktion `InstanceAuditRead`) | ja | 403 | 403 | 403 | 403 |
+
+Abweichung vom Vorschlag in der ersten Tabelle: Der Org-Admin liest das Protokoll der Organisation vollständig (nicht „begrenzt“), WorkspaceAdmins ohne Org-Rolle lesen es nicht, und der Operator hat **keinen** impliziten Zugriff auf das Protokoll einer Organisation (nur auf Instanz-Ereignisse). Verweigerte Anfragen (403) werden aggregiert aufgezeichnet, 404-Antworten nicht. Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (`project_and_file_actions_follow_workspace_roles` mit der Zeile `AuditRead`, `instance_actions_are_operator_only`) und `crates/craftcloud-api/tests/audit.rs` (`only_owners_and_admins_read_the_audit_log_of_their_organization`).
+
 ## Negativtests
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.

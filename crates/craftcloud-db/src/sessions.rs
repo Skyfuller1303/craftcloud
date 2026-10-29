@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 
 /// Input for [`create`].
 #[derive(Debug, Clone)]
@@ -55,7 +56,32 @@ pub async fn create_for_verified_login(
     new: &NewSession,
     verified_hash: &str,
 ) -> Result<Option<Uuid>, DbError> {
+    create_for_verified_login_inner(pool, new, verified_hash, None).await
+}
+
+/// Like [`create_for_verified_login`], and records the `auth.login` audit
+/// event (actor: the user) in the same transaction as the session.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert fails the login.
+pub async fn create_for_verified_login_audited(
+    pool: &PgPool,
+    new: &NewSession,
+    verified_hash: &str,
+    audit: &AuditCtx,
+) -> Result<Option<Uuid>, DbError> {
+    create_for_verified_login_inner(pool, new, verified_hash, Some(audit)).await
+}
+
+async fn create_for_verified_login_inner(
+    pool: &PgPool,
+    new: &NewSession,
+    verified_hash: &str,
+    audit: Option<&AuditCtx>,
+) -> Result<Option<Uuid>, DbError> {
     let id = Uuid::new_v4();
+    let mut tx = pool.begin().await?;
     let result = sqlx::query(
         "INSERT INTO sessions (id, user_id, token_hash, created_at, last_seen_at, absolute_expires_at) \
          SELECT $1, $2, $3, $4, $4, $5 \
@@ -68,9 +94,25 @@ pub async fn create_for_verified_login(
     .bind(new.now)
     .bind(new.absolute_expires_at)
     .bind(verified_hash)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok((result.rows_affected() == 1).then_some(id))
+    if result.rows_affected() != 1 {
+        return Ok(None);
+    }
+    if let Some(audit) = audit {
+        let by = AuditCtx {
+            actor_id: Some(new.user_id),
+            request_id: audit.request_id.clone(),
+        };
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("auth.login").target("user", new.user_id),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(id))
 }
 
 /// Finds the active session for a token hash: not revoked, not past its
@@ -186,6 +228,49 @@ pub async fn revoke_owned(
     Ok(result.rows_affected() == 1)
 }
 
+/// Like [`revoke_owned`], and records `auth.session_revoke` (actor: the user)
+/// in the same transaction when a session was revoked. The caller passes
+/// `record = false` for the session in use (an ordinary logout is not an
+/// audit event).
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert leaves the session active.
+pub async fn revoke_owned_audited(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+    record: bool,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    let revoked = sqlx::query(
+        "UPDATE sessions SET revoked_at = $3 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if revoked && record {
+        let by = AuditCtx {
+            actor_id: Some(user_id),
+            request_id: audit.request_id.clone(),
+        };
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("auth.session_revoke").target("session", id),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(revoked)
+}
+
 /// Maximum number of sessions returned by [`list_active_for_user`].
 pub const MAX_LISTED_SESSIONS: i64 = 100;
 
@@ -232,6 +317,47 @@ pub async fn revoke_all_for_user(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Like [`revoke_all_for_user`], and records the `auth.logout_all` audit event
+/// (actor: the user) in the same transaction.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert leaves the sessions active.
+pub async fn revoke_all_for_user_audited(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await?;
+    let revoked = sqlx::query(
+        "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let by = AuditCtx {
+        actor_id: Some(user_id),
+        request_id: audit.request_id.clone(),
+    };
+    record_in(
+        &mut tx,
+        &by,
+        &NewEvent::new("auth.logout_all")
+            .target("user", user_id)
+            .detail("sessions", Detail::Count(count(revoked))),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
+fn count(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 /// Deletes sessions that expired or were revoked before `cutoff`. Returns the

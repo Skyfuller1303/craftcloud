@@ -555,6 +555,12 @@ ul {
   font-size: var(--text-small);
 }
 
+// Short codes (action, result) stay on one line; the table scrolls instead.
+.table td.nowrap {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
 .error-notice {
   display: flex;
   flex-direction: column;

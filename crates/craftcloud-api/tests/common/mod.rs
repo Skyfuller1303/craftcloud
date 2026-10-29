@@ -274,6 +274,10 @@ pub struct TestEnv {
     /// Fault plan of the object store (nothing armed by default).
     pub faults: Arc<FaultPlan>,
     pub storage_dir: std::path::PathBuf,
+    /// Budgets of best-effort audit writes (denials and failed logins; downloads
+    /// and exports): a test holds their permits to simulate pressure.
+    pub audit_lossy: Arc<tokio::sync::Semaphore>,
+    pub audit_important: Arc<tokio::sync::Semaphore>,
 }
 
 fn shared_hash() -> &'static str {
@@ -338,6 +342,7 @@ impl TestEnv {
                 .unwrap();
             services = services.with_storage(store);
         }
+        let (audit_lossy, audit_important) = services.audit_semaphores();
         let app = router_with_services(
             Capabilities::development_defaults(),
             &config,
@@ -352,6 +357,8 @@ impl TestEnv {
             operator_id,
             faults,
             storage_dir,
+            audit_lossy,
+            audit_important,
         }
     }
 

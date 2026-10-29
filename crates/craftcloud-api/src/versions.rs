@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::audit::{Change, commit_audited, ctx as audit_ctx, record_change, record_important};
 use crate::orgs::{audit, conflict, db_failure, not_found, page_error, parse_id, rfc3339};
 use crate::pagination::{PageQuery, decode_number_cursor, encode_number_cursor};
 use crate::projects::{Resolved, read_gate, write_gate};
@@ -42,6 +43,7 @@ use crate::responses::{internal, rejection_response, unavailable, validation_fai
 use crate::session::AuthenticatedSession;
 use crate::uploads::upload_write_gate;
 use crate::{ApiState, Services, error_response, error_response_with_details};
+use craftcloud_db::audit::{AggScope, Detail, NewEvent};
 
 // ---- helpers ------------------------------------------------------------------
 
@@ -259,7 +261,24 @@ pub(crate) async fn commit_version(
         Ok(outcome) => outcome,
         Err(error) => return db_failure(&error, &headers, "commit failed"),
     };
-    // Lazy expiry done on the way is committed with every outcome.
+    // One event per new version; a replay or a refusal records nothing. The
+    // event commits with the version (lazy expiry done on the way is
+    // committed with every outcome).
+    if let CommitOutcome::Committed(version) = &outcome {
+        let change = Change::new(
+            &headers,
+            session.user_id,
+            "version.commit",
+            resolved.org_id,
+            Some(version.id),
+        )
+        .workspace(resolved.workspace_id)
+        .detail("file_id", Detail::Id(resolved.id))
+        .detail("number", Detail::Count(version.number));
+        if let Err(error) = record_change(&mut tx, &change).await {
+            return db_failure(&error, &headers, "commit failed");
+        }
+    }
     if let Err(error) = tx.commit().await {
         return db_failure(&error, &headers, "commit failed");
     }
@@ -441,17 +460,23 @@ pub(crate) async fn restore_version(
         .await
     {
         Ok(RestoreOutcome::Restored(version)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "version.restore",
+                    resolved.org_id,
+                    Some(version.id),
+                )
+                .workspace(resolved.workspace_id)
+                .detail("file_id", Detail::Id(resolved.id))
+                .detail("number", Detail::Count(version.number)),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "restore failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "version.restore",
-                Some(resolved.org_id),
-                Some(version.id),
-                "success",
-            );
             version_response(StatusCode::CREATED, &version)
         }
         Ok(RestoreOutcome::PreconditionFailed { current }) => {
@@ -477,8 +502,14 @@ fn blob_corrupt(headers: &HeaderMap) -> Response {
 }
 
 /// A body fed by a task through a small channel (bounded memory).
-struct ChannelBody {
+pub(crate) struct ChannelBody {
     rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl ChannelBody {
+    pub(crate) fn new(rx: mpsc::Receiver<Result<Bytes, std::io::Error>>) -> Self {
+        Self { rx }
+    }
 }
 
 impl http_body::Body for ChannelBody {
@@ -609,8 +640,17 @@ pub(crate) async fn download_head(
     headers: HeaderMap,
     session: AuthenticatedSession,
     Path(file_raw): Path<String>,
+    method: axum::http::Method,
 ) -> Response {
-    download(&state, &headers, &session, &file_raw, None).await
+    download(
+        &state,
+        &headers,
+        &session,
+        &file_raw,
+        None,
+        method == axum::http::Method::HEAD,
+    )
+    .await
 }
 
 pub(crate) async fn download_version(
@@ -618,11 +658,21 @@ pub(crate) async fn download_version(
     headers: HeaderMap,
     session: AuthenticatedSession,
     Path((file_raw, version_raw)): Path<(String, String)>,
+    method: axum::http::Method,
 ) -> Response {
     let Some(version_id) = parse_id(&version_raw) else {
         return not_found(&headers);
     };
-    download(&state, &headers, &session, &file_raw, Some(version_id)).await
+    let is_head = method == axum::http::Method::HEAD;
+    download(
+        &state,
+        &headers,
+        &session,
+        &file_raw,
+        Some(version_id),
+        is_head,
+    )
+    .await
 }
 
 async fn download(
@@ -631,6 +681,7 @@ async fn download(
     session: &AuthenticatedSession,
     file_raw: &str,
     version: Option<Uuid>,
+    is_head: bool,
 ) -> Response {
     let resolved = match resolve_file(state, headers, file_raw).await {
         Ok(resolved) => resolved,
@@ -780,6 +831,24 @@ async fn download(
         Some(info.version_id),
         "success",
     );
+    // Downloads are recorded per policy (`CRAFTCLOUD_AUDIT_DOWNLOADS`) whenever
+    // content is handed out, whatever the range (a client can read a whole file
+    // in pieces), but folded into one row per person, version and 15-minute
+    // window with a counter, so range reads cannot flood the log. HEAD returns
+    // no content and is not recorded. Best-effort: a read has nothing to roll back.
+    if services.settings.audit_downloads && !is_head {
+        record_important(
+            &services,
+            &audit_ctx(headers, Some(session.user_id)),
+            &NewEvent::new("file.download")
+                .org(resolved.org_id)
+                .workspace(resolved.workspace_id)
+                .target("file_version", info.version_id)
+                .detail("file_id", Detail::Id(resolved.id)),
+            Some(AggScope::Target),
+        )
+        .await;
+    }
     response
 }
 

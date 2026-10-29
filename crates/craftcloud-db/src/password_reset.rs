@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 
 /// Input for [`create`].
 #[derive(Debug, Clone)]
@@ -61,6 +62,29 @@ pub enum IssueOutcome {
 ///
 /// Database failures only; nothing changes on failure.
 pub async fn create(pool: &PgPool, new: &NewResetToken) -> Result<IssueOutcome, DbError> {
+    create_inner(pool, new, None).await
+}
+
+/// Like [`create`], and records the `password_reset.issue` audit event (actor
+/// from `audit`, normally the operator) in the same transaction. The event
+/// never contains the token.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert stores no token.
+pub async fn create_audited(
+    pool: &PgPool,
+    new: &NewResetToken,
+    audit: &AuditCtx,
+) -> Result<IssueOutcome, DbError> {
+    create_inner(pool, new, Some(audit)).await
+}
+
+async fn create_inner(
+    pool: &PgPool,
+    new: &NewResetToken,
+    audit: Option<&AuditCtx>,
+) -> Result<IssueOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let disabled: Option<bool> =
         sqlx::query_scalar("SELECT disabled_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE")
@@ -99,6 +123,19 @@ pub async fn create(pool: &PgPool, new: &NewResetToken) -> Result<IssueOutcome, 
     .bind(new.expires_at)
     .execute(&mut *tx)
     .await?;
+    if let Some(audit) = audit {
+        record_in(
+            &mut tx,
+            audit,
+            &NewEvent::new("password_reset.issue")
+                .target("user", new.user_id)
+                .detail(
+                    "sessions_revoked",
+                    Detail::Count(i64::try_from(revoked_sessions).unwrap_or(i64::MAX)),
+                ),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(IssueOutcome::Issued { revoked_sessions })
 }
@@ -122,6 +159,44 @@ pub async fn void_pending(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Like [`void_pending`], and records `password_reset.void` (actor from
+/// `audit`) in the same transaction when at least one link was voided.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert voids nothing.
+pub async fn void_pending_audited(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await?;
+    let voided = sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if voided > 0 {
+        record_in(
+            &mut tx,
+            audit,
+            &NewEvent::new("password_reset.void")
+                .target("user", user_id)
+                .detail(
+                    "links",
+                    Detail::Count(i64::try_from(voided).unwrap_or(i64::MAX)),
+                ),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(voided)
 }
 
 /// Returns the account for a token that is unused and not expired, without
@@ -164,6 +239,34 @@ pub async fn consume(
     token_hash: &[u8; 32],
     new_password_hash: &str,
     now: OffsetDateTime,
+) -> Result<Option<Uuid>, DbError> {
+    consume_inner(pool, token_hash, new_password_hash, now, None).await
+}
+
+/// Like [`consume`], and records the `password_reset.use` audit event (actor:
+/// the account whose password was reset) in the same transaction. A token
+/// that cannot be consumed (unknown, used, expired) records nothing, so a
+/// replay never produces a second event.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert leaves the token unused.
+pub async fn consume_audited(
+    pool: &PgPool,
+    token_hash: &[u8; 32],
+    new_password_hash: &str,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<Option<Uuid>, DbError> {
+    consume_inner(pool, token_hash, new_password_hash, now, Some(audit)).await
+}
+
+async fn consume_inner(
+    pool: &PgPool,
+    token_hash: &[u8; 32],
+    new_password_hash: &str,
+    now: OffsetDateTime,
+    audit: Option<&AuditCtx>,
 ) -> Result<Option<Uuid>, DbError> {
     let mut tx = pool.begin().await?;
     // Lock order: the users row first (like `create` and
@@ -213,6 +316,18 @@ pub async fn consume(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    if let Some(audit) = audit {
+        let by = AuditCtx {
+            actor_id: Some(user_id),
+            request_id: audit.request_id.clone(),
+        };
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("password_reset.use").target("user", user_id),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(Some(user_id))
 }

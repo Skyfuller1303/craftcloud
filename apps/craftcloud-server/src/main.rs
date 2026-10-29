@@ -192,8 +192,18 @@ async fn connect_database(settings: &DatabaseSettings) -> Result<Option<PgPool>,
     let Some(path) = &settings.url_file else {
         return Ok(None);
     };
-    let secret = secret::load_secret_file(path)
-        .map_err(|err| Failure::config(format!("CRAFTCLOUD_DATABASE_URL_FILE: {err}")))?;
+    connect_url_file(settings, path, "CRAFTCLOUD_DATABASE_URL_FILE")
+        .await
+        .map(Some)
+}
+
+async fn connect_url_file(
+    settings: &DatabaseSettings,
+    path: &std::path::Path,
+    key: &str,
+) -> Result<PgPool, Failure> {
+    let secret =
+        secret::load_secret_file(path).map_err(|err| Failure::config(format!("{key}: {err}")))?;
     let pool = craftcloud_db::connect(
         secret.expose(),
         settings.max_connections,
@@ -201,14 +211,26 @@ async fn connect_database(settings: &DatabaseSettings) -> Result<Option<PgPool>,
     )
     .await
     .map_err(|err| Failure::runtime(err.to_string()))?;
-    Ok(Some(pool))
+    Ok(pool)
 }
 
+/// Applies the migrations. With `CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE` (the
+/// owner role) the tables belong to that role and the runtime role named by
+/// `CRAFTCLOUD_DATABASE_RUNTIME_ROLE` gets only data privileges; without it a
+/// single role does everything and the audit log guard is advisory.
 async fn migrate(settings: &DatabaseSettings) -> Result<(), Failure> {
-    let Some(pool) = connect_database(settings).await? else {
-        return Err(Failure::config(
-            "migrate requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
-        ));
+    let pool = match (&settings.migrate_url_file, &settings.url_file) {
+        (Some(owner), _) => {
+            connect_url_file(settings, owner, "CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE").await?
+        }
+        (None, Some(runtime)) => {
+            connect_url_file(settings, runtime, "CRAFTCLOUD_DATABASE_URL_FILE").await?
+        }
+        (None, None) => {
+            return Err(Failure::config(
+                "migrate requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+            ));
+        }
     };
     let applied = craftcloud_db::migrate::run(&pool)
         .await
@@ -223,6 +245,27 @@ async fn migrate(settings: &DatabaseSettings) -> Result<(), Failure> {
             );
         }
         println!("applied {} migration(s)", applied.len());
+    }
+    if let Some(role) = &settings.runtime_role {
+        craftcloud_db::migrate::grant_runtime_role(&pool, role)
+            .await
+            .map_err(|err| match err {
+                // A wrong role setting is a configuration problem (exit 2).
+                craftcloud_db::migrate::GrantError::InvalidName
+                | craftcloud_db::migrate::GrantError::SameAsOwner
+                | craftcloud_db::migrate::GrantError::Privileged(_)
+                | craftcloud_db::migrate::GrantError::UnknownRole => {
+                    Failure::config(format!("CRAFTCLOUD_DATABASE_RUNTIME_ROLE: {err}"))
+                }
+                other => Failure::runtime(format!("granting the runtime role: {other}")),
+            })?;
+        println!(
+            "runtime role {role} has data privileges only (audit log: no DELETE, no TRUNCATE)"
+        );
+    } else {
+        println!(
+            "single-role mode: the audit log guard is advisory (set CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE and CRAFTCLOUD_DATABASE_RUNTIME_ROLE to separate the roles)"
+        );
     }
     pool.close().await;
     Ok(())
@@ -269,7 +312,8 @@ async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failur
     };
     let token = OpaqueToken::generate().map_err(|err| Failure::runtime(err.to_string()))?;
     let now = time::OffsetDateTime::now_utc();
-    let outcome = craftcloud_db::password_reset::create(
+    // Host access is the authority here: the audit event has no actor.
+    let outcome = craftcloud_db::password_reset::create_audited(
         &pool,
         &craftcloud_db::password_reset::NewResetToken {
             user_id: account.id,
@@ -278,6 +322,7 @@ async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failur
             now,
             expires_at: now + PASSWORD_RESET_TTL,
         },
+        &craftcloud_db::audit::AuditCtx::system(),
     )
     .await
     .map_err(|err| Failure::runtime(err.to_string()))?;
@@ -371,6 +416,7 @@ fn maintenance_settings(config: &Config) -> MaintenanceSettings {
         config.verify_bytes_per_run,
     );
     settings.quarantine_retention = config.quarantine_retention;
+    settings.audit_retention_days = config.audit_retention_days;
     settings
 }
 
@@ -526,6 +572,15 @@ async fn run(config: Config) -> Result<(), Failure> {
             ))
         })?;
         tracing::info!("database schema verified");
+        if craftcloud_db::migrate::audit_guard_is_advisory(pool)
+            .await
+            .map_err(|err| Failure::runtime(err.to_string()))?
+            == Some(true)
+        {
+            tracing::warn!(
+                "the database role of this server owns the audit log table, so the append-only                  guard is advisory (that role can disable its triggers); use separate roles:                  CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE and CRAFTCLOUD_DATABASE_RUNTIME_ROLE"
+            );
+        }
         if bootstrap.is_some()
             && craftcloud_db::setup::is_completed(pool)
                 .await
@@ -582,6 +637,7 @@ async fn run(config: Config) -> Result<(), Failure> {
         trash_retention: config.trash_retention,
         max_file_size_bytes: config.max_file_size_bytes,
         upload_ttl: config.upload_ttl,
+        audit_downloads: config.audit_downloads,
         ..AuthSettings::default()
     };
     // The maintenance job runs inside the server next to the HTTP stack; its

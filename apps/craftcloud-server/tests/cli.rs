@@ -284,7 +284,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 5"));
         assert!(text(&out).contains("applied migration 9"));
         assert!(text(&out).contains("applied migration 10"));
-        assert!(text(&out).contains("applied 10 migration(s)"));
+        assert!(text(&out).contains("applied migration 12"));
+        assert!(text(&out).contains("applied 12 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));
@@ -631,6 +632,19 @@ mod tests {
         assert_eq!(
             fx.scalar("SELECT (created_by_user_id IS NULL)::text FROM password_reset_tokens"),
             "true"
+        );
+        // The offline issuance leaves one audit event without actor, and no token.
+        assert_eq!(
+            fx.scalar(
+                "SELECT count(*)::text FROM audit_events                  WHERE action = 'password_reset.issue' AND actor_id IS NULL AND result = 'success'"
+            ),
+            "1"
+        );
+        assert_eq!(
+            fx.scalar(&format!(
+                "SELECT count(*)::text FROM audit_events a WHERE row_to_json(a)::text LIKE '%{token}%'"
+            )),
+            "0"
         );
         assert_eq!(
             fx.scalar("SELECT (expires_at - created_at = interval '1 hour')::text FROM password_reset_tokens"),

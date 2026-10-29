@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 use crate::organizations::{AfterKey, clamp_page};
 
 /// What login needs to know about an account.
@@ -213,6 +214,61 @@ pub async fn change_password(
     keep_session: Uuid,
     now: OffsetDateTime,
 ) -> Result<Option<u64>, DbError> {
+    let change = PasswordChange {
+        user_id,
+        verified_hash,
+        new_hash,
+        keep_session,
+        now,
+    };
+    change_password_inner(pool, &change, None).await
+}
+
+/// Like [`change_password`], and records the `auth.password_change` audit
+/// event (actor: the user) in the same transaction.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert leaves the password unchanged.
+pub async fn change_password_audited(
+    pool: &PgPool,
+    user_id: Uuid,
+    verified_hash: &str,
+    new_hash: &str,
+    keep_session: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<Option<u64>, DbError> {
+    let change = PasswordChange {
+        user_id,
+        verified_hash,
+        new_hash,
+        keep_session,
+        now,
+    };
+    change_password_inner(pool, &change, Some(audit)).await
+}
+
+struct PasswordChange<'a> {
+    user_id: Uuid,
+    verified_hash: &'a str,
+    new_hash: &'a str,
+    keep_session: Uuid,
+    now: OffsetDateTime,
+}
+
+async fn change_password_inner(
+    pool: &PgPool,
+    change: &PasswordChange<'_>,
+    audit: Option<&AuditCtx>,
+) -> Result<Option<u64>, DbError> {
+    let PasswordChange {
+        user_id,
+        verified_hash,
+        new_hash,
+        keep_session,
+        now,
+    } = *change;
     let mut tx = pool.begin().await?;
     let updated =
         sqlx::query("UPDATE users SET password_hash = $3 WHERE id = $1 AND password_hash = $2")
@@ -252,6 +308,23 @@ pub async fn change_password(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    if let Some(audit) = audit {
+        let by = AuditCtx {
+            actor_id: Some(user_id),
+            request_id: audit.request_id.clone(),
+        };
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("auth.password_change")
+                .target("user", user_id)
+                .detail(
+                    "sessions_revoked",
+                    Detail::Count(i64::try_from(revoked).unwrap_or(i64::MAX)),
+                ),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(Some(revoked))
 }
@@ -298,6 +371,33 @@ pub async fn set_disabled(
     user_id: Uuid,
     disabled: bool,
     now: OffsetDateTime,
+) -> Result<DisableOutcome, DbError> {
+    set_disabled_inner(pool, user_id, disabled, now, None).await
+}
+
+/// Like [`set_disabled`], and records `user.disable` / `user.enable` (actor
+/// from `audit`) in the same transaction when the state changed; an
+/// unchanged account records nothing.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert leaves the account unchanged.
+pub async fn set_disabled_audited(
+    pool: &PgPool,
+    user_id: Uuid,
+    disabled: bool,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<DisableOutcome, DbError> {
+    set_disabled_inner(pool, user_id, disabled, now, Some(audit)).await
+}
+
+async fn set_disabled_inner(
+    pool: &PgPool,
+    user_id: Uuid,
+    disabled: bool,
+    now: OffsetDateTime,
+    audit: Option<&AuditCtx>,
 ) -> Result<DisableOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let row: Option<(bool, bool)> = sqlx::query_as(
@@ -360,6 +460,23 @@ pub async fn set_disabled(
     } else {
         Vec::new()
     };
+    if let (Some(audit), true) = (audit, changed) {
+        record_in(
+            &mut tx,
+            audit,
+            &NewEvent::new(if disabled {
+                "user.disable"
+            } else {
+                "user.enable"
+            })
+            .target("user", user_id)
+            .detail(
+                "orphaned_organizations",
+                Detail::Count(i64::try_from(orphaned_organizations.len()).unwrap_or(i64::MAX)),
+            ),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(if changed {
         DisableOutcome::Changed {

@@ -20,6 +20,7 @@ use craftcloud_core::policy::{
     WorkspaceRole, can,
 };
 use craftcloud_core::{DisplayName, NormalizedEmail};
+use craftcloud_db::audit::Detail;
 use craftcloud_db::invitations::{
     self, AcceptBy, AcceptOutcome, CreateInvitationOutcome, Invitation, NewInvitation,
 };
@@ -31,6 +32,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use zeroize::Zeroize;
 
+use crate::audit::{Change, commit_audited};
 use crate::orgs::{
     Gate, audit, conflict, db_failure, gate, not_found, page_error, parse_id, rfc3339,
 };
@@ -210,17 +212,21 @@ pub(crate) async fn create_invitation(
         .await;
     match created {
         Ok(CreateInvitationOutcome::Created(invitation)) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "invitation.create",
+                    org_id,
+                    Some(invitation.id),
+                )
+                .detail("role", Detail::Code(org_role.as_str())),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "invitation creation failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "invitation.create",
-                Some(org_id),
-                Some(invitation.id),
-                "success",
-            );
             // The token travels in the URL fragment: not sent to servers or Referer.
             let invite_url = format!("{public_url}/invite#token={}", token.expose());
             (
@@ -401,17 +407,20 @@ pub(crate) async fn revoke_invitation(
         .await
     {
         Ok(true) => {
-            if let Err(error) = tx.commit().await {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    &headers,
+                    session.user_id,
+                    "invitation.revoke",
+                    org_id,
+                    Some(invitation_id),
+                ),
+            )
+            .await
+            {
                 return db_failure(&error, &headers, "invitation revoke failed");
             }
-            audit(
-                &headers,
-                session.user_id,
-                "invitation.revoke",
-                Some(org_id),
-                Some(invitation_id),
-                "success",
-            );
             StatusCode::NO_CONTENT.into_response()
         }
         // Already accepted, revoked or invalid.
@@ -552,7 +561,14 @@ pub(crate) async fn accept_invitation(
         }
     };
 
-    let outcome = invitations::accept(&services.pool, &token_hash, &by, now).await;
+    let outcome = invitations::accept_audited(
+        &services.pool,
+        &token_hash,
+        &by,
+        now,
+        &crate::audit::ctx(&headers, None),
+    )
+    .await;
     let (user_id, org_id, workspace_id, account_created, applied) = match outcome {
         Ok(AcceptOutcome::Accepted {
             user_id,
@@ -626,7 +642,7 @@ pub(crate) async fn accept_invitation(
             return internal(&headers);
         };
         let absolute = now + services.settings.absolute_timeout;
-        let created = sessions::create_for_verified_login(
+        let created = sessions::create_for_verified_login_audited(
             &services.pool,
             &sessions::NewSession {
                 user_id,
@@ -635,6 +651,7 @@ pub(crate) async fn accept_invitation(
                 absolute_expires_at: absolute,
             },
             &hash,
+            &crate::audit::ctx(&headers, Some(user_id)),
         )
         .await;
         match created {

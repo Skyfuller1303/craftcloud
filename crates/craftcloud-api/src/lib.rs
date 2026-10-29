@@ -10,6 +10,7 @@
 //! from `Host` or `X-Forwarded-*` headers (see [`ClientIp`] for how forwarded
 //! client addresses are treated).
 
+mod audit;
 mod auth;
 mod client_ip;
 mod clock;
@@ -150,6 +151,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
     ("/api/v1/admin/maintenance", &["GET"]),
+    ("/api/v1/organizations/{org_id}/audit", &["GET"]),
+    ("/api/v1/organizations/{org_id}/audit/export", &["GET"]),
+    ("/api/v1/admin/audit", &["GET"]),
+    ("/api/v1/admin/audit/export", &["GET"]),
     ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
     ("/api/v1/admin/users/{user_id}/enable", &["POST"]),
     ("/api/v1/auth/login", &["POST"]),
@@ -188,6 +193,7 @@ pub fn router_with_services(
         capabilities,
         services: services.map(Arc::new),
     };
+    let audit_services = state.services.clone();
     let routes = Router::new()
         .route("/health/live", get(health_live))
         .route("/api/v1/info", get(info))
@@ -306,6 +312,19 @@ pub fn router_with_services(
         .route("/api/v1/admin/users", get(orgs::list_all_users))
         .route("/api/v1/admin/maintenance", get(maintenance::get_status))
         .route(
+            "/api/v1/organizations/{org_id}/audit",
+            get(audit::list_org_audit),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/audit/export",
+            get(audit::export_org_audit),
+        )
+        .route("/api/v1/admin/audit", get(audit::list_instance_audit))
+        .route(
+            "/api/v1/admin/audit/export",
+            get(audit::export_instance_audit),
+        )
+        .route(
             "/api/v1/admin/users/{user_id}/disable",
             post(orgs::disable_user),
         )
@@ -341,7 +360,12 @@ pub fn router_with_services(
         )
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
-    with_middleware(routes, config, false).merge(with_middleware(streaming, config, true))
+    with_middleware(routes, config, false, audit_services.clone()).merge(with_middleware(
+        streaming,
+        config,
+        true,
+        audit_services,
+    ))
 }
 
 /// Shared handler state. Opaque: only used as the state type of
@@ -354,7 +378,17 @@ pub struct ApiState {
 
 /// Applies the centralized middleware stack. The last layer added is the
 /// outermost one, so the order below reads from the handler outwards.
-fn with_middleware(router: Router, config: &ApiConfig, streaming: bool) -> Router {
+fn with_middleware(
+    router: Router,
+    config: &ApiConfig,
+    streaming: bool,
+    audit_services: Option<Arc<Services>>,
+) -> Router {
+    // Innermost: stores the policy denials (403) that handlers marked.
+    let router = router.layer(middleware::from_fn_with_state(
+        audit_services,
+        audit::record_denials,
+    ));
     let router = if streaming {
         router
     } else {
@@ -703,7 +737,7 @@ mod tests {
                     "late"
                 }),
             );
-        with_middleware(routes, config, false)
+        with_middleware(routes, config, false, None)
     }
 
     #[tokio::test]
@@ -751,7 +785,7 @@ mod tests {
                     .map_or_else(|| "none".to_owned(), |ip| ip.0.to_string())
             }),
         );
-        with_middleware(routes, &config, false)
+        with_middleware(routes, &config, false, None)
     }
 
     async fn client_ip_for(app: Router, peer: Option<&str>, xff: Option<&str>) -> String {

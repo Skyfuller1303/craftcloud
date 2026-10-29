@@ -309,8 +309,10 @@ pub enum AbortOutcome {
 /// Result of setting a workspace quota.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaSetOutcome {
-    /// Stored.
+    /// Stored (the value changed).
     Set,
+    /// The workspace already had this quota; nothing changed.
+    Unchanged,
     /// The workspace quota would exceed the organization quota.
     ExceedsOrganization,
     /// No such workspace in this organization.
@@ -751,13 +753,15 @@ impl OrgTx {
     /// # Errors
     ///
     /// Database failures only.
-    pub async fn org_quota_set(&mut self, quota: Option<i64>) -> Result<(), DbError> {
-        sqlx::query("UPDATE organizations SET quota_bytes = $2 WHERE id = $1")
-            .bind(self.org_id)
-            .bind(quota)
-            .execute(&mut *self.tx)
-            .await?;
-        Ok(())
+    pub async fn org_quota_set(&mut self, quota: Option<i64>) -> Result<bool, DbError> {
+        let changed =
+            sqlx::query("UPDATE organizations SET quota_bytes = $2 WHERE id = $1 AND quota_bytes IS DISTINCT FROM $2")
+                .bind(self.org_id)
+                .bind(quota)
+                .execute(&mut *self.tx)
+                .await?
+                .rows_affected();
+        Ok(changed == 1)
     }
 
     /// Sets the storage quota of a workspace; a quota above the organization
@@ -786,13 +790,20 @@ impl OrgTx {
                 return Ok(QuotaSetOutcome::ExceedsOrganization);
             }
         }
-        sqlx::query("UPDATE workspaces SET quota_bytes = $3 WHERE id = $1 AND org_id = $2")
-            .bind(workspace_id)
-            .bind(self.org_id)
-            .bind(quota)
-            .execute(&mut *self.tx)
-            .await?;
-        Ok(QuotaSetOutcome::Set)
+        let changed = sqlx::query(
+            "UPDATE workspaces SET quota_bytes = $3              WHERE id = $1 AND org_id = $2 AND quota_bytes IS DISTINCT FROM $3",
+        )
+        .bind(workspace_id)
+        .bind(self.org_id)
+        .bind(quota)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        Ok(if changed == 1 {
+            QuotaSetOutcome::Set
+        } else {
+            QuotaSetOutcome::Unchanged
+        })
     }
 
     /// Recomputes the usage counters of the organization and its workspaces

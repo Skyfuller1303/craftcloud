@@ -31,6 +31,7 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::audit::{AuditCtx, NewEvent};
 use crate::organizations::{AfterKey, Organization, UpdateOutcome, clamp_page};
 use crate::{DbError, OrgScope};
 
@@ -391,6 +392,20 @@ impl OrgTx {
         })
     }
 
+    /// The current display name, read under the lock.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn current_name(&mut self) -> Result<String, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT name FROM organizations WHERE id = $1")
+                .bind(self.org_id)
+                .fetch_one(&mut *self.tx)
+                .await?,
+        )
+    }
+
     /// The organization setting that lets workspace admins invite.
     ///
     /// # Errors
@@ -403,6 +418,18 @@ impl OrgTx {
         .bind(self.org_id)
         .fetch_one(&mut *self.tx)
         .await?)
+    }
+
+    /// Records an audit event of this organization in the transaction, so it
+    /// commits or rolls back together with the change it describes. The event's
+    /// tenant is always the transaction's organization. On error the caller
+    /// must abandon the transaction (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// Database failures.
+    pub async fn audit(&mut self, ctx: &AuditCtx, event: NewEvent<'_>) -> Result<(), DbError> {
+        crate::audit::record_in(&mut self.tx, ctx, &event.org(self.org_id)).await
     }
 
     /// Commits the transaction and releases the lock.

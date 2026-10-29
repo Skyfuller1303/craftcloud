@@ -10,12 +10,13 @@ import { useI18n } from "../i18n/index.tsx";
 import { useRoleNames } from "../roles.ts";
 import type { ThemeChoice } from "../preferences.ts";
 import { usePagedList } from "../usePagedList.ts";
+import { ActivityScreen } from "./ActivityScreen.tsx";
 import { FilesScreen } from "./FilesScreen.tsx";
 import { InvitationsScreen } from "./InvitationsScreen.tsx";
 import { MembersScreen } from "./MembersScreen.tsx";
 import { ProjectsScreen } from "./ProjectsScreen.tsx";
 
-/** Dashboard sections. Settings and activity follow with CC-P03-05 and later; they stay placeholders. */
+/** Dashboard sections. Settings follows with a later ticket and stays a placeholder. */
 const SECTIONS = ["overview", "projects", "files", "members", "invitations", "settings", "activity"] as const;
 type Section = (typeof SECTIONS)[number];
 
@@ -230,6 +231,13 @@ export function Shell({
             />
           ) : section === "invitations" ? (
             <InvitationsScreen key={organizationId} scope={scope} workspaces={workspaces.items} />
+          ) : section === "activity" ? (
+            <ActivityScreen
+              key={organizationId}
+              scope={scope}
+              isOperator={session.instance_role === "operator"}
+              workspaces={workspaces.items}
+            />
           ) : (
             <p className="muted">{t("This view is not available yet.")}</p>
           )}

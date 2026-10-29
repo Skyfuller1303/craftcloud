@@ -33,6 +33,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::DbError;
+use crate::audit::{AuditCtx, Detail, NewEvent};
 use crate::members::OrgTx;
 use crate::uploads::{HOLDING, SESSION_COLUMNS, UploadSession};
 
@@ -322,8 +323,8 @@ impl OrgTx {
         cutoff: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<PurgeCounts, DbError> {
-        let due: Option<bool> = sqlx::query_scalar(
-            "SELECT deleted_at < $3 FROM files \
+        let due: Option<(bool, Uuid)> = sqlx::query_as(
+            "SELECT deleted_at < $3, workspace_id FROM files \
              WHERE id = $1 AND org_id = $2 AND deleted_at IS NOT NULL FOR UPDATE",
         )
         .bind(file_id)
@@ -331,10 +332,21 @@ impl OrgTx {
         .bind(cutoff)
         .fetch_optional(&mut *self.tx)
         .await?;
-        if due != Some(true) {
+        let Some((true, workspace_id)) = due else {
             return Ok(PurgeCounts::default());
+        };
+        let counts = self.purge_file_rows(file_id, now).await?;
+        if counts.files > 0 {
+            self.audit(
+                &AuditCtx::system(),
+                NewEvent::new("file.purge")
+                    .target("file", file_id)
+                    .workspace(workspace_id)
+                    .detail("versions", Detail::Count(clamp_count(counts.versions))),
+            )
+            .await?;
         }
-        self.purge_file_rows(file_id, now).await
+        Ok(counts)
     }
 
     /// Permanently deletes a project that has been in the trash since before
@@ -352,8 +364,8 @@ impl OrgTx {
         now: OffsetDateTime,
         file_limit: i64,
     ) -> Result<PurgeCounts, DbError> {
-        let due: Option<bool> = sqlx::query_scalar(
-            "SELECT deleted_at < $3 FROM projects \
+        let due: Option<(bool, Uuid)> = sqlx::query_as(
+            "SELECT deleted_at < $3, workspace_id FROM projects \
              WHERE id = $1 AND org_id = $2 AND deleted_at IS NOT NULL FOR UPDATE",
         )
         .bind(project_id)
@@ -361,9 +373,9 @@ impl OrgTx {
         .bind(cutoff)
         .fetch_optional(&mut *self.tx)
         .await?;
-        if due != Some(true) {
+        let Some((true, workspace_id)) = due else {
             return Ok(PurgeCounts::default());
-        }
+        };
         let files: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM files WHERE project_id = $1 AND org_id = $2 \
              ORDER BY id LIMIT $3 FOR UPDATE",
@@ -391,6 +403,20 @@ impl OrgTx {
                 .await?
                 .rows_affected();
         }
+        // A long project is emptied over several transactions; each one that
+        // removed something records what it did.
+        if counts.files > 0 || counts.projects > 0 {
+            self.audit(
+                &AuditCtx::system(),
+                NewEvent::new("project.purge")
+                    .target("project", project_id)
+                    .workspace(workspace_id)
+                    .detail("files", Detail::Count(clamp_count(counts.files)))
+                    .detail("versions", Detail::Count(clamp_count(counts.versions)))
+                    .detail("completed", Detail::Flag(counts.projects == 1)),
+            )
+            .await?;
+        }
         Ok(counts)
     }
 
@@ -414,8 +440,9 @@ impl OrgTx {
         file_id: Uuid,
         cutoff: OffsetDateTime,
     ) -> Result<u64, DbError> {
-        let live: Option<(Option<Uuid>, bool, bool)> = sqlx::query_as(
-            "SELECT f.head_version_id, f.deleted_at IS NOT NULL, p.deleted_at IS NOT NULL \
+        let live: Option<(Option<Uuid>, bool, bool, Uuid)> = sqlx::query_as(
+            "SELECT f.head_version_id, f.deleted_at IS NOT NULL, p.deleted_at IS NOT NULL, \
+                    f.workspace_id \
              FROM files f JOIN projects p ON p.id = f.project_id \
              WHERE f.id = $1 AND f.org_id = $2 FOR UPDATE OF f",
         )
@@ -423,7 +450,7 @@ impl OrgTx {
         .bind(self.org_id)
         .fetch_optional(&mut *self.tx)
         .await?;
-        let Some((head, false, false)) = live else {
+        let Some((head, false, false, workspace_id)) = live else {
             return Ok(0);
         };
         let old: Vec<Uuid> = sqlx::query_scalar(
@@ -475,8 +502,21 @@ impl OrgTx {
             .execute(&mut *self.tx)
             .await?;
         }
-        Ok(old.len() as u64)
+        let deleted = old.len() as u64;
+        self.audit(
+            &AuditCtx::system(),
+            NewEvent::new("version.trim")
+                .target("file", file_id)
+                .workspace(workspace_id)
+                .detail("versions", Detail::Count(clamp_count(deleted))),
+        )
+        .await?;
+        Ok(deleted)
     }
+}
+
+fn clamp_count(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 // ---- blob garbage collection ------------------------------------------------
@@ -1000,6 +1040,17 @@ pub async fn rebind_store(
     .bind(now)
     .bind(epoch)
     .execute(&mut *tx)
+    .await?;
+    // Operator decision from the command line: instance-level, no actor.
+    crate::audit::record_in(
+        &mut tx,
+        &AuditCtx::system(),
+        &NewEvent::new("storage.rebind")
+            .target("storage_binding", store_id)
+            .detail("epoch", Detail::Count(epoch))
+            .detail("was_bound", Detail::Flag(old.is_some()))
+            .detail("changed", Detail::Flag(old != Some(store_id))),
+    )
     .await?;
     tx.commit().await?;
     Ok(old)
