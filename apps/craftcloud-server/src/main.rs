@@ -352,6 +352,25 @@ async fn run(config: Config) -> Result<(), Failure> {
         );
     }
 
+    // The object store is validated at startup when configured; storage
+    // features themselves arrive with the upload and download routes.
+    let _object_store = match &config.storage_dir {
+        Some(dir) => {
+            let store = craftcloud_storage::LocalStore::open(dir)
+                .await
+                .map_err(|err| Failure::runtime(err.to_string()))?;
+            tracing::info!(
+                max_file_size_bytes = config.max_file_size_bytes,
+                "object storage directory verified"
+            );
+            Some(store)
+        }
+        None => {
+            tracing::warn!("CRAFTCLOUD_STORAGE_DIR is not set: file storage is unavailable");
+            None
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|err| Failure::runtime(format!("cannot bind {}: {err}", config.bind)))?;

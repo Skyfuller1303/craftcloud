@@ -81,3 +81,19 @@ Until e-mail verification exists, link possession is the proof of an address (AD
 | Viewer or editor exceeding their role | exact policy actions, roles loaded freshly in the locked transaction | `project_role_matrix`, `file_role_matrix_and_metadata_defaults` |
 | Names as personal data in logs | audit lines carry ids only | `the_file_name_never_reaches_a_path_or_the_logs` |
 | Resurrecting data after the retention period, or into a taken name | restore checks the clock and the name key; 410 / 409 | `trash_restore_and_retention_follow_the_clock` |
+
+## Object storage abuse cases (PR-009, CC-F09)
+
+| Abuse case | Mitigation | Test |
+|---|---|---|
+| Path traversal through keys or names | paths are built only from a server generated `ObjectKey` (32 lowercase hex characters) or a validated temporary id; file names never reach storage; hostile strings do not parse | `only_server_generated_keys_reach_paths`, key unit tests |
+| Partial or corrupt object becomes visible | data goes to `tmp/<id>.part` through synchronous std file writes (no deferred write errors), is verified (length, SHA-256, file length on the handle after fsync) and published by one hard link; failed, aborted or dropped writers remove their file | `a_write_failing_at_byte_n_leaves_nothing_behind`, `fsync_and_rename_failures_publish_nothing`, `dropping_or_aborting_a_writer_removes_its_temporary_file`, `length_and_checksum_mismatches_discard_the_upload` |
+| Oversized upload or memory exhaustion | caller supplied hard byte limit per write, 64 KiB buffers and chunks (a 1 GiB stream used 26 MiB peak job memory in the manual run) | `the_byte_limit_is_enforced_and_kills_the_writer`, `large_one_gibibyte_streams_with_bounded_buffers` |
+| Disk full | typed `Full` error (ENOSPC / `ERROR_DISK_FULL`), temporary file removed, later 507 | fault injection `FaultKind::Full`, `disk_full_conditions_map_to_full` (real ENOSPC not exercised) |
+| Symlink or junction swap inside the storage tree | root canonicalized, root/`objects`/`tmp`/shard directories must be plain directories, files opened with `O_NOFOLLOW` or `FILE_FLAG_OPEN_REPARSE_POINT` and required to be regular files | `links_in_the_tree_are_refused` (skipped on this Windows host without symlink privilege; unix `O_NOFOLLOW` path unverified) |
+| Overwriting a published object | exclusive create for temporary files, publishing by `hard_link` (fails atomically with `AlreadyExists`, never overwrites), random keys, published objects read-only | `write_finalize_read_head_verify_delete` |
+| Cross-tenant inference through deduplication | no deduplication; equal contents get distinct keys | `equal_contents_get_distinct_keys_and_nothing_is_deduplicated` |
+| Error messages leaking server paths | `StorageError` Display carries no paths; details only in server logs | `other_errors_keep_their_class_and_display_has_no_paths` |
+| Tampering with stored data | `verify` re-reads and compares the SHA-256; reads of truncated files fail | `verify_detects_changed_data_and_truncated_files_fail_to_read` |
+
+Out of the threat model: an attacker with write access to the storage directory on the host (who could swap a directory for a link between a check and an open, or read the data directly). The checks against links in the tree defend against mistakes and hostile restores, not against a local root-level attacker; protect the directory with file system permissions. A capability-based file API (such as `cap-std`) is not used for now. A cancelled publish can leave an unreferenced object or a `.part` file; the reconciliation job (CC-P02-07) removes them after a grace period.

@@ -254,6 +254,7 @@ dependencies = [
  "craftcloud-auth",
  "craftcloud-core",
  "craftcloud-db",
+ "craftcloud-storage",
  "ipnet",
  "libc",
  "sqlx",
@@ -263,6 +264,18 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "craftcloud-storage"
+version = "0.0.0"
+dependencies = [
+ "craftcloud-storage",
+ "libc",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

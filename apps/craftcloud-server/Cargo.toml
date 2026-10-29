@@ -12,6 +12,7 @@ craftcloud-auth.workspace = true
 craftcloud-core.workspace = true
 time.workspace = true
 craftcloud-db.workspace = true
+craftcloud-storage.workspace = true
 ipnet.workspace = true
 url.workspace = true
 zeroize.workspace = true

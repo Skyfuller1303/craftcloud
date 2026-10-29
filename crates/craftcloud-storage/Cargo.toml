@@ -1,0 +1,27 @@
+[package]
+name = "craftcloud-storage"
+description = "CraftCloud object storage: local filesystem adapter with checksums and bounded streams (no HTTP)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sha2.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+
+[features]
+# Lets tests arm injected failures. The server never enables it.
+fault-injection = []
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+craftcloud-storage = { path = ".", features = ["fault-injection"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

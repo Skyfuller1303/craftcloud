@@ -31,6 +31,8 @@ const SESSION_IDLE_MINUTES_RANGE: (u64, u64) = (5, 72 * 60);
 const DEFAULT_SESSION_ABSOLUTE_HOURS: u64 = 7 * 24;
 const SESSION_ABSOLUTE_HOURS_RANGE: (u64, u64) = (1, 30 * 24);
 const DEFAULT_TRASH_RETENTION_DAYS: u64 = 30;
+const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_FILE_SIZE_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 const TRASH_RETENTION_DAYS_RANGE: (u64, u64) = (1, 3650);
 const DEFAULT_DB_MAX_CONNECTIONS: u64 = 10;
 const DB_MAX_CONNECTIONS_RANGE: (u64, u64) = (1, 100);
@@ -46,7 +48,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 14] = [
+const SUPPORTED_KEYS: [&str; 16] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -58,6 +60,8 @@ const SUPPORTED_KEYS: [&str; 14] = [
     "SESSION_IDLE_TIMEOUT_MINUTES",
     "SESSION_ABSOLUTE_TIMEOUT_HOURS",
     "TRASH_RETENTION_DAYS",
+    "STORAGE_DIR",
+    "MAX_FILE_SIZE_BYTES",
     "DATABASE_URL_FILE",
     "DATABASE_MAX_CONNECTIONS",
     "DATABASE_CONNECT_TIMEOUT_SECS",
@@ -144,6 +148,11 @@ pub struct Config {
     pub session_absolute_timeout: Duration,
     /// How long soft-deleted projects and files stay restorable (ADR-0014).
     pub trash_retention: Duration,
+    /// Directory of the local object store, if configured. Validated when the
+    /// server starts (exists, writable, no links, same file system).
+    pub storage_dir: Option<PathBuf>,
+    /// Largest accepted file size in bytes (ADR-0014: 5 GiB by default).
+    pub max_file_size_bytes: u64,
 }
 
 impl Config {
@@ -297,6 +306,21 @@ impl Config {
             parse_ranged(key, raw, TRASH_RETENTION_DAYS_RANGE)
         })
         .unwrap_or(DEFAULT_TRASH_RETENTION_DAYS);
+        let storage_dir = field(&mut errors, env, "STORAGE_DIR", |key, raw| {
+            let path = PathBuf::from(raw.trim());
+            if raw.trim().is_empty() || !path.is_absolute() {
+                Err(ConfigError::new(
+                    key,
+                    "must be an absolute path to a directory",
+                ))
+            } else {
+                Ok(path)
+            }
+        });
+        let max_file_size_bytes = field(&mut errors, env, "MAX_FILE_SIZE_BYTES", |key, raw| {
+            parse_ranged(key, raw, MAX_FILE_SIZE_RANGE)
+        })
+        .unwrap_or(DEFAULT_MAX_FILE_SIZE_BYTES);
         if session_idle_minutes > session_absolute_hours * 60 {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}SESSION_IDLE_TIMEOUT_MINUTES"),
@@ -337,6 +361,8 @@ impl Config {
                 session_idle_timeout: Duration::from_secs(session_idle_minutes * 60),
                 session_absolute_timeout: Duration::from_secs(session_absolute_hours * 3600),
                 trash_retention: Duration::from_secs(trash_retention_days * 24 * 3600),
+                storage_dir,
+                max_file_size_bytes,
             })
         } else {
             Err(errors)
@@ -630,6 +656,31 @@ mod tests {
             retention.trash_retention,
             Duration::from_secs(7 * 24 * 3600)
         );
+        assert_eq!(defaults.storage_dir, None);
+        assert_eq!(defaults.max_file_size_bytes, 5 * 1024 * 1024 * 1024);
+        let storage = Config::from_env_map(&env(&[
+            (
+                "CRAFTCLOUD_STORAGE_DIR",
+                if cfg!(windows) {
+                    "C:\\data\\cc"
+                } else {
+                    "/var/lib/cc"
+                },
+            ),
+            ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "1048576"),
+        ]))
+        .unwrap();
+        assert!(storage.storage_dir.is_some());
+        assert_eq!(storage.max_file_size_bytes, 1_048_576);
+        for (key, bad) in [
+            ("CRAFTCLOUD_STORAGE_DIR", "relative/dir"),
+            ("CRAFTCLOUD_STORAGE_DIR", ""),
+            ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "1048575"),
+            ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "1099511627777"),
+            ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "5GiB"),
+        ] {
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
         for bad in ["0", "3651", "abc", "-1"] {
             let key = "CRAFTCLOUD_TRASH_RETENTION_DAYS";
             assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");

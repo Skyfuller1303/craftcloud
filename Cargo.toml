@@ -6,6 +6,7 @@ members = [
     "crates/craftcloud-api",
     "crates/craftcloud-auth",
     "crates/craftcloud-db",
+    "crates/craftcloud-storage",
     "xtask",
 ]
 
@@ -21,6 +22,7 @@ craftcloud-core = { path = "crates/craftcloud-core" }
 craftcloud-api = { path = "crates/craftcloud-api" }
 craftcloud-db = { path = "crates/craftcloud-db" }
 craftcloud-auth = { path = "crates/craftcloud-auth" }
+craftcloud-storage = { path = "crates/craftcloud-storage" }
 argon2 = { version = "0.5", features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
 subtle = "2"
@@ -62,4 +64,8 @@ debug = "line-tables-only"
 opt-level = 3
 
 [profile.dev.package.blake2]
+opt-level = 3
+
+# Streaming checksums over large files.
+[profile.dev.package.sha2]
 opt-level = 3

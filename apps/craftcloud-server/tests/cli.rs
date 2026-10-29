@@ -79,6 +79,25 @@ mod tests {
         assert!(text(&out).contains("CRAFTCLOUD_DATABASE_URL_FILE"));
     }
 
+    #[test]
+    fn unusable_storage_directory_stops_startup_with_exit_1() {
+        let missing = std::env::temp_dir().join("craftcloud-cli-test-storage-missing");
+        let missing = missing.to_string_lossy().into_owned();
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_STORAGE_DIR", &missing),
+                ("CRAFTCLOUD_BIND", "127.0.0.1:0"),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(text(&out).contains("storage directory"), "{}", text(&out));
+        // A relative path is a configuration error.
+        let out = run(&[], &[("CRAFTCLOUD_STORAGE_DIR", "relative")]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(text(&out).contains("CRAFTCLOUD_STORAGE_DIR"));
+    }
+
     // ---- PostgreSQL-backed tests -------------------------------------
 
     /// Temp secret file plus throwaway database, both cleaned up on drop.

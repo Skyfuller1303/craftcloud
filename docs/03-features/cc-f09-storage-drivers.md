@@ -1,6 +1,6 @@
 # CC-F09 — Speicheradapter Local FS und S3
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
+> **Status:** lokaler Dateisystem-Adapter umgesetzt (PR-009, Review offen): Crate `craftcloud-storage` mit Trait `ObjectStore` und `LocalStore` (zufällige Server-Schlüssel, Schreiben über temporäre Objekte mit Byte-Limit und SHA-256, atomares Veröffentlichen per Hard-Link ohne Überschreiben, Schreiben über den Blocking-Pool (Schreibfehler erscheinen sofort, nicht verzögert), Range-Lesen in 64-KiB-Blöcken, Auflisten für die Abstimmung, Symlink-Abwehr, typisierte Fehler inkl. `Full`) samt Fehlerinjektion. Keine HTTP-Routen (Upload/Download folgen mit CC-F07/CC-P02-05). Nicht umgesetzt: S3-Adapter, Deduplizierung (bewusst nie), fortsetzbare Uploads. Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen

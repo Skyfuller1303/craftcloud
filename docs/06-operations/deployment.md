@@ -25,6 +25,8 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES` | `480` (8 h) | 5 bis 4320; nicht größer als die absolute Dauer |
 | `CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS` | `168` (7 Tage) | 1 bis 720 |
 | `CRAFTCLOUD_TRASH_RETENTION_DAYS` | `30` | 1 bis 3650; so lange bleiben in den Papierkorb verschobene Projekte und Dateien wiederherstellbar (ADR-0014). Es gibt noch keine automatische endgültige Löschung (CC-P02-06): abgelaufene Einträge bleiben in der Datenbank, sind aber nicht mehr wiederherstellbar |
+| `CRAFTCLOUD_STORAGE_DIR` | nicht gesetzt (Dateispeicher nicht verfügbar) | absoluter Pfad eines Verzeichnisses für Dateiinhalte. Beim Start geprüft: vorhanden, Verzeichnis, beschreibbar, kein Symlink/Reparse-Point; `objects` und `tmp` darunter werden angelegt und müssen auf demselben Dateisystem liegen (Probe mit Anlegen und Hard-Link; das Dateisystem muss Hard-Links unterstützen, z. B. NTFS, ext4, XFS, nicht FAT/exFAT). Bei einem Fehler beendet sich der Server mit Exit 1 |
+| `CRAFTCLOUD_MAX_FILE_SIZE_BYTES` | `5368709120` (5 GiB) | 1048576 bis 1099511627776; größte erlaubte Dateigröße (ADR-0014) |
 | `CRAFTCLOUD_DATABASE_URL_FILE` | nicht gesetzt (Prototypmodus ohne Datenbank) | absoluter Pfad einer Secret-Datei mit der PostgreSQL-URL |
 | `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` | `10` | 1 bis 100 |
 | `CRAFTCLOUD_DATABASE_CONNECT_TIMEOUT_SECS` | `5` | 1 bis 60 |
@@ -101,6 +103,14 @@ Das Konto muss existieren und aktiviert sein; es wird als Owner hinzugefügt ode
 - Der Organisationsschalter `workspace_admin_invites_enabled` (Standard `true`, `PATCH /api/v1/organizations/{org_id}`, Owner/Admin) bestimmt, ob Workspace-Admins in ihren Workspace einladen dürfen. Höchstens 1000 offene Einladungen je Organisation; Anlegen ist je Nutzer ratenbegrenzt (Standard 30 je Fenster, Zähler im Speicher, eine Instanz).
 - **Account-Squatting (Restrisiko):** Wer einen Einladungslink für eine fremde Adresse erzeugt und selbst annimmt, legt ein Konto für diese Adresse an; die echte Person erhält später `LOGIN_REQUIRED`. Der Operator sieht Herkunft und Einlader mit `GET /api/v1/admin/users?unverified=true` (Organisation, einladender Nutzer, Einladung; `email_verified` ist bis zu einer Verifikation für alle Konten `false`) und im Audit-Log (`account.created_via_invitation`, nur IDs). Abhilfe: das Konto mit `POST /api/v1/admin/users/{user_id}/disable` sperren; anschließend mit der echten Person eine Wiederherstellung vereinbaren (Break-glass: Passwort-Reset-Link des Operators für das Konto, nachdem der Operator die Identität außerhalb des Systems geprüft hat, dann Konto wieder aktivieren). Vor einem Mehrmandanten-Produktivbetrieb ist E-Mail-Verifikation nötig.
 - Migration 0006 muss vor dem Start der neuen Version mit `craftcloud-server migrate` eingespielt werden (nur vorwärts).
+
+## Dateispeicher (PR-009)
+
+- Das Speicherverzeichnis gehört dem Serverbenutzer (unix: Modus 0700 empfohlen; der Server legt Dateien mit 0600 an, veröffentlichte Objekte sind schreibgeschützt). Es muss auf einem lokalen Dateisystem liegen, das atomare Hard-Links innerhalb des Verzeichnisses kann (kein Netzwerkdateisystem mit schwacher Semantik); `objects` und `tmp` dürfen nicht auf verschiedene Dateisysteme zeigen (z. B. per Mount).
+- Struktur: `objects/<2 Hex>/<2 Hex>/<32 Hex>` für veröffentlichte Objekte, `tmp/<32 Hex>.part` für laufende Schreibvorgänge. Schlüssel sind zufällig; Dateinamen, Organisationen oder Nutzer tauchen in Pfaden nie auf. Identische Inhalte werden nicht dedupliziert.
+- Nach einem Absturz können `.part`-Dateien in `tmp` liegen bleiben; sie sind nie sichtbar und werden mit dem Abstimmungsjob (CC-P02-07) entfernt. Sie dürfen bei gestopptem Server gefahrlos gelöscht werden.
+- Backups: Datenbank und Speicherverzeichnis gemeinsam sichern (zuerst die Datenbank, danach das Verzeichnis, damit jeder Datenbankeintrag ein Objekt hat; überzählige Objekte sind harmlos). Symlinks im Baum werden vom Server abgelehnt; beim Wiederherstellen keine Links anlegen.
+- Plattenplatz: ein volles Gerät führt zu typisierten Fehlern (`Full`, später HTTP 507); der Server bleibt nutzbar. Quoten und Überwachung folgen mit CC-F10/CC-F15.
 
 ## Setup-Runbook
 

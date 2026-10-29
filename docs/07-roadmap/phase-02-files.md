@@ -10,9 +10,10 @@ Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und M
 ## Umsetzungstickets
 
 - [ ] **CC-P02-01** — Project/File metadata + safe filename/path handling (CC-F06)
-  - Status: Umsetzung lokal vorhanden (PR-008, Review offen): Projekte und Dateimetadaten mit Soft-Delete/Restore, Namensvalidierung und Eindeutigkeit, Paginierung, Rollenmatrix, IDOR-Tests. Nicht enthalten: Ordner, Dateiinhalte, endgültiges Löschen. Das Ticket wird nach der Übergabe angehakt.
+  - Status: Umsetzung lokal vorhanden (PR-008, Review offen): Projekte und Dateimetadaten mit Soft-Delete/Restore, Namensvalidierung und Eindeutigkeit, Paginierung, Rollenmatrix, IDOR-Tests. Nicht enthalten: Ordner, Dateiinhalte, endgültiges Löschen. Hinweis für CC-P02-07: Ein Abbruch während des Veröffentlichens kann ein nicht referenziertes Objekt oder eine `.part`-Datei hinterlassen; die Abstimmung muss nicht referenzierte Objekte (älter als eine Karenzzeit) und alte `.part`-Dateien löschen. Das Ticket wird nach der Übergabe angehakt.
 - [ ] **CC-P02-02** — Stream upload session, quota reservation, bounded memory, SHA-256 verify (CC-F07)
 - [ ] **CC-P02-03** — local FS storage adapter and fault-injection tests (CC-F09)
+  - Status: Umsetzung lokal vorhanden (PR-009, Review offen): `craftcloud-storage` mit Fehlerinjektion (Fehler bei Byte N, fsync, Rename, volles Gerät), Abbruch-/Drop-Tests, Nebenläufigkeit, Range-Randfälle, 1-GiB-Streaming-Test (manuell, `#[ignore]`). Echte ENOSPC-Fälle sind nur über die Fehlerabbildung getestet. Das Ticket wird nach der Übergabe angehakt.
 - [ ] **CC-P02-04** — Immutable blobs, version commit with CAS/ETag and conflict codes (CC-F08)
 - [ ] **CC-P02-05** — File download with ACL recheck and integrity verification
 - [ ] **CC-P02-06** — Soft delete, retention, quota accounting, GC leases (CC-F10)

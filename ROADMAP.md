@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-29 — PR-009 (CC-P02-03) implemented locally: crate `craftcloud-storage` (trait `ObjectStore`, local filesystem adapter with random keys, byte limits, SHA-256, atomic publish, range reads, listing, symlink defense, fault injection), config keys `CRAFTCLOUD_STORAGE_DIR` and `CRAFTCLOUD_MAX_FILE_SIZE_BYTES`. No HTTP routes. Not reviewed or merged.
+
 2026-10-29 — PR-008 (CC-P02-01) implemented locally: projects and file metadata (CC-F06) with soft delete/restore (`CRAFTCLOUD_TRASH_RETENTION_DAYS`), safe NFC file names, composite foreign keys, 12 new policy actions, migration 0007. Not reviewed or merged.
 
 2026-10-29 — CC-P01-09 implemented locally: contract tests (`crates/craftcloud-api/tests/contract.rs`) comparing `contracts/openapi.yaml` with the served routes, committed `contracts/openapi.snapshot` (`cargo xtask openapi-snapshot [--update]`), common error shape tests; stale `/files` placeholder removed from the OpenAPI document; phase-01 status lines and exit gates updated. Dev-dependency `serde_yaml_ng` (tests only). Not reviewed or merged.
