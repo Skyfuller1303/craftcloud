@@ -21,8 +21,10 @@ Stand 2026-10-30. Dieser Ordner beschreibt den nächsten Ausbau von CraftCloud a
 | AC-05 | [Cloud-Speichern in den Craft-Apps](ac-05-app-integration.md) | PhotoCraft, FigCraft, VectorCraft (lokal) | AC-04 | Review |
 | AC-06 | [FigCraft-Livelinks über CraftCloud](ac-06-figcraft-live-hosting.md) | CraftCloud (+ FigCraft-Spike) | AC-03 | Opus-Review (Sicherheit) |
 | AC-07 | [Launcher-Konto und Dateibrowser](ac-07-launcher-account.md) | craft-launcher (lokal) | AC-01, AC-02, AC-03, AC-04 | Review |
+| AC-08 | [Admin-Konsole](ac-08-admin-console.md) | CraftCloud | AC-01, AC-03, AC-02 | Opus-Review (Sicherheit) |
+| OPS-01 | [Installation auf eigenem Server und Releases](ops-01-install-and-releases.md) | CraftCloud | — | Review (Betrieb, Geheimnisse) |
 
-Empfohlene Reihenfolge: AC-01 und AC-03 parallel (verschiedene Dateien, siehe jeweilige Zuständigkeit), danach AC-02 und AC-04, dann AC-05, AC-06 und AC-07. AC-05 und AC-07 arbeiten in fremden Repositories nur lokal.
+Empfohlene Reihenfolge: AC-01 und AC-03 parallel (verschiedene Dateien, siehe jeweilige Zuständigkeit), danach AC-02 und AC-04, dann AC-05, AC-06 und AC-07. AC-05 und AC-07 arbeiten in fremden Repositories nur lokal. Stand 2026-10-30: AC-01 und AC-03 sind gemerged (main 73a06bd), AC-02 und AC-04 laufen. OPS-01 kann jederzeit parallel laufen, weil es kaum Dateien der anderen Briefings berührt; AC-08 folgt nach AC-02.
 
 ## Feste Entscheidungen
 

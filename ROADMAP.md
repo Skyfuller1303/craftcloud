@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-30 — Briefings AC-05, AC-06 and AC-07 aligned with the merged API (device login, leases, grants, error codes; AC-06 now revokes FigCraft links through an outbox). New briefings OPS-01 (installation on own Linux server from a source release archive, no prebuilt images, upgrade/rollback/backup timer) and AC-08 (admin console with management and instance areas).
+
 2026-10-30 — AC-01 (desktop device sessions, bearer tokens, refresh rotation, device list) and AC-03 (person grants, guest role, edit-lock leases, shared-with-me) merged after independent security review of both runs and of the fixes; leases integrated with device sessions. `cargo xtask ci` and `cargo xtask db-test` green (328 DB tests). AC-02 (two-factor) in progress; AC-04 can start.
 
 2026-10-30 — Planned the app-cloud extension in `docs/12-app-cloud/` (seven briefings AC-01 to AC-07 for Codex, each with a mandatory report): desktop sign-in with device sessions, TOTP two-factor, grants to people with edit locks, client SDK with shared egui dialogs, cloud open/save in PhotoCraft and FigCraft, FigCraft live links hosted by CraftCloud, and a launcher account with file browser. Decisions logged; P4/P5 tickets now route through these briefings.
