@@ -245,6 +245,16 @@ async fn create_for(
             response
         }
         CreateOutcome::TargetGone => not_found(&headers),
+        CreateOutcome::FileDeleted => crate::orgs::conflict(
+            "FILE_DELETED",
+            "The file is in the trash; restore it first.",
+            &headers,
+        ),
+        CreateOutcome::ProjectDeleted => crate::orgs::conflict(
+            "PROJECT_DELETED",
+            "The project is in the trash; restore it first.",
+            &headers,
+        ),
         CreateOutcome::NotMember => crate::orgs::conflict(
             "GRANTEE_NOT_MEMBER",
             "The recipient must be an active organization member.",
@@ -482,7 +492,7 @@ pub(crate) async fn revoke(
         Ok(v) => v,
         Err(e) => return db_failure(&e, &headers, "grant lookup failed"),
     };
-    let Some((target, _, _, revoked)) = located else {
+    let Some((target, _, _, _)) = located else {
         return not_found(&headers);
     };
     let mut opened = match lock(
@@ -529,7 +539,7 @@ pub(crate) async fn revoke(
         .grant_revoke(&scope, id, services.clock.now())
         .await
     {
-        Ok(Some(_grant)) if !revoked => {
+        Ok(Some((_grant, true))) => {
             if let Err(e) = commit_audited(
                 opened.tx,
                 Change::new(
@@ -547,7 +557,7 @@ pub(crate) async fn revoke(
             }
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(Some(_)) | Ok(None) => {
+        Ok(Some((_, false))) | Ok(None) => {
             if let Err(e) = opened.tx.commit().await {
                 return db_failure(&e, &headers, "grant revoke failed");
             }

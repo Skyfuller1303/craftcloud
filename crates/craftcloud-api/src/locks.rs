@@ -1,12 +1,12 @@
 //! Session-bound file edit leases.
 use crate::audit::{Change, commit_audited};
-use crate::orgs::{db_failure, not_found, parse_id};
+use crate::orgs::{Gate, db_failure, gate, not_found, parse_id};
 use crate::responses::{rejection_response, unavailable, validation_failed};
 use crate::workspaces::lock;
 use crate::{
     ApiState,
     projects::{self, Resolved},
-    session::AuthenticatedSession,
+    session::{AuthenticatedSession, CredentialKind},
 };
 use axum::http::StatusCode;
 use axum::{
@@ -32,6 +32,13 @@ pub(crate) struct AcquireRequest {
 #[derive(Deserialize, Default)]
 pub(crate) struct LockQuery {
     force: Option<bool>,
+}
+
+fn session_kind(session: &AuthenticatedSession) -> LockSessionKind {
+    match session.credential_kind {
+        CredentialKind::Cookie => LockSessionKind::Browser,
+        CredentialKind::Device => LockSessionKind::Device,
+    }
 }
 
 fn lock_json(lock: &locks::FileLock, user_id: Uuid, session_id: Uuid) -> serde_json::Value {
@@ -120,11 +127,15 @@ pub(crate) async fn acquire(
         Ok(v) => v,
         Err(e) => return db_failure(&e, &headers, "file grant lookup failed"),
     };
-    if can(&opened.actor, Action::FileLockAcquire, &resource)
-        .permit()
-        .is_none()
-    {
-        return not_found(&headers);
+    if let Gate::Closed(r) = gate(
+        can(&opened.actor, Action::FileLockAcquire, &resource),
+        &headers,
+        session.user_id,
+        "file.locked",
+        Some(resolved.org_id),
+        Some(resolved.id),
+    ) {
+        return r;
     }
     match unsupported(&mut opened.tx, resolved.id).await {
         Ok(true) => {
@@ -147,7 +158,7 @@ pub(crate) async fn acquire(
                 session_id: session.session_id,
                 expires_at: session.expires_at,
                 idle_timeout_secs: resolved.services.settings.idle_timeout.as_secs() as i64,
-                kind: LockSessionKind::Browser,
+                kind: session_kind(&session),
             },
             &request.client_id,
             request.takeover,
@@ -191,6 +202,16 @@ pub(crate) async fn acquire(
         AcquireOutcome::Locked { current, .. } => {
             projects::locked_response(&current, session.session_id, session.user_id, &headers)
         }
+        AcquireOutcome::FileDeleted => crate::orgs::conflict(
+            "FILE_DELETED",
+            "The file is in the trash; restore it first.",
+            &headers,
+        ),
+        AcquireOutcome::ProjectDeleted => crate::orgs::conflict(
+            "PROJECT_DELETED",
+            "The project is in the trash; restore it first.",
+            &headers,
+        ),
         AcquireOutcome::SessionExpired => crate::error_response(
             axum::http::StatusCode::UNAUTHORIZED,
             "UNAUTHENTICATED",
@@ -240,11 +261,15 @@ pub(crate) async fn release(
         Ok(v) => v,
         Err(e) => return db_failure(&e, &headers, "file grant lookup failed"),
     };
-    if can(&opened.actor, Action::FileLockRelease, &resource)
-        .permit()
-        .is_none()
-    {
-        return not_found(&headers);
+    if let Gate::Closed(r) = gate(
+        can(&opened.actor, Action::FileLockRelease, &resource),
+        &headers,
+        session.user_id,
+        "file.unlocked",
+        Some(resolved.org_id),
+        Some(resolved.id),
+    ) {
+        return r;
     }
     match unsupported(&mut opened.tx, resolved.id).await {
         Ok(true) => {
@@ -259,11 +284,16 @@ pub(crate) async fn release(
         Err(e) => return db_failure(&e, &headers, "file metadata lookup failed"),
     }
     if force
-        && can(&opened.actor, Action::FileLockForce, &resource)
-            .permit()
-            .is_none()
+        && let Gate::Closed(r) = gate(
+            can(&opened.actor, Action::FileLockForce, &resource),
+            &headers,
+            session.user_id,
+            "file.lock_forced",
+            Some(resolved.org_id),
+            Some(resolved.id),
+        )
     {
-        return not_found(&headers);
+        return r;
     }
     let released = match opened
         .tx
@@ -274,7 +304,7 @@ pub(crate) async fn release(
                 session_id: session.session_id,
                 expires_at: session.expires_at,
                 idle_timeout_secs: resolved.services.settings.idle_timeout.as_secs() as i64,
-                kind: LockSessionKind::Browser,
+                kind: session_kind(&session),
             },
             force,
         )

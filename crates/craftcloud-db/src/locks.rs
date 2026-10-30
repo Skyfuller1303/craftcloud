@@ -10,12 +10,14 @@ pub const LEASE_SECONDS: i64 = 300;
 #[derive(Debug, Clone, Copy)]
 pub enum LockSessionKind {
     Browser,
+    Device,
 }
 
 impl LockSessionKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Browser => "browser",
+            Self::Device => "device",
         }
     }
 }
@@ -55,6 +57,10 @@ pub enum AcquireOutcome {
         same_user: bool,
     },
     SessionExpired,
+    /// The file is in the trash.
+    FileDeleted,
+    /// The file's project is in the trash.
+    ProjectDeleted,
 }
 
 pub async fn get(pool: &PgPool, org_id: Uuid, file_id: Uuid) -> Result<Option<FileLock>, DbError> {
@@ -102,8 +108,25 @@ impl OrgTx {
         if now >= session.expires_at {
             return Ok(false);
         }
-        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked_at IS NULL AND s.absolute_expires_at>$3 AND s.last_seen_at + ($4::bigint * interval '1 second') > $3 AND u.disabled_at IS NULL)")
-            .bind(session.session_id).bind(session.user_id).bind(now).bind(session.idle_timeout_secs).fetch_one(&mut *self.tx).await?)
+        // Lock the user row (the same row revocation locks first) and then the
+        // session row, so a concurrent revocation commits either before this
+        // check or after the lease exists and removes it.
+        let user_enabled: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM users WHERE id=$1 AND disabled_at IS NULL FOR KEY SHARE",
+        )
+        .bind(session.user_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        if user_enabled.is_none() {
+            return Ok(false);
+        }
+        let active: Option<i32> = match session.kind {
+            LockSessionKind::Browser => sqlx::query_scalar("SELECT 1 FROM sessions s WHERE s.id=$1 AND s.user_id=$2 AND s.revoked_at IS NULL AND s.absolute_expires_at>$3 AND s.last_seen_at + ($4::bigint * interval '1 second') > $3 FOR SHARE OF s")
+                .bind(session.session_id).bind(session.user_id).bind(now).bind(session.idle_timeout_secs).fetch_optional(&mut *self.tx).await?,
+            LockSessionKind::Device => sqlx::query_scalar("SELECT 1 FROM device_sessions d WHERE d.id=$1 AND d.user_id=$2 AND d.revoked_at IS NULL AND d.absolute_expires_at>$3 AND d.idle_expires_at>$3 FOR SHARE OF d")
+                .bind(session.session_id).bind(session.user_id).bind(now).fetch_optional(&mut *self.tx).await?,
+        };
+        Ok(active.is_some())
     }
     pub async fn lock_acquire(
         &mut self,
@@ -117,6 +140,11 @@ impl OrgTx {
             .await?;
         if !self.session_is_active(session, now).await? {
             return Ok(AcquireOutcome::SessionExpired);
+        }
+        match self.file_state(file_id).await? {
+            Some((_, _, _, true)) => return Ok(AcquireOutcome::ProjectDeleted),
+            Some((_, _, true, _)) => return Ok(AcquireOutcome::FileDeleted),
+            _ => {}
         }
         sqlx::query("DELETE FROM file_locks WHERE org_id=$1 AND file_id=$2 AND expires_at<=$3")
             .bind(self.org_id)
@@ -204,4 +232,35 @@ pub async fn expire_for_org(pool: &PgPool, org_id: Uuid, limit: i64) -> Result<u
         .bind(org_id).bind(limit.clamp(1, 1000)).execute(&mut *tx.tx).await?.rows_affected();
     tx.commit().await?;
     Ok(deleted)
+}
+
+/// Deletes the leases held by one revoked session. Call in the revoking transaction.
+pub(crate) async fn delete_for_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: Uuid,
+) -> Result<u64, DbError> {
+    Ok(
+        sqlx::query("DELETE FROM file_locks WHERE holder_session_id=$1")
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// Deletes the leases a user holds through sessions of `kind`, optionally
+/// keeping those of one still-valid session. Call in the revoking transaction.
+pub(crate) async fn delete_for_user_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+    kind: LockSessionKind,
+    except_session: Option<Uuid>,
+) -> Result<u64, DbError> {
+    Ok(sqlx::query("DELETE FROM file_locks WHERE holder_user_id=$1 AND holder_session_kind=$2 AND ($3::uuid IS NULL OR holder_session_id<>$3)")
+        .bind(user_id)
+        .bind(kind.as_str())
+        .bind(except_session)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected())
 }

@@ -97,6 +97,9 @@ pub struct AuthSettings {
     pub pwchange_limit: u32,
     /// Invitations a user may create per `rate_window`.
     pub invite_limit: u32,
+    /// Member searches (`GET /organizations/{id}/members?query=`) a user may
+    /// run per `rate_window`; limits enumeration of the member directory.
+    pub member_search_limit: u32,
     /// Window of the request rate limits.
     pub rate_window: Duration,
     /// Maximum number of tracked keys in each request rate limit table.
@@ -136,6 +139,7 @@ impl Default for AuthSettings {
             ip_limit: 10,
             pwchange_limit: 5,
             invite_limit: 30,
+            member_search_limit: 60,
             rate_window: Duration::from_secs(60),
             rate_max_entries: 10_000,
             failed_login_pair_limit: 5,
@@ -174,6 +178,7 @@ pub struct Services {
     accept_ip: WindowLimiter,
     pwchange: WindowLimiter,
     invite_create: WindowLimiter,
+    member_search: WindowLimiter,
     guard: Arc<AccountGuard>,
     last_cleanup: AtomicI64,
     pub(crate) audit_budget: crate::audit::AuditBudget,
@@ -214,6 +219,7 @@ impl Services {
             accept_ip: WindowLimiter::new(cap),
             pwchange: WindowLimiter::new(cap),
             invite_create: WindowLimiter::new(cap),
+            member_search: WindowLimiter::new(cap),
             guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
             audit_budget: crate::audit::AuditBudget::for_pool(pool_connections),
@@ -348,6 +354,22 @@ impl Services {
                 self.window_secs(),
             )
             .map_err(|retry| self.too_many("invite", retry, headers))
+    }
+
+    /// Per-user rate limit for member searches; counts the request.
+    pub(crate) fn rate_limit_member_search(
+        &self,
+        user_id: Uuid,
+        headers: &HeaderMap,
+    ) -> Result<(), Box<Response>> {
+        self.member_search
+            .check(
+                &user_id.to_string(),
+                self.now_secs(),
+                self.settings.member_search_limit,
+                self.window_secs(),
+            )
+            .map_err(|retry| self.too_many("member_search", retry, headers))
     }
 
     /// Checks the failed-login limits for `email` (the normalized address of

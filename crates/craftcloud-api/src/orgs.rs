@@ -601,6 +601,9 @@ pub(crate) async fn list_members(
             Gate::Open(_) => {}
             Gate::Closed(response) => return response,
         }
+        if let Err(response) = services.rate_limit_member_search(session.user_id, &headers) {
+            return *response;
+        }
     }
     let mut rows = match if let Some(term) = &search {
         craftcloud_db::members::search(&services.pool, &scope, term, limit + 1, after).await

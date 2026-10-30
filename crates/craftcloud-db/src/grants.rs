@@ -91,6 +91,10 @@ pub struct NewGrant {
 pub enum CreateOutcome {
     Created(Box<Grant>),
     TargetGone,
+    /// The file is in the trash.
+    FileDeleted,
+    /// The project (or the file's project) is in the trash.
+    ProjectDeleted,
     NotMember,
     AlreadyExists,
 }
@@ -317,12 +321,19 @@ impl OrgTx {
         new: NewGrant,
     ) -> Result<CreateOutcome, DbError> {
         self.check(scope, craftcloud_core::policy::Action::GrantCreate)?;
-        let target_exists: bool = match new.target.kind {
-            TargetKind::Project => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE org_id=$1 AND workspace_id=$2 AND id=$3)").bind(self.org_id).bind(new.target.workspace_id).bind(new.target.id).fetch_one(&mut *self.tx).await?,
-            TargetKind::File => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM files WHERE org_id=$1 AND workspace_id=$2 AND id=$3)").bind(self.org_id).bind(new.target.workspace_id).bind(new.target.id).fetch_one(&mut *self.tx).await?,
+        // (project trashed, file trashed); `None` when the target does not exist.
+        let state: Option<(bool, bool)> = match new.target.kind {
+            TargetKind::Project => sqlx::query_as("SELECT p.deleted_at IS NOT NULL, false FROM projects p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.id=$3").bind(self.org_id).bind(new.target.workspace_id).bind(new.target.id).fetch_optional(&mut *self.tx).await?,
+            TargetKind::File => sqlx::query_as("SELECT p.deleted_at IS NOT NULL, f.deleted_at IS NOT NULL FROM files f JOIN projects p ON p.org_id=f.org_id AND p.id=f.project_id WHERE f.org_id=$1 AND f.workspace_id=$2 AND f.id=$3").bind(self.org_id).bind(new.target.workspace_id).bind(new.target.id).fetch_optional(&mut *self.tx).await?,
         };
-        if !target_exists {
+        let Some((project_deleted, file_deleted)) = state else {
             return Ok(CreateOutcome::TargetGone);
+        };
+        if project_deleted {
+            return Ok(CreateOutcome::ProjectDeleted);
+        }
+        if file_deleted {
+            return Ok(CreateOutcome::FileDeleted);
         }
         let member: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM organization_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=$1 AND m.user_id=$2 AND m.status='active' AND u.disabled_at IS NULL)")
             .bind(self.org_id).bind(new.grantee_user_id).fetch_one(&mut *self.tx).await?;
@@ -403,14 +414,15 @@ impl OrgTx {
         scope: &OrgScope,
         id: Uuid,
         now: OffsetDateTime,
-    ) -> Result<Option<Grant>, DbError> {
+    ) -> Result<Option<(Grant, bool)>, DbError> {
         self.check(scope, craftcloud_core::policy::Action::GrantChange)?;
         let Some(current) = self.grant(id).await? else {
             return Ok(None);
         };
+        let mut changed = false;
         if current.revoked_at.is_none() {
-            sqlx::query("UPDATE grants SET revoked_at=$3,version=version+1 WHERE org_id=$1 AND id=$2 AND revoked_at IS NULL")
-                .bind(self.org_id).bind(id).bind(now).execute(&mut *self.tx).await?;
+            changed = sqlx::query("UPDATE grants SET revoked_at=$3,version=version+1 WHERE org_id=$1 AND id=$2 AND revoked_at IS NULL")
+                .bind(self.org_id).bind(id).bind(now).execute(&mut *self.tx).await?.rows_affected() == 1;
             match current.target_kind.as_str() {
                 "file" => {
                     sqlx::query("DELETE FROM file_locks WHERE org_id=$1 AND file_id=$2 AND holder_user_id=$3").bind(self.org_id).bind(current.target_id).bind(current.grantee_user_id).execute(&mut *self.tx).await?;
@@ -421,6 +433,6 @@ impl OrgTx {
                 _ => return Err(DbError::Internal),
             }
         }
-        self.grant(id).await
+        Ok(self.grant(id).await?.map(|grant| (grant, changed)))
     }
 }

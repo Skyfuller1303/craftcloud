@@ -340,6 +340,13 @@ async fn change_password_inner(
         .await?
         .rows_affected()
     };
+    crate::locks::delete_for_user_tx(
+        &mut tx,
+        user_id,
+        crate::locks::LockSessionKind::Browser,
+        (!keep_device_session).then_some(keep_session),
+    )
+    .await?;
     let device_audit = audit.cloned().unwrap_or(AuditCtx {
         actor_id: Some(user_id),
         request_id: None,
@@ -476,6 +483,13 @@ async fn set_disabled_inner(
             .bind(user_id)
             .bind(now)
             .execute(&mut *tx)
+            .await?;
+            crate::locks::delete_for_user_tx(
+                &mut tx,
+                user_id,
+                crate::locks::LockSessionKind::Browser,
+                None,
+            )
             .await?;
             let device_audit = audit.cloned().unwrap_or(AuditCtx {
                 actor_id: Some(user_id),

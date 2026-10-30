@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::DbError;
 use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
 use crate::device_sessions;
+use crate::locks::{self, LockSessionKind};
 
 /// Input for [`create`].
 #[derive(Debug, Clone)]
@@ -174,13 +175,20 @@ pub async fn touch(
 ///
 /// Database failures only.
 pub async fn revoke(pool: &PgPool, id: Uuid, now: OffsetDateTime) -> Result<bool, DbError> {
-    let result =
+    let mut tx = pool.begin().await?;
+    let revoked =
         sqlx::query("UPDATE sessions SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL")
             .bind(id)
             .bind(now)
-            .execute(pool)
-            .await?;
-    Ok(result.rows_affected() == 1)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1;
+    if revoked {
+        locks::delete_for_session_tx(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(revoked)
 }
 
 /// Revokes the session with the given token hash, if any (used when a login
@@ -195,14 +203,19 @@ pub async fn revoke_by_token_hash(
     token_hash: &[u8; 32],
     now: OffsetDateTime,
 ) -> Result<bool, DbError> {
-    let result = sqlx::query(
-        "UPDATE sessions SET revoked_at = $2 WHERE token_hash = $1 AND revoked_at IS NULL",
+    let mut tx = pool.begin().await?;
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE sessions SET revoked_at = $2 WHERE token_hash = $1 AND revoked_at IS NULL RETURNING id",
     )
     .bind(token_hash.as_slice())
     .bind(now)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    if let Some(id) = id {
+        locks::delete_for_session_tx(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(id.is_some())
 }
 
 /// Revokes a session only if it belongs to `user_id`. Another user's or an
@@ -218,15 +231,22 @@ pub async fn revoke_owned(
     user_id: Uuid,
     now: OffsetDateTime,
 ) -> Result<bool, DbError> {
-    let result = sqlx::query(
+    let mut tx = pool.begin().await?;
+    let revoked = sqlx::query(
         "UPDATE sessions SET revoked_at = $3 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
     )
     .bind(id)
     .bind(user_id)
     .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() == 1)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if revoked {
+        locks::delete_for_session_tx(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(revoked)
 }
 
 /// Like [`revoke_owned`], and records `auth.session_revoke` (actor: the user)
@@ -260,6 +280,9 @@ pub async fn revoke_owned_audited(
     .await?
     .rows_affected()
         == 1;
+    if revoked {
+        locks::delete_for_session_tx(&mut tx, id).await?;
+    }
     if revoked && record {
         let by = AuditCtx {
             actor_id: Some(user_id),
@@ -326,6 +349,7 @@ pub async fn revoke_all_for_user(
             .execute(&mut *tx)
             .await?
             .rows_affected();
+    locks::delete_for_user_tx(&mut tx, user_id, LockSessionKind::Browser, None).await?;
     let audit = AuditCtx {
         actor_id: Some(user_id),
         request_id: None,
@@ -360,6 +384,7 @@ pub async fn revoke_all_for_user_audited(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    locks::delete_for_user_tx(&mut tx, user_id, LockSessionKind::Browser, None).await?;
     let device_audit = AuditCtx {
         actor_id: Some(user_id),
         request_id: audit.request_id.clone(),

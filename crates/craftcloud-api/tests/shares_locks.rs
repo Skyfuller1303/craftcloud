@@ -21,7 +21,10 @@ mod tests {
     }
 
     async fn fixture(app: &str) -> Fixture {
-        let env = TestEnv::new().await;
+        fixture_in(TestEnv::new().await, app).await
+    }
+
+    async fn fixture_in(env: TestEnv, app: &str) -> Fixture {
         let operator = env.login_ok("op").await;
         let owner_id = env.user("ac03-owner").await;
         let owner = env.login_ok("ac03-owner").await;
@@ -1207,5 +1210,357 @@ mod tests {
         .await;
         assert_eq!(response.status, StatusCode::CONFLICT);
         assert_eq!(response.body["error"]["code"], "LOCK_NOT_SUPPORTED");
+    }
+
+    fn device_config() -> craftcloud_api::ApiConfig {
+        craftcloud_api::ApiConfig {
+            trusted_proxies: vec!["127.0.0.1/32".parse().unwrap()],
+            ..craftcloud_api::ApiConfig::default()
+        }
+    }
+
+    /// Sends the request as a trusted proxy would forward an HTTPS request.
+    async fn call_https(env: &TestEnv, req: Req) -> crate::common::Resp {
+        use tower::ServiceExt;
+        let mut request = req.build();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        request
+            .headers_mut()
+            .insert("x-forwarded-proto", "https".parse().unwrap());
+        let response = env.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        crate::common::Resp {
+            status,
+            headers,
+            body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// Logs the user in as a desktop device and returns the access token.
+    async fn device_token(env: &TestEnv, email: &str) -> String {
+        let response = call_https(
+            env,
+            Req::new("POST", "/api/v1/auth/device/login").json(json!({
+                "email": email,
+                "password": crate::common::PASSWORD,
+                "client_kind": "app",
+                "client_id": "photocraft",
+                "device_name": "PhotoCraft test"
+            })),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        response.body["access_token"].as_str().unwrap().to_owned()
+    }
+
+    fn bearer(method: &'static str, path: &str, token: &str) -> Req {
+        Req::new(method, path).header("Authorization", &format!("Bearer {token}"))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn device_lease_is_foreign_to_the_browser_session_and_ends_with_device_logout() {
+        let f = fixture_in(
+            TestEnv::with(crate::common::settings(), device_config()).await,
+            "photocraft",
+        )
+        .await;
+        let token = device_token(&f.env, "ac03-owner@example.test").await;
+        let lock_path = format!("/api/v1/files/{}/lock", f.file);
+        let acquired = call(
+            &f.env.app,
+            bearer("POST", &lock_path, &token).json(json!({"client_id":"photocraft"})),
+        )
+        .await;
+        assert_eq!(acquired.status, StatusCode::OK, "{}", acquired.text);
+        assert_eq!(acquired.body["held_by_current_session"], true);
+        let kind: String =
+            sqlx::query_scalar("SELECT holder_session_kind FROM file_locks WHERE file_id=$1")
+                .bind(f.file)
+                .fetch_one(&f.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "device");
+
+        // The browser session of the same user sees its own lease, but not as this session.
+        let seen = call(
+            &f.env.app,
+            Req::new("GET", &format!("/api/v1/files/{}", f.file)).cookie_only(&f.owner),
+        )
+        .await;
+        assert_eq!(seen.body["lock"]["mine"], true);
+        assert_eq!(seen.body["lock"]["held_by_current_session"], false);
+        let blocked = call(
+            &f.env.app,
+            Req::new("POST", &lock_path)
+                .session(&f.owner)
+                .json(json!({"client_id":"browser"})),
+        )
+        .await;
+        assert_eq!(blocked.status, StatusCode::LOCKED, "{}", blocked.text);
+        assert_eq!(
+            blocked.body["error"]["details"]["held_by_current_session"],
+            false
+        );
+        let trash_blocked = call(
+            &f.env.app,
+            Req::new("DELETE", &format!("/api/v1/files/{}", f.file)).session(&f.owner),
+        )
+        .await;
+        assert_eq!(trash_blocked.status, StatusCode::LOCKED);
+        // The device itself recognizes the lease as its own.
+        let own = call(
+            &f.env.app,
+            bearer("GET", &format!("/api/v1/files/{}", f.file), &token),
+        )
+        .await;
+        assert_eq!(own.body["lock"]["held_by_current_session"], true);
+
+        // Device logout removes the lease in the same transaction.
+        let logout = call_https(&f.env, bearer("POST", "/api/v1/auth/device/logout", &token)).await;
+        assert!(logout.status.is_success(), "{}", logout.text);
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM file_locks WHERE file_id=$1")
+            .bind(f.file)
+            .fetch_one(&f.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let after = call(
+            &f.env.app,
+            Req::new("POST", &lock_path)
+                .session(&f.owner)
+                .json(json!({"client_id":"browser"})),
+        )
+        .await;
+        assert_eq!(after.status, StatusCode::OK, "{}", after.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn lease_taken_while_the_body_streams_blocks_upload_completion() {
+        use sha2::{Digest, Sha256};
+        let f = fixture("photocraft").await;
+        let data = b"lease versus upload".to_vec();
+        let sha: String = Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let created = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/uploads", f.file))
+                .session(&f.owner)
+                .json(json!({"size_bytes":data.len(),"sha256":sha})),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let upload = created.body["upload_id"].as_str().unwrap().to_owned();
+        // Another session of the same user takes the lease after the upload session exists.
+        let other = f.env.login_ok("ac03-owner").await;
+        let lease = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/lock", f.file))
+                .session(&other)
+                .json(json!({"client_id":"other"})),
+        )
+        .await;
+        assert_eq!(lease.status, StatusCode::OK, "{}", lease.text);
+        let put = call(
+            &f.env.app,
+            Req::new("PUT", &format!("/api/v1/uploads/{upload}/content"))
+                .session(&f.owner)
+                .body(axum::body::Body::from(data.clone())),
+        )
+        .await;
+        assert_eq!(put.status, StatusCode::LOCKED, "{}", put.text);
+        assert_eq!(put.body["error"]["code"], "FILE_LOCKED");
+        let state: String = sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id=$1")
+            .bind(Uuid::parse_str(&upload).unwrap())
+            .fetch_one(&f.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn member_search_is_rate_limited_per_user() {
+        let mut settings = crate::common::settings();
+        settings.member_search_limit = 2;
+        let f = fixture_in(
+            TestEnv::with(settings, craftcloud_api::ApiConfig::default()).await,
+            "photocraft",
+        )
+        .await;
+        let path = format!("/api/v1/organizations/{}/members?query=ac", f.org);
+        for _ in 0..2 {
+            let ok = call(&f.env.app, Req::new("GET", &path).cookie_only(&f.owner)).await;
+            assert_eq!(ok.status, StatusCode::OK, "{}", ok.text);
+        }
+        let limited = call(&f.env.app, Req::new("GET", &path).cookie_only(&f.owner)).await;
+        assert_eq!(
+            limited.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            limited.text
+        );
+        assert_eq!(limited.body["error"]["code"], "RATE_LIMITED");
+        // A plain listing is not a search and is not counted.
+        let list = call(
+            &f.env.app,
+            Req::new("GET", &format!("/api/v1/organizations/{}/members", f.org))
+                .cookie_only(&f.owner),
+        )
+        .await;
+        assert_eq!(list.status, StatusCode::OK, "{}", list.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn lock_routes_answer_403_for_forbidden_and_404_for_hidden() {
+        let f = fixture("photocraft").await;
+        let (_, viewer) = add_workspace_role(&f, "ac03-lock-viewer", "viewer").await;
+        f.env.user("ac03-lock-outsider").await;
+        let outsider = f.env.login_ok("ac03-lock-outsider").await;
+        let path = format!("/api/v1/files/{}/lock", f.file);
+        let denied = call(
+            &f.env.app,
+            Req::new("POST", &path)
+                .session(&viewer)
+                .json(json!({"client_id":"v"})),
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text);
+        let denied_release = call(&f.env.app, Req::new("DELETE", &path).session(&viewer)).await;
+        assert_eq!(
+            denied_release.status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            denied_release.text
+        );
+        let denied_force = call(
+            &f.env.app,
+            Req::new("DELETE", &format!("{path}?force=true")).session(&viewer),
+        )
+        .await;
+        assert_eq!(
+            denied_force.status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            denied_force.text
+        );
+        let hidden = call(
+            &f.env.app,
+            Req::new("POST", &path)
+                .session(&outsider)
+                .json(json!({"client_id":"o"})),
+        )
+        .await;
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND, "{}", hidden.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn trashed_targets_reject_grants_and_leases() {
+        let f = fixture("photocraft").await;
+        let (target, _) = add_member(&f, "ac03-trash-target").await;
+        let trash_file = call(
+            &f.env.app,
+            Req::new("DELETE", &format!("/api/v1/files/{}", f.sibling)).session(&f.owner),
+        )
+        .await;
+        assert_eq!(
+            trash_file.status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            trash_file.text
+        );
+        let grant = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/grants", f.sibling))
+                .session(&f.owner)
+                .json(json!({"user_id":target.to_string(),"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(grant.status, StatusCode::CONFLICT, "{}", grant.text);
+        assert_eq!(grant.body["error"]["code"], "FILE_DELETED");
+        let lease = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/lock", f.sibling))
+                .session(&f.owner)
+                .json(json!({"client_id":"x"})),
+        )
+        .await;
+        assert_eq!(lease.status, StatusCode::CONFLICT, "{}", lease.text);
+        assert_eq!(lease.body["error"]["code"], "FILE_DELETED");
+        let trash_project = call(
+            &f.env.app,
+            Req::new("DELETE", &format!("/api/v1/projects/{}", f.project)).session(&f.owner),
+        )
+        .await;
+        assert_eq!(
+            trash_project.status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            trash_project.text
+        );
+        let project_grant = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/projects/{}/grants", f.project))
+                .session(&f.owner)
+                .json(json!({"user_id":target.to_string(),"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(
+            project_grant.status,
+            StatusCode::CONFLICT,
+            "{}",
+            project_grant.text
+        );
+        assert_eq!(project_grant.body["error"]["code"], "PROJECT_DELETED");
+        let lease = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/lock", f.file))
+                .session(&f.owner)
+                .json(json!({"client_id":"x"})),
+        )
+        .await;
+        assert_eq!(lease.status, StatusCode::CONFLICT, "{}", lease.text);
+        assert_eq!(lease.body["error"]["code"], "PROJECT_DELETED");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn concurrent_grant_revocation_audits_exactly_once() {
+        let f = fixture("photocraft").await;
+        let (target, _) = add_member(&f, "ac03-revoke-target").await;
+        let created = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/grants", f.file))
+                .session(&f.owner)
+                .json(json!({"user_id":target.to_string(),"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let path = format!("/api/v1/grants/{}", created.body["id"].as_str().unwrap());
+        let (a, b) = tokio::join!(
+            call(&f.env.app, Req::new("DELETE", &path).session(&f.owner)),
+            call(&f.env.app, Req::new("DELETE", &path).session(&f.owner)),
+        );
+        assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
+        assert_eq!(b.status, StatusCode::NO_CONTENT, "{}", b.text);
+        let audits: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action='grant.revoked'")
+                .fetch_one(&f.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(audits, 1);
     }
 }

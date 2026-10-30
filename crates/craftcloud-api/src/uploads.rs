@@ -877,6 +877,24 @@ async fn finish_upload(finish: Finish) -> Response {
         fail_session(&services, org_id, upload_id).await;
         return internal(&headers);
     };
+    // A lease taken by another session while the body streamed in still blocks
+    // the write: decided here under the organization lock, like the write gate.
+    match tx.file_lock(file_id).await {
+        Ok(Some(lock)) if lock.holder_session_id != login_session_id => {
+            fail_in_tx(tx, &services, org_id, upload_id, now).await;
+            guard.key = None;
+            delete_object(&services, &key).await;
+            return crate::projects::locked_response(&lock, login_session_id, user_id, &headers);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            guard.key = None;
+            drop(tx);
+            delete_object(&services, &key).await;
+            fail_session(&services, org_id, upload_id).await;
+            return db_failure(&error, &headers, "file lock lookup failed");
+        }
+    }
     let stored = match tx.upload_store(&scope, upload_id, key.as_str(), now).await {
         Ok(outcome) => outcome,
         Err(error) => {

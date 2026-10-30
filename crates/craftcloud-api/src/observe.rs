@@ -46,13 +46,14 @@ const BUCKETS: [f64; 11] = [
 ];
 
 /// Rate limit classes with a counter of their own (label `class`).
-const RATE_CLASSES: [&str; 7] = [
+const RATE_CLASSES: [&str; 8] = [
     "login",
     "setup",
     "reset",
     "accept",
     "pwchange",
     "invite",
+    "member_search",
     "failed_login",
 ];
 

@@ -163,6 +163,8 @@ pub async fn refresh(
     if !current {
         sqlx::query("UPDATE device_sessions SET revoked_at=$2,revoke_reason='refresh_reuse',access_hash=NULL,access_expires_at=NULL WHERE refresh_family=(SELECT refresh_family FROM device_sessions WHERE id=$1) AND revoked_at IS NULL")
             .bind(id).bind(now).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM file_locks WHERE holder_session_kind='device' AND holder_session_id IN (SELECT id FROM device_sessions WHERE refresh_family=(SELECT refresh_family FROM device_sessions WHERE id=$1))")
+            .bind(id).execute(&mut *tx).await?;
         let by = AuditCtx {
             actor_id: Some(user_id),
             request_id: audit.request_id.clone(),
@@ -212,6 +214,7 @@ pub async fn revoke_owned(
     let changed=sqlx::query("UPDATE device_sessions SET revoked_at=$3,revoke_reason=$4,access_hash=NULL,access_expires_at=NULL WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL")
         .bind(id).bind(user_id).bind(now).bind(reason).execute(&mut *tx).await?.rows_affected()==1;
     if changed {
+        crate::locks::delete_for_session_tx(&mut tx, id).await?;
         let by = AuditCtx {
             actor_id: Some(user_id),
             request_id: audit.request_id.clone(),
@@ -242,6 +245,7 @@ pub async fn revoke_current(
     let changed=sqlx::query("UPDATE device_sessions SET revoked_at=$3,revoke_reason='logout',access_hash=NULL,access_expires_at=NULL WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL")
         .bind(id).bind(user_id).bind(now).execute(&mut *tx).await?.rows_affected()==1;
     if changed {
+        crate::locks::delete_for_session_tx(&mut tx, id).await?;
         let by = AuditCtx {
             actor_id: Some(user_id),
             request_id: audit.request_id.clone(),
@@ -265,6 +269,8 @@ pub async fn revoke_all_for_user_tx(
 ) -> Result<u64, DbError> {
     let ids: Vec<Uuid> = sqlx::query_scalar("UPDATE device_sessions SET revoked_at=$2,revoke_reason='security',access_hash=NULL,access_expires_at=NULL WHERE user_id=$1 AND revoked_at IS NULL RETURNING id")
         .bind(user_id).bind(now).fetch_all(&mut **tx).await?;
+    crate::locks::delete_for_user_tx(tx, user_id, crate::locks::LockSessionKind::Device, None)
+        .await?;
     let by = AuditCtx {
         actor_id: audit.actor_id,
         request_id: audit.request_id.clone(),
@@ -282,7 +288,7 @@ pub async fn revoke_all_for_user_tx(
 
 pub async fn count_expired(pool: &PgPool) -> Result<u64, DbError> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM device_sessions WHERE LEAST(idle_expires_at,absolute_expires_at) < now() - interval '30 days' OR revoked_at < now() - interval '30 days'",
+        "SELECT count(*) FROM device_sessions WHERE idle_expires_at < now() - interval '30 days' OR revoked_at < now() - interval '30 days'",
     )
     .fetch_one(pool)
     .await?;
@@ -292,7 +298,7 @@ pub async fn count_expired(pool: &PgPool) -> Result<u64, DbError> {
 /// Deletes at most `batch_size` device sessions expired or revoked 30 days ago.
 pub async fn delete_expired(pool: &PgPool, batch_size: i64) -> Result<u64, DbError> {
     let removed: i64 = sqlx::query_scalar(
-        "WITH doomed AS (SELECT id FROM device_sessions WHERE LEAST(idle_expires_at,absolute_expires_at) < now() - interval '30 days' OR revoked_at < now() - interval '30 days' ORDER BY COALESCE(revoked_at, LEAST(idle_expires_at,absolute_expires_at)), id LIMIT $1), gone AS (DELETE FROM device_sessions d USING doomed x WHERE d.id=x.id RETURNING 1) SELECT count(*) FROM gone",
+        "WITH doomed AS (SELECT id FROM device_sessions WHERE idle_expires_at < now() - interval '30 days' OR revoked_at < now() - interval '30 days' ORDER BY id LIMIT $1), gone AS (DELETE FROM device_sessions d USING doomed x WHERE d.id=x.id RETURNING 1) SELECT count(*) FROM gone",
     )
     .bind(batch_size.max(1))
     .fetch_one(pool)

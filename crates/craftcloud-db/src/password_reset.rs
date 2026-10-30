@@ -112,6 +112,13 @@ async fn create_inner(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    crate::locks::delete_for_user_tx(
+        &mut tx,
+        new.user_id,
+        crate::locks::LockSessionKind::Browser,
+        None,
+    )
+    .await?;
     let device_audit = audit.cloned().unwrap_or(AuditCtx {
         actor_id: Some(new.user_id),
         request_id: None,
@@ -315,6 +322,13 @@ async fn consume_inner(
         .bind(now)
         .execute(&mut *tx)
         .await?;
+    crate::locks::delete_for_user_tx(
+        &mut tx,
+        user_id,
+        crate::locks::LockSessionKind::Browser,
+        None,
+    )
+    .await?;
     sqlx::query(
         "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
     )

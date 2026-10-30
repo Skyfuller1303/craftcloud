@@ -199,6 +199,13 @@ mod tests {
                 workspace_id: Uuid::new_v4(),
             },
             craftcloud_core::policy::Action::WorkspaceCreate => Resource::Organization { org_id },
+            craftcloud_core::policy::Action::GrantList
+            | craftcloud_core::policy::Action::GrantCreate
+            | craftcloud_core::policy::Action::GrantChange => Resource::Object {
+                org_id,
+                workspace_id: Uuid::new_v4(),
+                target: craftcloud_core::policy::ObjectTarget::File { grant_role: None },
+            },
             _ => Resource::Organization { org_id },
         };
         let permit = can(&actor, action, &resource).permit().unwrap();
@@ -596,6 +603,582 @@ mod tests {
             !still_locked,
             "project grant demotion clears descendant leases"
         );
+    }
+
+    /// Org with an owner, a member (grantee), a workspace, a project and a
+    /// non-figcraft file.
+    struct LeaseFixture {
+        scope: OrgScope,
+        owner: User,
+        user: User,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        file_id: Uuid,
+    }
+
+    async fn lease_fixture(db: &TestDb, slug: &str) -> LeaseFixture {
+        let (scope, owner) = org(&db.pool, slug).await;
+        let workspace = workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
+            &NewWorkspace {
+                slug: "ws".to_owned(),
+                name: "Workspace".to_owned(),
+                quota_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+        let user = user(&db.pool, &format!("member-{slug}@example.test")).await;
+        organizations::add_member(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::MemberAdd),
+            user.id,
+            OrgRole::Member,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        let project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,org_id,workspace_id,name,name_key,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,'Project','project',$4,CURRENT_TIMESTAMP,$4,CURRENT_TIMESTAMP)")
+            .bind(project_id).bind(scope.org_id()).bind(workspace.id).bind(owner.id).execute(&db.pool).await.unwrap();
+        let file_id =
+            insert_file(&db.pool, &scope, workspace.id, project_id, owner.id, "file").await;
+        LeaseFixture {
+            scope,
+            owner,
+            user,
+            workspace_id: workspace.id,
+            project_id,
+            file_id,
+        }
+    }
+
+    async fn insert_file(
+        pool: &PgPool,
+        scope: &OrgScope,
+        workspace_id: Uuid,
+        project_id: Uuid,
+        user_id: Uuid,
+        name: &str,
+    ) -> Uuid {
+        let file_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO files(id,org_id,workspace_id,project_id,name,name_key,app,format,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,$4,$5,$5,'photocraft','pcf',$6,CURRENT_TIMESTAMP,$6,CURRENT_TIMESTAMP)")
+            .bind(file_id).bind(scope.org_id()).bind(workspace_id).bind(project_id).bind(name).bind(user_id).execute(pool).await.unwrap();
+        file_id
+    }
+
+    async fn insert_browser_session(pool: &PgPool, user_id: Uuid, marker: u8) -> Uuid {
+        let id = Uuid::new_v4();
+        let now = time::OffsetDateTime::now_utc();
+        sqlx::query("INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at) VALUES($1,$2,$3,$4,$4,$5)")
+            .bind(id).bind(user_id).bind([marker; 32].as_slice()).bind(now).bind(now + time::Duration::hours(1)).execute(pool).await.unwrap();
+        id
+    }
+
+    /// A device session created `age` ago whose access token expires `access_ttl` from now.
+    async fn insert_device_session(
+        pool: &PgPool,
+        user_id: Uuid,
+        marker: u8,
+        access_ttl: time::Duration,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let now = time::OffsetDateTime::now_utc();
+        sqlx::query("INSERT INTO device_sessions(id,user_id,name,client_kind,client_id,refresh_hash,refresh_family,access_hash,access_expires_at,created_at,last_used_at,idle_expires_at,absolute_expires_at) VALUES($1,$2,'Desktop','app','app-1',$3,$4,$5,$6,$7,$7,$8,$9)")
+            .bind(id).bind(user_id).bind([marker; 32].as_slice()).bind(Uuid::new_v4())
+            .bind([marker.wrapping_add(100); 32].as_slice()).bind(now + access_ttl).bind(now - time::Duration::hours(3))
+            .bind(now + time::Duration::days(1)).bind(now + time::Duration::days(30))
+            .execute(pool).await.unwrap();
+        id
+    }
+
+    fn lease_context(
+        user_id: Uuid,
+        session_id: Uuid,
+        kind: craftcloud_db::locks::LockSessionKind,
+    ) -> craftcloud_db::locks::LockSessionContext {
+        craftcloud_db::locks::LockSessionContext {
+            user_id,
+            session_id,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            idle_timeout_secs: 3600,
+            kind,
+        }
+    }
+
+    async fn acquire_lease(
+        pool: &PgPool,
+        org_id: Uuid,
+        file_id: Uuid,
+        context: craftcloud_db::locks::LockSessionContext,
+    ) -> craftcloud_db::locks::AcquireOutcome {
+        let mut tx = craftcloud_db::members::OrgTx::begin(pool, org_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = tx
+            .lock_acquire(file_id, context, "test", false)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        outcome
+    }
+
+    async fn lease_count(pool: &PgPool, file_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM file_locks WHERE file_id=$1")
+            .bind(file_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn device_session_holds_a_lease_that_a_browser_session_of_the_same_user_does_not_share() {
+        use craftcloud_db::locks::{AcquireOutcome, LockSessionKind};
+        let db = migrated().await;
+        let f = lease_fixture(&db, "dev-lease").await;
+        let org_id = f.scope.org_id();
+        let device =
+            insert_device_session(&db.pool, f.user.id, 11, time::Duration::minutes(15)).await;
+        let browser = insert_browser_session(&db.pool, f.user.id, 12).await;
+
+        let acquired = acquire_lease(
+            &db.pool,
+            org_id,
+            f.file_id,
+            lease_context(f.user.id, device, LockSessionKind::Device),
+        )
+        .await;
+        let AcquireOutcome::Acquired {
+            current, created, ..
+        } = acquired
+        else {
+            panic!("a valid device session acquires a lease");
+        };
+        assert!(created);
+        assert_eq!(current.holder_session_kind, "device");
+        assert_eq!(current.holder_session_id, device);
+
+        // The browser session of the same user is not the holder.
+        let browser_attempt = acquire_lease(
+            &db.pool,
+            org_id,
+            f.file_id,
+            lease_context(f.user.id, browser, LockSessionKind::Browser),
+        )
+        .await;
+        assert!(matches!(
+            browser_attempt,
+            AcquireOutcome::Locked { same_user: true, ref current } if current.holder_session_id == device
+        ));
+        let mut tx = craftcloud_db::members::OrgTx::begin(&db.pool, org_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tx.active_project_lock(f.project_id, browser)
+                .await
+                .unwrap()
+                .is_some(),
+            "the device lease blocks writes from the browser session"
+        );
+        assert!(
+            tx.active_project_lock(f.project_id, device)
+                .await
+                .unwrap()
+                .is_none(),
+            "the holding device session is not blocked by its own lease"
+        );
+        tx.commit().await.unwrap();
+
+        // A browser session id presented as a device session is not valid.
+        let wrong_kind = acquire_lease(
+            &db.pool,
+            org_id,
+            f.file_id,
+            lease_context(f.user.id, browser, LockSessionKind::Device),
+        )
+        .await;
+        assert!(matches!(wrong_kind, AcquireOutcome::SessionExpired));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn revoking_a_session_removes_its_leases_in_the_same_transaction() {
+        use craftcloud_db::audit::AuditCtx;
+        use craftcloud_db::locks::{AcquireOutcome, LockSessionKind};
+        let db = migrated().await;
+        let f = lease_fixture(&db, "revoke-lease").await;
+        let org_id = f.scope.org_id();
+        let user_id = f.user.id;
+        let now = time::OffsetDateTime::now_utc();
+        let file_id = f.file_id;
+        let second_file = insert_file(
+            &db.pool,
+            &f.scope,
+            f.workspace_id,
+            f.project_id,
+            f.owner.id,
+            "second",
+        )
+        .await;
+        let hold = |file: Uuid, session: Uuid, kind: LockSessionKind| {
+            let pool = db.pool.clone();
+            async move {
+                assert!(matches!(
+                    acquire_lease(&pool, org_id, file, lease_context(user_id, session, kind)).await,
+                    AcquireOutcome::Acquired { .. }
+                ));
+            }
+        };
+
+        // Device logout.
+        let device =
+            insert_device_session(&db.pool, user_id, 21, time::Duration::minutes(15)).await;
+        hold(file_id, device, LockSessionKind::Device).await;
+        assert_eq!(lease_count(&db.pool, file_id).await, 1);
+        assert!(
+            craftcloud_db::device_sessions::revoke_current(
+                &db.pool,
+                device,
+                user_id,
+                now,
+                &AuditCtx::system()
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            lease_count(&db.pool, file_id).await,
+            0,
+            "device logout removes the lease"
+        );
+        assert!(
+            matches!(
+                acquire_lease(
+                    &db.pool,
+                    org_id,
+                    file_id,
+                    lease_context(user_id, device, LockSessionKind::Device)
+                )
+                .await,
+                AcquireOutcome::SessionExpired
+            ),
+            "a revoked device session cannot acquire"
+        );
+
+        // Device revoke from the account page keeps other sessions' leases.
+        let device =
+            insert_device_session(&db.pool, user_id, 22, time::Duration::minutes(15)).await;
+        let browser = insert_browser_session(&db.pool, user_id, 23).await;
+        hold(file_id, device, LockSessionKind::Device).await;
+        hold(second_file, browser, LockSessionKind::Browser).await;
+        assert!(
+            craftcloud_db::device_sessions::revoke_owned(
+                &db.pool,
+                device,
+                user_id,
+                now,
+                "user_revoked",
+                &AuditCtx::system()
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(lease_count(&db.pool, file_id).await, 0);
+        assert_eq!(lease_count(&db.pool, second_file).await, 1);
+        assert!(sessions::revoke(&db.pool, browser, now).await.unwrap());
+        assert_eq!(
+            lease_count(&db.pool, second_file).await,
+            0,
+            "browser logout removes its lease"
+        );
+
+        // Logout-all and account disable clear leases of both kinds.
+        for step in 0..2_u8 {
+            let device =
+                insert_device_session(&db.pool, user_id, 30 + step, time::Duration::minutes(15))
+                    .await;
+            let browser = insert_browser_session(&db.pool, user_id, 40 + step).await;
+            hold(file_id, device, LockSessionKind::Device).await;
+            hold(second_file, browser, LockSessionKind::Browser).await;
+            if step == 0 {
+                sessions::revoke_all_for_user_audited(&db.pool, user_id, now, &AuditCtx::system())
+                    .await
+                    .unwrap();
+            } else {
+                craftcloud_db::accounts::set_disabled(&db.pool, user_id, true, now)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                lease_count(&db.pool, file_id).await,
+                0,
+                "step {step}: device"
+            );
+            assert_eq!(
+                lease_count(&db.pool, second_file).await,
+                0,
+                "step {step}: browser"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn refresh_reuse_revokes_the_family_and_its_leases() {
+        use craftcloud_db::audit::AuditCtx;
+        use craftcloud_db::device_sessions::{self, RefreshOutcome};
+        use craftcloud_db::locks::{AcquireOutcome, LockSessionKind};
+        let db = migrated().await;
+        let f = lease_fixture(&db, "reuse-lease").await;
+        let device =
+            insert_device_session(&db.pool, f.user.id, 51, time::Duration::minutes(15)).await;
+        assert!(matches!(
+            acquire_lease(
+                &db.pool,
+                f.scope.org_id(),
+                f.file_id,
+                lease_context(f.user.id, device, LockSessionKind::Device)
+            )
+            .await,
+            AcquireOutcome::Acquired { .. }
+        ));
+        let now = time::OffsetDateTime::now_utc();
+        let rotate = |old: u8, new: u8| {
+            let pool = db.pool.clone();
+            async move {
+                device_sessions::refresh(
+                    &pool,
+                    &[old; 32],
+                    &[new; 32],
+                    &[new.wrapping_add(1); 32],
+                    now,
+                    Duration::from_secs(900),
+                    Duration::from_secs(86_400),
+                    &AuditCtx::system(),
+                )
+                .await
+                .unwrap()
+                .0
+            }
+        };
+        assert!(matches!(rotate(51, 70).await, RefreshOutcome::Rotated));
+        assert_eq!(lease_count(&db.pool, f.file_id).await, 1);
+        assert!(matches!(rotate(51, 72).await, RefreshOutcome::Reused));
+        assert_eq!(
+            lease_count(&db.pool, f.file_id).await,
+            0,
+            "replay revokes the family and removes its lease"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn upload_completion_check_ignores_access_token_and_idle_expiry_of_a_device_session() {
+        let db = migrated().await;
+        let f = lease_fixture(&db, "dev-valid").await;
+        let now = time::OffsetDateTime::now_utc();
+        // The access token expired a minute ago and the idle window ended: a long
+        // upload that began with a valid token must still be able to finish.
+        let device =
+            insert_device_session(&db.pool, f.user.id, 61, -time::Duration::minutes(1)).await;
+        sqlx::query("UPDATE device_sessions SET idle_expires_at=$2 WHERE id=$1")
+            .bind(device)
+            .bind(now - time::Duration::seconds(5))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let check = |session: Uuid| {
+            let pool = db.pool.clone();
+            let org_id = f.scope.org_id();
+            let user_id = f.user.id;
+            async move {
+                let mut tx = craftcloud_db::members::OrgTx::begin(&pool, org_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let valid = tx
+                    .session_valid(session, user_id, time::OffsetDateTime::now_utc(), true)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                valid
+            }
+        };
+        assert!(check(device).await);
+        sqlx::query("UPDATE device_sessions SET revoked_at=$2,revoke_reason='logout' WHERE id=$1")
+            .bind(device)
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(!check(device).await, "a revoked device session is invalid");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn concurrent_member_removal_from_two_organizations_never_deadlocks() {
+        use craftcloud_db::audit::AuditCtx;
+        let db = migrated().await;
+        let (scope_a, _owner_a) = org(&db.pool, "rm-a").await;
+        let (scope_b, _owner_b) = org(&db.pool, "rm-b").await;
+        for round in 0..15 {
+            let shared = user(&db.pool, &format!("shared-{round}@example.test")).await;
+            for scope in [&scope_a, &scope_b] {
+                organizations::add_member(
+                    &db.pool,
+                    &sc(scope, craftcloud_core::policy::Action::MemberAdd),
+                    shared.id,
+                    OrgRole::Member,
+                    MemberStatus::Active,
+                )
+                .await
+                .unwrap();
+            }
+            let remove = |scope: &OrgScope| {
+                let pool = db.pool.clone();
+                let scope = sc(scope, craftcloud_core::policy::Action::MemberRemove);
+                let user_id = shared.id;
+                async move {
+                    let mut tx = craftcloud_db::members::OrgTx::begin(&pool, scope.org_id())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let outcome = tx
+                        .remove_audited(&scope, user_id, &AuditCtx::system())
+                        .await;
+                    if outcome.is_ok() {
+                        tx.commit().await.unwrap();
+                    }
+                    outcome
+                }
+            };
+            let (a, b) = tokio::join!(remove(&scope_a), remove(&scope_b));
+            a.unwrap_or_else(|error| panic!("round {round}: org A removal failed: {error:?}"));
+            b.unwrap_or_else(|error| panic!("round {round}: org B removal failed: {error:?}"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn trashed_targets_reject_grants_and_leases_and_revoke_reports_the_change() {
+        use craftcloud_core::policy::Action;
+        use craftcloud_db::grants::{CreateOutcome, GrantRole, NewGrant, Target, TargetKind};
+        use craftcloud_db::locks::{AcquireOutcome, LockSessionKind};
+        let db = migrated().await;
+        let f = lease_fixture(&db, "trashed").await;
+        let org_id = f.scope.org_id();
+        let session = insert_browser_session(&db.pool, f.user.id, 81).await;
+        let now = time::OffsetDateTime::now_utc();
+        let new_grant = |kind: TargetKind, id: Uuid| NewGrant {
+            target: Target {
+                org_id,
+                workspace_id: f.workspace_id,
+                kind,
+                id,
+            },
+            grantee_user_id: f.user.id,
+            role: GrantRole::Editor,
+            created_by: f.owner.id,
+            now,
+        };
+        let create = |grant: NewGrant| {
+            let pool = db.pool.clone();
+            let scope = sc(&f.scope, Action::GrantCreate);
+            async move {
+                let mut tx = craftcloud_db::members::OrgTx::begin(&pool, org_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let outcome = tx.grant_create(&scope, grant).await.unwrap();
+                tx.commit().await.unwrap();
+                outcome
+            }
+        };
+
+        sqlx::query(
+            "UPDATE files SET deleted_at=CURRENT_TIMESTAMP, deleted_by_user_id=$2 WHERE id=$1",
+        )
+        .bind(f.file_id)
+        .bind(f.owner.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            create(new_grant(TargetKind::File, f.file_id)).await,
+            CreateOutcome::FileDeleted
+        ));
+        assert!(matches!(
+            acquire_lease(
+                &db.pool,
+                org_id,
+                f.file_id,
+                lease_context(f.user.id, session, LockSessionKind::Browser)
+            )
+            .await,
+            AcquireOutcome::FileDeleted
+        ));
+        sqlx::query("UPDATE files SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=$1")
+            .bind(f.file_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE projects SET deleted_at=CURRENT_TIMESTAMP, deleted_by_user_id=$2 WHERE id=$1",
+        )
+        .bind(f.project_id)
+        .bind(f.owner.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            create(new_grant(TargetKind::Project, f.project_id)).await,
+            CreateOutcome::ProjectDeleted
+        ));
+        assert!(matches!(
+            create(new_grant(TargetKind::File, f.file_id)).await,
+            CreateOutcome::ProjectDeleted
+        ));
+        assert!(matches!(
+            acquire_lease(
+                &db.pool,
+                org_id,
+                f.file_id,
+                lease_context(f.user.id, session, LockSessionKind::Browser)
+            )
+            .await,
+            AcquireOutcome::ProjectDeleted
+        ));
+        sqlx::query("UPDATE projects SET deleted_at=NULL, deleted_by_user_id=NULL WHERE id=$1")
+            .bind(f.project_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let CreateOutcome::Created(grant) = create(new_grant(TargetKind::File, f.file_id)).await
+        else {
+            panic!("a live target accepts a grant");
+        };
+        let revoke = || {
+            let pool = db.pool.clone();
+            let scope = sc(&f.scope, Action::GrantChange);
+            let id = grant.id;
+            async move {
+                let mut tx = craftcloud_db::members::OrgTx::begin(&pool, org_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let result = tx.grant_revoke(&scope, id, now).await.unwrap();
+                tx.commit().await.unwrap();
+                result.map(|(_, changed)| changed)
+            }
+        };
+        assert_eq!(revoke().await, Some(true), "first revoke changes a row");
+        assert_eq!(revoke().await, Some(false), "second revoke changes nothing");
     }
 
     #[tokio::test]
@@ -1246,7 +1829,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         migrate::verify(&db.pool).await.unwrap();
         let ws = workspaces::get(&db.pool, &scope, ws_id)
