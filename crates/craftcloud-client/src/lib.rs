@@ -487,6 +487,28 @@ impl<T: CloudTransport> CloudClient<T> {
     ) -> Result<TOut, CloudError> {
         self.auth_json("POST", path, Some(body), None, &[])
     }
+    /// Update a resource under its ETag without bypassing session refresh or URL checks.
+    pub fn patch<TOut: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        if_match: &str,
+    ) -> Result<TOut, CloudError> {
+        if if_match.is_empty() || if_match.contains(['\r', '\n']) {
+            return Err(CloudError::Validation("invalid precondition".into()));
+        }
+        self.auth_json(
+            "PATCH",
+            path,
+            Some(body),
+            None,
+            &[("If-Match".into(), if_match.into())],
+        )
+    }
+    /// Delete a resource, accepting an empty successful response (including 204).
+    pub fn delete(&self, path: &str) -> Result<(), CloudError> {
+        self.auth_bytes("DELETE", path, Vec::new(), &[]).map(|_| ())
+    }
     pub fn create_upload(
         &self,
         file_id: Uuid,
@@ -1100,6 +1122,94 @@ mod tests {
             let page: Result<Page<String>, _> = c.get("/api/v1/organizations");
             assert!(page.is_ok());
         }
+    }
+    #[test]
+    fn conditional_patch_refreshes_and_delete_accepts_empty_response() -> Result<(), CloudError> {
+        struct Recorded {
+            replies: Mock,
+            requests: Mutex<Vec<Request>>,
+        }
+        impl CloudTransport for Recorded {
+            fn send(&self, request: Request) -> Result<Response, CloudError> {
+                self.requests
+                    .lock()
+                    .map_err(|_| CloudError::Offline)?
+                    .push(request);
+                self.replies.send(Request {
+                    method: String::new(),
+                    path: String::new(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    cancelled: None,
+                })
+            }
+        }
+        let client = authenticated(Recorded {
+            replies: Mock::new(vec![
+                Ok(response(401, "{}")),
+                Ok(response(200, ROTATED)),
+                Ok(response(200, r#"{"role":"viewer","version":3}"#)),
+                Ok(response(204, "")),
+            ]),
+            requests: Mutex::new(Vec::new()),
+        })?;
+        let result: serde_json::Value = client.patch(
+            "/api/v1/grants/test",
+            &serde_json::json!({"role":"viewer"}),
+            "\"grant-v2\"",
+        )?;
+        assert_eq!(
+            result.get("version").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        client.delete("/api/v1/grants/test")?;
+        let calls = client
+            .transport()
+            .requests
+            .lock()
+            .map_err(|_| CloudError::Offline)?;
+        assert_eq!(calls.len(), 4);
+        for request in calls.iter().filter(|request| request.method == "PATCH") {
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name == "If-Match" && value == "\"grant-v2\"")
+            );
+            assert_eq!(request.path, "https://cloud.example/api/v1/grants/test");
+        }
+        let retried = calls.get(2).ok_or(CloudError::InvalidResponse)?;
+        assert!(
+            retried
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Authorization" && value == "Bearer new-a")
+        );
+        assert_eq!(
+            calls.last().map(|request| request.method.as_str()),
+            Some("DELETE")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mutations_reject_cross_origin_paths_and_header_injection() -> Result<(), CloudError> {
+        let client = authenticated(Mock::new(Vec::new()))?;
+        assert_eq!(
+            client.delete("https://other.example/api/v1/grants/test"),
+            Err(CloudError::InvalidUrl)
+        );
+        assert_eq!(
+            client.delete("//other.example/api/v1/grants/test"),
+            Err(CloudError::InvalidUrl)
+        );
+        let patch: Result<serde_json::Value, _> = client.patch(
+            "/api/v1/grants/test",
+            &serde_json::json!({"role":"viewer"}),
+            "\"grant-v2\"\r\nAuthorization: other",
+        );
+        assert!(matches!(patch, Err(CloudError::Validation(_))));
+        Ok(())
     }
     #[test]
     fn refresh_reuse_failure_clears_session() {
