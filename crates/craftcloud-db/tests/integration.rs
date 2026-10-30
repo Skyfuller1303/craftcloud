@@ -286,7 +286,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -1199,14 +1199,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            16,
+            17,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 16);
+        assert_eq!(count, 17);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -1221,7 +1221,7 @@ mod tests {
         assert_eq!(
             migrate::verify(&db.pool).await,
             Err(DbError::Schema(SchemaProblem::Pending(vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
             ])))
         );
 
@@ -1230,7 +1230,7 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -1829,7 +1829,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         migrate::verify(&db.pool).await.unwrap();
         let ws = workspaces::get(&db.pool, &scope, ws_id)
@@ -2037,6 +2037,93 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn second_factor_completion_binds_secret_generation_and_consumes_challenge_once() {
+        use craftcloud_db::two_factor::{self, VerifiedFactor};
+        use sha2::{Digest, Sha256};
+
+        let db = migrated().await;
+        let user_id = user_with_hash(&db.pool, "mfa@example.test", "h1").await;
+        let now = time::OffsetDateTime::now_utc();
+        let ciphertext = vec![7_u8; 32];
+        sqlx::query("INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,last_accepted_step,created_at) VALUES($1,$2,$3,NULL,$3)")
+            .bind(user_id).bind(&ciphertext).bind(now).execute(&db.pool).await.unwrap();
+        let challenge_id = [9_u8; 32];
+        let password_digest: [u8; 32] = Sha256::digest(b"h1").into();
+        sqlx::query("INSERT INTO two_factor_login_challenges(id_hash,user_id,password_hash_digest,login_kind,client_address,created_at,expires_at) VALUES($1,$2,$3,'browser','192.0.2.9',$4,$4 + interval '5 minutes')")
+            .bind(challenge_id.as_slice()).bind(user_id).bind(password_digest.as_slice()).bind(now).execute(&db.pool).await.unwrap();
+        let audit = craftcloud_db::audit::AuditCtx {
+            actor_id: Some(user_id),
+            request_id: Some("test-request".into()),
+        };
+        let new_session = |marker| NewSession {
+            user_id,
+            token_hash: [marker; 32],
+            now,
+            absolute_expires_at: now + time::Duration::days(1),
+        };
+
+        let stale_generation = two_factor::complete_browser_login(
+            &db.pool,
+            &challenge_id,
+            user_id,
+            "192.0.2.9",
+            "h1",
+            &[8_u8; 32],
+            VerifiedFactor::TotpStep(100),
+            &new_session(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale_generation, None);
+
+        let completed = two_factor::complete_browser_login(
+            &db.pool,
+            &challenge_id,
+            user_id,
+            "192.0.2.9",
+            "h1",
+            &ciphertext,
+            VerifiedFactor::TotpStep(100),
+            &new_session(2),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert!(completed.is_some());
+        let replay = two_factor::complete_browser_login(
+            &db.pool,
+            &challenge_id,
+            user_id,
+            "192.0.2.9",
+            "h1",
+            &ciphertext,
+            VerifiedFactor::TotpStep(100),
+            &new_session(3),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay, None);
+        let step: Option<i64> =
+            sqlx::query_scalar("SELECT last_accepted_step FROM user_two_factor WHERE user_id=$1")
+                .bind(user_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(step, Some(100));
+        let live_sessions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sessions WHERE user_id=$1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(live_sessions, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn verified_login_insert_waits_for_a_password_change_in_flight_and_then_refuses() {
         let db = migrated().await;
         let id = user_with_hash(&db.pool, "race@example.test", "h1").await;
@@ -2231,6 +2318,7 @@ mod tests {
                 user_id: id,
                 token_hash: [7; 32],
                 created_by: None,
+                reset_two_factor: false,
                 now,
                 expires_at: now + time::Duration::hours(1),
             },
@@ -2268,6 +2356,7 @@ mod tests {
                             user_id: id,
                             token_hash: [marker; 32],
                             created_by: None,
+                            reset_two_factor: false,
                             now,
                             expires_at: now + time::Duration::hours(1),
                         },
@@ -2306,6 +2395,7 @@ mod tests {
                         user_id: id,
                         token_hash: [round.wrapping_mul(2).wrapping_add(1); 32],
                         created_by: None,
+                        reset_two_factor: false,
                         now,
                         expires_at: now + time::Duration::hours(1),
                     },
@@ -2903,7 +2993,7 @@ mod tests {
         // A read permit drives no write ...
         assert!(tx.add(&read, stranger.id, OrgRole::Member).await.is_err());
         assert!(
-            tx.update_settings(&read, Some("Renamed"), None, 1)
+            tx.update_settings(&read, Some("Renamed"), None, None, 1)
                 .await
                 .is_err()
         );
@@ -2919,7 +3009,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            tx.update_settings(&add_scope, Some("Renamed"), None, 1)
+            tx.update_settings(&add_scope, Some("Renamed"), None, None, 1)
                 .await
                 .is_err()
         );
@@ -2960,6 +3050,7 @@ mod tests {
             tx.update_settings(
                 &sc(&base, Action::OrganizationUpdate),
                 Some("Renamed"),
+                None,
                 None,
                 1
             )
@@ -3512,6 +3603,7 @@ mod tests {
                     user_id: user.id,
                     token_hash: hash,
                     created_by: None,
+                    reset_two_factor: false,
                     now,
                     expires_at: now + time::Duration::hours(1),
                 },

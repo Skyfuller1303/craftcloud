@@ -15,7 +15,9 @@ mod healthcheck;
 mod secret;
 mod server;
 
+use base64::Engine;
 use std::process::ExitCode;
+use zeroize::Zeroize;
 
 use config::{Config, DatabaseSettings, LogFormat};
 use craftcloud_api::maintenance::{
@@ -34,12 +36,13 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
 
-const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>]]\n\
+const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin user reset-2fa <email> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>]]\n\
     \n\
     (no argument)                          start the HTTP server\n\
     migrate                                apply pending database migrations and exit\n\
     healthcheck                            exit 0 if GET /health/ready on the local listener answers 200 (container healthcheck)\n\
     admin issue-password-reset --email E   print a one-hour password reset link for account E\n\
+    admin user reset-2fa E                 clear TOTP and recovery codes; revoke all sessions\n\
     admin set-org-owner --org SLUG --email E\n\
                                            break glass: make the enabled account E an owner of organization SLUG\n\
     admin maintenance --once [--dry-run]   run the maintenance job once (retention purge, blob garbage collection,\n\
@@ -76,6 +79,7 @@ enum Command {
     Migrate,
     Healthcheck,
     IssuePasswordReset { email: String },
+    ResetTwoFactor { email: String },
     SetOrgOwner { org: String, email: String },
     Maintenance { dry_run: bool },
     StorageBind,
@@ -95,6 +99,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             if admin == "admin" && action == "issue-password-reset" && flag == "--email" =>
         {
             Ok(Command::IssuePasswordReset {
+                email: email.clone(),
+            })
+        }
+        [admin, user, action, email]
+            if admin == "admin" && user == "user" && action == "reset-2fa" =>
+        {
+            Ok(Command::ResetTwoFactor {
                 email: email.clone(),
             })
         }
@@ -249,6 +260,7 @@ async fn main() -> ExitCode {
         Command::Migrate => migrate(&config.database).await,
         Command::Serve => run(config).await,
         Command::IssuePasswordReset { email } => issue_password_reset(&config, &email).await,
+        Command::ResetTwoFactor { email } => reset_two_factor(&config, &email).await,
         Command::SetOrgOwner { org, email } => set_org_owner(&config, &org, &email).await,
         Command::Maintenance { dry_run } => maintenance_once(&config, dry_run).await,
         Command::StorageBind => storage_bind(&config).await,
@@ -380,6 +392,34 @@ fn load_metrics_token(config: &Config) -> Result<Option<BootstrapToken>, Failure
         .map_err(|err| Failure::config(format!("CRAFTCLOUD_METRICS_TOKEN_FILE: {err}")))
 }
 
+/// Loads an optional Base64 32-byte TOTP encryption key without making server
+/// startup depend on key-file availability. Diagnostics never include paths
+/// or key material.
+fn load_two_factor_key(path: Option<&std::path::PathBuf>) -> Option<[u8; 32]> {
+    let path = path?;
+    let secret = match secret::load_secret_file(path) {
+        Ok(secret) => secret,
+        Err(_) => {
+            tracing::warn!("two-factor secret key file is unavailable or invalid");
+            return None;
+        }
+    };
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(secret.expose().trim()) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            tracing::warn!("two-factor secret key is not valid Base64");
+            return None;
+        }
+    };
+    let mut decoded = decoded;
+    let key = decoded.as_slice().try_into().ok();
+    decoded.zeroize();
+    if key.is_none() {
+        tracing::warn!("two-factor secret key must decode to exactly 32 bytes");
+    }
+    key
+}
+
 /// Offline recovery: prints a single-use reset link to stdout. The token is
 /// never logged; it only appears on stdout. The password is never an
 /// argument; the user sets it through the link.
@@ -415,6 +455,7 @@ async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failur
             user_id: account.id,
             token_hash: token.hash(),
             created_by: None,
+            reset_two_factor: false,
             now,
             expires_at: now + PASSWORD_RESET_TTL,
         },
@@ -452,6 +493,47 @@ async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failur
 /// organization that lost its enabled owners. Runs on the host with access to
 /// the database secret; it is not reachable through the HTTP API. Writes an
 /// audit log line (identifiers only) and prints the result to stdout.
+async fn reset_two_factor(config: &Config, email: &str) -> Result<(), Failure> {
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "reset-2fa requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let Ok(email) = NormalizedEmail::parse(email) else {
+        return Err(Failure::runtime("no account with that e-mail address"));
+    };
+    let Some(account) = craftcloud_db::accounts::find_by_email(&pool, email.as_str())
+        .await
+        .map_err(|err| Failure::runtime(err.to_string()))?
+    else {
+        return Err(Failure::runtime("no account with that e-mail address"));
+    };
+    let changed = craftcloud_db::two_factor::reset_for_user(
+        &pool,
+        account.id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        time::OffsetDateTime::now_utc(),
+        &craftcloud_db::audit::AuditCtx::system(),
+        "auth.two_factor_reset",
+    )
+    .await
+    .map_err(|err| Failure::runtime(err.to_string()))?;
+    if changed {
+        println!("Two-factor authentication and recovery codes cleared; all sessions revoked.");
+    } else {
+        println!("No two-factor enrollment was active.");
+    }
+    pool.close().await;
+    Ok(())
+}
+
 async fn set_org_owner(config: &Config, org_slug: &str, email: &str) -> Result<(), Failure> {
     use craftcloud_db::recovery::{SetOwnerOutcome, set_org_owner};
 
@@ -821,6 +903,11 @@ async fn run(config: Config) -> Result<(), Failure> {
     // error (exit 2) and must stop startup before anything is bound.
     let bootstrap = load_bootstrap_token(&config)?;
     let metrics_token = load_metrics_token(&config)?;
+    let two_factor_key = load_two_factor_key(config.secret_key_file.as_ref());
+    let two_factor_old_key = load_two_factor_key(config.secret_key_old_file.as_ref());
+    if two_factor_key.is_none() {
+        tracing::warn!("two-factor setup is unavailable: current secret key is not usable");
+    }
     let metrics = std::sync::Arc::new(Metrics::new());
     // Migrations are never applied implicitly: only verify the schema.
     let pool = connect_database(&config.database).await?;
@@ -969,6 +1056,7 @@ async fn run(config: Config) -> Result<(), Failure> {
     let store_refused = object_store.is_some() && serving_store.is_none();
     let services = pool.as_ref().map(|pool| {
         let services = Services::new(pool.clone(), bootstrap, auth_settings)
+            .with_two_factor_keys(two_factor_key, two_factor_old_key)
             .with_metrics(std::sync::Arc::clone(&metrics));
         let services = match serving_store {
             Some(store) => services.with_storage(store),
@@ -1124,6 +1212,9 @@ mod tests {
         ));
         assert!(parse_args(&args(&["healthcheck", "extra"])).is_err());
         assert!(matches!(parse_args(&args(&["--help"])), Ok(Command::Help)));
+        assert!(
+            matches!(parse_args(&args(&["admin", "user", "reset-2fa", "user@example.test"])), Ok(Command::ResetTwoFactor { email }) if email == "user@example.test")
+        );
         assert!(parse_args(&args(&["nope"])).is_err());
         assert!(parse_args(&args(&["migrate", "extra"])).is_err());
     }

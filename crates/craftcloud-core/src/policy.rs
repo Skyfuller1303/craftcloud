@@ -154,6 +154,8 @@ pub enum Action {
     OrganizationRead,
     /// Change organization settings (name).
     OrganizationUpdate,
+    /// Change the organization's mandatory two-factor policy.
+    OrganizationTwoFactorPolicyUpdate,
     /// Create an organization (operator).
     OrganizationCreate,
     /// List organization metadata of the whole instance (operator).
@@ -305,6 +307,7 @@ impl Action {
             | Self::SharedWithMe
             | Self::MemberSearch => false,
             Self::OrganizationUpdate
+            | Self::OrganizationTwoFactorPolicyUpdate
             | Self::OrganizationCreate
             | Self::MemberAdd
             | Self::MemberChangeRole
@@ -344,10 +347,11 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 61] = [
+    pub const ALL: [Action; 62] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
+        Action::OrganizationTwoFactorPolicyUpdate,
         Action::OrganizationCreate,
         Action::OrganizationListAll,
         Action::UserListAll,
@@ -672,6 +676,13 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             None => Decision::Hidden,
         },
         (A::OrganizationUpdate, Resource::Organization { org_id }) => {
+            match role_in(actor, *org_id) {
+                Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+                Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
+                None => Decision::Hidden,
+            }
+        }
+        (A::OrganizationTwoFactorPolicyUpdate, Resource::Organization { org_id }) => {
             match role_in(actor, *org_id) {
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
                 Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
@@ -1305,6 +1316,11 @@ mod tests {
     fn organization_read_and_update() {
         check(Action::OrganizationRead, org(), [H, Y, Y, Y]);
         check(Action::OrganizationUpdate, org(), [H, F, Y, Y]);
+        check(
+            Action::OrganizationTwoFactorPolicyUpdate,
+            org(),
+            [H, F, Y, Y],
+        );
     }
 
     #[test]
@@ -1476,6 +1492,7 @@ mod tests {
         for (action, resource) in [
             (Action::OrganizationRead, org()),
             (Action::OrganizationUpdate, org()),
+            (Action::OrganizationTwoFactorPolicyUpdate, org()),
             (Action::MemberList, member(None, None)),
             (Action::MemberAdd, member(None, Some(OrgRole::Member))),
             (
@@ -1501,6 +1518,7 @@ mod tests {
         for (action, resource) in [
             (Action::OrganizationRead, org()),
             (Action::OrganizationUpdate, org()),
+            (Action::OrganizationTwoFactorPolicyUpdate, org()),
             (Action::MemberList, member(None, None)),
             (Action::MemberAdd, member(None, Some(OrgRole::Member))),
             (
@@ -1627,6 +1645,7 @@ mod tests {
             Action::OrganizationListOwn,
             Action::OrganizationRead,
             Action::OrganizationUpdate,
+            Action::OrganizationTwoFactorPolicyUpdate,
             Action::OrganizationCreate,
             Action::OrganizationListAll,
             Action::UserListAll,
@@ -1694,6 +1713,7 @@ mod tests {
                 Action::OrganizationListOwn
                 | Action::OrganizationRead
                 | Action::OrganizationUpdate
+                | Action::OrganizationTwoFactorPolicyUpdate
                 | Action::OrganizationCreate
                 | Action::OrganizationListAll
                 | Action::UserListAll

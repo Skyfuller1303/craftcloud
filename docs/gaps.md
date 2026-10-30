@@ -2,7 +2,7 @@
 
 ## Blocking decisions
 
-AC-01 (2026-10-30) ergänzt lokal Desktop-Geräte-Sitzungen, Bearer-Authentifizierung und eine Geräteliste in den Web-Einstellungen; die historischen Lücken zur Desktop-Anmeldung und Geräteliste sind damit teilweise geschlossen. Offen bleiben AC-02 (TOTP), AC-04 (Schlüsselbund und Client-SDK), fremde Geräte durch Administratoren, Browser-Device-Flow und OIDC. Refresh verwendet bewusst keine optionale Gnadenfrist: Ein wiederholter Versuch nach einer verlorenen Antwort widerruft die Familie und erfordert eine erneute Anmeldung. Die zusätzlichen Sicherheitstests verwenden synthetische Daten; reale Clients, Proxy-Deployments und assistive Technologien benötigen weiterhin eigene Abnahme.
+AC-01 (2026-10-30) ergänzt lokal Desktop-Geräte-Sitzungen, Bearer-Authentifizierung und eine Geräteliste in den Web-Einstellungen; die historischen Lücken zur Desktop-Anmeldung und Geräteliste sind damit teilweise geschlossen. AC-02 ergänzt lokal TOTP mit Wiederherstellungscodes für Browser und Geräte, Organisationspflicht, Operator-Reset und verschlüsselte Sicherung; Prüfstatus und Einschränkungen stehen im zugehörigen Abschlussbericht. Offen bleiben AC-04 (Schlüsselbund und Client-SDK), fremde Geräte durch Administratoren, Browser-Device-Flow, OIDC und Passkeys. Refresh verwendet bewusst keine optionale Gnadenfrist: Ein wiederholter Versuch nach einer verlorenen Antwort widerruft die Familie und erfordert eine erneute Anmeldung. Die zusätzlichen Sicherheitstests verwenden synthetische Daten; reale Clients, Proxy-Deployments und assistive Technologien benötigen weiterhin eigene Abnahme.
 
 ### AC-03 work in progress
 

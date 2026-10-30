@@ -30,7 +30,26 @@ Die zusätzliche Vertrauensgrenze liegt zwischen einem Desktop-Client und der AP
 
 Restrisiken: Ein gestohlenes noch gültiges Token bleibt bis zu Ablauf oder Widerruf verwendbar. Es gibt keine optionale Refresh-Gnadenfrist: Nach einer verlorenen Antwort kann eine erneute Anmeldung nötig sein. TLS schützt nicht vor kompromittierten Clients oder einem kompromittierten Host. Proxy-Logs und Betriebssystem-Schlüsselbund liegen außerhalb dieser Serverimplementierung; TOTP folgt in AC-02. Die Geräte-Namen sind untrusted Anzeigetext und werden bereinigt sowie vom Webpanel als Text gerendert.
 
-## STRIDE-Matrix
+## Zwei-Faktor-Anmeldung (AC-02)
+
+[ADR-0019](../09-decisions/adr-0019-two-factor.md) erweitert Browser- und Geräte-Anmeldung um denselben zweiten Faktor. Die bisherigen Hinweise „MFA later“ und „TOTP folgt in AC-02“ sind für diesen Ausbau durch die folgende Entscheidung ersetzt. Die Abnahme einschließlich der tatsächlich ausgeführten Testnamen und Logs steht im AC-02-Abschlussbericht.
+
+| Angriff | Schutzanforderung |
+|---|---|
+| Datenbankabzug offenbart TOTP-Geheimnisse | Authentifizierte Verschlüsselung mit einem getrennt verwahrten Serverschlüssel; keine Schlüsseldatei im Datenbank-Backup. Wiederherstellungscodes werden nur als gesalzene Hashes gespeichert. |
+| Gestohlenes Passwort erzeugt direkt eine Sitzung | Nach Passwortprüfung bei aktivem 2FA ausschließlich Challenge; Sitzung erst nach gültigem zweiten Faktor. Browser- und Geräte-Challenges sind getrennt gebunden. |
+| Replay oder parallele Einlösung | Kontozeile, Proof-Verbrauch und Sitzungsausstellung werden transaktional abgesichert. Jeder angenommene Zeitschritt und Wiederherstellungscode wird höchstens einmal verwendet. |
+| Challenge-Diebstahl, Raten oder unbegrenzte Datenbankbelegung | Zufällige opake Challenge, gehasht gespeichert, fünf Minuten Gültigkeit, höchstens fünf Versuche, Bindung an Konto, Adresse und Anmeldeart sowie bestehende Login-Limits. |
+| Passwortwechsel, 2FA-Wechsel oder Reset während der Anmeldung | Alte Challenges und vorab geprüfte Credentials dürfen keine neue Sitzung nach dem Widerruf erzeugen; die finale Entscheidung muss den aktuellen Kontozustand unter Sperre prüfen. |
+| Fehlende Schlüsseldatei wird zum 2FA-Bypass | Fehlende oder falsche Schlüssel führen zu einer nicht verfügbaren Funktion, niemals zu Passwort-only-Anmeldung eines bereits eingerichteten Kontos. |
+| Grant oder direkter Objektzugriff umgeht Organisationspflicht | Prüfung im serverseitigen Organisationsscope einschließlich AC-03-Grants und Schreibabschluss nach Upload. Andere Organisationen bleiben erreichbar. |
+| QR-Dienst, Browser-Speicher oder Telemetrie verrät Geheimnisse | QR-Erzeugung lokal im Browser, unveränderte CSP, Geheimnisse nur im flüchtigen Einrichtungsdialog; keine Codes, Challenge-IDs oder Geheimnisse in Log/Audit. |
+| Sicherheitsänderung lässt gestohlene Sitzungen gültig | Aktivierung, Deaktivierung und Reset widerrufen andere Browser- und Geräte-Sitzungen atomar mit der Änderung. |
+| Restore reaktiviert alte Faktoren oder Wiederherstellungscodes | Geschützte Schlüsselaufbewahrung und dokumentierte Restore-Probe; nach produktivem Restore Recovery-Codes erneuern und zurückgesetzte Faktoren überprüfen. |
+
+Restrisiken: TOTP schützt nicht gegen Phishing mit sofortiger Weiterleitung oder einen kompromittierten Client. Ein Angreifer mit Zugriff auf Datenbank und Schlüsseldatei kann Geheimnisse entschlüsseln. Die bestehende Ratenbegrenzung ist pro Serverprozess; eine horizontale Verteilung benötigt eine gemeinsame Begrenzung. Ein legitimer Wechsel der Client-Adresse während des Anmeldeschritts kann einen Neustart der Anmeldung erfordern. Passkeys sind nicht Bestandteil von AC-02.
+
+## Allgemeine STRIDE-Matrix
 
 | Risiko | Beispiel | Gegenmaßnahmen | Test |
 |---|---|---|---|

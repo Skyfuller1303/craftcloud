@@ -430,6 +430,21 @@ mod tests {
         let alice = w.user("alice").await;
         let bob = w.user("bob").await;
         let carol = w.user("carol").await;
+        let factor_now = time::OffsetDateTime::now_utc();
+        let factor_key = [31_u8; 32];
+        let factor_secret = [23_u8; 20];
+        let factor_ciphertext =
+            craftcloud_auth::encrypt_secret_for(&factor_key, alice.0, b"totp", &factor_secret)
+                .unwrap();
+        let recovery = craftcloud_auth::recovery_codes().unwrap().remove(0);
+        let (recovery_salt, recovery_hash) =
+            craftcloud_auth::hash_recovery_code(&recovery).unwrap();
+        sqlx::query("INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,last_accepted_step,created_at) VALUES($1,$2,$3,42,$3)")
+            .bind(alice.0).bind(&factor_ciphertext).bind(factor_now).execute(&w.env.pool).await.unwrap();
+        sqlx::query("INSERT INTO user_two_factor_recovery_codes(user_id,salt,code_hash,created_at) VALUES($1,$2,$3,$4)")
+            .bind(alice.0).bind(recovery_salt.as_slice()).bind(recovery_hash.as_slice()).bind(factor_now).execute(&w.env.pool).await.unwrap();
+        sqlx::query("INSERT INTO two_factor_login_challenges(id_hash,user_id,password_hash_digest,login_kind,client_address,created_at,expires_at) VALUES($1,$2,$3,'browser','192.0.2.42',$4,$4 + interval '5 minutes')")
+            .bind(vec![11_u8; 32]).bind(alice.0).bind(vec![13_u8; 32]).bind(factor_now).execute(&w.env.pool).await.unwrap();
         let acme = w.org("acme", alice.0).await;
         let bobco = w.org("bobco", bob.0).await;
         w.org_member(&alice.1, acme, carol.0).await;
@@ -462,7 +477,7 @@ mod tests {
         let backup_time = started.elapsed();
         assert!(created.audit_recorded);
         assert_eq!(created.blobs, 5, "{:?}", created.manifest.blobs);
-        assert_eq!(created.manifest.migration_version, 16);
+        assert_eq!(created.manifest.migration_version, 17);
 
         let report = craftcloud_backup::verify(&out, Some(&created.manifest_sha256)).unwrap();
         assert_eq!(report.blobs, 5);
@@ -516,6 +531,22 @@ mod tests {
                 .await,
             0
         );
+        assert_eq!(
+            target.count("SELECT count(*) FROM user_two_factor").await,
+            1
+        );
+        assert_eq!(
+            target
+                .count("SELECT count(*) FROM user_two_factor_recovery_codes")
+                .await,
+            1
+        );
+        assert_eq!(
+            target
+                .count("SELECT count(*) FROM two_factor_login_challenges")
+                .await,
+            0
+        );
 
         // Bytes: every blob of every version is byte-identical in the new store.
         let rows: Vec<(String, Vec<u8>, i64)> = sqlx::query_as(
@@ -545,9 +576,42 @@ mod tests {
         assert_ne!(marker.store_id.to_string(), created.manifest.store.store_id);
 
         // Permissions and content through the API of the restored instance.
-        let app = target.router().await;
+        let restored_ciphertext: Vec<u8> =
+            sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1")
+                .bind(alice.0)
+                .fetch_one(&target.pool)
+                .await
+                .unwrap();
+        assert_eq!(restored_ciphertext, factor_ciphertext);
+        assert_eq!(
+            craftcloud_auth::decrypt_secret_for(
+                &factor_key,
+                &restored_ciphertext,
+                alice.0,
+                b"totp"
+            )
+            .unwrap(),
+            factor_secret
+        );
+        let services = Services::new(target.pool.clone(), None, settings())
+            .with_storage(target.store().await)
+            .with_two_factor_keys(Some(factor_key), None);
+        let app = router_with_shared(
+            Capabilities::development_defaults(),
+            &ApiConfig::default(),
+            Some(Arc::new(services)),
+        );
+        let challenge = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/login")
+                .json(json!({"email":"alice@example.test","password":crate::common::PASSWORD})),
+        )
+        .await;
+        assert_eq!(challenge.code(), "SECOND_FACTOR_REQUIRED");
+        let alice_login = call(&app, Req::new("POST", "/api/v1/auth/login/second-factor").json(json!({"challenge_id":challenge.body["error"]["details"]["challenge_id"],"recovery_code":recovery}))).await;
+        assert_eq!(alice_login.status, StatusCode::OK);
         let (a, b, c) = (
-            login(&app, "alice").await,
+            crate::common::session_from(&alice_login),
             login(&app, "bob").await,
             login(&app, "carol").await,
         );
@@ -796,7 +860,7 @@ mod tests {
 
         // Forged manifests with a matching checksum file: unknown versions.
         rewrite_manifest(&out, |m| m["migration_version"] = json!(99));
-        expect(&out, ErrorKind::Format, "only knows up to 16");
+        expect(&out, ErrorKind::Format, "only knows up to 17");
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
             m["format_version"] = json!(2);
@@ -808,7 +872,7 @@ mod tests {
         );
         rewrite_manifest(&out, |m| {
             m["format_version"] = json!(1);
-            m["migration_version"] = json!(16);
+            m["migration_version"] = json!(17);
             m["tables"][0]["rows"] = json!(77);
         });
         expect(&out, ErrorKind::Integrity, "rows but the manifest says 77");
@@ -968,12 +1032,38 @@ mod tests {
         // export) to model the manifest produced by a version 11 server. (No
         // older server build exists here to produce a genuine one.)
         std::fs::remove_file(out.join("tables").join("grants.copy")).unwrap();
+        // AC-02 adds two persistent tables and appends require_two_factor to
+        // organizations. Model the old COPY column order as well as its manifest.
+        for table in ["user_two_factor", "user_two_factor_recovery_codes"] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+        let org_path = out.join("tables").join("organizations.copy");
+        let current_orgs = std::fs::read_to_string(&org_path).unwrap();
+        let old_orgs: String = current_orgs
+            .lines()
+            .map(|line| {
+                let (old_columns, policy) = line.rsplit_once('\t').unwrap();
+                assert_eq!(policy, "f");
+                format!("{old_columns}\n")
+            })
+            .collect();
+        std::fs::write(&org_path, &old_orgs).unwrap();
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(11);
-            m["tables"]
+            m["tables"].as_array_mut().unwrap().retain(|t| {
+                !matches!(
+                    t["name"].as_str(),
+                    Some("grants" | "user_two_factor" | "user_two_factor_recovery_codes")
+                )
+            });
+            let org = m["tables"]
                 .as_array_mut()
                 .unwrap()
-                .retain(|t| t["name"] != "grants");
+                .iter_mut()
+                .find(|t| t["name"] == "organizations")
+                .unwrap();
+            org["bytes"] = json!(old_orgs.len());
+            org["sha256"] = json!(sha_hex(old_orgs.as_bytes()));
             m["excluded_tables"] = json!([
                 "sessions",
                 "password_reset_tokens",
@@ -995,7 +1085,7 @@ mod tests {
 
         // Restore, then migrate.
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 5);
+        assert_eq!(applied.len(), 6);
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         assert_eq!(
             dump(&w.env.pool, "users").await,
@@ -1407,7 +1497,7 @@ mod tests {
         .unwrap();
         assert_eq!((row.0, row.1, row.2.as_str()), (None, None, "success"));
         assert_eq!(row.3["blobs"], 1);
-        assert_eq!(row.3["migration"], 16);
+        assert_eq!(row.3["migration"], 17);
 
         // The manifest holds no secrets: neither a connection string nor the
         // password of the database URL, and no names.

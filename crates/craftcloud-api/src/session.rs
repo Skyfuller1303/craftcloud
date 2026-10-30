@@ -25,6 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use craftcloud_auth::{DeviceToken, DeviceTokenKind, OpaqueToken};
+use craftcloud_core::policy::OrgRole;
 use craftcloud_db::sessions;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -82,6 +83,7 @@ enum Kind {
     Unavailable,
     Internal,
     Ambiguous,
+    TwoFactorSetupRequired,
 }
 
 impl AuthRejection {
@@ -131,6 +133,11 @@ impl IntoResponse for AuthRejection {
                 StatusCode::BAD_REQUEST,
                 "AMBIGUOUS_CREDENTIALS",
                 "Send either a session cookie or a bearer token, not both.",
+            ),
+            Kind::TwoFactorSetupRequired => (
+                StatusCode::FORBIDDEN,
+                "TWO_FACTOR_SETUP_REQUIRED",
+                "Set up two-factor authentication to access this organization.",
             ),
         };
         error_response(status, code, message, &self.request_headers)
@@ -231,6 +238,14 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
                 )
             };
 
+        match organization_requires_two_factor(&services, user_id, parts.uri.path()).await {
+            Ok(true) => return Err(AuthRejection::new(Kind::TwoFactorSetupRequired, parts)),
+            Ok(false) => {}
+            Err(AuthRejectionKind::Internal) => {
+                return Err(AuthRejection::new(Kind::Internal, parts));
+            }
+        }
+
         crate::observe::note_actor(user_id);
         Ok(Self {
             session_id,
@@ -241,6 +256,268 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
             csrf_token,
         })
     }
+}
+
+async fn organization_requires_two_factor(
+    services: &crate::services::Services,
+    user_id: Uuid,
+    path: &str,
+) -> Result<bool, AuthRejectionKind> {
+    // Axum route captures are percent-decoded. Decode each raw URI segment
+    // separately so encoded slashes cannot change the route structure.
+    let decoded: Vec<String> = path
+        .split('/')
+        .filter(|value| !value.is_empty())
+        .map(decode_path_segment)
+        .collect::<Option<_>>()
+        .ok_or(AuthRejectionKind::Internal)?;
+    let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
+    let id_after = |name: &str| -> Option<Uuid> {
+        let index = segments.iter().position(|segment| *segment == name)?;
+        Uuid::parse_str(segments.get(index + 1)?).ok()
+    };
+    let organization_id = if let Some(id) = id_after("organizations") {
+        Some(id)
+    } else if let Some(id) = id_after("workspaces") {
+        sqlx_scalar_org(services, "SELECT org_id FROM workspaces WHERE id=$1", id).await?
+    } else if let Some(id) = id_after("projects") {
+        sqlx_scalar_org(services, "SELECT org_id FROM projects WHERE id=$1", id).await?
+    } else if let Some(id) = id_after("files") {
+        sqlx_scalar_org(services, "SELECT org_id FROM files WHERE id=$1", id).await?
+    } else if let Some(id) = id_after("uploads") {
+        sqlx_scalar_org(
+            services,
+            "SELECT org_id FROM upload_sessions WHERE id=$1",
+            id,
+        )
+        .await?
+    } else if let Some(id) = id_after("grants") {
+        sqlx_scalar_org(
+            services,
+            "SELECT org_id FROM grants WHERE id=$1 AND revoked_at IS NULL",
+            id,
+        )
+        .await?
+    } else {
+        None
+    };
+    let Some(org_id) = organization_id else {
+        return Ok(false);
+    };
+    let member = craftcloud_db::organizations::active_role(&services.pool, org_id, user_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error,"2FA organization membership lookup failed");
+            AuthRejectionKind::Internal
+        })?;
+    if member.is_none() {
+        return Ok(false);
+    }
+    if !route_resource_visible(services, user_id, org_id, member, &segments, path).await? {
+        return Ok(false);
+    }
+    let required: Option<bool> =
+        sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
+            .bind(org_id)
+            .fetch_optional(&services.pool)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error,"2FA organization policy lookup failed");
+                AuthRejectionKind::Internal
+            })?;
+    if required != Some(true) {
+        return Ok(false);
+    }
+    let (enabled, _) = craftcloud_db::two_factor::status(&services.pool, user_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error,"2FA status lookup failed");
+            AuthRejectionKind::Internal
+        })?;
+    Ok(!enabled)
+}
+
+fn decode_path_segment(segment: &str) -> Option<String> {
+    let input = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while let Some(&byte) = input.get(index) {
+        if byte == b'%' {
+            let high = *input.get(index + 1)?;
+            let low = *input.get(index + 2)?;
+            decoded.push((hex_nibble(high)? << 4) | hex_nibble(low)?);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+async fn route_resource_visible(
+    services: &crate::services::Services,
+    user_id: Uuid,
+    org_id: Uuid,
+    role: Option<OrgRole>,
+    segments: &[&str],
+    path: &str,
+) -> Result<bool, AuthRejectionKind> {
+    let role = role.ok_or(AuthRejectionKind::Internal)?;
+    let privileged = matches!(role, OrgRole::Owner | OrgRole::Admin);
+    let active = |query: &'static str, id: Uuid| async move {
+        sqlx::query_scalar::<_, bool>(query)
+            .bind(id)
+            .bind(user_id)
+            .fetch_one(&services.pool)
+            .await
+    };
+    if let Some(index) = segments.iter().position(|value| *value == "organizations") {
+        let tail = segments.get(index + 2).copied();
+        return Ok(match tail {
+            None => !matches!(role, OrgRole::Guest),
+            Some("workspaces" | "shared-with-me") => true,
+            Some("members") => !matches!(role, OrgRole::Guest),
+            Some("audit" | "usage" | "invitations") => privileged,
+            _ => !matches!(role, OrgRole::Guest),
+        });
+    }
+    if let Some(workspace_id) = segments
+        .iter()
+        .position(|value| *value == "workspaces")
+        .and_then(|i| segments.get(i + 1))
+        .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        let exists = active(
+            "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND user_id=$2)",
+            workspace_id,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error,"workspace visibility lookup failed");
+            AuthRejectionKind::Internal
+        })?;
+        return Ok(privileged || exists);
+    }
+    if let Some(project_id) = segments
+        .iter()
+        .position(|value| *value == "projects")
+        .and_then(|i| segments.get(i + 1))
+        .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT workspace_id FROM projects WHERE id=$1 AND org_id=$2")
+                .bind(project_id)
+                .bind(org_id)
+                .fetch_optional(&services.pool)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error,"project visibility lookup failed");
+                    AuthRejectionKind::Internal
+                })?;
+        let Some((workspace_id,)) = row else {
+            return Ok(false);
+        };
+        let in_workspace = active(
+            "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND user_id=$2)",
+            workspace_id,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error,"project workspace visibility lookup failed");
+            AuthRejectionKind::Internal
+        })?;
+        let granted = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM grants WHERE org_id=$1 AND target_kind='project' AND target_id=$2 AND grantee_user_id=$3 AND revoked_at IS NULL)")
+            .bind(org_id).bind(project_id).bind(user_id).fetch_one(&services.pool).await
+            .map_err(|error| { tracing::error!(%error,"project grant visibility lookup failed"); AuthRejectionKind::Internal })?;
+        return Ok(privileged || in_workspace || granted);
+    }
+    if let Some(file_id) = segments
+        .iter()
+        .position(|value| *value == "files")
+        .and_then(|i| segments.get(i + 1))
+        .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        let row: Option<(Uuid, Uuid)> =
+            sqlx::query_as("SELECT workspace_id,project_id FROM files WHERE id=$1 AND org_id=$2")
+                .bind(file_id)
+                .bind(org_id)
+                .fetch_optional(&services.pool)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error,"file visibility lookup failed");
+                    AuthRejectionKind::Internal
+                })?;
+        let Some((workspace_id, project_id)) = row else {
+            return Ok(false);
+        };
+        let in_workspace = active(
+            "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND user_id=$2)",
+            workspace_id,
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error,"file workspace visibility lookup failed");
+            AuthRejectionKind::Internal
+        })?;
+        let granted = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM grants WHERE org_id=$1 AND grantee_user_id=$2 AND revoked_at IS NULL AND ((target_kind='file' AND target_id=$3) OR (target_kind='project' AND target_id=$4)) )")
+            .bind(org_id).bind(user_id).bind(file_id).bind(project_id).fetch_one(&services.pool).await
+            .map_err(|error| { tracing::error!(%error,"file grant visibility lookup failed"); AuthRejectionKind::Internal })?;
+        return Ok(privileged || in_workspace || granted);
+    }
+    if let Some(upload_id) = segments
+        .iter()
+        .position(|value| *value == "uploads")
+        .and_then(|i| segments.get(i + 1))
+        .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        let visible = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM upload_sessions WHERE id=$1 AND org_id=$2 AND (created_by_user_id=$3 OR EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=upload_sessions.workspace_id AND user_id=$3)))")
+            .bind(upload_id).bind(org_id).bind(user_id).fetch_one(&services.pool).await
+            .map_err(|error| { tracing::error!(%error,"upload visibility lookup failed"); AuthRejectionKind::Internal })?;
+        return Ok(privileged || visible);
+    }
+    if let Some(grant_id) = segments
+        .iter()
+        .position(|value| *value == "grants")
+        .and_then(|i| segments.get(i + 1))
+        .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        let visible = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM grants g WHERE g.id=$1 AND g.org_id=$2 AND g.revoked_at IS NULL AND (g.grantee_user_id=$3 OR EXISTS(SELECT 1 FROM workspace_members wm WHERE wm.workspace_id=g.workspace_id AND wm.user_id=$3)))")
+            .bind(grant_id).bind(org_id).bind(user_id).fetch_one(&services.pool).await
+            .map_err(|error| { tracing::error!(%error,"grant visibility lookup failed"); AuthRejectionKind::Internal })?;
+        return Ok(privileged || visible);
+    }
+    let _ = path;
+    Ok(true)
+}
+
+#[derive(Debug)]
+enum AuthRejectionKind {
+    Internal,
+}
+
+async fn sqlx_scalar_org(
+    services: &crate::services::Services,
+    query: &str,
+    id: Uuid,
+) -> Result<Option<Uuid>, AuthRejectionKind> {
+    sqlx::query_scalar::<_, Uuid>(query)
+        .bind(id)
+        .fetch_optional(&services.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error,"2FA resource scope lookup failed");
+            AuthRejectionKind::Internal
+        })
 }
 
 fn device_access_token(headers: &HeaderMap) -> (Option<DeviceToken>, bool) {
@@ -391,6 +668,19 @@ mod tests {
             public_origin: origin.map(str::to_owned),
             ..AuthSettings::default()
         }
+    }
+
+    #[test]
+    fn scope_path_decodes_each_segment_without_changing_encoded_slashes() {
+        assert_eq!(decode_path_segment("%31%32%33"), Some("123".to_owned()));
+        assert_eq!(decode_path_segment("a%2Fb"), Some("a/b".to_owned()));
+        assert_eq!(decode_path_segment("%GG"), None);
+        let segments: Vec<_> = "/files/a%2Fb"
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(decode_path_segment(segments[1]), Some("a/b".to_owned()));
     }
 
     #[test]

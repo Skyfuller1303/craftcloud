@@ -1,0 +1,29 @@
+# ADR-0019: Zwei-Faktor-Anmeldung mit TOTP
+
+Datum: 2026-10-30. Status: beschlossen für AC-02; Implementierungsnachweise folgen im Abschlussbericht.
+
+## Kontext
+
+Browser und Geräte-Sitzungen müssen denselben optionalen zweiten Faktor verwenden. Organisationen dürfen ihn für den Zugriff auf ihre Ressourcen voraussetzen, ohne den Zugriff auf andere Organisationen oder die persönliche Einrichtung zu blockieren.
+
+## Entscheidung
+
+Es gelten die zwölf Entscheidungen aus [AC-02](../12-app-cloud/ac-02-two-factor.md): RFC-6238-TOTP mit SHA-1, sechs Stellen, 30 Sekunden und einem Zeitfenster von ±1 Schritt; atomarer Wiederholungsschutz je Konto; zehn einmalige Wiederherstellungscodes; verschlüsselte Speicherung des zufälligen 160-Bit-Geheimnisses und getrennte Schlüsseldateien für aktuellen und vorherigen Schlüssel.
+
+Die Passwortprüfung stellt bei aktiviertem zweiten Faktor ausschließlich eine kurzlebige Challenge aus. Erst nach erfolgreicher zweiter Prüfung wird eine Browser- oder Geräte-Sitzung angelegt. Challenges sind an Konto, Anmeldeart und Client-Adresse gebunden, gelten höchstens fünf Minuten und erlauben höchstens fünf Versuche. Sicherheitsrelevante Zustandswechsel werden atomar gegen parallele Anmeldungen und Sitzungswiderruf abgesichert. Audit und Logs enthalten keine Geheimnisse oder Codes.
+
+Eine ausstehende Einrichtung ist zehn Minuten lang an die authentifizierte Browser- oder Geräte-Sitzung gebunden. Andere Sitzungen dürfen dieses Geheimnis nicht ersetzen oder bestätigen. Der erste Bestätigungscode verbraucht bereits seinen TOTP-Zeitschritt; weitere Aktionen benötigen den nächsten gültigen Schritt oder einen unbenutzten Wiederherstellungscode. Die Verwaltungsrouten teilen sich ein eigenes Konto-/Adressbudget, damit eine gestohlene Sitzung keine unbegrenzten Passwort- oder Codeversuche erlaubt. Anmeldeversuche mit zweitem Faktor verwenden weiterhin die bestehenden Login-Sperren.
+
+Organisationspflicht wird serverseitig pro Organisation geprüft. Ihre Aktivierung erfordert einen eigenen eingerichteten zweiten Faktor und die zentrale Owner-/Admin-Berechtigung. Einrichtung, Deaktivierung und Reset widerrufen die anderen Sitzungen einschließlich Geräte-Sitzungen. Offline-Wiederherstellung und dokumentierte Schlüsselrotation bleiben verfügbar.
+
+QR-Codes werden ausschließlich lokal im Browser erzeugt. Die bestehende Content Security Policy bleibt erhalten; Gestaltung erfolgt in SCSS und sämtliche Texte werden auf Deutsch und Englisch bereitgestellt.
+
+## Alternativen und Folgen
+
+Für die authentifizierte Verschlüsselung wird AES-256-GCM aus RustCrypto `aes-gcm` 0.10.3 verwendet. Jede Verschlüsselung erhält eine neue zufällige 96-Bit-Nonce; zusätzliche authentifizierte Daten binden das Chiffrat an Konto und Zweck. Die Crate ist unter MIT oder Apache-2.0 lizenziert und vermeidet eine eigene Verschlüsselungsimplementierung; siehe [Dokumentation und Sicherheitshinweise](https://docs.rs/aes-gcm/0.10.3/aes_gcm/). TOTP setzt HMAC-SHA-1 entsprechend [RFC 6238](https://www.rfc-editor.org/info/rfc6238/) um. SHA-1 wird ausschließlich innerhalb dieses vorgeschriebenen HMAC-Verfahrens eingesetzt, nicht als Passwort- oder Wiederherstellungscode-Hash.
+
+Der Browser verwendet `qrcode.react` 4.2.0 (ISC) für lokal erzeugte SVG-QR-Codes. Diese begrenzte neue Abhängigkeit ist durch den funktionalen AC-02-Auftrag erforderlich; die ältere Design-only-Regel ohne neue Pakete würde andernfalls einen eigenen QR-Encoder verlangen. SVG-Ausgabe ohne Inline-Styles erhält die strikte CSP und ermöglicht eine überprüfbare Darstellung in beiden Themes.
+
+Passkeys, SMS, E-Mail-Codes und eine neue Option zum Merken eines Geräts sind nicht Teil dieses Schritts. Ein externer QR-Dienst wurde verworfen, weil er das TOTP-Geheimnis erhalten würde. Klartextspeicherung und ein gemeinsamer globaler Organisationszugriffsblock wurden verworfen, weil sie die geforderten Sicherheits- beziehungsweise Mandantengrenzen verletzen.
+
+Ein Datenbank-Backup allein reicht zur Wiederherstellung nicht aus: Der passende Entschlüsselungsschlüssel muss getrennt und geschützt aufbewahrt werden. Fehlt der aktuelle Schlüssel, startet der Server weiterhin, meldet die Einschränkung in der Admin-Health-Antwort und lehnt neue Einrichtungen mit `TWO_FACTOR_UNAVAILABLE` ab. Bestehendes 2FA darf dadurch niemals umgangen werden.

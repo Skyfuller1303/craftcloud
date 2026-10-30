@@ -33,7 +33,7 @@ pub enum SecondFactorLogin {
     /// Password accepted; no second factor is required.
     Complete,
     /// Password accepted; issue only this short-lived challenge.
-    ChallengeRequired { challenge_id: Uuid },
+    ChallengeRequired { challenge_id: String },
 }
 
 #[derive(Deserialize)]
@@ -68,7 +68,7 @@ fn rfc3339(value: OffsetDateTime) -> String {
     value.format(&Rfc3339).unwrap_or_default()
 }
 
-fn device_expiries(
+pub(crate) fn device_expiries(
     now: OffsetDateTime,
     access_ttl: std::time::Duration,
     idle_ttl: std::time::Duration,
@@ -82,9 +82,27 @@ fn device_expiries(
     )
 }
 
-fn second_factor_decision(_user_id: Uuid) -> SecondFactorLogin {
-    // AC-02 replaces this with the account's configured-factor decision.
-    SecondFactorLogin::Complete
+async fn second_factor_decision(
+    services: &Services,
+    user_id: Uuid,
+    password_hash: &str,
+    client_ip: Option<ClientIp>,
+    client_kind: &str,
+    client_id: &str,
+    device_name: &str,
+) -> Result<SecondFactorLogin, DbError> {
+    Ok(crate::two_factor::issue_login_challenge(
+        services,
+        user_id,
+        password_hash,
+        "device",
+        client_ip,
+        Some((client_kind, client_id, device_name)),
+    )
+    .await?
+    .map_or(SecondFactorLogin::Complete, |challenge_id| {
+        SecondFactorLogin::ChallengeRequired { challenge_id }
+    }))
 }
 
 fn db_failure(error: &DbError, headers: &HeaderMap, what: &str) -> Response {
@@ -104,7 +122,7 @@ fn invalid_login(headers: &HeaderMap) -> Response {
     )
 }
 
-fn tls_ready(
+pub(crate) fn tls_ready(
     services: &Services,
     headers: &HeaderMap,
     trusted_proxy: Option<Extension<TrustedProxy>>,
@@ -172,7 +190,7 @@ fn rfc_token(token: &DeviceToken) -> String {
     token.expose().to_owned()
 }
 
-fn token_reply(
+pub(crate) fn token_reply(
     id: Uuid,
     access: &DeviceToken,
     refresh: &DeviceToken,
@@ -218,6 +236,7 @@ pub(crate) async fn login(
         );
     }
     let ip = client_ip.map(|Extension(ip)| ip.0);
+    let challenge_ip = ip.map(ClientIp);
     if let Err(response) = services.rate_limit_ip(IpClass::Login, ip, &headers) {
         return *response;
     }
@@ -275,21 +294,35 @@ pub(crate) async fn login(
     {
         return validation_failed(&["client_kind", "client_id", "device_name"], &headers);
     }
+    let cleaned_device_name = clean_device_name(&request.device_name).unwrap_or_default();
     let Ok(access) = DeviceToken::generate(DeviceTokenKind::Access) else {
         return internal(&headers);
     };
     let Ok(refresh) = DeviceToken::generate(DeviceTokenKind::Refresh) else {
         return internal(&headers);
     };
-    match second_factor_decision(account.user_id) {
-        SecondFactorLogin::Complete => {}
-        SecondFactorLogin::ChallengeRequired { challenge_id } => {
-            if let Some(reservation) = reservation {
-                reservation.record_success();
-            }
-            let mut response = Json(json!({"error":{"code":"SECOND_FACTOR_REQUIRED","message":"A second factor is required.","details":{"challenge_id":challenge_id.to_string()},"request_id":headers.get(crate::REQUEST_ID_HEADER).and_then(|v|v.to_str().ok()).unwrap_or("")}})).into_response();
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            return response;
+    match second_factor_decision(
+        &services,
+        account.user_id,
+        &stored_hash,
+        challenge_ip,
+        &request.client_kind,
+        &request.client_id,
+        &cleaned_device_name,
+    )
+    .await
+    {
+        Err(error) => return db_failure(&error, &headers, "two-factor challenge issuance failed"),
+        Ok(SecondFactorLogin::Complete) => {}
+        Ok(SecondFactorLogin::ChallengeRequired { challenge_id }) => {
+            drop(reservation);
+            return crate::error_response_with_details(
+                StatusCode::UNAUTHORIZED,
+                "SECOND_FACTOR_REQUIRED",
+                "A second factor is required.",
+                &headers,
+                Some(json!({ "challenge_id": challenge_id.to_string() })),
+            );
         }
     }
     let now = services.clock.now();
@@ -301,7 +334,7 @@ pub(crate) async fn login(
     );
     let new = NewDeviceSession {
         user_id: account.user_id,
-        name: clean_device_name(&request.device_name).unwrap_or_default(),
+        name: cleaned_device_name.clone(),
         client_kind: request.client_kind.clone(),
         client_id: request.client_id.clone(),
         refresh_hash: refresh.hash(),
@@ -321,6 +354,32 @@ pub(crate) async fn login(
     let id = match created {
         Ok(Some(id)) => id,
         Ok(None) => {
+            match second_factor_decision(
+                &services,
+                account.user_id,
+                &stored_hash,
+                challenge_ip,
+                &request.client_kind,
+                &request.client_id,
+                &cleaned_device_name,
+            )
+            .await
+            {
+                Ok(SecondFactorLogin::ChallengeRequired { challenge_id }) => {
+                    drop(reservation);
+                    return crate::error_response_with_details(
+                        StatusCode::UNAUTHORIZED,
+                        "SECOND_FACTOR_REQUIRED",
+                        "A second factor is required.",
+                        &headers,
+                        Some(json!({"challenge_id":challenge_id})),
+                    );
+                }
+                Ok(SecondFactorLogin::Complete) => {}
+                Err(error) => {
+                    return db_failure(&error, &headers, "two-factor challenge issuance failed");
+                }
+            }
             if let Some(reservation) = reservation {
                 reservation.record_failure(services.now_secs());
             }

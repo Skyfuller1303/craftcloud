@@ -41,6 +41,32 @@ export interface LoginResponse {
   expires_at: string;
 }
 
+export interface SecondFactorLoginRequest {
+  challenge_id: Uuid;
+  code?: string;
+  recovery_code?: string;
+}
+
+export interface TwoFactorStatus {
+  enabled: boolean;
+  available: boolean;
+  recovery_codes_remaining: number;
+}
+
+export interface TwoFactorSetup {
+  secret: string;
+  otpauth_url: string;
+}
+
+export interface RecoveryCodesResponse {
+  recovery_codes: string[];
+}
+
+export interface IssuedPasswordReset {
+  reset_url: string;
+  expires_at: string;
+}
+
 export interface SessionInfo {
   user_id: Uuid;
   email: string;
@@ -69,6 +95,7 @@ export interface Organization {
   role: OrgRole;
   version: number;
   workspace_admin_invites_enabled: boolean;
+  require_two_factor?: boolean;
   created_at: string;
 }
 
@@ -296,6 +323,10 @@ export interface FileVersion {
 export interface ResetPasswordRequest {
   token: string;
   new_password: string;
+}
+
+export interface IssuePasswordResetRequest {
+  reset_two_factor?: boolean;
 }
 
 /** Condition of one component in the operator health view. */

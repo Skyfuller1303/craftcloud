@@ -30,6 +30,7 @@ mod responses;
 mod services;
 mod session;
 mod setup;
+mod two_factor;
 mod uploads;
 mod versions;
 mod workspaces;
@@ -176,7 +177,14 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
     ("/api/v1/admin/users/{user_id}/enable", &["POST"]),
     ("/api/v1/auth/login", &["POST"]),
+    ("/api/v1/auth/login/second-factor", &["POST"]),
+    ("/api/v1/auth/2fa", &["GET"]),
+    ("/api/v1/auth/2fa/setup", &["POST"]),
+    ("/api/v1/auth/2fa/confirm", &["POST"]),
+    ("/api/v1/auth/2fa/disable", &["POST"]),
+    ("/api/v1/auth/2fa/recovery-codes", &["POST"]),
     ("/api/v1/auth/device/login", &["POST"]),
+    ("/api/v1/auth/device/login/second-factor", &["POST"]),
     ("/api/v1/auth/device/refresh", &["POST"]),
     ("/api/v1/auth/device/logout", &["POST"]),
     ("/api/v1/auth/devices", &["GET"]),
@@ -394,7 +402,23 @@ pub fn router_with_shared(
             post(orgs::enable_user),
         )
         .route("/api/v1/auth/login", post(auth::login))
+        .route(
+            "/api/v1/auth/login/second-factor",
+            post(two_factor::browser_login),
+        )
+        .route("/api/v1/auth/2fa", get(two_factor::status))
+        .route("/api/v1/auth/2fa/setup", post(two_factor::setup))
+        .route("/api/v1/auth/2fa/confirm", post(two_factor::confirm))
+        .route("/api/v1/auth/2fa/disable", post(two_factor::disable))
+        .route(
+            "/api/v1/auth/2fa/recovery-codes",
+            post(two_factor::regenerate),
+        )
         .route("/api/v1/auth/device/login", post(device::login))
+        .route(
+            "/api/v1/auth/device/login/second-factor",
+            post(two_factor::device_login),
+        )
         .route("/api/v1/auth/device/refresh", post(device::refresh))
         .route("/api/v1/auth/device/logout", post(device::logout))
         .route("/api/v1/auth/devices", get(device::list))

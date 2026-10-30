@@ -16,6 +16,7 @@ craftcloud-db.workspace = true
 craftcloud-storage.workspace = true
 ipnet.workspace = true
 url.workspace = true
+base64.workspace = true
 zeroize.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 axum.workspace = true

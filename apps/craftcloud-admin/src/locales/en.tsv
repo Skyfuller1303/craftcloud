@@ -444,3 +444,55 @@
 	Release lock for {name}	Release lock for {name}
 	Release edit lock	Release edit lock
 	Release the edit lock held by {name}?	Release the edit lock held by {name}?
+
+# Two-factor authentication (AC-02)
+	Two-factor authentication	Two-factor authentication
+	Loading two-factor status…	Loading two-factor status…
+	Use an authenticator app to protect browser and device sign-ins.	Use an authenticator app to protect browser and device sign-ins.
+	Enabled	Enabled
+	Not enabled	Not enabled
+	{count} recovery codes remain.	{count} recovery codes remain.
+	Two-factor authentication is unavailable because the server secret key is not configured.	Two-factor authentication is unavailable because the server secret key is not configured.
+	Save these recovery codes now. They will only be shown once.	Save these recovery codes now. They will only be shown once.
+	Recovery codes	Recovery codes
+	Download recovery codes	Download recovery codes
+	I have saved the codes	I have saved the codes
+	Current password	Current password
+	Preparing…	Preparing…
+	Set up two-factor authentication	Set up two-factor authentication
+	Scan this QR code with your authenticator app, or enter the secret manually.	Scan this QR code with your authenticator app, or enter the secret manually.
+	Authenticator setup QR code	Authenticator setup QR code
+	Secret	Secret
+	Authentication code	Authentication code
+	Confirm and show recovery codes	Confirm and show recovery codes
+	Cancel setup	Cancel setup
+	Recovery code	Recovery code
+	Generate new recovery codes	Generate new recovery codes
+	Use an authentication code	Use an authentication code
+	Use a recovery code	Use a recovery code
+	Disable two-factor authentication	Disable two-factor authentication
+	Organization policy	Organization policy
+	Select an organization to manage its sign-in policy.	Select an organization to manage its sign-in policy.
+	Require two-factor authentication for organization access.	Require two-factor authentication for organization access.
+	Set up two-factor authentication on your account before enabling this policy.	Set up two-factor authentication on your account before enabling this policy.
+	Make two-factor authentication mandatory	Make two-factor authentication mandatory
+	Only organization owners and admins can change this policy.	Only organization owners and admins can change this policy.
+	Enter a code from your authenticator app to finish signing in.	Enter a code from your authenticator app to finish signing in.
+	The authentication code or recovery code is incorrect.	The authentication code or recovery code is incorrect.
+	Checking…	Checking…
+	Verify and log in	Verify and log in
+	Back to password	Back to password
+	This organization requires two-factor authentication. Set it up to continue here; other organizations remain available.	This organization requires two-factor authentication. Set it up to continue here; other organizations remain available.
+	Open two-factor settings	Open two-factor settings
+	Reset account: issue a password reset link for {name}	Reset account: issue a password reset link for {name}
+	Reset account	Reset account
+	Issue account reset link	Issue account reset link
+	Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.	Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.
+	Also reset two-factor authentication	Also reset two-factor authentication
+	Issuing…	Issuing…
+	Issue reset link	Issue reset link
+	Password reset link	Password reset link
+	Copy this link now. It is shown once and expires at {expires}.	Copy this link now. It is shown once and expires at {expires}.
+	One-time reset link	One-time reset link
+
+# Two-factor authentication (AC-02)

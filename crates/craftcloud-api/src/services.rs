@@ -13,6 +13,7 @@ use craftcloud_auth::BootstrapToken;
 use craftcloud_db::PgPool;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::clock::{Clock, SystemClock};
 use crate::error_response;
@@ -167,6 +168,7 @@ impl AuthSettings {
 pub struct Services {
     pub(crate) pool: PgPool,
     pub(crate) bootstrap: Option<BootstrapToken>,
+    pub(crate) two_factor_keys: TwoFactorKeys,
     pub(crate) settings: AuthSettings,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) storage: Option<craftcloud_storage::LocalStore>,
@@ -180,6 +182,8 @@ pub struct Services {
     invite_create: WindowLimiter,
     member_search: WindowLimiter,
     guard: Arc<AccountGuard>,
+    // Separate from login failures: management proofs share one account/address budget.
+    two_factor_management_guard: Arc<AccountGuard>,
     last_cleanup: AtomicI64,
     pub(crate) audit_budget: crate::audit::AuditBudget,
     pub(crate) metrics: Arc<Metrics>,
@@ -190,6 +194,23 @@ pub struct Services {
     pub(crate) storage_unusable: bool,
     /// Set when the shutdown signal arrived: readiness answers 503.
     pub(crate) draining: std::sync::atomic::AtomicBool,
+}
+
+/// In-memory TOTP encryption keys. Keys are never copied into diagnostics.
+pub struct TwoFactorKeys {
+    pub(crate) current: Option<[u8; 32]>,
+    pub(crate) old: Option<[u8; 32]>,
+}
+
+impl Drop for TwoFactorKeys {
+    fn drop(&mut self) {
+        if let Some(key) = &mut self.current {
+            key.zeroize();
+        }
+        if let Some(key) = &mut self.old {
+            key.zeroize();
+        }
+    }
 }
 
 impl Services {
@@ -206,9 +227,19 @@ impl Services {
             window_secs: i64::try_from(settings.failed_login_window.as_secs()).unwrap_or(900),
             max_entries: settings.account_guard_max_entries,
         });
+        let two_factor_management_guard = AccountGuard::new(GuardConfig {
+            pair_limit: settings.failed_login_pair_limit,
+            account_limit: settings.failed_login_account_limit,
+            window_secs: i64::try_from(settings.failed_login_window.as_secs()).unwrap_or(900),
+            max_entries: settings.account_guard_max_entries,
+        });
         Self {
             pool,
             bootstrap,
+            two_factor_keys: TwoFactorKeys {
+                current: None,
+                old: None,
+            },
             settings,
             clock: Arc::new(SystemClock),
             storage: None,
@@ -221,6 +252,7 @@ impl Services {
             invite_create: WindowLimiter::new(cap),
             member_search: WindowLimiter::new(cap),
             guard,
+            two_factor_management_guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
             audit_budget: crate::audit::AuditBudget::for_pool(pool_connections),
             metrics: Arc::new(Metrics::new()),
@@ -229,6 +261,23 @@ impl Services {
             storage_unusable: false,
             draining: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Installs server TOTP encryption keys loaded at the process boundary.
+    #[must_use]
+    pub fn with_two_factor_keys(
+        mut self,
+        current: Option<[u8; 32]>,
+        old: Option<[u8; 32]>,
+    ) -> Self {
+        self.two_factor_keys = TwoFactorKeys { current, old };
+        self
+    }
+
+    /// Whether a current key is available for setting up new TOTP factors.
+    #[must_use]
+    pub fn two_factor_available(&self) -> bool {
+        self.two_factor_keys.current.is_some()
     }
 
     /// Attaches the object store; without one, upload routes answer 503
@@ -385,6 +434,18 @@ impl Services {
         self.guard
             .reserve(email, &ip_key(ip), self.now_secs())
             .map_err(|retry| self.too_many("failed_login", retry, headers))
+    }
+
+    /// Reserves a failed-proof budget shared by all two-factor management routes.
+    pub(crate) fn two_factor_management_reserve(
+        &self,
+        user_id: Uuid,
+        ip: Option<IpAddr>,
+        headers: &HeaderMap,
+    ) -> Result<Reservation, Box<Response>> {
+        self.two_factor_management_guard
+            .reserve(&user_id.to_string(), &ip_key(ip), self.now_secs())
+            .map_err(|retry| self.too_many("two_factor_management", retry, headers))
     }
 
     /// True at most once per [`CLEANUP_INTERVAL_SECS`] per process.

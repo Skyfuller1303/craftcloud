@@ -13,13 +13,13 @@ import { useRoleNames } from "../roles.ts";
 import type { ThemeChoice } from "../preferences.ts";
 import { usePagedList } from "../usePagedList.ts";
 import { ActivityScreen } from "./ActivityScreen.tsx";
-import { DevicesScreen } from "./DevicesScreen.tsx";
 import { FilesScreen } from "./FilesScreen.tsx";
 import { InvitationsScreen } from "./InvitationsScreen.tsx";
 import { MembersScreen } from "./MembersScreen.tsx";
 import { ProjectsScreen } from "./ProjectsScreen.tsx";
 import { SystemScreen } from "./SystemScreen.tsx";
 import { SharedWithMeScreen } from "./SharedWithMeScreen.tsx";
+import { TwoFactorSettingsScreen } from "./TwoFactorSettingsScreen.tsx";
 
 /**
  * Dashboard sections. Settings follows with a later ticket and stays a
@@ -59,6 +59,7 @@ export function Shell({
   const names = useRoleNames();
   const [logoutError, setLogoutError] = useState<unknown>(null);
   const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
+  const [needsTwoFactorSetup, setNeedsTwoFactorSetup] = useState(false);
   const attemptLogout = useCallback(() => {
     setLogoutError(null);
     logout().catch((error: unknown) => setLogoutError(error));
@@ -127,18 +128,41 @@ export function Shell({
   };
   const isOperator = session.instance_role === "operator";
   const isGuest = organization?.role === "guest";
+  useEffect(() => {
+    let current = true;
+    if (organization?.require_two_factor !== true) {
+      setNeedsTwoFactorSetup(false);
+      return () => { current = false; };
+    }
+    api.getTwoFactorStatus().then(
+      (status) => { if (current) { setNeedsTwoFactorSetup(!status.enabled); } },
+      () => { if (current) setNeedsTwoFactorSetup(false); },
+    );
+    return () => { current = false; };
+  }, [api, organization?.id, organization?.require_two_factor]);
+  const refreshTwoFactor = useCallback((enabled: boolean) => {
+    setNeedsTwoFactorSetup(organization?.require_two_factor === true && !enabled);
+    workspaces.refresh();
+  }, [organization?.require_two_factor, workspaces.refresh]);
+  useEffect(() => {
+    if (needsTwoFactorSetup && section !== "settings" && section !== "system" && section !== "overview") {
+      setSection("settings");
+    }
+  }, [needsTwoFactorSetup, section]);
   const limitedNavigation = isGuest || organization === null;
   useEffect(() => {
-    if (isGuest && !(section === "system" && isOperator) && !["overview", "shared"].includes(section)) {
+    if (isGuest && !(section === "system" && isOperator) && !["overview", "shared", "settings"].includes(section)) {
       setSection("shared");
     }
   }, [isGuest, isOperator, section]);
   const visibleContentSections = CONTENT_SECTIONS.filter((key) =>
     key === "shared"
       ? serverInfo?.features.includes("sharing.grants") === true
-      : !limitedNavigation || key === "overview",
+      : needsTwoFactorSetup
+        ? key === "overview"
+        : !limitedNavigation || key === "overview",
   );
-  const visibleAdminSections = ADMIN_SECTIONS.filter((key) => key === "system" ? isOperator : !limitedNavigation);
+  const visibleAdminSections = ADMIN_SECTIONS.filter((key) => key === "system" ? isOperator : true);
 
   return (
     <div className="shell">
@@ -228,6 +252,14 @@ export function Shell({
             />
           )}
           {notice !== undefined && <Alert tone="success">{notice}</Alert>}
+          {needsTwoFactorSetup && organization !== null && (
+            <Alert tone="info">
+              {t("This organization requires two-factor authentication. Set it up to continue here; other organizations remain available.")}
+              <Button className="button button--sm" onPress={() => setSection("settings")}>
+                {t("Open two-factor settings")}
+              </Button>
+            </Alert>
+          )}
           <ScreenHeading key={section}>{sectionLabel[section]}</ScreenHeading>
 
           {organizations.status === "error" && (
@@ -265,7 +297,7 @@ export function Shell({
             </Button>
           )}
 
-          {limitedNavigation && section !== "overview" && section !== "shared" && !(section === "system" && isOperator) ? (
+          {limitedNavigation && section !== "overview" && section !== "shared" && section !== "settings" && !(section === "system" && isOperator) ? (
             <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "overview" ? (
             <dl className="facts">
@@ -302,6 +334,7 @@ export function Shell({
           ) : section === "members" ? (
             <MembersScreen
               scope={scope}
+              isOperator={isOperator}
               onOrganizationsChanged={organizations.refresh}
               onWorkspacesChanged={workspaces.refresh}
             />
@@ -315,7 +348,13 @@ export function Shell({
               workspaces={workspaces.items}
             />
           ) : section === "settings" ? (
-            <DevicesScreen />
+            <TwoFactorSettingsScreen
+              organization={organization}
+              onFactorChanged={refreshTwoFactor}
+              onOrganizationUpdated={(updated) => {
+                organizations.mutate((items) => items.map((item) => item.id === updated.id ? updated : item));
+              }}
+            />
           ) : section === "system" ? (
             <SystemScreen isOperator={isOperator} />
           ) : section === "shared" ? (

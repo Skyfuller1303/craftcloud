@@ -25,6 +25,8 @@ pub struct NewResetToken {
     pub token_hash: [u8; 32],
     /// Operator who issued it; `None` for the offline CLI.
     pub created_by: Option<Uuid>,
+    /// Whether issuing the link also resets the account's second factor.
+    pub reset_two_factor: bool,
     /// Issue time.
     pub now: OffsetDateTime,
     /// Expiry time.
@@ -97,6 +99,16 @@ async fn create_inner(
         Some(true) => return Ok(IssueOutcome::AccountDisabled),
         Some(false) => {}
     }
+    if new.reset_two_factor {
+        sqlx::query("DELETE FROM user_two_factor WHERE user_id=$1")
+            .bind(new.user_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
+        .bind(new.user_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
     )
@@ -148,6 +160,14 @@ async fn create_inner(
                 ),
         )
         .await?;
+        if new.reset_two_factor {
+            record_in(
+                &mut tx,
+                audit,
+                &NewEvent::new("auth.two_factor_reset").target("user", new.user_id),
+            )
+            .await?;
+        }
     }
     tx.commit().await?;
     Ok(IssueOutcome::Issued { revoked_sessions })
@@ -315,6 +335,10 @@ async fn consume_inner(
     sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
         .bind(user_id)
         .bind(new_password_hash)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
+        .bind(user_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL")

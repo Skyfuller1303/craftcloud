@@ -452,19 +452,22 @@ impl OrgTx {
         scope: &OrgScope,
         name: Option<&str>,
         workspace_admin_invites_enabled: Option<bool>,
+        require_two_factor: Option<bool>,
         expected_version: i64,
     ) -> Result<UpdateOutcome, DbError> {
         self.check(scope, Action::OrganizationUpdate)?;
         let updated = sqlx::query_as::<_, Organization>(
             "UPDATE organizations SET name = COALESCE($2, name), \
                     workspace_admin_invites_enabled = COALESCE($3, workspace_admin_invites_enabled), \
+                    require_two_factor = COALESCE($4, require_two_factor), \
                     version = version + 1 \
-             WHERE id = $1 AND version = $4 \
-             RETURNING id, slug, name, owner_user_id, version, workspace_admin_invites_enabled, created_at",
+             WHERE id = $1 AND version = $5 \
+             RETURNING id, slug, name, owner_user_id, version, workspace_admin_invites_enabled, require_two_factor, created_at",
         )
         .bind(self.org_id)
         .bind(name)
         .bind(workspace_admin_invites_enabled)
+        .bind(require_two_factor)
         .bind(expected_version)
         .fetch_optional(&mut *self.tx)
         .await?;
@@ -506,6 +509,31 @@ impl OrgTx {
             "SELECT workspace_admin_invites_enabled FROM organizations WHERE id = $1",
         )
         .bind(self.org_id)
+        .fetch_one(&mut *self.tx)
+        .await?)
+    }
+
+    /// Current organization policy, read under the organization lock.
+    pub async fn require_two_factor(&mut self) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
+                .bind(self.org_id)
+                .fetch_one(&mut *self.tx)
+                .await?,
+        )
+    }
+
+    /// Checks the acting account's configured second factor under an exclusive
+    /// user-row lock, serializing policy changes against setup and reset.
+    pub async fn user_two_factor_enabled(&mut self, user_id: Uuid) -> Result<bool, DbError> {
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *self.tx)
+            .await?;
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
+        )
+        .bind(user_id)
         .fetch_one(&mut *self.tx)
         .await?)
     }
