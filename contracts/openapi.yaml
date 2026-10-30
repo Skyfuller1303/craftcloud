@@ -575,7 +575,8 @@ paths:
         without control or invisible formatting characters, otherwise 422 VALIDATION_ERROR with details.fields
         ["display_name"]. The e-mail address cannot be changed here; it stays operator-managed until e-mail delivery
         exists. Records the audit event `auth.profile_updated` (actor and target: the caller) without the name value.
-        Returns the updated account like `GET /auth/session`.
+        Returns the updated account like `GET /auth/session`. A name that equals the current one changes nothing and
+        records no audit event (still 200). Rate limited to 20 changes per minute and user (429 RATE_LIMITED).
       requestBody:
         required: true
         content:
@@ -593,6 +594,7 @@ paths:
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '415': {$ref: '#/components/responses/UnsupportedMediaType'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /auth/sessions:

@@ -643,28 +643,44 @@ pub(crate) async fn shared_with_me(
         None
     };
     // A guest only learns the names of what was shared with them: never the
-    // workspace, and a project only when the grant is on the project itself.
+    // workspace, and a project only when the guest holds a grant on that project.
     let guest = actor
         .membership
         .is_some_and(|membership| membership.role == craftcloud_core::policy::OrgRole::Guest);
-    let items: Vec<_> = rows
-        .iter()
-        .map(|x| {
-            let workspace_name = (!guest).then_some(x.workspace_name.as_str());
-            let project = x
-                .project_id
-                .filter(|_| !guest || x.target_kind == "project")
-                .map(|id| json!({"id": id.to_string(), "name": x.project_name}));
-            json!({
-                "target_kind": x.target_kind,
-                "target_id": x.target_id.to_string(),
-                "role": x.role,
-                "workspace": {"id": x.workspace_id.to_string(), "name": workspace_name},
-                "project": project,
-                "file": x.file_id.map(|id| json!({"id": id.to_string(), "name": x.file_name})),
-            })
-        })
-        .collect();
+    let mut items = Vec::with_capacity(rows.len());
+    for x in &rows {
+        let workspace_name = (!guest).then_some(x.workspace_name.as_str());
+        // A file row shows its project to a guest only when the guest also holds a
+        // grant on that project (the same rule as the file detail).
+        let project_visible = match x.project_id {
+            None => false,
+            Some(_) if !guest || x.target_kind == "project" => true,
+            Some(project_id) => match grants::project_role_for(
+                &services.pool,
+                org_id,
+                session.user_id,
+                x.workspace_id,
+                project_id,
+            )
+            .await
+            {
+                Ok(role) => role.is_some(),
+                Err(e) => return db_failure(&e, &headers, "project grant lookup failed"),
+            },
+        };
+        let project = x
+            .project_id
+            .filter(|_| project_visible)
+            .map(|id| json!({"id": id.to_string(), "name": x.project_name}));
+        items.push(json!({
+            "target_kind": x.target_kind,
+            "target_id": x.target_id.to_string(),
+            "role": x.role,
+            "workspace": {"id": x.workspace_id.to_string(), "name": workspace_name},
+            "project": project,
+            "file": x.file_id.map(|id| json!({"id": id.to_string(), "name": x.file_name})),
+        }));
+    }
     Json(json!({"items":items,"next_cursor":next})).into_response()
 }
 

@@ -685,4 +685,188 @@ mod tests {
         let detail = file_detail(&w, &member).await;
         assert_eq!(detail["project"]["name"], "Project");
     }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn overview_ignores_objects_inside_trashed_projects() {
+        let w = world().await;
+        let project: Uuid = sqlx::query_scalar("SELECT project_id FROM files WHERE id=$1")
+            .bind(w.file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let (member_id, _) = add_member(&w, "trash-member", "member").await;
+        grant(&w, "files", w.file, member_id, "viewer").await;
+        grant(&w, "projects", project, member_id, "viewer").await;
+        let lock = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/lock", w.file))
+                .session(&w.owner)
+                .json(json!({"client_id": "overview-test"})),
+        )
+        .await;
+        assert_eq!(lock.status, StatusCode::OK, "{}", lock.text);
+        let before = overview(&w.env, Some(&w.owner), &w.org.to_string()).await;
+        assert_eq!(
+            before.body["counts"],
+            json!({"workspaces": 1, "projects": 1, "files": 2, "active_locks": 1,
+                   "active_grants": 2, "pending_invitations": 0})
+        );
+        // Trashing a project only sets projects.deleted_at.
+        sqlx::query("UPDATE projects SET deleted_at=now(), deleted_by_user_id=created_by_user_id WHERE id=$1")
+            .bind(project)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let after = overview(&w.env, Some(&w.owner), &w.org.to_string()).await;
+        assert_eq!(
+            after.body["counts"],
+            json!({"workspaces": 1, "projects": 0, "files": 0, "active_locks": 0,
+                   "active_grants": 0, "pending_invitations": 0})
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn guest_sees_the_project_of_a_file_row_when_it_also_holds_a_project_grant() {
+        let w = world().await;
+        let project: Uuid = sqlx::query_scalar("SELECT project_id FROM files WHERE id=$1")
+            .bind(w.file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let (guest_id, guest) = add_member(&w, "red-guest-both", "member").await;
+        make_guest(&w, guest_id).await;
+        grant(&w, "files", w.file, guest_id, "viewer").await;
+        grant(&w, "projects", project, guest_id, "viewer").await;
+        let body = shared(&w, &guest).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(item["project"]["name"], "Project", "{item}");
+            assert_eq!(item["workspace"]["name"], Value::Null, "{item}");
+        }
+        let detail = file_detail(&w, &guest).await;
+        assert_eq!(detail["project"]["name"], "Project");
+    }
+
+    async fn require_two_factor(w: &World) {
+        sqlx::query("UPDATE organizations SET require_two_factor=true WHERE id=$1")
+            .bind(w.org)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn overview_follows_the_organization_two_factor_requirement() {
+        let w = world().await;
+        let org = w.org.to_string();
+        let (_, admin) = add_member(&w, "tf-admin", "admin").await;
+        let (_, member) = add_member(&w, "tf-member", "member").await;
+        require_two_factor(&w).await;
+        // Owner and admin without an enrolled second factor are held back by the
+        // organization requirement, like for every other organization route.
+        for (who, session) in [("owner", &w.owner), ("admin", &admin)] {
+            let blocked = overview(&w.env, Some(session), &org).await;
+            assert_eq!(
+                blocked.status,
+                StatusCode::FORBIDDEN,
+                "{who}: {}",
+                blocked.text
+            );
+            assert_eq!(blocked.code(), "TWO_FACTOR_SETUP_REQUIRED", "{who}");
+        }
+        // A plain member is simply not allowed; the requirement does not mask that.
+        let denied = overview(&w.env, Some(&member), &org).await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text);
+        assert_ne!(denied.code(), "TWO_FACTOR_SETUP_REQUIRED");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn profile_update_is_not_blocked_by_an_organization_two_factor_requirement() {
+        // ADR-0019: the requirement guards the organization's resources, not the
+        // personal account setup. The profile is account-scoped, not organization-scoped.
+        let w = world().await;
+        require_two_factor(&w).await;
+        let blocked = overview(&w.env, Some(&w.owner), &w.org.to_string()).await;
+        assert_eq!(blocked.code(), "TWO_FACTOR_SETUP_REQUIRED");
+        let response = patch(&w.env, &w.owner, json!({"display_name": "Owner Renamed"})).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        assert_eq!(response.body["display_name"], "Owner Renamed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn unchanged_name_writes_nothing_and_changes_are_rate_limited() {
+        let env = TestEnv::new().await;
+        let id = env.user("prof-rate").await;
+        let session = env.login_ok("prof-rate").await;
+        // Same name as stored: 200, current account, no audit event.
+        let same = patch(&env, &session, json!({"display_name": "  prof-rate "})).await;
+        assert_eq!(same.status, StatusCode::OK, "{}", same.text);
+        assert_eq!(same.body["display_name"], "prof-rate");
+        assert_eq!(
+            env.count("SELECT count(*) FROM audit_events WHERE action='auth.profile_updated'")
+                .await,
+            0
+        );
+        // A real change records one event.
+        let changed = patch(&env, &session, json!({"display_name": "Renamed"})).await;
+        assert_eq!(changed.status, StatusCode::OK, "{}", changed.text);
+        assert_eq!(
+            env.count("SELECT count(*) FROM audit_events WHERE action='auth.profile_updated'")
+                .await,
+            1
+        );
+        assert_eq!(stored_name(&env, id).await, "Renamed");
+        // 20 requests per window and user: two are used, 18 more pass, the next is limited.
+        for _ in 0..18 {
+            let ok = patch(&env, &session, json!({"display_name": "Renamed"})).await;
+            assert_eq!(ok.status, StatusCode::OK, "{}", ok.text);
+        }
+        let limited = patch(&env, &session, json!({"display_name": "Renamed"})).await;
+        assert_eq!(
+            limited.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            limited.text
+        );
+        assert_eq!(limited.code(), "RATE_LIMITED");
+        assert!(limited.headers.contains_key("retry-after"));
+        // The budget is per user.
+        env.user("prof-rate-other").await;
+        let other = env.login_ok("prof-rate-other").await;
+        let fine = patch(&env, &other, json!({"display_name": "Other Name"})).await;
+        assert_eq!(fine.status, StatusCode::OK, "{}", fine.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn a_disabled_account_cannot_change_its_name() {
+        let env = TestEnv::new().await;
+        let id = env.user("prof-disabled").await;
+        sqlx::query("UPDATE users SET disabled_at=now() WHERE id=$1")
+            .bind(id)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let audit = craftcloud_db::audit::AuditCtx {
+            actor_id: Some(id),
+            request_id: None,
+        };
+        let changed =
+            craftcloud_db::accounts::update_display_name_audited(&env.pool, id, "Nope", &audit)
+                .await
+                .unwrap();
+        assert!(!changed);
+        assert_eq!(stored_name(&env, id).await, "prof-disabled");
+        assert_eq!(
+            env.count("SELECT count(*) FROM audit_events WHERE action='auth.profile_updated'")
+                .await,
+            0
+        );
+    }
 }

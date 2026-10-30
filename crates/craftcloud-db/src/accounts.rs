@@ -398,7 +398,8 @@ async fn change_password_inner(
 
 /// Sets the display name of an account and records `auth.profile_updated`
 /// (actor and target: the user) in the same transaction. The audit event does
-/// not contain the name. Returns `false` when the account does not exist.
+/// not contain the name. Returns `false` when the account does not exist or is
+/// disabled.
 ///
 /// # Errors
 ///
@@ -410,12 +411,13 @@ pub async fn update_display_name_audited(
     audit: &AuditCtx,
 ) -> Result<bool, DbError> {
     let mut tx = pool.begin().await?;
-    let updated = sqlx::query("UPDATE users SET display_name = $2 WHERE id = $1")
-        .bind(user_id)
-        .bind(display_name)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let updated =
+        sqlx::query("UPDATE users SET display_name = $2 WHERE id = $1 AND disabled_at IS NULL")
+            .bind(user_id)
+            .bind(display_name)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
     if updated != 1 {
         return Ok(false);
     }

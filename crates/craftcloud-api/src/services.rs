@@ -48,6 +48,9 @@ impl IpClass {
     }
 }
 
+/// Display name changes a user may make per rate window.
+const PROFILE_LIMIT: u32 = 20;
+
 /// Session, cookie and rate limit settings.
 #[derive(Debug, Clone)]
 pub struct AuthSettings {
@@ -179,6 +182,7 @@ pub struct Services {
     reset_ip: WindowLimiter,
     accept_ip: WindowLimiter,
     pwchange: WindowLimiter,
+    profile: WindowLimiter,
     invite_create: WindowLimiter,
     member_search: WindowLimiter,
     guard: Arc<AccountGuard>,
@@ -249,6 +253,7 @@ impl Services {
             reset_ip: WindowLimiter::new(cap),
             accept_ip: WindowLimiter::new(cap),
             pwchange: WindowLimiter::new(cap),
+            profile: WindowLimiter::new(cap),
             invite_create: WindowLimiter::new(cap),
             member_search: WindowLimiter::new(cap),
             guard,
@@ -387,6 +392,23 @@ impl Services {
                 self.window_secs(),
             )
             .map_err(|retry| self.too_many("pwchange", retry, headers))
+    }
+
+    /// Per-user rate limit for display name changes (`PROFILE_LIMIT` per
+    /// window); counts the request.
+    pub(crate) fn rate_limit_profile(
+        &self,
+        user_id: Uuid,
+        headers: &HeaderMap,
+    ) -> Result<(), Box<Response>> {
+        self.profile
+            .check(
+                &user_id.to_string(),
+                self.now_secs(),
+                PROFILE_LIMIT,
+                self.window_secs(),
+            )
+            .map_err(|retry| self.too_many("profile", retry, headers))
     }
 
     /// Per-user rate limit for creating invitations; counts the request.

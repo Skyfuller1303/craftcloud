@@ -33,7 +33,8 @@ pub struct MemberCounts {
     pub two_factor_enrolled: i64,
 }
 
-/// Plain counters of an organization.
+/// Plain counters of an organization. Files, locks and grants inside a trashed
+/// project are not counted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct Totals {
     /// Workspaces.
@@ -101,7 +102,7 @@ pub async fn member_counts(pool: &PgPool, scope: &OrgScope) -> Result<MemberCoun
 /// Database failures only. `None` if the organization does not exist.
 pub async fn totals(pool: &PgPool, scope: &OrgScope) -> Result<Option<Totals>, DbError> {
     Ok(sqlx::query_as::<_, Totals>(
-        "SELECT            (SELECT count(*) FROM workspaces w WHERE w.org_id = o.id) AS workspaces,            (SELECT count(*) FROM projects p WHERE p.org_id = o.id AND p.deleted_at IS NULL) AS projects,            (SELECT count(*) FROM files f WHERE f.org_id = o.id AND f.deleted_at IS NULL) AS files,            (SELECT count(*) FROM file_locks l JOIN files lf ON lf.org_id = l.org_id AND lf.id = l.file_id               WHERE l.org_id = o.id AND l.expires_at > CURRENT_TIMESTAMP AND lf.app <> 'figcraft') AS active_locks,            (SELECT count(*) FROM grants g WHERE g.org_id = o.id AND g.revoked_at IS NULL) AS active_grants,            (SELECT count(*) FROM invitations i WHERE i.org_id = o.id AND i.accepted_at IS NULL               AND i.revoked_at IS NULL AND i.invalidated_at IS NULL AND i.expires_at > CURRENT_TIMESTAMP) AS pending_invitations,            o.committed_bytes, o.reserved_bytes, o.quota_bytes          FROM organizations o WHERE o.id = $1",
+        "SELECT            (SELECT count(*) FROM workspaces w WHERE w.org_id = o.id) AS workspaces,            (SELECT count(*) FROM projects p WHERE p.org_id = o.id AND p.deleted_at IS NULL) AS projects,            (SELECT count(*) FROM files f WHERE f.org_id = o.id AND f.deleted_at IS NULL \n              AND NOT EXISTS (SELECT 1 FROM projects fp WHERE fp.org_id = f.org_id AND fp.workspace_id = f.workspace_id \n                              AND fp.id = f.project_id AND fp.deleted_at IS NOT NULL)) AS files,            (SELECT count(*) FROM file_locks l JOIN files lf ON lf.org_id = l.org_id AND lf.id = l.file_id               WHERE l.org_id = o.id AND l.expires_at > CURRENT_TIMESTAMP AND lf.app <> 'figcraft' \n                AND NOT EXISTS (SELECT 1 FROM projects lp WHERE lp.org_id = lf.org_id AND lp.workspace_id = lf.workspace_id \n                                AND lp.id = lf.project_id AND lp.deleted_at IS NOT NULL)) AS active_locks,            (SELECT count(*) FROM grants g WHERE g.org_id = o.id AND g.revoked_at IS NULL \n              AND CASE g.target_kind \n                WHEN 'project' THEN NOT EXISTS (SELECT 1 FROM projects gp WHERE gp.org_id = g.org_id AND gp.id = g.target_id \n                                                AND gp.deleted_at IS NOT NULL) \n                ELSE NOT EXISTS (SELECT 1 FROM files gf JOIN projects gfp ON gfp.org_id = gf.org_id \n                                 AND gfp.workspace_id = gf.workspace_id AND gfp.id = gf.project_id \n                                 WHERE gf.org_id = g.org_id AND gf.id = g.target_id \n                                 AND gfp.deleted_at IS NOT NULL) END) AS active_grants,            (SELECT count(*) FROM invitations i WHERE i.org_id = o.id AND i.accepted_at IS NULL               AND i.revoked_at IS NULL AND i.invalidated_at IS NULL AND i.expires_at > CURRENT_TIMESTAMP) AS pending_invitations,            o.committed_bytes, o.reserved_bytes, o.quota_bytes          FROM organizations o WHERE o.id = $1",
     )
     .bind(scope.org_id())
     .fetch_optional(pool)

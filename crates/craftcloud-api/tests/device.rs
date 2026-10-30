@@ -1243,4 +1243,49 @@ mod tests {
             assert_eq!(name == "Device Name", user == id, "{user}");
         }
     }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn device_profile_update_ignores_an_organization_two_factor_requirement() {
+        // ADR-0019: the requirement guards organization resources only. The profile is
+        // account-scoped, so a device of a member of such an organization may still use it.
+        let env = device_test_env().await;
+        let id = env.user("device-tf-profile").await;
+        let org: Uuid =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE slug='operator-org'")
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO organization_members (org_id, user_id, role, status) VALUES ($1, $2, 'member', 'active')")
+            .bind(org)
+            .bind(id)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let login = device_for(&env, "device-tf-profile@example.test").await;
+        assert_eq!(login.status, StatusCode::OK, "{}", login.text);
+        let token = login.body["access_token"].as_str().unwrap().to_owned();
+        sqlx::query("UPDATE organizations SET require_two_factor=true WHERE id=$1")
+            .bind(org)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let bearer = format!("Bearer {token}");
+        let members = call(
+            &env.app,
+            Req::new("GET", &format!("/api/v1/organizations/{org}/members"))
+                .header("authorization", &bearer),
+        )
+        .await;
+        assert_status(&members, StatusCode::FORBIDDEN, "TWO_FACTOR_SETUP_REQUIRED");
+        let response = call(
+            &env.app,
+            Req::new("PATCH", "/api/v1/auth/profile")
+                .header("authorization", &bearer)
+                .json(json!({"display_name": "Device Under Requirement"})),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        assert_eq!(response.body["display_name"], "Device Under Requirement");
+    }
 }

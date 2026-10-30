@@ -486,6 +486,18 @@ pub(crate) async fn update_profile(
     let Some(Ok(name)) = request.display_name.as_deref().map(DisplayName::parse) else {
         return validation_failed(&["display_name"], &headers);
     };
+    if let Err(response) = services.rate_limit_profile(session.user_id, &headers) {
+        return *response;
+    }
+    // An unchanged name writes nothing and records no audit event.
+    match accounts::get(&services.pool, session.user_id).await {
+        Ok(Some(account)) if account.display_name == name.as_str() => {
+            return session_response(&services, &headers, &session).await;
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return invalid_credentials(&headers),
+        Err(error) => return db_failure(&error, &headers, "account lookup failed"),
+    }
     match accounts::update_display_name_audited(
         &services.pool,
         session.user_id,
