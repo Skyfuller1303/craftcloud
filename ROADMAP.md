@@ -13,6 +13,8 @@
 
 ### Revision log
 
+2026-10-30 — AC-01 (desktop device sessions, bearer tokens, refresh rotation, device list) and AC-03 (person grants, guest role, edit-lock leases, shared-with-me) merged after independent security review of both runs and of the fixes; leases integrated with device sessions. `cargo xtask ci` and `cargo xtask db-test` green (328 DB tests). AC-02 (two-factor) in progress; AC-04 can start.
+
 2026-10-30 — Planned the app-cloud extension in `docs/12-app-cloud/` (seven briefings AC-01 to AC-07 for Codex, each with a mandatory report): desktop sign-in with device sessions, TOTP two-factor, grants to people with edit locks, client SDK with shared egui dialogs, cloud open/save in PhotoCraft and FigCraft, FigCraft live links hosted by CraftCloud, and a launcher account with file browser. Decisions logged; P4/P5 tickets now route through these briefings.
 
 2026-10-30 — Admin UI design pass per `docs/11-design/` merged (Launcher-oriented tokens, SCSS partials, Badge/Banner/EmptyState/Toaster/Icon components, card view at 360 px, favicon). Real-browser check in Chromium: 212 states light/dark × EN/DE × 1280/360 px with 0 axe violations incl. contrast, 0 CSP violations, no horizontal scroll; Escape focus return 240/240. P3 gate "Admin UI keyboard operable and responsive" evidenced; only the external tester gate remains.
