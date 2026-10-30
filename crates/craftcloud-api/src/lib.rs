@@ -110,6 +110,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/organizations", &["GET", "POST"]),
     ("/api/v1/organizations/{org_id}", &["GET", "PATCH"]),
     ("/api/v1/organizations/{org_id}/members", &["GET", "POST"]),
+    ("/api/v1/organizations/{org_id}/grants", &["GET"]),
+    ("/api/v1/organizations/{org_id}/locks", &["GET"]),
     (
         "/api/v1/organizations/{org_id}/members/{user_id}",
         &["PATCH", "DELETE"],
@@ -169,6 +171,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/organizations/{org_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
+    ("/api/v1/admin/users/{user_id}/devices", &["GET"]),
+    (
+        "/api/v1/admin/users/{user_id}/devices/{device_ref}",
+        &["DELETE"],
+    ),
     ("/api/v1/admin/maintenance", &["GET"]),
     ("/api/v1/admin/health", &["GET"]),
     ("/api/v1/organizations/{org_id}/audit", &["GET"]),
@@ -259,6 +266,14 @@ pub fn router_with_shared(
         .route(
             "/api/v1/organizations/{org_id}/members",
             get(orgs::list_members).post(orgs::add_member),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/grants",
+            get(grants::list_organization),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/locks",
+            get(locks::list_organization),
         )
         .route(
             "/api/v1/organizations/{org_id}/members/{user_id}",
@@ -379,6 +394,14 @@ pub fn router_with_shared(
         )
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
         .route("/api/v1/admin/users", get(orgs::list_all_users))
+        .route(
+            "/api/v1/admin/users/{user_id}/devices",
+            get(device::admin_list),
+        )
+        .route(
+            "/api/v1/admin/users/{user_id}/devices/{device_ref}",
+            delete(device::admin_revoke),
+        )
         .route("/api/v1/admin/maintenance", get(maintenance::get_status))
         .route("/api/v1/admin/health", get(health::get_health))
         .route(

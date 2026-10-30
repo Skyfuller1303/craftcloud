@@ -147,12 +147,10 @@ describe("activity log", () => {
         "GET /organizations": { body: { items: [{ ...ORG_A, role: "member" }], next_cursor: null } },
       }),
     );
-    const user = userEvent.setup();
     renderApp(fetch);
-    await openActivity(user);
-    expect(
-      await screen.findByText("Only organization owners and admins can see the activity log."),
-    ).toBeTruthy();
+    const nav = await screen.findByRole("navigation");
+    expect(within(nav).queryByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ })).toBeNull();
+    expect(screen.queryByRole("heading", { level: 1, name: /^(Activity|Aktivit\u00e4t)$/ })).toBeNull();
     expect(screen.queryByRole("link", { name: "Export as NDJSON" })).toBeNull();
     expect(screen.queryByLabelText("Log")).toBeNull();
     expect(calls.some((c) => c.path.includes("/audit"))).toBe(false);
@@ -169,7 +167,7 @@ describe("activity log", () => {
     expect(screen.queryByRole("table")).toBeNull();
   });
 
-  it("lets the operator switch to the instance log, which has no workspace column", async () => {
+  it("lets an operator switch to the instance log, which has no workspace column", async () => {
     const instanceEvent = event(1, { org_id: null, actor_id: null, action: "auth.login", result: "failed", count: 3, target: null, details: {} });
     const { fetch, calls } = mockFetch(
       viewRoutes({
@@ -186,11 +184,8 @@ describe("activity log", () => {
     await within(await screen.findByRole("table")).findByText("auth.login");
     expect(calls.some((c) => c.path === "/admin/audit")).toBe(true);
     expect(within(screen.getByRole("table")).queryByText("Workspace")).toBeNull();
-    expect(screen.getByRole("link", { name: "Export as NDJSON" }).getAttribute("href")).toBe(
-      "/api/v1/admin/audit/export",
-    );
+    expect(screen.getByRole("link", { name: "Export as NDJSON" }).getAttribute("href")).toBe("/api/v1/admin/audit/export");
     expect(within(screen.getByRole("table")).getByText("Failed")).toBeTruthy();
-    // The instance log has its own action groups.
     expect(within(screen.getByLabelText("Action")).getByRole("option", { name: "Sign-in and sessions" })).toBeTruthy();
   });
 
@@ -201,12 +196,35 @@ describe("activity log", () => {
         "GET /admin/audit": page([]),
       }),
     );
-    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/admin/activity");
     renderApp(fetch);
-    await openActivity(user);
     expect(await screen.findByText("There are no matching events.")).toBeTruthy();
     expect(calls.some((c) => c.path === AUDIT)).toBe(false);
     expect(calls.some((c) => c.path === "/admin/audit")).toBe(true);
+  });
+
+  it.each([
+    ["without an organization", "system"],
+    ["without an organization", "legacy"],
+    ["as an organization guest with required 2FA", "system"],
+    ["as an organization guest with required 2FA", "legacy"],
+  ] as const)("opens only instance audit for an operator %s via %s", async (context, entry) => {
+    const organization = context.startsWith("as an") ? [{ ...ORG_A, role: "guest", require_two_factor: true }] : [];
+    const { fetch, calls } = mockFetch(viewRoutes({
+      "GET /organizations": { body: { items: organization, next_cursor: null } },
+      "GET /auth/2fa": { body: { enabled: false, available: true, recovery_codes_remaining: 0 } },
+      "GET /admin/audit": page([]),
+    }));
+    window.history.replaceState(null, "", entry === "system" ? "/admin/system" : "/admin/activity");
+    const user = userEvent.setup();
+    renderApp(fetch);
+    if (entry === "system") {
+      await user.click(await screen.findByRole("button", { name: "Open activity log" }));
+    }
+    await screen.findByRole("heading", { level: 1, name: "Activity" });
+    expect(await screen.findByText("There are no matching events.")).toBeTruthy();
+    expect(calls.some((call) => call.path === "/admin/audit")).toBe(true);
+    expect(calls.some((call) => call.path === AUDIT)).toBe(false);
   });
 });
 
@@ -251,7 +269,7 @@ describe.each(languages)("axe: activity log (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-      const activity = within(nav).getByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ });
+      const activity = await within(nav).findByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ });
     activity.focus();
     await user.keyboard("{Enter}");
     await screen.findByRole("table");

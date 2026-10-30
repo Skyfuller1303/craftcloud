@@ -30,6 +30,7 @@ use craftcloud_db::organizations::{
 use craftcloud_db::{DbError, OrgScope, accounts};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -222,6 +223,13 @@ fn member_json(member: &Member) -> Value {
         "role": member.role,
         "joined_at": rfc3339(member.joined_at),
     })
+}
+
+fn cursor_scope_hash(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ---- GET /organizations ----------------------------------------------------
@@ -542,6 +550,10 @@ pub(crate) struct MemberPageQuery {
     limit: Option<String>,
     cursor: Option<String>,
     query: Option<String>,
+    role: Option<String>,
+    status: Option<String>,
+    two_factor: Option<String>,
+    sort: Option<String>,
 }
 
 pub(crate) async fn list_members(
@@ -593,6 +605,30 @@ pub(crate) async fn list_members(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_lowercase);
+    let role_filter = match member_page.role.as_deref() {
+        Some(value) if OrgRole::parse(value).is_some() => member_page.role.as_deref(),
+        Some(_) => return validation_failed(&["role"], &headers),
+        None => None,
+    };
+    let status_filter = match member_page.status.as_deref() {
+        Some("active" | "invited" | "disabled" | "all") => member_page.status.as_deref(),
+        Some(_) => return validation_failed(&["status"], &headers),
+        None => None,
+    };
+    let two_factor_filter = match member_page.two_factor.as_deref() {
+        Some("enabled") => Some(true),
+        Some("disabled") => Some(false),
+        Some(_) => return validation_failed(&["two_factor"], &headers),
+        None => None,
+    };
+    let sort = member_page.sort.as_deref().unwrap_or("joined_asc");
+    if !["joined_asc", "joined_desc", "name_asc", "name_desc"].contains(&sort) {
+        return validation_failed(&["sort"], &headers);
+    }
+    let admin_filters = role_filter.is_some()
+        || status_filter.is_some()
+        || two_factor_filter.is_some()
+        || member_page.sort.is_some();
     let page = PageQuery {
         limit: member_page.limit,
         cursor: member_page.cursor,
@@ -609,13 +645,17 @@ pub(crate) async fn list_members(
     } else {
         "members"
     };
-    let after = match page
-        .cursor()
-        .map(|c| decode_time_cursor(c, cursor_kind, &scope_text))
-    {
-        Some(Ok(key)) => Some(key),
-        Some(Err(error)) => return page_error(error, &headers),
-        None => None,
+    let after = if admin_filters {
+        None
+    } else {
+        match page
+            .cursor()
+            .map(|c| decode_time_cursor(c, cursor_kind, &scope_text))
+        {
+            Some(Ok(key)) => Some(key),
+            Some(Err(error)) => return page_error(error, &headers),
+            None => None,
+        }
     };
     if let Some(term) = &search {
         if term.chars().count() < 2 || term.chars().count() > 100 {
@@ -655,6 +695,106 @@ pub(crate) async fn list_members(
         if let Err(response) = services.rate_limit_member_search(session.user_id, &headers) {
             return *response;
         }
+    }
+    if admin_filters {
+        let decision = craftcloud_core::policy::can(
+            &actor,
+            Action::MemberAdminList,
+            &Resource::Member {
+                org_id,
+                target: None,
+                role: None,
+            },
+        );
+        match gate(
+            decision,
+            &headers,
+            session.user_id,
+            "member.admin_list",
+            Some(org_id),
+            None,
+        ) {
+            Gate::Open(_) => {}
+            Gate::Closed(response) => return response,
+        }
+        let query_term = search.as_deref();
+        let filter_scope = format!(
+            "{org_id}:{}:{}:{}:{}:{}",
+            query_term.unwrap_or("*"),
+            role_filter.unwrap_or("*"),
+            status_filter.unwrap_or("*"),
+            member_page.two_factor.as_deref().unwrap_or("*"),
+            sort
+        );
+        let cursor_scope = cursor_scope_hash(&filter_scope);
+        let after = match page.cursor().map(|cursor| {
+            crate::pagination::decode_id_cursor(cursor, "admin-members", &cursor_scope)
+        }) {
+            Some(Ok(id)) => Some(id),
+            Some(Err(error)) => return page_error(error, &headers),
+            None => None,
+        };
+        if let Some(cursor_user_id) = after {
+            match craftcloud_db::members::admin_cursor_exists(
+                &services.pool,
+                &scope,
+                cursor_user_id,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => return page_error(crate::pagination::PageError::Cursor, &headers),
+                Err(error) => {
+                    return db_failure(&error, &headers, "admin member cursor lookup failed");
+                }
+            }
+        }
+        let mut rows = match craftcloud_db::members::list_admin(
+            &services.pool,
+            &scope,
+            craftcloud_db::members::AdminMemberList {
+                query: query_term,
+                role: role_filter,
+                status: status_filter,
+                two_factor: two_factor_filter,
+                sort,
+                limit: limit + 1,
+                after_id: after,
+            },
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => return db_failure(&error, &headers, "admin member list failed"),
+        };
+        let next = if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            rows.last().map(|row| {
+                crate::pagination::encode_id_cursor(
+                    "admin-members",
+                    &cursor_scope,
+                    row.member.user_id,
+                )
+            })
+        } else {
+            None
+        };
+        let items: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let mut member = member_json(&row.member);
+                if let Some(object) = member.as_object_mut() {
+                    object.insert("status".to_owned(), json!(row.status));
+                    object.insert("account_disabled".to_owned(), json!(row.account_disabled));
+                    object.insert(
+                        "two_factor_enabled".to_owned(),
+                        json!(row.two_factor_enabled),
+                    );
+                }
+                member
+            })
+            .collect();
+        return Json(json!({"items":items,"next_cursor":next})).into_response();
     }
     let mut rows = match if let Some(term) = &search {
         craftcloud_db::members::search(&services.pool, &scope, term, limit + 1, after).await
@@ -1181,7 +1321,9 @@ pub(crate) async fn list_all_orgs(
         .map(|o| {
             json!({
                 "id": o.id.to_string(), "slug": o.slug, "name": o.name,
-                "member_count": o.member_count, "created_at": rfc3339(o.created_at),
+                "member_count": o.member_count, "committed_bytes": o.committed_bytes,
+                "reserved_bytes": o.reserved_bytes, "quota_bytes": o.quota_bytes,
+                "created_at": rfc3339(o.created_at),
             })
         })
         .collect();
@@ -1214,7 +1356,7 @@ pub(crate) async fn list_all_users(
     let Ok(Query(query)) = query else {
         return validation_failed(&["query"], &headers);
     };
-    let (page, unverified) = match query.split() {
+    let (page, unverified, search) = match query.split() {
         Ok(parts) => parts,
         Err(_) => return validation_failed(&["unverified"], &headers),
     };
@@ -1223,23 +1365,37 @@ pub(crate) async fn list_all_users(
         Err(error) => return page_error(error, &headers),
     };
     // The cursor is bound to the filter, so it cannot be replayed for another one.
-    let scope = if unverified { "unverified" } else { "all" };
+    let filter_context = format!(
+        "{}:{}:{}",
+        if unverified { "unverified" } else { "all" },
+        search.as_deref().unwrap_or("").len(),
+        search.as_deref().unwrap_or("")
+    );
+    let scope = cursor_scope_hash(&filter_context);
     let after = match page
         .cursor()
-        .map(|c| decode_time_cursor(c, "admin-users", scope))
+        .map(|c| decode_time_cursor(c, "admin-users", &scope))
     {
         Some(Ok(key)) => Some(key),
         Some(Err(error)) => return page_error(error, &headers),
         None => None,
     };
-    let mut rows = match accounts::list_all(&services.pool, limit + 1, after, unverified).await {
+    let mut rows = match accounts::list_all_search(
+        &services.pool,
+        limit + 1,
+        after,
+        unverified,
+        search.as_deref(),
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(error) => return db_failure(&error, &headers, "account list failed"),
     };
     let next = if rows.len() > limit as usize {
         rows.truncate(limit as usize);
         rows.last()
-            .map(|last| encode_time_cursor("admin-users", scope, last.created_at, last.id))
+            .map(|last| encode_time_cursor("admin-users", &scope, last.created_at, last.id))
     } else {
         None
     };

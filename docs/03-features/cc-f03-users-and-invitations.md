@@ -3,6 +3,10 @@
 > **Status:** Einladungen lokal umgesetzt (PR-007, Review offen): Link-Einladung (72 h, einmalig, widerrufbar, nur SHA-256 gespeichert, kein E-Mail-Versand), Annahme mit neuem oder bestehendem Konto, Neubewertung der Rechte des Einladenden bei der Annahme, Limits und Ratenbegrenzung. E-Mail-Verifikation und Versand (SMTP) sind offen (Lücke). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+## AC-08: Personenverwaltung
+
+AC-08 ergänzt den Organisations-Ownern und -Admins vorbehaltenen Verwaltungsmodus der Personenliste: Rollen-, Status- und 2FA-Filter, Sortierung und Cursor-Paginierung. Einzelne Rollenänderungen, Entfernen und Einladungen bleiben bestehende API-Operationen; die Konsole zeigt Ergebnisse je Person und unterstützt höchstens 50 eingefügte Einladungsadressen pro Durchgang. Die gewöhnliche Mitgliedersuche für Freigaben erhält dadurch keine zusätzlichen Kontosicherheitsdaten. Entscheidungen und Prüfstatus: [ADR-0024](../09-decisions/adr-0024-admin-console.md) und AC-08-Abnahmebericht.
+
 ## Problem und Nutzen
 
 Organisationsadministrator lädt Nutzer per E-Mail zu einer Organisation oder konkret zu einem Workspace ein. Externe E-Mail-Sendeinfrastruktur ist optional; MVP kann einen einmalig kopierbaren Invite-Link bereitstellen, wenn Mailserver nicht konfiguriert ist. Mitgliedsstatus invited/active/disabled und sichtbare Einladungsübersicht im Adminpanel.

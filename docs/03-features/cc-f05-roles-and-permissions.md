@@ -6,6 +6,10 @@
 > **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-03 Freigaben an Personen, Gastrolle und Bearbeitungssperre).
 > **AC-03 Backend-Erweiterung:** Workspace-Rollen werden mit tenantgebundenen Projekt-/Datei-Grants kombiniert. `guest` erhält durch Einladung keine Workspace-Mitgliedschaft. Grant-Management und Mitgliedersuche sind Workspace-Editoren und höher vorbehalten; Rechte bleiben serverseitig in `can()` und werden nicht aus UI-Daten hergeleitet. Details und Scope-Matrix siehe [ADR-0020](../09-decisions/adr-0020-grants-and-edit-locks.md) und [Berechtigungsmatrix](../05-security/permission-matrix.md). Implementierung und Sicherheitsintegrationstests laufen im AC-03 Worktree.
 
+## AC-08: Verwaltungslisten
+
+Neue zentrale Policy-Aktionen schützen organisationsweite Freigaben- und Sperrenlisten sowie administrative Personenfilter. Workspace-Admins sehen ausschließlich Zeilen ihrer eigenen Admin-Workspaces; eine bloße Operatorrolle vermittelt keine Organisationsinhalte. Fremde Geräte bleiben ausschließlich dem Instanz-Operator vorbehalten. Die verbindliche Matrix steht in [permission-matrix.md](../05-security/permission-matrix.md); Vertragsdetails in [ADR-0024](../09-decisions/adr-0024-admin-console.md). Der Abschlussbericht weist die tatsächlich ausgeführten Prüfungen aus.
+
 ## Problem und Nutzen
 
 Zentrales Berechtigungsmodell mit Instanzadmin als Operator, Org-Owner, Org-Admin, Workspace-Admin, Editor, Viewer. Rollen sind **Scopes**, nicht globale Strings, und werden innerhalb der Autorisierungsservice-Schicht geprüft. Kein freies Merge von mehreren Rollen ohne definierten Vorrang. Alle Daten-APIs filtern schon in DB-Anfragen nach Tenant und erlaubtem Projekt.

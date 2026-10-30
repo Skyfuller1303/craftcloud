@@ -2,6 +2,9 @@ import type {
   AcceptedInvitation,
   AcceptInvitationRequest,
   AdminHealth,
+  AdminOrganization,
+  AdminUser,
+  AdminDevicePage,
   AuditEvent,
   AuditFilters,
   AuditSource,
@@ -20,6 +23,9 @@ import type {
   LoginResponse,
   SecondFactorLoginRequest,
   OrgMember,
+  OrganizationGrant,
+  OrganizationLock,
+  OrganizationUsage,
   OrgRole,
   Organization,
   Page,
@@ -69,9 +75,22 @@ export const ENDPOINTS = {
   listOrganizations: { method: "GET", path: "/organizations" },
   updateOrganization: { method: "PATCH", path: "/organizations/{org_id}" },
   listWorkspaces: { method: "GET", path: "/organizations/{org_id}/workspaces" },
+  createWorkspace: { method: "POST", path: "/organizations/{org_id}/workspaces" },
+  renameWorkspace: { method: "PATCH", path: "/workspaces/{workspace_id}" },
   acceptInvitation: { method: "POST", path: "/invitations/accept" },
   resetPassword: { method: "POST", path: "/auth/password-reset" },
   listOrgMembers: { method: "GET", path: "/organizations/{org_id}/members" },
+  listOrgGrants: { method: "GET", path: "/organizations/{org_id}/grants" },
+  listOrgLocks: { method: "GET", path: "/organizations/{org_id}/locks" },
+  orgUsage: { method: "GET", path: "/organizations/{org_id}/usage" },
+  updateWorkspaceQuota: { method: "PUT", path: "/workspaces/{workspace_id}/quota" },
+  listAdminOrganizations: { method: "GET", path: "/admin/organizations" },
+  updateAdminOrganizationQuota: { method: "PUT", path: "/admin/organizations/{org_id}/quota" },
+  listAdminUsers: { method: "GET", path: "/admin/users" },
+  disableAdminUser: { method: "POST", path: "/admin/users/{user_id}/disable" },
+  enableAdminUser: { method: "POST", path: "/admin/users/{user_id}/enable" },
+  listAdminUserDevices: { method: "GET", path: "/admin/users/{user_id}/devices" },
+  revokeAdminUserDevice: { method: "DELETE", path: "/admin/users/{user_id}/devices/{device_ref}" },
   listSharedWithMe: { method: "GET", path: "/organizations/{org_id}/shared-with-me" },
   changeOrgMemberRole: { method: "PATCH", path: "/organizations/{org_id}/members/{user_id}" },
   removeOrgMember: { method: "DELETE", path: "/organizations/{org_id}/members/{user_id}" },
@@ -289,10 +308,24 @@ export interface ApiClient {
   listOrganizations(cursor?: string): Promise<Page<Organization>>;
   updateOrganizationTwoFactor(orgId: string, organizationVersion: number, required: boolean): Promise<Organization>;
   listWorkspaces(orgId: string, cursor?: string): Promise<Page<Workspace>>;
+  createWorkspace(orgId: string, name: string, slug: string): Promise<Workspace>;
+  renameWorkspace(workspaceId: string, version: number, name: string): Promise<Workspace>;
   acceptInvitation(body: AcceptInvitationRequest): Promise<AcceptedInvitation>;
   resetPassword(body: ResetPasswordRequest): Promise<void>;
 
-  listOrgMembers(orgId: string, cursor?: string, query?: string): Promise<Page<OrgMember>>;
+  listOrgMembers(orgId: string, cursor?: string, query?: string, filters?: { role?: string; status?: string; two_factor?: string; sort?: string }): Promise<Page<OrgMember>>;
+  listOrgGrants(orgId: string, cursor?: string, filters?: { workspace_id?: string; user_id?: string; target_kind?: string }): Promise<Page<OrganizationGrant>>;
+  listOrgLocks(orgId: string, cursor?: string, filters?: { workspace_id?: string; user_id?: string }): Promise<Page<OrganizationLock>>;
+  getOrganizationUsage(orgId: string, cursor?: string): Promise<OrganizationUsage>;
+  updateOrganizationSettings(orgId: string, organizationVersion: number, body: { name?: string; workspace_admin_invites_enabled?: boolean; require_two_factor?: boolean }): Promise<Organization>;
+  updateWorkspaceQuota(workspaceId: string, quotaBytes: number | null): Promise<{ quota_bytes: number | null }>;
+  listAdminOrganizations(cursor?: string): Promise<Page<AdminOrganization>>;
+  updateAdminOrganizationQuota(orgId: string, quotaBytes: number | null): Promise<{ quota_bytes: number | null }>;
+  listAdminUsers(cursor?: string, query?: string): Promise<Page<AdminUser>>;
+  disableAdminUser(userId: string): Promise<{ orphaned_organization_ids: string[] }>;
+  enableAdminUser(userId: string): Promise<void>;
+  listAdminUserDevices(userId: string, cursor?: string): Promise<AdminDevicePage>;
+  revokeAdminUserDevice(userId: string, deviceRef: string): Promise<void>;
   listSharedWithMe(orgId: string, cursor?: string): Promise<Page<SharedItem>>;
   changeOrgMemberRole(orgId: string, userId: string, role: OrgRole): Promise<OrgMember>;
   removeOrgMember(orgId: string, userId: string): Promise<void>;
@@ -382,6 +415,7 @@ interface CallConfig {
 /** Strong entity tags the server derives from the `version` field of a row or a version id. */
 export const etag = {
   organization: (version: number) => `"org-v${version}"`,
+  workspace: (version: number) => `"ws-v${version}"`,
   project: (version: number) => `"prj-v${version}"`,
   grant: (version: number) => `"grant-v${version}"`,
   content: (versionId: string) => `"version:${versionId}"`,
@@ -539,6 +573,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         params: { org_id: orgId },
         query: { limit: "100", cursor },
       }),
+    createWorkspace: (orgId, name, slug) =>
+      call(ENDPOINTS.createWorkspace, { params: { org_id: orgId }, body: { name, slug } }),
+    renameWorkspace: (workspaceId, version, name) =>
+      call(ENDPOINTS.renameWorkspace, { params: { workspace_id: workspaceId }, body: { name }, headers: { "If-Match": etag.workspace(version) } }),
     async acceptInvitation(body) {
       const result = await call<AcceptedInvitation>(ENDPOINTS.acceptInvitation, {
         body,
@@ -551,8 +589,29 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     },
     resetPassword: (body) => call(ENDPOINTS.resetPassword, { body, anonymous: true }),
 
-    listOrgMembers: (orgId, cursor, query) =>
-      call(ENDPOINTS.listOrgMembers, { params: { org_id: orgId }, query: { limit: "50", cursor, query } }),
+    listOrgMembers: (orgId, cursor, query, filters = {}) =>
+      call(ENDPOINTS.listOrgMembers, { params: { org_id: orgId }, query: { limit: "50", cursor, query, ...filters } }),
+    listOrgGrants: (orgId, cursor, filters = {}) =>
+      call(ENDPOINTS.listOrgGrants, { params: { org_id: orgId }, query: { limit: "50", cursor, ...filters } }),
+    listOrgLocks: (orgId, cursor, filters = {}) =>
+      call(ENDPOINTS.listOrgLocks, { params: { org_id: orgId }, query: { limit: "50", cursor, ...filters } }),
+    getOrganizationUsage: (orgId, cursor) =>
+      call(ENDPOINTS.orgUsage, { params: { org_id: orgId }, query: { limit: "100", cursor } }),
+    updateOrganizationSettings: (orgId, version, body) =>
+      call(ENDPOINTS.updateOrganization, { params: { org_id: orgId }, body, headers: { "If-Match": etag.organization(version) } }),
+    updateWorkspaceQuota: (workspaceId, quotaBytes) =>
+      call(ENDPOINTS.updateWorkspaceQuota, { params: { workspace_id: workspaceId }, body: { quota_bytes: quotaBytes } }),
+    listAdminOrganizations: (cursor) => call(ENDPOINTS.listAdminOrganizations, { query: { limit: "100", cursor } }),
+    updateAdminOrganizationQuota: (orgId, quotaBytes) =>
+      call(ENDPOINTS.updateAdminOrganizationQuota, { params: { org_id: orgId }, body: { quota_bytes: quotaBytes } }),
+    listAdminUsers: (cursor, query) => call(ENDPOINTS.listAdminUsers, { query: { limit: "100", cursor, query } }),
+    disableAdminUser: (userId) => call(ENDPOINTS.disableAdminUser, { params: { user_id: userId } }),
+    enableAdminUser: (userId) => call(ENDPOINTS.enableAdminUser, { params: { user_id: userId } }),
+    listAdminUserDevices: (userId, cursor) => call<AdminDevicePage>(ENDPOINTS.listAdminUserDevices, {
+      params: { user_id: userId },
+      query: { limit: "50", cursor },
+    }),
+    revokeAdminUserDevice: (userId, deviceRef) => call(ENDPOINTS.revokeAdminUserDevice, { params: { user_id: userId, device_ref: deviceRef } }),
     listSharedWithMe: (orgId, cursor) =>
       call(ENDPOINTS.listSharedWithMe, { params: { org_id: orgId }, query: { limit: "50", cursor } }),
     changeOrgMemberRole: (orgId, userId, role) =>

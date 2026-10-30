@@ -123,6 +123,183 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn admin_member_filters_are_private_and_cursor_bound() {
+        let world = World::new().await;
+        let owner_id = world.env.user("ac08-members-owner").await;
+        let owner = world.env.login_ok("ac08-members-owner").await;
+        let org = world
+            .org(&format!("ac08-{}", Uuid::new_v4().simple()), owner_id)
+            .await;
+        let member_id = world.env.user("ac08-members-member").await;
+        let member = world.env.login_ok("ac08-members-member").await;
+        assert_eq!(
+            world.add(&owner, org, member_id, "member").await.status,
+            StatusCode::CREATED
+        );
+        let invited_id = world.env.user("ac08-members-invited").await;
+        sqlx::query("INSERT INTO organization_members(org_id,user_id,role,status) VALUES($1,$2,'member','invited')")
+            .bind(org).bind(invited_id).execute(&world.env.pool).await.unwrap();
+        let first = call(
+            &world.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/organizations/{org}/members?status=all&sort=name_asc&limit=1"),
+            )
+            .session(&owner),
+        )
+        .await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+        assert_eq!(first.body["items"].as_array().unwrap().len(), 1);
+        assert!(first.body["items"][0]["status"].is_string());
+        assert!(first.body["items"][0]["account_disabled"].is_boolean());
+        assert!(first.body["items"][0]["two_factor_enabled"].is_boolean());
+        let cursor = first.body["next_cursor"].as_str().unwrap();
+        let second = call(&world.env.app, Req::new("GET", &format!("/api/v1/organizations/{org}/members?status=all&sort=name_asc&limit=1&cursor={cursor}")).session(&owner)).await;
+        assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+        assert_eq!(second.body["items"].as_array().unwrap().len(), 1);
+        assert_ne!(
+            first.body["items"][0]["user_id"],
+            second.body["items"][0]["user_id"]
+        );
+        let old_shape = call(
+            &world.env.app,
+            Req::new("GET", &format!("/api/v1/organizations/{org}/members")).session(&member),
+        )
+        .await;
+        assert_eq!(old_shape.status, StatusCode::OK, "{}", old_shape.text);
+        assert!(
+            old_shape.body["items"][0]
+                .get("two_factor_enabled")
+                .is_none()
+        );
+        let denied = call(
+            &world.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/organizations/{org}/members?status=all"),
+            )
+            .session(&member),
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text);
+        let invited = call(
+            &world.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/organizations/{org}/members?status=invited"),
+            )
+            .session(&owner),
+        )
+        .await;
+        assert_eq!(invited.status, StatusCode::OK, "{}", invited.text);
+        assert_eq!(invited.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(invited.body["items"][0]["user_id"], invited_id.to_string());
+        assert_eq!(invited.body["items"][0]["status"], "invited");
+        let disabled = call(
+            &world.env.app,
+            Req::new("POST", &format!("/api/v1/admin/users/{member_id}/disable"))
+                .session(&world.op),
+        )
+        .await;
+        assert_eq!(disabled.status, StatusCode::OK, "{}", disabled.text);
+        let disabled_members = call(
+            &world.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/organizations/{org}/members?status=disabled"),
+            )
+            .session(&owner),
+        )
+        .await;
+        assert_eq!(
+            disabled_members.status,
+            StatusCode::OK,
+            "{}",
+            disabled_members.text
+        );
+        assert_eq!(disabled_members.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(disabled_members.body["items"][0]["account_disabled"], true);
+        let invalid_cursor = call(&world.env.app, Req::new("GET", &format!("/api/v1/organizations/{org}/members?status=invited&sort=name_asc&limit=1&cursor={cursor}")).session(&owner)).await;
+        assert_eq!(
+            invalid_cursor.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            invalid_cursor.text
+        );
+        assert_eq!(invalid_cursor.code(), "INVALID_CURSOR");
+        assert_eq!(
+            world.remove(&owner, org, invited_id).await.status,
+            StatusCode::NO_CONTENT
+        );
+        let removed_cursor = call(&world.env.app, Req::new("GET", &format!("/api/v1/organizations/{org}/members?status=all&sort=name_asc&limit=1&cursor={cursor}")).session(&owner)).await;
+        assert_eq!(
+            removed_cursor.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            removed_cursor.text
+        );
+        assert_eq!(removed_cursor.code(), "INVALID_CURSOR");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn operator_user_search_cursors_hash_arbitrary_filter_text() {
+        let world = World::new().await;
+        let pipe_users = [
+            world.env.user("ac08-pipe-a").await,
+            world.env.user("ac08-pipe-b").await,
+        ];
+        let emoji_users = [
+            world.env.user("ac08-emoji-a").await,
+            world.env.user("ac08-emoji-b").await,
+        ];
+        for (id, name) in pipe_users.iter().zip(["alpha|beta-one", "alpha|beta-two"]) {
+            sqlx::query("UPDATE users SET display_name=$2 WHERE id=$1")
+                .bind(id)
+                .bind(name)
+                .execute(&world.env.pool)
+                .await
+                .unwrap();
+        }
+        let emoji = "😀".repeat(100);
+        for id in emoji_users {
+            sqlx::query("UPDATE users SET display_name=$2 WHERE id=$1")
+                .bind(id)
+                .bind(&emoji)
+                .execute(&world.env.pool)
+                .await
+                .unwrap();
+        }
+
+        let emoji_query = "%F0%9F%98%80".repeat(100);
+        for search in ["alpha%7Cbeta", &emoji_query] {
+            let first = call(
+                &world.env.app,
+                Req::new(
+                    "GET",
+                    &format!("/api/v1/admin/users?limit=1&query={search}"),
+                )
+                .session(&world.op),
+            )
+            .await;
+            assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+            let cursor = first.body["next_cursor"].as_str().expect("another result");
+            let second = call(
+                &world.env.app,
+                Req::new(
+                    "GET",
+                    &format!("/api/v1/admin/users?limit=1&query={search}&cursor={cursor}"),
+                )
+                .session(&world.op),
+            )
+            .await;
+            assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+            assert_ne!(first.body["items"][0]["id"], second.body["items"][0]["id"]);
+        }
+    }
+
     // ---- operator: create / list ------------------------------------------------
 
     #[tokio::test]
@@ -236,7 +413,20 @@ mod tests {
         for item in items {
             let mut keys: Vec<_> = item.as_object().unwrap().keys().cloned().collect();
             keys.sort();
-            assert_eq!(keys, ["created_at", "id", "member_count", "name", "slug"]);
+            assert_eq!(
+                keys,
+                [
+                    "committed_bytes",
+                    "created_at",
+                    "id",
+                    "member_count",
+                    "name",
+                    "quota_bytes",
+                    "reserved_bytes",
+                    "slug"
+                ]
+            );
+            assert_eq!(item["quota_bytes"], serde_json::Value::Null);
         }
         assert!(!list.text.contains("@example.test"));
     }

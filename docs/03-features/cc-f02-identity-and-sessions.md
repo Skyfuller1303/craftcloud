@@ -11,6 +11,10 @@
 
 Der Ausbau folgt [AC-02](../12-app-cloud/ac-02-two-factor.md) und [ADR-0019](../09-decisions/adr-0019-two-factor.md): verschlüsselte TOTP-Geheimnisse, einmalige Wiederherstellungscodes, zweistufige Browser-/Geräte-Anmeldung, Organisationspflicht, Operator-Reset und Widerruf anderer Sitzungen bei Sicherheitsänderungen. Die Web-Einstellungen erzeugen QR-Codes lokal und bieten einmalige Anzeige beziehungsweise lokalen Download der Wiederherstellungscodes. Passkeys und Client-Schlüsselbund bleiben separate Vorhaben. Verifizierter Implementierungs- und Prüfstand steht im AC-02-Abschlussbericht; diese Statusnotiz ersetzt keinen Testnachweis.
 
+## AC-08: Operatorverwaltung fremder Geräte
+
+Die Instanzkonsole ergänzt die operatorgeschützte Liste und den Einzelwiderruf fremder Geräte. Die Antwort enthält eine opaque Verwaltungsreferenz und keine interne Sitzungs-ID; Organisationsadmins erhalten keine fremden Gerätenamen. Ein Widerruf entfernt atomar die Sitzungssperren und wird mit dem Operator als Akteur auditiert. Die persönliche Geräteliste bleibt unverändert. Siehe [ADR-0024](../09-decisions/adr-0024-admin-console.md); Prüfbelege stehen im AC-08-Abnahmebericht.
+
 ## Problem und Nutzen
 
 Lokales Benutzerkonto für CraftCloud Web-Admin; unabhängig vom optional späteren ArtCraft-Hosted-Account. E-Mail normalisieren, Passwort-Hashes mit Argon2id und wartbaren Parametern, Login-Versuch pro Account/IP begrenzen. Account-Status active/disabled, Passwortwechsel, Logout an allen Geräten, Session-Timeout und eindeutige Revokation.

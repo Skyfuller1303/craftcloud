@@ -162,8 +162,14 @@ pub enum Action {
     OrganizationListAll,
     /// List the accounts of the instance (operator only; account metadata, no organization data).
     UserListAll,
+    /// List an account's device metadata (operator only).
+    UserDeviceList,
+    /// Revoke an account device session (operator only).
+    UserDeviceRevoke,
     /// List the members of an organization.
     MemberList,
+    /// List members with administrative status and two-factor fields.
+    MemberAdminList,
     /// Add an existing user as member.
     MemberAdd,
     /// Change the role of a member.
@@ -259,6 +265,10 @@ pub enum Action {
     InstanceAuditRead,
     /// Manage grants for an object.
     GrantList,
+    /// List organization grants, including workspace-admin scope.
+    OrganizationGrantList,
+    /// List organization file locks, including workspace-admin scope.
+    OrganizationLockList,
     /// Create a grant.
     GrantCreate,
     /// Change a grant role or revoke a grant.
@@ -285,11 +295,13 @@ impl Action {
             | Self::OrganizationRead
             | Self::OrganizationListAll
             | Self::UserListAll
+            | Self::UserDeviceList
             | Self::MaintenanceRead
             | Self::HealthRead
             | Self::AuditRead
             | Self::InstanceAuditRead
             | Self::MemberList
+            | Self::MemberAdminList
             | Self::WorkspaceRead
             | Self::WorkspaceList
             | Self::WorkspaceMemberList
@@ -304,6 +316,8 @@ impl Action {
             | Self::VersionRead
             | Self::FileDownload
             | Self::GrantList
+            | Self::OrganizationGrantList
+            | Self::OrganizationLockList
             | Self::SharedWithMe
             | Self::MemberSearch => false,
             Self::OrganizationUpdate
@@ -314,6 +328,7 @@ impl Action {
             | Self::MemberRemove
             | Self::UserDisable
             | Self::UserEnable
+            | Self::UserDeviceRevoke
             | Self::PasswordResetIssue
             | Self::PasswordResetVoid
             | Self::WorkspaceManage
@@ -347,7 +362,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 62] = [
+    pub const ALL: [Action; 67] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -355,7 +370,10 @@ impl Action {
         Action::OrganizationCreate,
         Action::OrganizationListAll,
         Action::UserListAll,
+        Action::UserDeviceList,
+        Action::UserDeviceRevoke,
         Action::MemberList,
+        Action::MemberAdminList,
         Action::MemberAdd,
         Action::MemberChangeRole,
         Action::MemberRemove,
@@ -403,6 +421,8 @@ impl Action {
         Action::AuditRead,
         Action::InstanceAuditRead,
         Action::GrantList,
+        Action::OrganizationGrantList,
+        Action::OrganizationLockList,
         Action::GrantCreate,
         Action::GrantChange,
         Action::SharedWithMe,
@@ -649,6 +669,8 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             A::OrganizationCreate
             | A::OrganizationListAll
             | A::UserListAll
+            | A::UserDeviceList
+            | A::UserDeviceRevoke
             | A::MaintenanceRead
             | A::HealthRead
             | A::InstanceAuditRead
@@ -675,6 +697,13 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             Some(_) => allow(action, Some(*org_id)),
             None => Decision::Hidden,
         },
+        (A::OrganizationGrantList | A::OrganizationLockList, Resource::Organization { org_id }) => {
+            match role_in(actor, *org_id) {
+                Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+                Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
+                None => Decision::Hidden,
+            }
+        }
         (A::OrganizationUpdate, Resource::Organization { org_id }) => {
             match role_in(actor, *org_id) {
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
@@ -694,6 +723,11 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
         (A::MemberList, Resource::Member { org_id, .. }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin | OrgRole::Member) => allow(action, Some(*org_id)),
             Some(OrgRole::Guest) => Decision::Forbidden,
+            None => Decision::Hidden,
+        },
+        (A::MemberAdminList, Resource::Member { org_id, .. }) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+            Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
         },
         (
@@ -809,6 +843,24 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                 (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             }
         }
+        (
+            A::OrganizationGrantList | A::OrganizationLockList,
+            Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        ) => match (
+            role_in(actor, *org_id),
+            workspace_role_in(actor, *workspace_id),
+        ) {
+            (None, _) | (Some(OrgRole::Guest), _) | (Some(OrgRole::Member), None) => {
+                Decision::Hidden
+            }
+            (Some(OrgRole::Owner | OrgRole::Admin), _) | (_, Some(WorkspaceRole::Admin)) => {
+                allow(action, Some(*org_id))
+            }
+            (Some(OrgRole::Member), Some(_)) => Decision::Forbidden,
+        },
 
         // ---- workspace listing / creation ----
         (A::WorkspaceList, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
@@ -1324,6 +1376,102 @@ mod tests {
     }
 
     #[test]
+    fn admin_console_read_actions_follow_role_boundaries() {
+        check(Action::MemberAdminList, member(None, None), [H, F, Y, Y]);
+        assert_eq!(
+            outcome(can(
+                &actor(Some(OrgRole::Guest), false),
+                Action::MemberAdminList,
+                &member(None, None)
+            )),
+            F
+        );
+        let foreign_member = Resource::Member {
+            org_id: OTHER_ORG,
+            target: None,
+            role: None,
+        };
+        assert_eq!(
+            outcome(can(
+                &actor(Some(OrgRole::Owner), false),
+                Action::MemberAdminList,
+                &foreign_member
+            )),
+            H
+        );
+        for action in [Action::OrganizationGrantList, Action::OrganizationLockList] {
+            let workspace = Resource::Workspace {
+                org_id: ORG,
+                workspace_id: WS,
+            };
+            check(action, org(), [H, F, Y, Y]);
+            assert_eq!(
+                outcome(can(&actor(Some(OrgRole::Guest), false), action, &org())),
+                F
+            );
+            assert_eq!(outcome(can(&actor(None, true), action, &workspace)), H);
+            assert_eq!(
+                outcome(can(&actor(Some(OrgRole::Admin), false), action, &workspace)),
+                Y
+            );
+            assert_eq!(
+                outcome(can(
+                    &with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Admin),
+                    action,
+                    &workspace
+                )),
+                Y
+            );
+            assert_eq!(
+                outcome(can(
+                    &with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Editor),
+                    action,
+                    &workspace
+                )),
+                F
+            );
+            assert_eq!(
+                outcome(can(
+                    &with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Viewer),
+                    action,
+                    &workspace
+                )),
+                F
+            );
+            assert_eq!(
+                outcome(can(
+                    &with_ws(actor(Some(OrgRole::Guest), false), WorkspaceRole::Viewer),
+                    action,
+                    &workspace
+                )),
+                H
+            );
+            let foreign_workspace = Resource::Workspace {
+                org_id: OTHER_ORG,
+                workspace_id: WS,
+            };
+            assert_eq!(
+                outcome(can(
+                    &actor(Some(OrgRole::Owner), false),
+                    action,
+                    &foreign_workspace
+                )),
+                H
+            );
+        }
+        for action in [Action::UserDeviceList, Action::UserDeviceRevoke] {
+            assert_eq!(
+                outcome(can(&actor(None, false), action, &Resource::Instance)),
+                F
+            );
+            assert_eq!(
+                outcome(can(&actor(None, true), action, &Resource::Instance)),
+                Y
+            );
+        }
+    }
+
+    #[test]
     fn member_list() {
         check(Action::MemberList, member(None, None), [H, Y, Y, Y]);
         assert_eq!(
@@ -1649,7 +1797,10 @@ mod tests {
             Action::OrganizationCreate,
             Action::OrganizationListAll,
             Action::UserListAll,
+            Action::UserDeviceList,
+            Action::UserDeviceRevoke,
             Action::MemberList,
+            Action::MemberAdminList,
             Action::MemberAdd,
             Action::MemberChangeRole,
             Action::MemberRemove,
@@ -1697,6 +1848,8 @@ mod tests {
             Action::AuditRead,
             Action::InstanceAuditRead,
             Action::GrantList,
+            Action::OrganizationGrantList,
+            Action::OrganizationLockList,
             Action::GrantCreate,
             Action::GrantChange,
             Action::SharedWithMe,
@@ -1717,7 +1870,10 @@ mod tests {
                 | Action::OrganizationCreate
                 | Action::OrganizationListAll
                 | Action::UserListAll
+                | Action::UserDeviceList
+                | Action::UserDeviceRevoke
                 | Action::MemberList
+                | Action::MemberAdminList
                 | Action::MemberAdd
                 | Action::MemberChangeRole
                 | Action::MemberRemove
@@ -1765,6 +1921,8 @@ mod tests {
                 | Action::AuditRead
                 | Action::InstanceAuditRead
                 | Action::GrantList
+                | Action::OrganizationGrantList
+                | Action::OrganizationLockList
                 | Action::GrantCreate
                 | Action::GrantChange
                 | Action::SharedWithMe
@@ -1791,7 +1949,9 @@ mod tests {
                 Action::OrganizationRead,
                 Action::OrganizationListAll,
                 Action::UserListAll,
+                Action::UserDeviceList,
                 Action::MemberList,
+                Action::MemberAdminList,
                 Action::WorkspaceRead,
                 Action::WorkspaceList,
                 Action::WorkspaceMemberList,
@@ -1810,6 +1970,8 @@ mod tests {
                 Action::AuditRead,
                 Action::InstanceAuditRead,
                 Action::GrantList,
+                Action::OrganizationGrantList,
+                Action::OrganizationLockList,
                 Action::SharedWithMe,
                 Action::MemberSearch,
             ]

@@ -2,7 +2,7 @@
 
 use axum::{
     Extension, Json,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{Path, Query, State, rejection::JsonRejection, rejection::QueryRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -14,12 +14,14 @@ use craftcloud_db::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::audit::ctx as audit_ctx;
 use crate::client_ip::TrustedProxy;
+use crate::pagination::{PageQuery, decode_device_cursor, encode_device_cursor};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::services::{IpClass, Services};
 use crate::session::{AuthenticatedSession, CredentialKind, ambiguous_credentials};
@@ -610,6 +612,217 @@ pub(crate) async fn revoke(
     }
 }
 
+fn admin_device_ref(id: Uuid) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"craftcloud-admin-device-ref-v1\0");
+    digest.update(id.as_bytes());
+    let bytes = digest.finalize();
+    let mut out = String::with_capacity(67);
+    out.push_str("ds_");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+async fn find_active_by_ref(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    device_ref: &str,
+) -> Result<Option<device_sessions::DeviceSession>, DbError> {
+    let mut after = None;
+    loop {
+        let devices = device_sessions::list_active_page(pool, user_id, now, 100, after).await?;
+        if let Some(device) = devices
+            .iter()
+            .find(|device| admin_device_ref(device.id) == device_ref)
+        {
+            return Ok(Some(device.clone()));
+        }
+        let Some(last) = devices.last() else {
+            return Ok(None);
+        };
+        after = Some((last.created_at, last.id));
+        if devices.len() < 100 {
+            return Ok(None);
+        }
+    }
+}
+
+pub(crate) async fn admin_list(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path(user_raw): Path<String>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(response) = crate::orgs::operator_only(
+        &services,
+        &session,
+        craftcloud_core::policy::Action::UserDeviceList,
+        "admin.user_devices.list",
+        None,
+        &headers,
+    )
+    .await
+    {
+        return *response;
+    }
+    let Ok(Query(query)) = query else {
+        return validation_failed(&["query"], &headers);
+    };
+    let limit = match query.limit() {
+        Ok(limit) => limit,
+        Err(error) => return crate::orgs::page_error(error, &headers),
+    };
+    let Some(user_id) = Uuid::parse_str(&user_raw).ok() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "The requested resource does not exist.",
+            &headers,
+        );
+    };
+    match accounts::get(&services.pool, user_id).await {
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "The requested resource does not exist.",
+                &headers,
+            );
+        }
+        Err(error) => return db_failure(&error, &headers, "account lookup failed"),
+        Ok(Some(_)) => {}
+    }
+    let scope = user_id.to_string();
+    let after = match query
+        .cursor()
+        .map(|cursor| decode_device_cursor(cursor, &scope))
+    {
+        Some(Ok((at, device_ref))) => {
+            match find_active_by_ref(&services.pool, user_id, services.clock.now(), &device_ref)
+                .await
+            {
+                Ok(Some(device)) if device.created_at == at => Some((at, device.id)),
+                Ok(_) => {
+                    return crate::orgs::page_error(crate::pagination::PageError::Cursor, &headers);
+                }
+                Err(error) => return db_failure(&error, &headers, "device cursor lookup failed"),
+            }
+        }
+        Some(Err(error)) => return crate::orgs::page_error(error, &headers),
+        None => None,
+    };
+    let mut devices = match device_sessions::list_active_page(
+        &services.pool,
+        user_id,
+        services.clock.now(),
+        limit + 1,
+        after,
+    )
+    .await
+    {
+        Ok(devices) => devices,
+        Err(error) => return db_failure(&error, &headers, "device list failed"),
+    };
+    let has_more = devices.len() > limit as usize;
+    if has_more {
+        devices.truncate(limit as usize);
+    }
+    let next = devices
+        .last()
+        .filter(|_| has_more)
+        .map(|last| encode_device_cursor(&scope, last.created_at, &admin_device_ref(last.id)));
+    Json(json!({"devices":devices.iter().map(|device| json!({"device_ref":admin_device_ref(device.id),"name":device.name,"client_kind":device.client_kind,"client_id":device.client_id,"created_at":crate::orgs::rfc3339(device.created_at),"last_used_at":crate::orgs::rfc3339(device.last_used_at)})).collect::<Vec<_>>(),"next_cursor":next})).into_response()
+}
+
+pub(crate) async fn admin_revoke(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path((user_raw, device_ref)): Path<(String, String)>,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(response) = crate::orgs::operator_only(
+        &services,
+        &session,
+        craftcloud_core::policy::Action::UserDeviceRevoke,
+        "admin.user_device.revoke",
+        None,
+        &headers,
+    )
+    .await
+    {
+        return *response;
+    }
+    let Some(user_id) = Uuid::parse_str(&user_raw).ok() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "The requested resource does not exist.",
+            &headers,
+        );
+    };
+    match accounts::get(&services.pool, user_id).await {
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "The requested resource does not exist.",
+                &headers,
+            );
+        }
+        Err(error) => return db_failure(&error, &headers, "account lookup failed"),
+        Ok(Some(_)) => {}
+    }
+    let device = match find_active_by_ref(
+        &services.pool,
+        user_id,
+        services.clock.now(),
+        &device_ref,
+    )
+    .await
+    {
+        Ok(device) => device,
+        Err(error) => return db_failure(&error, &headers, "device lookup failed"),
+    };
+    let Some(device) = device else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "The requested resource does not exist.",
+            &headers,
+        );
+    };
+    match device_sessions::revoke_admin_owned(
+        &services.pool,
+        device.id,
+        user_id,
+        session.user_id,
+        services.clock.now(),
+        &audit_ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
+        Ok(Some(_leases_removed)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "The requested resource does not exist.",
+            &headers,
+        ),
+        Err(error) => db_failure(&error, &headers, "device revocation failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +847,23 @@ mod tests {
         );
         assert!(access <= idle && idle <= absolute);
         assert_eq!(idle, absolute);
+    }
+
+    #[test]
+    fn admin_device_cursor_contains_only_opaque_ref_and_timestamp() {
+        use base64::Engine as _;
+
+        let id = Uuid::new_v4();
+        let reference = admin_device_ref(id);
+        let cursor = encode_device_cursor("user-scope", OffsetDateTime::UNIX_EPOCH, &reference);
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&cursor);
+        assert_eq!(
+            decoded,
+            Ok(format!("v1|admin-devices|user-scope|0|{reference}").into_bytes())
+        );
+        assert_eq!(
+            decode_device_cursor(&cursor, "user-scope"),
+            Ok((OffsetDateTime::UNIX_EPOCH, reference))
+        );
     }
 }

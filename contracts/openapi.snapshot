@@ -6,6 +6,8 @@ GET /api/v1/admin/maintenance auth=cookie|bearer req=- ok=MaintenanceStatus code
 GET /api/v1/admin/organizations auth=cookie|bearer req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
 GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
+GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,500,503
+DELETE /api/v1/admin/users/{user_id}/devices/{device_ref} auth=cookie+csrf|bearer req=- ok=- codes=204,401,403,404,500,503
 POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,404,409,500,503
 POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
 DELETE /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
@@ -55,9 +57,11 @@ GET /api/v1/organizations/{org_id} auth=cookie|bearer req=- ok=Organization code
 PATCH /api/v1/organizations/{org_id} auth=cookie+csrf|bearer req=UpdateOrganizationRequest ok=Organization codes=200,400,401,403,404,412,413,415,422,428,500,503
 GET /api/v1/organizations/{org_id}/audit auth=cookie|bearer req=- ok=AuditEventPage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/audit/export auth=cookie|bearer req=- ok=- codes=200,400,401,403,404,422,500,503
+GET /api/v1/organizations/{org_id}/grants auth=cookie|bearer req=- ok=GrantPage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/invitations auth=cookie|bearer req=- ok=InvitationPage codes=200,400,401,403,404,422,500,503
 POST /api/v1/organizations/{org_id}/invitations auth=cookie+csrf|bearer req=CreateInvitationRequest ok=CreatedInvitation codes=201,400,401,403,404,409,413,415,422,429,500,503
 DELETE /api/v1/organizations/{org_id}/invitations/{invitation_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
+GET /api/v1/organizations/{org_id}/locks auth=cookie|bearer req=- ok=LockPage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/members auth=cookie|bearer req=- ok=MemberPage codes=200,400,401,403,404,422,429,500,503
 POST /api/v1/organizations/{org_id}/members auth=cookie+csrf|bearer req=AddMemberRequest ok=Member codes=201,400,401,403,404,409,413,415,422,500,503
 DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
@@ -95,7 +99,9 @@ AcceptInvitationRequest
 AcceptedInvitation
 AddMemberRequest
 AddWorkspaceMemberRequest
+AdminDevicePage
 AdminHealth
+AdminMember
 AdminUser
 AdminUserPage
 AuditEvent
@@ -123,11 +129,13 @@ FilePage
 Grant
 GrantChangeRequest
 GrantCreateRequest
+GrantPage
 HealthLevel
 Invitation
 InvitationPage
 IssuePasswordResetRequest
 LockAcquireRequest
+LockPage
 LoginRequest
 LoginResponse
 MaintenanceRun
@@ -136,6 +144,7 @@ Member
 MemberPage
 MyOrganizationPage
 Organization
+OrganizationLock
 OrganizationSummaryPage
 Project
 ProjectPage

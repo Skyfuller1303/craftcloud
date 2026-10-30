@@ -45,6 +45,32 @@ pub struct FileLock {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct OrganizationLock {
+    pub file_id: Uuid,
+    pub file_name: String,
+    pub workspace_id: Uuid,
+    pub holder_user_id: Uuid,
+    pub holder_display_name: String,
+    pub since: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+    pub session_kind: String,
+}
+
+pub async fn list_organization(
+    pool: &PgPool,
+    org_id: Uuid,
+    workspaces: &[Uuid],
+    workspace_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    limit: u32,
+    after: Option<(OffsetDateTime, Uuid)>,
+) -> Result<Vec<OrganizationLock>, DbError> {
+    Ok(sqlx::query_as::<_, OrganizationLock>(
+        "SELECT l.file_id,f.name AS file_name,f.workspace_id,l.holder_user_id,u.display_name AS holder_display_name,l.acquired_at AS since,l.expires_at,l.holder_session_kind AS session_kind FROM file_locks l JOIN files f ON f.org_id=l.org_id AND f.id=l.file_id JOIN users u ON u.id=l.holder_user_id WHERE l.org_id=$1 AND f.workspace_id=ANY($2) AND ($3::uuid IS NULL OR f.workspace_id=$3) AND ($4::uuid IS NULL OR l.holder_user_id=$4) AND l.expires_at>CURRENT_TIMESTAMP AND f.app<>'figcraft' AND ($5::timestamptz IS NULL OR (l.acquired_at,l.file_id)>($5,$6)) ORDER BY l.acquired_at,l.file_id LIMIT $7"
+    ).bind(org_id).bind(workspaces).bind(workspace_id).bind(user_id).bind(after.map(|x|x.0)).bind(after.map(|x|x.1)).bind(crate::organizations::clamp_page(limit)).fetch_all(pool).await?)
+}
+
 #[derive(Debug, Clone)]
 pub enum AcquireOutcome {
     Acquired {

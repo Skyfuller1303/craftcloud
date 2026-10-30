@@ -23,7 +23,7 @@ export function AppModal({
   title: string;
   onClose: () => void;
   busy?: boolean;
-  size?: "sm" | "md" | "lg";
+  size?: "sm" | "md" | "lg" | "side";
   children: ReactNode;
 }) {
   // The control that had focus when the dialog opened (read during the first
@@ -48,7 +48,7 @@ export function AppModal({
   );
   return (
     <ModalOverlay
-      className="overlay"
+      className={size === "side" ? "overlay overlay--side" : "overlay"}
       isOpen
       isDismissable={!busy}
       isKeyboardDismissDisabled={busy}

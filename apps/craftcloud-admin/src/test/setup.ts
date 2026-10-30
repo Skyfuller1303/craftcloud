@@ -31,6 +31,7 @@ if (typeof window !== "undefined") {
   HTMLCanvasElement.prototype.getContext = (() => null) as typeof HTMLCanvasElement.prototype.getContext;
 
   beforeEach(() => {
+    window.history.replaceState(null, "", "/admin");
     window.localStorage.clear();
     document.documentElement.removeAttribute("data-theme");
     document.documentElement.lang = "en";

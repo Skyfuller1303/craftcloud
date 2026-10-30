@@ -75,13 +75,24 @@ pub async fn list_all(
     after: Option<AfterKey>,
     unverified_only: bool,
 ) -> Result<Vec<AccountSummary>, DbError> {
+    list_all_search(pool, limit, after, unverified_only, None).await
+}
+
+pub async fn list_all_search(
+    pool: &PgPool,
+    limit: u32,
+    after: Option<AfterKey>,
+    unverified_only: bool,
+    query: Option<&str>,
+) -> Result<Vec<AccountSummary>, DbError> {
     Ok(sqlx::query_as::<_, AccountSummary>(
-        "SELECT u.id, u.normalized_email, u.display_name, u.created_at, u.disabled_at,                 u.email_verified_at, i.org_id AS origin_organization_id,                 i.created_by_user_id AS invited_by_user_id,                 u.created_via_invitation_id AS invitation_id          FROM users u LEFT JOIN invitations i ON i.id = u.created_via_invitation_id          WHERE ($4::boolean = false OR u.email_verified_at IS NULL)            AND ($1::timestamptz IS NULL OR (u.created_at, u.id) > ($1::timestamptz, $2::uuid))          ORDER BY u.created_at, u.id LIMIT $3",
+        "SELECT u.id, u.normalized_email, u.display_name, u.created_at, u.disabled_at, u.email_verified_at, i.org_id AS origin_organization_id, i.created_by_user_id AS invited_by_user_id, u.created_via_invitation_id AS invitation_id FROM users u LEFT JOIN invitations i ON i.id = u.created_via_invitation_id WHERE ($4::boolean = false OR u.email_verified_at IS NULL) AND ($5::text IS NULL OR position($5 in lower(u.display_name))>0 OR position($5 in u.normalized_email)>0) AND ($1::timestamptz IS NULL OR (u.created_at, u.id) > ($1::timestamptz, $2::uuid)) ORDER BY u.created_at, u.id LIMIT $3",
     )
     .bind(after.map(|(at, _)| at))
     .bind(after.map(|(_, id)| id))
     .bind(clamp_page(limit))
     .bind(unverified_only)
+    .bind(query)
     .fetch_all(pool)
     .await?)
 }

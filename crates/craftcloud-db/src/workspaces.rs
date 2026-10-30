@@ -196,6 +196,15 @@ pub async fn list(pool: &PgPool, scope: &OrgScope, limit: u32) -> Result<Vec<Wor
     .await?)
 }
 
+pub async fn ids(pool: &PgPool, scope: &OrgScope) -> Result<Vec<Uuid>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE org_id=$1 ORDER BY id")
+            .bind(scope.org_id())
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
 /// Lists the workspaces of the scoped organization that the user may see:
 /// all of them if `only_member_of` is `None` (organization owners and admins),
 /// otherwise only workspaces the user belongs to. Keyset paginated by

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "react-aria-components";
 import type { Organization, Project, ServerInfo, SessionInfo, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
@@ -6,7 +6,7 @@ import { ContextSelect } from "../components/ContextSelect.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Badge } from "../components/Badge.tsx";
 import { EmptyState } from "../components/EmptyState.tsx";
-import { Alert, ScreenHeading } from "../components/forms.tsx";
+import { Alert, Field, ScreenHeading } from "../components/forms.tsx";
 import { Preferences } from "../components/Preferences.tsx";
 import { useI18n } from "../i18n/index.tsx";
 import { useRoleNames } from "../roles.ts";
@@ -20,6 +20,7 @@ import { ProjectsScreen } from "./ProjectsScreen.tsx";
 import { SystemScreen } from "./SystemScreen.tsx";
 import { SharedWithMeScreen } from "./SharedWithMeScreen.tsx";
 import { TwoFactorSettingsScreen } from "./TwoFactorSettingsScreen.tsx";
+import { AdminGrantsScreen, AdminLocksScreen, AdminOperatorScreen, AdminOverview, AdminPeopleScreen, AdminWorkspacesScreen } from "./AdminScreens.tsx";
 
 /**
  * Dashboard sections. Settings follows with a later ticket and stays a
@@ -34,8 +35,22 @@ const CONTENT_SECTIONS = [
   "activity",
   "shared",
 ] as const;
-const ADMIN_SECTIONS = ["settings", "system"] as const;
+const ADMIN_SECTIONS = ["admin-overview", "admin-people", "admin-workspaces", "admin-grants", "admin-locks", "admin-activity", "org-settings", "settings", "instance-organizations", "instance-accounts", "system"] as const;
 type Section = (typeof CONTENT_SECTIONS)[number] | (typeof ADMIN_SECTIONS)[number];
+
+function sectionFromPath(path: string): Section {
+  const tail = path.replace(/\/+$/, "").split("/").at(-1) ?? "";
+  if (path.includes("/workspaces/") && (tail === "members" || tail === "invitations")) return tail;
+  if (path.includes("/organizations/") && tail === "activity") return "admin-activity";
+  const aliases: Record<string, Section> = { people: "admin-people", workspaces: "admin-workspaces", grants: "admin-grants", locks: "admin-locks", "org-settings": "org-settings", organizations: "instance-organizations", accounts: "instance-accounts", overview: "admin-overview", members: "admin-people", invitations: "admin-people", activity: "activity", settings: "settings", system: "system", projects: "projects", files: "files", shared: "shared" };
+  return aliases[tail] ?? "overview";
+}
+
+function contextFromPath(path: string, kind: "organizations" | "workspaces"): string | null {
+  const parts = path.split("/").filter(Boolean);
+  const index = parts.indexOf(kind);
+  return index >= 0 ? parts[index + 1] ?? null : null;
+}
 
 export function Shell({
   session,
@@ -52,9 +67,12 @@ export function Shell({
 }) {
   const { t } = useI18n();
   const { api, logout } = useAuth();
-  const [section, setSection] = useState<Section>("overview");
-  const [organizationId, setOrganizationId] = useState<string | null>(null);
-  const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  const [section, setSection] = useState<Section>(() => sectionFromPath(window.location.pathname));
+  const [organizationId, setOrganizationId] = useState<string | null>(() => contextFromPath(window.location.pathname, "organizations"));
+  const [workspaceId, setWorkspaceId] = useState<string | null>(() => contextFromPath(window.location.pathname, "workspaces"));
+  const [workspaceRouteResolved, setWorkspaceRouteResolved] = useState(() => !window.location.pathname.includes("/workspaces/"));
+  const historyNavigation = useRef(false);
+  const workspaceScopedRoute = useRef(window.location.pathname.startsWith("/admin/workspaces/"));
   const [projectId, setProjectId] = useState<string | null>(null);
   const names = useRoleNames();
   const [logoutError, setLogoutError] = useState<unknown>(null);
@@ -90,6 +108,31 @@ export function Shell({
     });
   }, [organizations.status, organizations.items, preferredOrganizationId]);
 
+  useEffect(() => {
+    if (workspaceId === null || workspaceRouteResolved || organizations.status !== "ready") return;
+    let live = true;
+    void (async () => {
+      let orgCursor: string | undefined;
+      do {
+        const orgPage = await api.listOrganizations(orgCursor);
+        for (const org of orgPage.items) {
+          let workspaceCursor: string | undefined;
+          do {
+            const page = await api.listWorkspaces(org.id, workspaceCursor);
+            if (page.items.some((item) => item.id === workspaceId)) {
+              if (live) { setOrganizationId(org.id); setWorkspaceRouteResolved(true); }
+              return;
+            }
+            workspaceCursor = page.next_cursor ?? undefined;
+          } while (workspaceCursor !== undefined);
+        }
+        orgCursor = orgPage.next_cursor ?? undefined;
+      } while (orgCursor !== undefined);
+      if (live) setWorkspaceRouteResolved(true);
+    })().catch(() => undefined);
+    return () => { live = false; };
+  }, [api, workspaceId, organizations.status, workspaceRouteResolved]);
+
   const loadWorkspaces = useMemo(
     () =>
       organizationId === null
@@ -100,6 +143,9 @@ export function Shell({
   const workspaces = usePagedList<Workspace>(loadWorkspaces);
 
   useEffect(() => {
+    if (organizations.status !== "ready") return;
+    if (workspaceId !== null && !workspaceRouteResolved) return;
+    if (workspaceId !== null && (!workspaceRouteResolved || workspaces.status !== "ready" || organizationId === null)) return;
     setWorkspaceId((current) => {
       if (workspaces.status !== "ready") {
         return current !== null && workspaces.items.some((ws) => ws.id === current) ? current : null;
@@ -125,9 +171,53 @@ export function Shell({
     activity: t("Activity"),
     shared: t("Shared with me"),
     system: t("System"),
+    "admin-overview": t("Overview"),
+    "admin-people": t("People"),
+    "admin-workspaces": t("Workspaces"),
+    "admin-grants": t("Grants"),
+    "admin-locks": t("Locks"),
+    "admin-activity": t("Activity"),
+    "org-settings": t("Organization settings"),
+    "instance-organizations": t("Organizations"),
+    "instance-accounts": t("Accounts"),
   };
   const isOperator = session.instance_role === "operator";
   const isGuest = organization?.role === "guest";
+  const orgAdmin = organization !== null && ["owner", "admin"].includes(organization.role);
+  const workspaceAdmin = workspace?.workspace_role === "admin";
+  const mayAdmin = orgAdmin || workspaceAdmin;
+  useEffect(() => {
+    const onPop = () => {
+      const path = window.location.pathname;
+      historyNavigation.current = true;
+      workspaceScopedRoute.current = path.startsWith("/admin/workspaces/");
+      setSection(sectionFromPath(path));
+      setOrganizationId(contextFromPath(path, "organizations"));
+      setWorkspaceId(contextFromPath(path, "workspaces"));
+      setWorkspaceRouteResolved(!path.includes("/workspaces/"));
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+  useEffect(() => {
+    if (historyNavigation.current) {
+      historyNavigation.current = false;
+      return;
+    }
+    if (organizations.status !== "ready") return;
+    if (workspaceId !== null && (!workspaceRouteResolved || workspaces.status !== "ready" || organizationId === null)) return;
+    const route = section.startsWith("instance-") || section === "system"
+      ? `/admin/${section === "instance-organizations" ? "organizations" : section === "instance-accounts" ? "accounts" : "system"}`
+      : section.startsWith("admin-") || section === "org-settings"
+        ? workspaceAdmin && (workspaceScopedRoute.current || !orgAdmin) && ["admin-grants", "admin-locks"].includes(section)
+          ? `/admin/workspaces/${workspaceId}/${section === "admin-grants" ? "grants" : "locks"}`
+          : `/admin/organizations/${organizationId ?? ""}/${section.replace(/^admin-/, "")}`
+        : section === "activity" && isOperator ? "/admin/activity"
+        : section === "overview" || section === "settings" ? `/admin/${section === "overview" ? "" : "settings"}`
+          : ["members", "invitations"].includes(section) && workspaceAdmin ? `/admin/workspaces/${workspaceId}/${section}`
+            : `/admin/organizations/${organizationId ?? ""}/${section}`;
+    if (window.location.pathname !== route) window.history.pushState(null, "", route);
+  }, [section, organizationId, workspaceId, orgAdmin, workspaceAdmin, organizations.status, workspaces.status, workspaceRouteResolved]);
   useEffect(() => {
     let current = true;
     if (organization?.require_two_factor !== true) {
@@ -145,24 +235,43 @@ export function Shell({
     workspaces.refresh();
   }, [organization?.require_two_factor, workspaces.refresh]);
   useEffect(() => {
-    if (needsTwoFactorSetup && section !== "settings" && section !== "system" && section !== "overview") {
+    if (needsTwoFactorSetup && section !== "settings" && section !== "system" && section !== "overview" && !(isOperator && section === "activity")) {
       setSection("settings");
     }
-  }, [needsTwoFactorSetup, section]);
+  }, [isOperator, needsTwoFactorSetup, section]);
   const limitedNavigation = isGuest || organization === null;
   useEffect(() => {
-    if (isGuest && !(section === "system" && isOperator) && !["overview", "shared", "settings"].includes(section)) {
+    if (isGuest && !(isOperator && (section.startsWith("instance-") || section === "system" || section === "activity")) && !["overview", "shared", "settings"].includes(section)) {
       setSection("shared");
     }
   }, [isGuest, isOperator, section]);
   const visibleContentSections = CONTENT_SECTIONS.filter((key) =>
-    key === "shared"
+    key === "overview"
+      ? !orgAdmin
+      : key === "shared"
       ? serverInfo?.features.includes("sharing.grants") === true
+      : key === "members"
+        ? workspace !== null
+        : key === "invitations"
+          ? workspaceAdmin
+      : key === "activity"
+        ? false
       : needsTwoFactorSetup
-        ? key === "overview"
-        : !limitedNavigation || key === "overview",
+        ? false
+        : !limitedNavigation,
   );
-  const visibleAdminSections = ADMIN_SECTIONS.filter((key) => key === "system" ? isOperator : true);
+  const visibleAdminSections = ADMIN_SECTIONS.filter((key) =>
+    key === "settings" ? true : key.startsWith("instance-") || key === "system" ? isOperator :
+      ["admin-grants", "admin-locks"].includes(key) ? mayAdmin : orgAdmin,
+  );
+  const validSection = visibleAdminSections.includes(section as (typeof ADMIN_SECTIONS)[number]) || visibleContentSections.includes(section as (typeof CONTENT_SECTIONS)[number]) || (section === "overview" && orgAdmin) || (section === "activity" && isOperator);
+  useEffect(() => {
+    if (workspaceId !== null && !workspaceRouteResolved) return;
+    if (organizations.status === "ready" && organizationId !== null && organization === null) return;
+    if (organizations.status === "ready" && !validSection) {
+      setSection(isOperator ? "instance-organizations" : "overview");
+    }
+  }, [validSection, isOperator, organizations.status, organizationId, organization]);
 
   return (
     <div className="shell">
@@ -179,6 +288,7 @@ export function Shell({
             choices={organizations.items.map((org) => ({ id: org.id, label: org.name }))}
             selectedId={organizationId}
             onSelect={(id) => {
+              workspaceScopedRoute.current = false;
               setOrganizationId(id);
               setWorkspaceId(null);
               setProjectId(null);
@@ -195,6 +305,7 @@ export function Shell({
             choices={workspaces.items.map((ws) => ({ id: ws.id, label: ws.name }))}
             selectedId={workspaceId}
             onSelect={(id) => {
+              workspaceScopedRoute.current = false;
               setWorkspaceId(id);
               setProjectId(null);
             }}
@@ -225,9 +336,30 @@ export function Shell({
                 </button>
               </li>
             ))}
+            {visibleAdminSections.includes("settings") && (
+              <li>
+                <button type="button" className="nav__item" aria-current={section === "settings" ? "page" : undefined} onClick={() => setSection("settings")}>
+                  {sectionLabel.settings}
+                </button>
+              </li>
+            )}
           </ul>
-          <ul>
-            {visibleAdminSections.map((key) => (
+          {visibleAdminSections.some((key) => ["admin-overview", "admin-people", "admin-workspaces", "admin-grants", "admin-locks", "admin-activity", "org-settings"].includes(key)) && <>
+            <h2 className="shell__nav-heading">{t("Administration")}</h2>
+            <ul>
+              {visibleAdminSections.filter((key) => ["admin-overview", "admin-people", "admin-workspaces", "admin-grants", "admin-locks", "admin-activity", "org-settings"].includes(key)).map((key) => (
+                <li key={key}>
+                  <button type="button" className="nav__item" aria-current={section === key ? "page" : undefined} onClick={() => setSection(key)}>
+                    {sectionLabel[key]}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </>}
+          {visibleAdminSections.some((key) => ["instance-organizations", "instance-accounts", "system"].includes(key)) && <>
+            <h2 className="shell__nav-heading">{t("Instance")}</h2>
+            <ul>
+              {visibleAdminSections.filter((key) => ["instance-organizations", "instance-accounts", "system"].includes(key)).map((key) => (
               <li key={key}>
                 <button
                   type="button"
@@ -238,8 +370,9 @@ export function Shell({
                   {sectionLabel[key]}
                 </button>
               </li>
-            ))}
-          </ul>
+              ))}
+            </ul>
+          </>}
         </nav>
 
         <main id="main" className="shell__main" tabIndex={-1}>
@@ -297,7 +430,25 @@ export function Shell({
             </Button>
           )}
 
-          {limitedNavigation && section !== "overview" && section !== "shared" && section !== "settings" && !(section === "system" && isOperator) ? (
+          {section === "admin-overview" ? (
+            <AdminOverview key={organizationId} organization={orgAdmin ? organization : null} workspaces={workspaces.items} />
+          ) : section === "admin-people" ? (
+            <AdminPeopleScreen key={organizationId} organization={orgAdmin ? organization : null} onChanged={organizations.refresh} />
+          ) : section === "admin-workspaces" ? (
+            <AdminWorkspacesScreen key={organizationId} organization={orgAdmin ? organization : null} workspaces={workspaces.items} hasMore={workspaces.hasMore} onLoadMore={workspaces.loadMore} onRefresh={workspaces.refresh} />
+          ) : section === "admin-grants" ? (
+            mayAdmin ? <AdminGrantsScreen key={`${organizationId}:${workspaceId}`} organization={organization} workspaces={workspaces.items} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : section === "admin-locks" ? (
+            mayAdmin ? <AdminLocksScreen key={`${organizationId}:${workspaceId}`} organization={organization} workspaces={workspaces.items} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : section === "admin-activity" ? (
+            orgAdmin ? <ActivityScreen key={organizationId} scope={scope} isOperator={isOperator} workspaces={workspaces.items} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : section === "org-settings" ? (
+            orgAdmin && organization !== null ? <OrganizationSettingsScreen organization={organization} onUpdated={(updated) => organizations.mutate((items) => items.map((item) => item.id === updated.id ? updated : item))} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : section === "instance-organizations" ? (
+            isOperator ? <AdminOperatorScreen key="organizations" section="organizations" /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : section === "instance-accounts" ? (
+            isOperator ? <AdminOperatorScreen key="accounts" section="accounts" /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : limitedNavigation && section !== "overview" && section !== "shared" && section !== "settings" && !(isOperator && (section === "system" || section === "activity")) ? (
             <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "overview" ? (
             <dl className="facts">
@@ -356,7 +507,13 @@ export function Shell({
               }}
             />
           ) : section === "system" ? (
-            <SystemScreen isOperator={isOperator} />
+            <>
+              <SystemScreen isOperator={isOperator} />
+              {isOperator && <section className="section">
+                <h2 className="section__title">{t("Instance activity")}</h2>
+                <Button className="button" onPress={() => setSection("activity")}>{t("Open activity log")}</Button>
+              </section>}
+            </>
           ) : section === "shared" ? (
             <SharedWithMeScreen organizationId={organizationId} />
           ) : (
@@ -364,6 +521,74 @@ export function Shell({
           )}
         </main>
       </div>
+    </div>
+  );
+}
+
+function OrganizationSettingsScreen({ organization, onUpdated }: { organization: Organization; onUpdated: (updated: Organization) => void }) {
+  const { t } = useI18n();
+  const { api } = useAuth();
+  const [name, setName] = useState(organization.name);
+  const [invites, setInvites] = useState(organization.workspace_admin_invites_enabled);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [twoFactorAvailable, setTwoFactorAvailable] = useState(false);
+  useEffect(() => {
+    setName(organization.name);
+    setInvites(organization.workspace_admin_invites_enabled);
+  }, [organization]);
+  useEffect(() => {
+    let live = true;
+    void api.serverInfo().then(
+      (info) => { if (live) setTwoFactorAvailable(info.feature_flags?.two_factor === true); },
+      () => { if (live) setTwoFactorAvailable(false); },
+    );
+    return () => { live = false; };
+  }, [api]);
+  async function save(patch: { name?: string; workspace_admin_invites_enabled?: boolean }) {
+    if (pending) return;
+    setPending(true);
+    setError(null);
+    try {
+      const updated = await api.updateOrganizationSettings(organization.id, organization.version, patch);
+      onUpdated(updated);
+    } catch (failure) {
+      setError(failure);
+      setName(organization.name);
+      setInvites(organization.workspace_admin_invites_enabled);
+    } finally {
+      setPending(false);
+    }
+  }
+  return (
+    <div className="stack">
+      <section className="section">
+        <h2 className="section__title">{t("Organization settings")}</h2>
+        {error !== null && <ErrorNotice error={error} />}
+        <Field label={t("Organization name")} name="organization-name" value={name} onChange={setName} />
+        <Button
+          className="button button--primary"
+          isDisabled={pending || name.trim() === "" || name === organization.name}
+          onPress={() => void save({ name: name.trim() })}
+        >
+          {t("Save name")}
+        </Button>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={invites}
+            disabled={pending}
+            onChange={(event) => {
+              setInvites(event.currentTarget.checked);
+              void save({ workspace_admin_invites_enabled: event.currentTarget.checked });
+            }}
+          />
+          <span>{t("Allow workspace admins to invite people")}</span>
+        </label>
+      </section>
+      {twoFactorAvailable
+        ? <TwoFactorSettingsScreen organization={organization} onFactorChanged={() => undefined} onOrganizationUpdated={onUpdated} />
+        : <p className="muted">{t("Two-factor policy is unavailable on this server.")}</p>}
     </div>
   );
 }

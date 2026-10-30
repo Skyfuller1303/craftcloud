@@ -709,4 +709,28 @@ mod tests {
             serde_json::json!(["integer", "null"])
         );
     }
+
+    #[test]
+    fn member_page_accepts_normal_and_admin_member_shapes() {
+        let doc = openapi();
+        let items = &doc["components"]["schemas"]["MemberPage"]["properties"]["items"]["items"];
+        assert!(items.get("oneOf").is_none());
+        let choices = items["anyOf"]
+            .as_array()
+            .expect("admin and ordinary members can overlap");
+        assert_eq!(choices.len(), 2);
+        let refs: BTreeSet<_> = choices
+            .iter()
+            .filter_map(|choice| choice["$ref"].as_str())
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                "#/components/schemas/Member",
+                "#/components/schemas/AdminMember"
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
 }

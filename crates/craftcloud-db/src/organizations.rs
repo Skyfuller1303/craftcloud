@@ -332,6 +332,12 @@ pub struct OrganizationSummary {
     pub created_at: OffsetDateTime,
     /// Number of active members.
     pub member_count: i64,
+    /// Committed bytes.
+    pub committed_bytes: i64,
+    /// Reserved bytes.
+    pub reserved_bytes: i64,
+    /// Organization quota.
+    pub quota_bytes: Option<i64>,
 }
 
 /// Lists all organizations (metadata only) ordered by `(created_at, id)`,
@@ -348,7 +354,8 @@ pub async fn list_all(
     Ok(sqlx::query_as::<_, OrganizationSummary>(
         "SELECT o.id, o.slug, o.name, o.created_at, \
                 (SELECT count(*) FROM organization_members m \
-                 WHERE m.org_id = o.id AND m.status = 'active') AS member_count \
+                 WHERE m.org_id = o.id AND m.status = 'active') AS member_count, \
+                o.committed_bytes, o.reserved_bytes, o.quota_bytes \
          FROM organizations o \
          WHERE ($1::timestamptz IS NULL OR (o.created_at, o.id) > ($1::timestamptz, $2::uuid)) \
          ORDER BY o.created_at, o.id LIMIT $3",

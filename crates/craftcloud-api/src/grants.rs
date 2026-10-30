@@ -15,10 +15,290 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use craftcloud_core::policy::{Action, Resource, can};
+use craftcloud_core::policy::{Action, Resource, WorkspaceMembership, can};
 use craftcloud_db::grants::{self, ChangeOutcome, CreateOutcome, GrantRole, Target, TargetKind};
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
+
+pub(crate) async fn organization_listing_scope(
+    services: &crate::Services,
+    user_id: Uuid,
+    org_id: Uuid,
+    workspace_id: Option<Uuid>,
+    action: Action,
+    action_name: &str,
+    headers: &HeaderMap,
+) -> Result<(craftcloud_db::OrgScope, Vec<Uuid>), Box<Response>> {
+    let mut actor = match crate::orgs::load_actor(services, user_id, Some(org_id)).await {
+        Ok(actor) => actor,
+        Err(error) => return Err(Box::new(db_failure(&error, headers, "actor lookup failed"))),
+    };
+    if let Some(workspace_id) = workspace_id {
+        match craftcloud_db::workspaces::org_of(&services.pool, workspace_id).await {
+            Ok(Some(workspace_org)) if workspace_org == org_id => {}
+            Ok(_) => return Err(Box::new(not_found(headers))),
+            Err(error) => {
+                return Err(Box::new(db_failure(
+                    &error,
+                    headers,
+                    "workspace lookup failed",
+                )));
+            }
+        }
+        let (membership, workspace) =
+            match craftcloud_db::workspaces::roles(&services.pool, org_id, workspace_id, user_id)
+                .await
+            {
+                Ok(roles) => roles,
+                Err(error) => {
+                    return Err(Box::new(db_failure(
+                        &error,
+                        headers,
+                        "workspace authorization lookup failed",
+                    )));
+                }
+            };
+        actor.membership =
+            membership.map(|role| craftcloud_core::policy::OrgMembership { org_id, role });
+        actor.workspace = workspace.map(|role| WorkspaceMembership { workspace_id, role });
+        let decision = can(
+            &actor,
+            action,
+            &Resource::Workspace {
+                org_id,
+                workspace_id,
+            },
+        );
+        let permit = match gate(
+            decision,
+            headers,
+            user_id,
+            action_name,
+            Some(org_id),
+            Some(workspace_id),
+        ) {
+            Gate::Open(permit) => permit,
+            Gate::Closed(response) => return Err(Box::new(response)),
+        };
+        let Some(scope) = craftcloud_db::OrgScope::from_permit(&permit) else {
+            return Err(Box::new(crate::responses::internal(headers)));
+        };
+        return Ok((scope, vec![workspace_id]));
+    }
+    let role = actor.membership.map(|m| m.role);
+    let (permit, workspaces) = match role {
+        Some(craftcloud_core::policy::OrgRole::Owner | craftcloud_core::policy::OrgRole::Admin) => {
+            let permit = match gate(
+                can(&actor, action, &Resource::Organization { org_id }),
+                headers,
+                user_id,
+                action_name,
+                Some(org_id),
+                None,
+            ) {
+                Gate::Open(permit) => permit,
+                Gate::Closed(response) => return Err(Box::new(response)),
+            };
+            let Some(scope) = craftcloud_db::OrgScope::from_permit(&permit) else {
+                return Err(Box::new(crate::responses::internal(headers)));
+            };
+            let ids = match craftcloud_db::workspaces::ids(&services.pool, &scope).await {
+                Ok(ids) => ids,
+                Err(error) => {
+                    return Err(Box::new(db_failure(
+                        &error,
+                        headers,
+                        "workspace listing failed",
+                    )));
+                }
+            };
+            (permit, ids)
+        }
+        Some(_) => {
+            let ids =
+                match craftcloud_db::members::admin_workspace_ids(&services.pool, org_id, user_id)
+                    .await
+                {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        return Err(Box::new(db_failure(
+                            &error,
+                            headers,
+                            "workspace authorization lookup failed",
+                        )));
+                    }
+                };
+            let mut allowed = None;
+            for id in &ids {
+                actor.workspace = Some(WorkspaceMembership {
+                    workspace_id: *id,
+                    role: craftcloud_core::policy::WorkspaceRole::Admin,
+                });
+                if let craftcloud_core::policy::Decision::Allow(permit) = can(
+                    &actor,
+                    action,
+                    &Resource::Workspace {
+                        org_id,
+                        workspace_id: *id,
+                    },
+                ) {
+                    allowed = Some(permit);
+                    break;
+                }
+            }
+            let Some(permit) = allowed else {
+                let decision = if actor.membership.is_none() {
+                    craftcloud_core::policy::Decision::Hidden
+                } else {
+                    craftcloud_core::policy::Decision::Forbidden
+                };
+                return match gate(decision, headers, user_id, action_name, Some(org_id), None) {
+                    Gate::Closed(response) => Err(Box::new(response)),
+                    Gate::Open(_) => Err(Box::new(crate::responses::internal(headers))),
+                };
+            };
+            (permit, ids)
+        }
+        None => {
+            return match gate(
+                can(&actor, action, &Resource::Organization { org_id }),
+                headers,
+                user_id,
+                action_name,
+                Some(org_id),
+                None,
+            ) {
+                Gate::Closed(response) => Err(Box::new(response)),
+                Gate::Open(_) => Err(Box::new(crate::responses::internal(headers))),
+            };
+        }
+    };
+    let Some(scope) = craftcloud_db::OrgScope::from_permit(&permit) else {
+        return Err(Box::new(crate::responses::internal(headers)));
+    };
+    Ok((scope, workspaces))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrganizationGrantQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+    workspace_id: Option<String>,
+    user_id: Option<String>,
+    target_kind: Option<String>,
+}
+
+pub(crate) async fn list_organization(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path(org_raw): Path<String>,
+    query: Result<Query<OrganizationGrantQuery>, QueryRejection>,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    let Some(org_id) = parse_id(&org_raw) else {
+        return not_found(&headers);
+    };
+    let Ok(Query(query)) = query else {
+        return validation_failed(&["query"], &headers);
+    };
+    let workspace_filter = match query.workspace_id.as_deref().map(parse_id) {
+        Some(Some(id)) => Some(id),
+        Some(None) => return validation_failed(&["workspace_id"], &headers),
+        None => None,
+    };
+    let user_filter = match query.user_id.as_deref().map(parse_id) {
+        Some(Some(id)) => Some(id),
+        Some(None) => return validation_failed(&["user_id"], &headers),
+        None => None,
+    };
+    let target_kind = match query.target_kind.as_deref() {
+        Some("file" | "project") => query.target_kind.as_deref(),
+        Some(_) => return validation_failed(&["target_kind"], &headers),
+        None => None,
+    };
+    let page = PageQuery {
+        limit: query.limit,
+        cursor: query.cursor,
+    };
+    let limit = match page.limit() {
+        Ok(v) => v,
+        Err(e) => return crate::orgs::page_error(e, &headers),
+    };
+    let (scope, workspace_ids) = match organization_listing_scope(
+        &services,
+        session.user_id,
+        org_id,
+        workspace_filter,
+        Action::OrganizationGrantList,
+        "organization.grants.list",
+        &headers,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(response) => return *response,
+    };
+    let cursor_scope = format!(
+        "{org_id}:{}:{}:{}",
+        workspace_filter.map_or_else(|| "*".to_owned(), |id| id.to_string()),
+        user_filter.map_or_else(|| "*".to_owned(), |id| id.to_string()),
+        target_kind.unwrap_or("*")
+    );
+    let after = match page
+        .cursor()
+        .map(|cursor| decode_time_cursor(cursor, "organization-grants", &cursor_scope))
+    {
+        Some(Ok(key)) => Some(key),
+        Some(Err(e)) => return crate::orgs::page_error(e, &headers),
+        None => None,
+    };
+    let mut rows = match grants::list_organization(
+        &services.pool,
+        &scope,
+        grants::OrganizationGrantList {
+            workspaces: &workspace_ids,
+            workspace_id: workspace_filter,
+            user_id: user_filter,
+            target_kind,
+            limit: limit + 1,
+            after,
+        },
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return db_failure(&error, &headers, "organization grants listing failed"),
+    };
+    let next = if rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+        rows.last().map(|row| {
+            encode_time_cursor(
+                "organization-grants",
+                &cursor_scope,
+                row.grant.created_at,
+                row.grant.id,
+            )
+        })
+    } else {
+        None
+    };
+    let items: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let mut item = grant_json(&row.grant);
+            if let Some(object) = item.as_object_mut() {
+                object.insert("target_name".to_owned(), json!(row.target_name));
+            }
+            item
+        })
+        .collect();
+    Json(json!({"items":items,"next_cursor":next})).into_response()
+}
 
 fn grant_json(grant: &grants::Grant) -> serde_json::Value {
     json!({"id":grant.id.to_string(),"organization_id":grant.org_id.to_string(),"workspace_id":grant.workspace_id.to_string(),"target_kind":grant.target_kind,"target_id":grant.target_id.to_string(),"grantee":{"user_id":grant.grantee_user_id.to_string(),"display_name":grant.display_name,"email":grant.email},"role":grant.role,"created_by":grant.created_by_user_id.to_string(),"created_at":rfc3339(grant.created_at),"version":grant.version})

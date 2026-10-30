@@ -116,6 +116,233 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn organization_grants_and_locks_are_scoped_filtered_and_paginated() {
+        let f = fixture("photocraft").await;
+        let (_, workspace_admin) = add_workspace_role(&f, "ac08-ws-admin", "admin").await;
+        let (grantee_id, _) = add_member(&f, "ac08-grantee").await;
+        let second_ws = call(
+            &f.env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/organizations/{}/workspaces", f.org),
+            )
+            .session(&f.owner)
+            .json(json!({"name":"Second workspace","slug":"ac08-second"})),
+        )
+        .await;
+        assert_eq!(second_ws.status, StatusCode::CREATED, "{}", second_ws.text);
+        let second_ws_id = uuid(&second_ws.body, "id");
+        let project = call(
+            &f.env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/workspaces/{second_ws_id}/projects"),
+            )
+            .session(&f.owner)
+            .json(json!({"name":"Other project"})),
+        )
+        .await;
+        assert_eq!(project.status, StatusCode::CREATED, "{}", project.text);
+        let other_file = call(
+            &f.env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/projects/{}/files", uuid(&project.body, "id")),
+            )
+            .session(&f.owner)
+            .json(json!({"name":"Other file","app":"photocraft","format":"native"})),
+        )
+        .await;
+        assert_eq!(
+            other_file.status,
+            StatusCode::CREATED,
+            "{}",
+            other_file.text
+        );
+        let other_file_id = uuid(&other_file.body, "id");
+        for file in [f.file, other_file_id] {
+            let grant = call(
+                &f.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/grants"))
+                    .session(&f.owner)
+                    .json(json!({"user_id":grantee_id.to_string(),"role":"viewer"})),
+            )
+            .await;
+            assert_eq!(grant.status, StatusCode::CREATED, "{}", grant.text);
+            let locked = call(
+                &f.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/lock"))
+                    .session(&f.owner)
+                    .json(json!({"client_id":"admin-console-test"})),
+            )
+            .await;
+            assert_eq!(locked.status, StatusCode::OK, "{}", locked.text);
+        }
+
+        let grants = call(
+            &f.env.app,
+            Req::new(
+                "GET",
+                &format!(
+                    "/api/v1/organizations/{}/grants?limit=1&target_kind=file",
+                    f.org
+                ),
+            )
+            .session(&f.owner),
+        )
+        .await;
+        assert_eq!(grants.status, StatusCode::OK, "{}", grants.text);
+        assert_eq!(grants.body["items"].as_array().unwrap().len(), 1);
+        let mut grant_targets = vec![(
+            grants.body["items"][0]["target_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            grants.body["items"][0]["target_name"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )];
+        assert!(grants.body["next_cursor"].is_string());
+        let cursor = grants.body["next_cursor"].as_str().unwrap();
+        let second_page = call(
+            &f.env.app,
+            Req::new(
+                "GET",
+                &format!(
+                    "/api/v1/organizations/{}/grants?limit=1&target_kind=file&cursor={cursor}",
+                    f.org
+                ),
+            )
+            .session(&f.owner),
+        )
+        .await;
+        assert_eq!(second_page.status, StatusCode::OK, "{}", second_page.text);
+        assert_eq!(second_page.body["items"].as_array().unwrap().len(), 1);
+        grant_targets.push((
+            second_page.body["items"][0]["target_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            second_page.body["items"][0]["target_name"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        ));
+        grant_targets.sort();
+        let mut expected_targets = vec![
+            (f.file.to_string(), "File".to_owned()),
+            (other_file_id.to_string(), "Other file".to_owned()),
+        ];
+        expected_targets.sort();
+        assert_eq!(grant_targets, expected_targets);
+        let filtered = call(
+            &f.env.app,
+            Req::new(
+                "GET",
+                &format!(
+                    "/api/v1/organizations/{}/grants?user_id={grantee_id}&workspace_id={}",
+                    f.org, f.workspace
+                ),
+            )
+            .session(&workspace_admin),
+        )
+        .await;
+        assert_eq!(filtered.status, StatusCode::OK, "{}", filtered.text);
+        assert_eq!(filtered.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            filtered.body["items"][0]["workspace_id"],
+            f.workspace.to_string()
+        );
+        let locks = call(
+            &f.env.app,
+            Req::new("GET", &format!("/api/v1/organizations/{}/locks", f.org))
+                .session(&workspace_admin),
+        )
+        .await;
+        assert_eq!(locks.status, StatusCode::OK, "{}", locks.text);
+        assert_eq!(locks.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(locks.body["items"][0]["file_id"], f.file.to_string());
+        assert_eq!(locks.body["items"][0]["session_kind"], "browser");
+        assert!(!locks.text.contains("session_id"));
+        let raw_session: Uuid =
+            sqlx::query_scalar("SELECT holder_session_id FROM file_locks WHERE file_id=$1")
+                .bind(f.file)
+                .fetch_one(&f.env.pool)
+                .await
+                .unwrap();
+        assert!(!locks.text.contains(&raw_session.to_string()));
+        let outsider_id = f.env.user("ac08-outsider").await;
+        let outsider = f.env.login_ok("ac08-outsider").await;
+        let hidden = call(
+            &f.env.app,
+            Req::new("GET", &format!("/api/v1/organizations/{}/grants", f.org)).session(&outsider),
+        )
+        .await;
+        assert_eq!(
+            hidden.status,
+            StatusCode::NOT_FOUND,
+            "outsider {outsider_id}: {}",
+            hidden.text
+        );
+        let operator = f.env.login_ok("op").await;
+        let foreign_owner_id = f.env.user("ac08-foreign-owner").await;
+        let foreign_owner = f.env.login_ok("ac08-foreign-owner").await;
+        let foreign_org = call(
+            &f.env.app,
+            Req::new("POST", "/api/v1/organizations")
+                .session(&operator)
+                .json(json!({"name":"Foreign org","slug":format!("ac08-foreign-{}", Uuid::new_v4().simple()),"owner_user_id":foreign_owner_id.to_string()})),
+        ).await;
+        assert_eq!(
+            foreign_org.status,
+            StatusCode::CREATED,
+            "{}",
+            foreign_org.text
+        );
+        let foreign_org_id = uuid(&foreign_org.body, "id");
+        let foreign_workspace = call(
+            &f.env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/organizations/{foreign_org_id}/workspaces"),
+            )
+            .session(&foreign_owner)
+            .json(json!({"name":"Foreign workspace","slug":"foreign"})),
+        )
+        .await;
+        assert_eq!(
+            foreign_workspace.status,
+            StatusCode::CREATED,
+            "{}",
+            foreign_workspace.text
+        );
+        for workspace_id in [uuid(&foreign_workspace.body, "id"), Uuid::new_v4()] {
+            for collection in ["grants", "locks"] {
+                let response = call(
+                    &f.env.app,
+                    Req::new(
+                        "GET",
+                        &format!(
+                            "/api/v1/organizations/{}/{collection}?workspace_id={workspace_id}",
+                            f.org
+                        ),
+                    )
+                    .session(&f.owner),
+                )
+                .await;
+                assert_eq!(
+                    response.status,
+                    StatusCode::NOT_FOUND,
+                    "{collection} {workspace_id}: {}",
+                    response.text
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn grant_crud_authorization_matrix_covers_organization_and_workspace_roles() {
         let f = fixture("photocraft").await;
         let operator = f.env.login_ok("op").await;

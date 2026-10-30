@@ -125,6 +125,21 @@ Der bestehende Instanz-Operator kann beim Ausstellen eines Passwortresetlinks op
 
 TOTP-Wiederholung, doppelte Recovery-Code-Nutzung, gleichzeitige Challenge-Einlösung, falsche Adresse oder Anmeldeart, Challenge-Ablauf und Versuchsgrenze, Passwortwechsel beziehungsweise Reset während einer Anmeldung sowie 2FA-Pflicht bei Grants und laufenden Uploads müssen serverseitig abgedeckt werden. Aktuelle Testergebnisse werden im AC-02-Abnahmebericht festgehalten.
 
+## AC-08: Organisations- und Instanzkonsole
+
+Die neuen Listen verwenden eigene zentrale Policy-Aktionen. Eine Operatorrolle ist kein Ersatz für eine Mitgliedschaft in einer Organisation. Workspace-Administratoren erhalten nur Zeilen aus Workspaces, in denen sie selbst Admin sind; diese Grenze wird in der Datenbankabfrage angewandt, nicht erst in der Oberfläche. Ein ausdrücklich angefragter fremder Workspace bleibt verborgen.
+
+| Aktion | Org-Owner/Admin | WS-Admin als Org-Mitglied | WS-Editor | WS-Viewer | Org-Mitglied ohne WS-Adminrolle | Gast | Operator ohne Org-Mitgliedschaft | Fremde Organisation |
+|---|---|---|---|---|---|---|---|---|
+| Verwaltungsfilter und Sicherheitsstatus in der Personenliste (`MemberAdminList`) | ja | 403 | 403 | 403 | 403 | 403 | 404 | 404 |
+| Organisationsfreigaben (`OrganizationGrantList`) | gesamte Organisation | nur eigene Admin-Workspaces | 403 | 403 | 403 | 403 | 404 | 404 |
+| Organisationssperren (`OrganizationLockList`) | gesamte Organisation | nur eigene Admin-Workspaces | 403 | 403 | 403 | 403 | 404 | 404 |
+| Fremde Geräte auflisten/widerrufen (`UserDeviceList`, `UserDeviceRevoke`) | nur mit zusätzlicher Operatorrolle | nur mit zusätzlicher Operatorrolle | nur mit zusätzlicher Operatorrolle | nur mit zusätzlicher Operatorrolle | nur mit zusätzlicher Operatorrolle | nur mit zusätzlicher Operatorrolle | ja | Instanzscope; kein Organisationsrecht |
+
+Die bestehende Mitgliedersuche für Freigaben behält ihre Rechte und Ratenbegrenzung; sie erhält durch AC-08 keinen Zugriff auf 2FA- oder Kontostatus. Geräteantworten verwenden eine opaque Verwaltungsreferenz statt der internen Sitzungs-ID. Der Operatorwiderruf verwendet dieselbe atomare Bereinigung der Sitzungssperren wie der eigene Gerätewiderruf, protokolliert aber den Operator als Akteur. Organisationsadmins sehen keine fremden Gerätenamen. Sperrenlisten nennen ausschließlich die Sitzungsart `browser` oder `device`. Die Einzelmutationen für Rollen, Mitgliedschaften, Einladungen, Freigaben und Force-Unlock behalten ihre bestehenden Policy-Prüfungen und Audit-Regeln.
+
+Entscheidungen und Vertragspräzisierungen: [ADR-0024](../09-decisions/adr-0024-admin-console.md). Rollenmatrix, HTTP- und Datenbankprüfungen sowie Browserbelege werden im AC-08-Abnahmebericht ausgewiesen; dieser Abschnitt allein ist kein Testnachweis.
+
 ## Allgemeine Negativtests
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.

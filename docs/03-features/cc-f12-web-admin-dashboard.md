@@ -5,6 +5,10 @@
 Gestaltung: verbindlich nach [Admin-UI-Designsystem](../11-design/README.md).
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+## AC-08: Organisationsverwaltung und Instanzkonsole
+
+AC-08 ergänzt lokal eine Organisationsverwaltung mit Übersicht, gefilterter Personenliste, einzeln ausgeführten Mehrfachaktionen, Einladungslisten, Personendetails, Workspaces, Freigaben, Sperren, Aktivität und Einstellungen. Der getrennte Instanzbereich bündelt Organisationen, Konten einschließlich Gerätewiderruf und Systemzustand. Workspace-Admins sehen ausschließlich Freigaben und Sperren ihrer eigenen Admin-Workspaces; Organisationsrechte vermitteln keinen Zugriff auf kontoweite Geräte. Die neuen Verträge und Sicherheitsgrenzen stehen in [ADR-0024](../09-decisions/adr-0024-admin-console.md) und der [Berechtigungsmatrix](../05-security/permission-matrix.md). Verifizierter Prüfstand und verbleibende Einschränkungen stehen im AC-08-Abnahmebericht; es wurde nichts veröffentlicht.
+
 ## Problem und Nutzen
 
 Das Webinterface ist Verwaltungswerkzeug: Setup, sichere Anmeldung, Org/Workspace-Auswahl, Projektliste, Dateien/Versionen, Mitglieder und Invites, Rollen/Quota, Storage-Health und Audit. Es soll den Craft-Stil in abstrahierten Tokens aufnehmen, aber keine fremden Assets kopieren. Für einen separaten Server ist React+TypeScript pragmatisch; NICHT in Rust-only Launcher integrieren.

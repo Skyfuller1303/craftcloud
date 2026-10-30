@@ -1,6 +1,7 @@
 //! Session-bound file edit leases.
 use crate::audit::{Change, commit_audited};
 use crate::orgs::{Gate, db_failure, gate, not_found, parse_id};
+use crate::pagination::{PageQuery, decode_time_cursor, encode_time_cursor};
 use crate::responses::{rejection_response, unavailable, validation_failed};
 use crate::workspaces::lock;
 use crate::{
@@ -20,6 +21,105 @@ use craftcloud_db::locks::{self, AcquireOutcome, LockSessionContext, LockSession
 use craftcloud_db::members::OrgTx;
 use serde::Deserialize;
 use serde_json::json;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrganizationLockQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+    workspace_id: Option<String>,
+    user_id: Option<String>,
+}
+
+pub(crate) async fn list_organization(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path(org_raw): Path<String>,
+    query: Result<
+        axum::extract::Query<OrganizationLockQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    let Some(org_id) = parse_id(&org_raw) else {
+        return not_found(&headers);
+    };
+    let Ok(axum::extract::Query(query)) = query else {
+        return validation_failed(&["query"], &headers);
+    };
+    let workspace_filter = match query.workspace_id.as_deref().map(parse_id) {
+        Some(Some(id)) => Some(id),
+        Some(None) => return validation_failed(&["workspace_id"], &headers),
+        None => None,
+    };
+    let user_filter = match query.user_id.as_deref().map(parse_id) {
+        Some(Some(id)) => Some(id),
+        Some(None) => return validation_failed(&["user_id"], &headers),
+        None => None,
+    };
+    let page = PageQuery {
+        limit: query.limit,
+        cursor: query.cursor,
+    };
+    let limit = match page.limit() {
+        Ok(v) => v,
+        Err(e) => return crate::orgs::page_error(e, &headers),
+    };
+    let (_scope, workspace_ids) = match crate::grants::organization_listing_scope(
+        &services,
+        session.user_id,
+        org_id,
+        workspace_filter,
+        Action::OrganizationLockList,
+        "organization.locks.list",
+        &headers,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(response) => return *response,
+    };
+    let cursor_scope = format!(
+        "{org_id}:{}:{}",
+        workspace_filter.map_or_else(|| "*".to_owned(), |id| id.to_string()),
+        user_filter.map_or_else(|| "*".to_owned(), |id| id.to_string())
+    );
+    let after = match page
+        .cursor()
+        .map(|cursor| decode_time_cursor(cursor, "organization-locks", &cursor_scope))
+    {
+        Some(Ok(key)) => Some(key),
+        Some(Err(e)) => return crate::orgs::page_error(e, &headers),
+        None => None,
+    };
+    let mut rows = match locks::list_organization(
+        &services.pool,
+        org_id,
+        &workspace_ids,
+        workspace_filter,
+        user_filter,
+        limit + 1,
+        after,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return db_failure(&error, &headers, "organization locks listing failed"),
+    };
+    let next = if rows.len() > limit as usize {
+        rows.truncate(limit as usize);
+        rows.last().map(|row| {
+            encode_time_cursor("organization-locks", &cursor_scope, row.since, row.file_id)
+        })
+    } else {
+        None
+    };
+    let items: Vec<_> = rows.iter().map(|row| json!({"file_id":row.file_id.to_string(),"file_name":row.file_name,"workspace_id":row.workspace_id.to_string(),"holder_user_id":row.holder_user_id.to_string(),"holder_display_name":row.holder_display_name,"since":crate::orgs::rfc3339(row.since),"expires_at":crate::orgs::rfc3339(row.expires_at),"session_kind":row.session_kind})).collect();
+    Json(json!({"items":items,"next_cursor":next})).into_response()
+}
 use uuid::Uuid;
 
 #[derive(Deserialize)]

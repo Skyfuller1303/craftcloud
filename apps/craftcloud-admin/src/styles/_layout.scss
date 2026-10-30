@@ -49,6 +49,14 @@
   ul + ul { margin-top: var(--space-3); padding-top: var(--space-3); border-top: var(--hairline) solid var(--line); }
   li { padding: 0 var(--space-3); }
 }
+.shell__nav-heading {
+  margin: var(--space-4) var(--space-4) var(--space-2);
+  color: var(--muted);
+  font-size: var(--text-small);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
 .shell__main {
   display: flex;
   flex: 1 1 0;
@@ -128,6 +136,7 @@
   .shell__nav { position: sticky; z-index: 5; top: 0; width: 100%; padding: 0; border-right: 0; border-bottom: var(--hairline) solid var(--line); background: var(--bg); }
   // Items wrap onto further rows instead of scrolling, so every section stays visible.
   .shell__nav ul, .shell__nav ul + ul { display: flex; flex-wrap: wrap; width: 100%; gap: 0; margin: 0; padding: 0; border: 0; }
+  .shell__nav-heading { flex: 0 0 100%; margin: var(--space-2) var(--space-3) 0; }
   .shell__nav li { flex: 0 0 auto; padding: 0; }
   .nav__item { width: auto; min-height: 40px; padding-inline: var(--space-3); white-space: nowrap; }
   .shell__nav + .shell__main { margin: 0; }

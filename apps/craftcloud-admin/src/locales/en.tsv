@@ -6,6 +6,10 @@
 # be split into separate source texts. `npm run i18n:check` compares all catalogues.
 
 # Errors
+	Administration	Administration
+	Instance	Instance
+	Instance activity	Instance activity
+	Open activity log	Open activity log
 	Something went wrong. Try again.	Something went wrong. Try again.
 	Reference: {id}	Reference: {id}
 	The request was rejected for security reasons. Reload the page and try again.	The request was rejected for security reasons. Reload the page and try again.
@@ -432,7 +436,6 @@
 	Search organization members	Search organization members
 	Searching…	Searching…
 	No members found.	No members found.
-	Role for {name}	Role for {name}
 	Remove access	Remove access
 	{name} will lose access to {target}.	{name} will lose access to {target}.
 	Shared with me	Shared with me
@@ -495,5 +498,114 @@
 	Password reset link	Password reset link
 	Copy this link now. It is shown once and expires at {expires}.	Copy this link now. It is shown once and expires at {expires}.
 	One-time reset link	One-time reset link
+	Active people	Active people
+	Open invitations	Open invitations
+	Storage used	Storage used
+	Active locks	Active locks
+	Two-factor coverage	Two-factor coverage
+	Some totals are incomplete because the listing limit was reached.	Some totals are incomplete because the listing limit was reached.
+	Workspace storage	Workspace storage
+	Used	Used
+	Recent activity	Recent activity
+	No recent activity.	No recent activity.
+	Loading person details…	Loading person details…
+	No workspace roles.	No workspace roles.
+	No received grants.	No received grants.
+	No held locks.	No held locks.
+	People	People
+	Workspaces	Workspaces
+	Grants	Grants
+	Locks	Locks
+	Organization settings	Organization settings
+	Organizations	Organizations
+	Accounts	Accounts
+	Search people	Search people
+	Search workspaces	Search workspaces
+	Enter at least two characters to search.	Enter at least two characters to search.
+	All roles	All roles
+	All statuses	All statuses
+	Any	Any
+	Sort by	Sort by
+	Newest first	Newest first
+	Oldest first	Oldest first
+	Name A to Z	Name A to Z
+	Name Z to A	Name Z to A
+	Select	Select
+	Select {name}	Select {name}
+	Invalid email address	Invalid email address
+	Enter no more than 50 addresses.	Enter no more than 50 addresses.
+	Invitation created	Invitation created
+	Done	Done
+	Change selected role to {role}	Change selected role to {role}
+	Remove selected	Remove selected
+	Email addresses, one per line	Email addresses, one per line
+	Invite people	Invite people
+	Send invitations	Send invitations
+	Sending invitations…	Sending invitations…
+	Batch results	Batch results
+	Workspace roles	Workspace roles
+	Quota in bytes	Quota in bytes
+	Save quota	Save quota
+	Quota for {name}	Quota for {name}
+	Enter a whole number of bytes.	Enter a whole number of bytes.
+	No workspaces found.	No workspaces found.
+	Target type	Target type
+	All target types	All target types
+	No active grants.	No active grants.
+	Loading grants…	Loading grants…
+	Revoke grant	Revoke grant
+	This person will lose access to the shared item.	This person will lose access to the shared item.
+	No active locks.	No active locks.
+	Loading locks…	Loading locks…
+	Holder	Holder
+	Session type	Session type
+	Device	Device
+	Browser	Browser
+	The holder will lose this editing lock immediately.	The holder will lose this editing lock immediately.
+	No organizations found.	No organizations found.
+	Loading overview…	Loading overview…
+	Storage	Storage
+	Quota	Quota
+	Search accounts	Search accounts
+	No accounts found.	No accounts found.
+	Loading accounts…	Loading accounts…
+	E-mail verified	E-mail verified
+	Yes	Yes
+	No	No
+	Disable	Disable
+	Enable	Enable
+	Reset password	Reset password
+	Some person details are incomplete because the listing limit was reached.	Some person details are incomplete because the listing limit was reached.
+	Devices for {name}	Devices for {name}
+	Revoke device	Revoke device
+	This device session will end and its editing locks will be released.	This device session will end and its editing locks will be released.
+	Disable account	Disable account
+	Enable account	Enable account
+	This account can sign in again.	This account can sign in again.
+	This revokes all sessions and blocks sign-in for this account.	This revokes all sessions and blocks sign-in for this account.
+	Unlimited	Unlimited
+	Save name	Save name
+	Allow workspace admins to invite people	Allow workspace admins to invite people
+	Two-factor policy is unavailable on this server.	Two-factor policy is unavailable on this server.
+	Active	Active
+	Invited	Invited
+	Disabled	Disabled
+	No people found.	No people found.
+	Remove selected members	Remove selected members
+	Selected people will lose access to this organization and its workspaces.	Selected people will lose access to this organization and its workspaces.
+	Slug	Slug
+	Remove workspace member	Remove workspace member
+	Received grants	Received grants
+	Held locks	Held locks
+	Last activity	Last activity
+	Role for {name}	Role for {name}
+	Create workspace	Create workspace
+	All people	All people
+	Workspace name	Workspace name
+	Workspace name for {name}	Workspace name for {name}
+	Loading storage quotas…	Loading storage quotas…
+	Quota unavailable	Quota unavailable
+	Since	Since
+	Account	Account
 
 # Two-factor authentication (AC-02)

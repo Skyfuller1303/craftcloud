@@ -35,22 +35,34 @@ pub(crate) struct UserListQuery {
     limit: Option<String>,
     cursor: Option<String>,
     unverified: Option<String>,
+    query: Option<String>,
 }
 
 impl UserListQuery {
     /// Paging parameters and the `unverified` filter (`true` or `false`).
-    pub(crate) fn split(self) -> Result<(PageQuery, bool), PageError> {
+    pub(crate) fn split(self) -> Result<(PageQuery, bool, Option<String>), PageError> {
         let unverified = match self.unverified.as_deref() {
             None | Some("false") => false,
             Some("true") => true,
             Some(_) => return Err(PageError::Limit),
         };
+        let query = self
+            .query
+            .map(|query| query.trim().to_lowercase())
+            .filter(|query| !query.is_empty());
+        if query
+            .as_ref()
+            .is_some_and(|query| query.chars().count() < 2 || query.chars().count() > 100)
+        {
+            return Err(PageError::Limit);
+        }
         Ok((
             PageQuery {
                 limit: self.limit,
                 cursor: self.cursor,
             },
             unverified,
+            query,
         ))
     }
 }
@@ -163,9 +175,58 @@ pub(crate) fn decode_time_cursor(
     Ok((at, id))
 }
 
+/// Cursor for an active device listing. It carries the public opaque reference,
+/// never the session UUID used by the database keyset query.
+pub(crate) fn encode_device_cursor(scope: &str, at: OffsetDateTime, device_ref: &str) -> String {
+    encode(&[
+        "v1",
+        "admin-devices",
+        scope,
+        &micros(at).to_string(),
+        device_ref,
+    ])
+}
+
+pub(crate) fn decode_device_cursor(
+    cursor: &str,
+    scope: &str,
+) -> Result<(OffsetDateTime, String), PageError> {
+    let fields = decode(cursor, "admin-devices", scope, 2)?;
+    let (Some(at), Some(device_ref)) = (fields.first(), fields.get(1)) else {
+        return Err(PageError::Cursor);
+    };
+    let at = at
+        .parse::<i128>()
+        .ok()
+        .and_then(from_micros)
+        .ok_or(PageError::Cursor)?;
+    let valid_ref = device_ref.strip_prefix("ds_").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !valid_ref {
+        return Err(PageError::Cursor);
+    }
+    Ok((at, device_ref.clone()))
+}
+
 /// Cursor of a listing ordered by a number (newest first).
 pub(crate) fn encode_number_cursor(kind: &str, scope: &str, number: i64) -> String {
     encode(&["v1", kind, scope, &number.to_string()])
+}
+
+pub(crate) fn encode_id_cursor(kind: &str, scope: &str, id: Uuid) -> String {
+    encode(&["v1", kind, scope, &id.to_string()])
+}
+
+pub(crate) fn decode_id_cursor(cursor: &str, kind: &str, scope: &str) -> Result<Uuid, PageError> {
+    let fields = decode(cursor, kind, scope, 1)?;
+    fields
+        .first()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or(PageError::Cursor)
 }
 
 pub(crate) fn decode_number_cursor(

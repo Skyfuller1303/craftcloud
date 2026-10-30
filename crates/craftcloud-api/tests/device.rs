@@ -16,6 +16,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::StatusCode;
+    use base64::Engine as _;
     use bytes::Bytes;
     use craftcloud_api::{ApiConfig, AuthSettings};
     use serde_json::{Value, json};
@@ -672,6 +673,259 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "REFRESH_TOKEN_INVALID",
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn operator_device_refs_hide_session_ids_and_revoke_leases() {
+        let env = device_test_env().await;
+        let owner_id = env.user("ac08-device-owner").await;
+        let owner = env.login_ok("ac08-device-owner").await;
+        let operator = env.login_ok("op").await;
+        let org = create_org(&env, &operator, owner_id).await;
+        let workspace = call(
+            &env.app,
+            Req::new("POST", &format!("/api/v1/organizations/{org}/workspaces"))
+                .session(&owner)
+                .json(json!({"name":"Device workspace","slug":"device"})),
+        )
+        .await;
+        assert_eq!(workspace.status, StatusCode::CREATED, "{}", workspace.text);
+        let project = call(
+            &env.app,
+            Req::new(
+                "POST",
+                &format!(
+                    "/api/v1/workspaces/{}/projects",
+                    workspace.body["id"].as_str().unwrap()
+                ),
+            )
+            .session(&owner)
+            .json(json!({"name":"Device project"})),
+        )
+        .await;
+        assert_eq!(project.status, StatusCode::CREATED, "{}", project.text);
+        let file = call(
+            &env.app,
+            Req::new(
+                "POST",
+                &format!(
+                    "/api/v1/projects/{}/files",
+                    project.body["id"].as_str().unwrap()
+                ),
+            )
+            .session(&owner)
+            .json(json!({"name":"Device file","app":"photocraft","format":"native"})),
+        )
+        .await;
+        assert_eq!(file.status, StatusCode::CREATED, "{}", file.text);
+
+        let logged_device = device_login(&env, "ac08-device-owner@example.test", PASSWORD).await;
+        assert_eq!(
+            logged_device.status,
+            StatusCode::OK,
+            "{}",
+            logged_device.text
+        );
+        let token = access(&logged_device);
+        let device_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL",
+        )
+        .bind(owner_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        let lock = call(
+            &env.app,
+            bearer(
+                "POST",
+                &format!("/api/v1/files/{}/lock", file.body["id"].as_str().unwrap()),
+                &token,
+            )
+            .json(json!({"client_id":"photocraft"})),
+        )
+        .await;
+        assert_eq!(lock.status, StatusCode::OK, "{}", lock.text);
+
+        let now = time::OffsetDateTime::now_utc();
+        let mut old_device_ids = Vec::new();
+        for i in 0..105_i64 {
+            let id = Uuid::new_v4();
+            old_device_ids.push(id);
+            let refresh_a = Uuid::new_v4();
+            let refresh_b = Uuid::new_v4();
+            let access_a = Uuid::new_v4();
+            let access_b = Uuid::new_v4();
+            let mut refresh_hash = [0; 32];
+            refresh_hash[..16].copy_from_slice(refresh_a.as_bytes());
+            refresh_hash[16..].copy_from_slice(refresh_b.as_bytes());
+            let mut access_hash = [0; 32];
+            access_hash[..16].copy_from_slice(access_a.as_bytes());
+            access_hash[16..].copy_from_slice(access_b.as_bytes());
+            sqlx::query("INSERT INTO device_sessions (id,user_id,name,client_kind,client_id,refresh_hash,refresh_family,access_hash,access_expires_at,created_at,last_used_at,idle_expires_at,absolute_expires_at) VALUES ($1,$2,'Historical device','cli','test-cli',$3,$4,$5,$6,$7,$7,$8,$9)")
+                .bind(id).bind(owner_id).bind(refresh_hash.as_slice()).bind(Uuid::new_v4())
+                .bind(access_hash.as_slice()).bind(now + time::Duration::days(1))
+                .bind(now - time::Duration::seconds(1000 + i)).bind(now + time::Duration::days(2))
+                .bind(now + time::Duration::days(3)).execute(&env.pool).await.unwrap();
+        }
+        let admin_list = call(
+            &env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/admin/users/{owner_id}/devices?limit=100"),
+            )
+            .session(&operator),
+        )
+        .await;
+        assert_eq!(admin_list.status, StatusCode::OK, "{}", admin_list.text);
+        assert_eq!(admin_list.body["devices"].as_array().unwrap().len(), 100);
+        let next_cursor = admin_list.body["next_cursor"].as_str().unwrap().to_owned();
+        let decoded_cursor = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&next_cursor)
+            .unwrap();
+        let decoded_cursor = String::from_utf8(decoded_cursor).unwrap();
+        let anchor_id = old_device_ids[98];
+        assert!(!decoded_cursor.contains(&anchor_id.to_string()));
+        assert!(
+            decoded_cursor.contains(
+                admin_list.body["devices"][99]["device_ref"]
+                    .as_str()
+                    .unwrap()
+            )
+        );
+        let second_page = call(
+            &env.app,
+            Req::new(
+                "GET",
+                &format!(
+                    "/api/v1/admin/users/{owner_id}/devices?limit=100&cursor={}",
+                    next_cursor
+                ),
+            )
+            .session(&operator),
+        )
+        .await;
+        assert_eq!(second_page.status, StatusCode::OK, "{}", second_page.text);
+        assert_eq!(second_page.body["devices"].as_array().unwrap().len(), 6);
+        let buried = &second_page.body["devices"][5];
+        let buried_id = old_device_ids[104];
+        assert!(!second_page.text.contains(&buried_id.to_string()));
+        let buried_revoke = call(
+            &env.app,
+            Req::new(
+                "DELETE",
+                &format!(
+                    "/api/v1/admin/users/{owner_id}/devices/{}",
+                    buried["device_ref"].as_str().unwrap()
+                ),
+            )
+            .session(&operator),
+        )
+        .await;
+        assert_eq!(
+            buried_revoke.status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            buried_revoke.text
+        );
+        let buried_revoked: bool =
+            sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM device_sessions WHERE id=$1")
+                .bind(buried_id)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert!(buried_revoked);
+        let revoked_anchor = call(
+            &env.app,
+            Req::new(
+                "DELETE",
+                &format!(
+                    "/api/v1/admin/users/{owner_id}/devices/{}",
+                    admin_list.body["devices"][99]["device_ref"]
+                        .as_str()
+                        .unwrap()
+                ),
+            )
+            .session(&operator),
+        )
+        .await;
+        assert_eq!(
+            revoked_anchor.status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            revoked_anchor.text
+        );
+        let invalidated = call(
+            &env.app,
+            Req::new(
+                "GET",
+                &format!(
+                    "/api/v1/admin/users/{owner_id}/devices?limit=100&cursor={}",
+                    admin_list.body["next_cursor"].as_str().unwrap()
+                ),
+            )
+            .session(&operator),
+        )
+        .await;
+        assert_eq!(
+            invalidated.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            invalidated.text
+        );
+        assert_eq!(invalidated.code(), "INVALID_CURSOR");
+        let row = &admin_list.body["devices"][0];
+        assert!(row["device_ref"].as_str().unwrap().starts_with("ds_"));
+        assert!(!admin_list.text.contains(&device_id.to_string()));
+        for secret_field in ["session_id", "access_token", "refresh_token", "token"] {
+            assert!(
+                !admin_list.text.contains(secret_field),
+                "{secret_field}: {}",
+                admin_list.text
+            );
+        }
+        let denied = call(
+            &env.app,
+            Req::new("GET", &format!("/api/v1/admin/users/{owner_id}/devices")).session(&owner),
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN, "{}", denied.text);
+
+        let revoked = call(
+            &env.app,
+            Req::new(
+                "DELETE",
+                &format!(
+                    "/api/v1/admin/users/{owner_id}/devices/{}",
+                    row["device_ref"].as_str().unwrap()
+                ),
+            )
+            .session(&operator),
+        )
+        .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.text);
+        assert_eq!(
+            env.count(&format!(
+                "SELECT count(*) FROM file_locks WHERE file_id='{}'",
+                file.body["id"].as_str().unwrap()
+            ))
+            .await,
+            0
+        );
+        let (actor, target, leases): (Uuid, Uuid, i64) = sqlx::query_as("SELECT actor_id,target_id,(details->>'leases_removed')::bigint FROM audit_events WHERE action='admin.user_device_revoked' AND actor_id=$1 AND target_id=$2 ORDER BY created_at DESC,id DESC LIMIT 1")
+            .bind(env.operator_id).bind(owner_id).fetch_one(&env.pool).await.unwrap();
+        let device_revoked: bool = sqlx::query_scalar(
+            "SELECT revoked_at IS NOT NULL FROM device_sessions WHERE id=$1 AND user_id=$2",
+        )
+        .bind(device_id)
+        .bind(owner_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        assert!(device_revoked);
+        assert_eq!(actor, env.operator_id);
+        assert_eq!(target, owner_id);
+        assert_eq!(leases, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

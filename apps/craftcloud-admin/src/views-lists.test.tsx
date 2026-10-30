@@ -120,7 +120,7 @@ describe("lists across pages", () => {
     await user.click(screen.getByRole("button", { name: "Create invitation" }));
     await screen.findByLabelText("Link");
 
-    const orgButton = screen.getByRole("button", { name: /Organization/ });
+    const orgButton = screen.getByRole("button", { name: `${ORG_A.name} Organization` });
     orgButton.focus();
     await user.keyboard("{Enter}");
     await user.click(await screen.findByRole("option", { name: ORG_B.name }));

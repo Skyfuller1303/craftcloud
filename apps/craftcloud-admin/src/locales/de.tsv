@@ -4,6 +4,10 @@
 # Escapes: \t \n \r \\ . `npm run i18n:check` meldet fehlende und überzählige Einträge.
 
 # Errors
+	Administration	Verwaltung
+	Instance	Instanz
+	Instance activity	Aktivitäten der Instanz
+	Open activity log	Aktivitätsprotokoll öffnen
 	Something went wrong. Try again.	Etwas ist schiefgelaufen. Versuche es erneut.
 	Reference: {id}	Referenz: {id}
 	The request was rejected for security reasons. Reload the page and try again.	Die Anfrage wurde aus Sicherheitsgründen abgelehnt. Lade die Seite neu und versuche es erneut.
@@ -430,7 +434,6 @@
 	Search organization members	Organisationsmitglieder suchen
 	Searching…	Suche läuft …
 	No members found.	Keine Mitglieder gefunden.
-	Role for {name}	Rolle für {name}
 	Remove access	Zugriff entfernen
 	{name} will lose access to {target}.	{name} verliert den Zugriff auf {target}.
 	Shared with me	Für mich freigegeben
@@ -493,3 +496,112 @@
 	Password reset link	Passwort-Zurücksetzlink
 	Copy this link now. It is shown once and expires at {expires}.	Kopiere diesen Link jetzt. Er wird nur einmal angezeigt und läuft ab: {expires}.
 	One-time reset link	Einmaliger Zurücksetzlink
+	Active people	Aktive Personen
+	Open invitations	Offene Einladungen
+	Storage used	Belegter Speicher
+	Active locks	Aktive Sperren
+	Two-factor coverage	Abdeckung der Zwei-Faktor-Anmeldung
+	Some totals are incomplete because the listing limit was reached.	Einige Summen sind unvollständig, weil das Listenlimit erreicht wurde.
+	Workspace storage	Workspace-Speicher
+	Used	Belegt
+	Recent activity	Letzte Aktivität
+	No recent activity.	Keine aktuelle Aktivität.
+	Loading person details…	Personendetails werden geladen …
+	No workspace roles.	Keine Workspace-Rollen.
+	No received grants.	Keine erhaltenen Freigaben.
+	No held locks.	Keine aktiven Sperren.
+	People	Personen
+	Workspaces	Workspaces
+	Grants	Freigaben
+	Locks	Sperren
+	Organization settings	Organisationseinstellungen
+	Organizations	Organisationen
+	Accounts	Konten
+	Search people	Personen suchen
+	Search workspaces	Workspaces suchen
+	Enter at least two characters to search.	Gib mindestens zwei Zeichen ein.
+	All roles	Alle Rollen
+	All statuses	Alle Status
+	Any	Beliebig
+	Sort by	Sortieren nach
+	Newest first	Neueste zuerst
+	Oldest first	Älteste zuerst
+	Name A to Z	Name A bis Z
+	Name Z to A	Name Z bis A
+	Select	Auswählen
+	Select {name}	{name} auswählen
+	Invalid email address	Ungültige E-Mail-Adresse
+	Enter no more than 50 addresses.	Gib höchstens 50 Adressen ein.
+	Invitation created	Einladung erstellt
+	Done	Erledigt
+	Change selected role to {role}	Rolle der Auswahl auf {role} ändern
+	Remove selected	Auswahl entfernen
+	Email addresses, one per line	E-Mail-Adressen, eine je Zeile
+	Invite people	Personen einladen
+	Send invitations	Einladungen senden
+	Sending invitations…	Einladungen werden gesendet …
+	Batch results	Ergebnisse der Sammelaktion
+	Workspace roles	Workspace-Rollen
+	Quota in bytes	Kontingent in Byte
+	Save quota	Kontingent speichern
+	Quota for {name}	Kontingent für {name}
+	Enter a whole number of bytes.	Gib eine ganze Anzahl Byte ein.
+	No workspaces found.	Keine Workspaces gefunden.
+	Target type	Zielart
+	All target types	Alle Zielarten
+	No active grants.	Keine aktiven Freigaben.
+	Loading grants…	Freigaben werden geladen …
+	Revoke grant	Freigabe widerrufen
+	This person will lose access to the shared item.	Diese Person verliert den Zugriff auf das geteilte Element.
+	No active locks.	Keine aktiven Sperren.
+	Loading locks…	Sperren werden geladen …
+	Holder	Halter
+	Session type	Sitzungsart
+	Device	Gerät
+	Browser	Browser
+	The holder will lose this editing lock immediately.	Der Halter verliert diese Bearbeitungssperre sofort.
+	No organizations found.	Keine Organisationen gefunden.
+	Loading overview…	Übersicht wird geladen …
+	Storage	Speicher
+	Quota	Kontingent
+	Search accounts	Konten suchen
+	No accounts found.	Keine Konten gefunden.
+	Loading accounts…	Konten werden geladen …
+	E-mail verified	E-Mail bestätigt
+	Yes	Ja
+	No	Nein
+	Disable	Deaktivieren
+	Enable	Aktivieren
+	Reset password	Passwort zurücksetzen
+	Some person details are incomplete because the listing limit was reached.	Einige Personendetails sind unvollständig, weil das Listenlimit erreicht wurde.
+	Devices for {name}	Geräte von {name}
+	Revoke device	Gerät widerrufen
+	This device session will end and its editing locks will be released.	Diese Gerätesitzung wird beendet und ihre Bearbeitungssperren werden aufgehoben.
+	Disable account	Konto deaktivieren
+	Enable account	Konto aktivieren
+	This account can sign in again.	Dieses Konto kann sich wieder anmelden.
+	This revokes all sessions and blocks sign-in for this account.	Damit werden alle Sitzungen widerrufen und Anmeldungen für dieses Konto gesperrt.
+	Unlimited	Unbegrenzt
+	Save name	Namen speichern
+	Allow workspace admins to invite people	Workspace-Admins dürfen Personen einladen
+	Two-factor policy is unavailable on this server.	Die Richtlinie zur Zwei-Faktor-Anmeldung ist auf diesem Server nicht verfügbar.
+	Active	Aktiv
+	Invited	Eingeladen
+	Disabled	Deaktiviert
+	No people found.	Keine Personen gefunden.
+	Remove selected members	Ausgewählte Personen entfernen
+	Selected people will lose access to this organization and its workspaces.	Ausgewählte Personen verlieren den Zugriff auf diese Organisation und ihre Workspaces.
+	Slug	Kurzname
+	Remove workspace member	Workspace-Mitglied entfernen
+	Received grants	Erhaltene Freigaben
+	Held locks	Gehaltene Sperren
+	Last activity	Letzte Aktivität
+	Role for {name}	Rolle für {name}
+	Create workspace	Workspace erstellen
+	All people	Alle Personen
+	Workspace name	Workspace-Name
+	Workspace name for {name}	Name des Workspaces {name}
+	Loading storage quotas…	Speicherkontingente werden geladen …
+	Quota unavailable	Kontingent nicht verfügbar
+	Since	Seit
+	Account	Konto

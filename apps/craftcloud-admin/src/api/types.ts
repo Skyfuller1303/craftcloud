@@ -138,6 +138,36 @@ export interface OrgMember {
   email: string;
   role: OrgRole;
   joined_at: string;
+  status?: "active" | "invited" | "disabled";
+  account_disabled?: boolean;
+  two_factor_enabled?: boolean;
+}
+
+export interface OrganizationGrant extends ShareGrant { target_name: string; }
+export interface OrganizationLock {
+  file_id: Uuid; file_name: string; workspace_id: Uuid; holder_user_id: Uuid;
+  holder_display_name: string; since: string; expires_at: string; session_kind: "browser" | "device";
+}
+export interface WorkspaceUsage {
+  workspace_id: Uuid; effective_limit_bytes: number | null; quota_bytes: number | null;
+  reserved_bytes: number; committed_bytes: number;
+}
+export interface UsageEntry { quota_bytes: number | null; reserved_bytes: number; committed_bytes: number; }
+export interface OrganizationUsage { organization: UsageEntry; workspaces: WorkspaceUsage[]; next_cursor: string | null; }
+export interface AdminOrganization {
+  id: Uuid; slug: string; name: string; member_count: number; created_at: string;
+  committed_bytes: number; reserved_bytes: number; quota_bytes: number | null;
+}
+export interface AdminUser {
+  id: Uuid; email: string; display_name: string; created_at: string; disabled: boolean;
+  email_verified: boolean; origin: { organization_id: Uuid | null; invited_by_user_id: Uuid | null; invitation_id: Uuid } | null;
+}
+export interface AdminDevice {
+  device_ref: string; name: string; client_kind: string; client_id: string; created_at: string; last_used_at: string;
+}
+export interface AdminDevicePage {
+  devices: AdminDevice[];
+  next_cursor: string | null;
 }
 
 export interface WorkspaceMember {
@@ -276,6 +306,7 @@ export interface SharedItem {
 
 export interface ServerInfo {
   features: string[];
+  feature_flags?: { two_factor?: boolean; grants?: boolean; locks?: boolean };
 }
 
 export interface CreateFileRequest {

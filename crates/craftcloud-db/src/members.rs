@@ -50,6 +50,15 @@ pub struct Member {
     pub joined_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct AdminMember {
+    #[sqlx(flatten)]
+    pub member: Member,
+    pub status: String,
+    pub account_disabled: bool,
+    pub two_factor_enabled: bool,
+}
+
 impl Member {
     /// The parsed role.
     #[must_use]
@@ -104,6 +113,79 @@ pub async fn search(
     .bind(scope.org_id()).bind(query).bind(after.map(|x|x.0)).bind(after.map(|x|x.1)).bind(clamp_page(limit)).fetch_all(pool).await?)
 }
 
+pub struct AdminMemberList<'a> {
+    pub query: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub two_factor: Option<bool>,
+    pub sort: &'a str,
+    pub limit: u32,
+    pub after_id: Option<Uuid>,
+}
+
+pub async fn list_admin(
+    pool: &PgPool,
+    scope: &OrgScope,
+    page: AdminMemberList<'_>,
+) -> Result<Vec<AdminMember>, DbError> {
+    let AdminMemberList {
+        query,
+        role,
+        status,
+        two_factor,
+        sort,
+        limit,
+        after_id,
+    } = page;
+    let order = match sort {
+        "joined_desc" => "m.created_at DESC,m.user_id DESC",
+        "name_asc" => "lower(u.display_name),m.created_at,m.user_id",
+        "name_desc" => "lower(u.display_name) DESC,m.created_at DESC,m.user_id DESC",
+        _ => "m.created_at,m.user_id",
+    };
+    let after = match sort {
+        "joined_desc" => {
+            "(m.created_at,m.user_id)<(SELECT m2.created_at,m2.user_id FROM organization_members m2 WHERE m2.org_id=m.org_id AND m2.user_id=$6)"
+        }
+        "name_asc" => {
+            "(lower(u.display_name),m.created_at,m.user_id)>(SELECT lower(u2.display_name),m2.created_at,m2.user_id FROM organization_members m2 JOIN users u2 ON u2.id=m2.user_id WHERE m2.org_id=m.org_id AND m2.user_id=$6)"
+        }
+        "name_desc" => {
+            "(lower(u.display_name),m.created_at,m.user_id)<(SELECT lower(u2.display_name),m2.created_at,m2.user_id FROM organization_members m2 JOIN users u2 ON u2.id=m2.user_id WHERE m2.org_id=m.org_id AND m2.user_id=$6)"
+        }
+        _ => {
+            "(m.created_at,m.user_id)>(SELECT m2.created_at,m2.user_id FROM organization_members m2 WHERE m2.org_id=m.org_id AND m2.user_id=$6)"
+        }
+    };
+    let sql = format!(
+        "SELECT u.id AS user_id,u.display_name,u.normalized_email AS email,m.role,m.created_at AS joined_at,CASE WHEN u.disabled_at IS NOT NULL OR m.status='disabled' THEN 'disabled' ELSE m.status END AS status,(u.disabled_at IS NOT NULL) AS account_disabled,EXISTS(SELECT 1 FROM user_two_factor tf WHERE tf.user_id=u.id AND tf.enabled_at IS NOT NULL) AS two_factor_enabled FROM organization_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=$1 AND ($2::text IS NULL OR position($2 in lower(u.display_name))>0 OR position($2 in u.normalized_email)>0) AND ($3::text IS NULL OR m.role=$3) AND ($4::text IS NULL OR $4='all' OR ($4='disabled' AND (m.status='disabled' OR u.disabled_at IS NOT NULL)) OR ($4<>'disabled' AND m.status=$4 AND u.disabled_at IS NULL)) AND ($5::boolean IS NULL OR EXISTS(SELECT 1 FROM user_two_factor tf WHERE tf.user_id=u.id AND tf.enabled_at IS NOT NULL)=$5) AND ($6::uuid IS NULL OR {after}) ORDER BY {order} LIMIT $7"
+    );
+    Ok(sqlx::query_as::<_, AdminMember>(&sql)
+        .bind(scope.org_id())
+        .bind(query)
+        .bind(role)
+        .bind(status)
+        .bind(two_factor)
+        .bind(after_id)
+        .bind(crate::organizations::clamp_page(limit))
+        .fetch_all(pool)
+        .await?)
+}
+
+pub async fn admin_cursor_exists(
+    pool: &PgPool,
+    scope: &OrgScope,
+    user_id: Uuid,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM organization_members WHERE org_id=$1 AND user_id=$2)",
+    )
+    .bind(scope.org_id())
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 pub async fn can_manage_grants(
     pool: &PgPool,
     org_id: Uuid,
@@ -111,6 +193,15 @@ pub async fn can_manage_grants(
 ) -> Result<bool, DbError> {
     Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM organization_members m WHERE m.org_id=$1 AND m.user_id=$2 AND m.status='active' AND m.role IN ('owner','admin')) OR EXISTS(SELECT 1 FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id AND w.org_id=wm.org_id JOIN organization_members m ON m.org_id=wm.org_id AND m.user_id=wm.user_id AND m.status='active' AND m.role <> 'guest' WHERE wm.org_id=$1 AND wm.user_id=$2 AND wm.role IN ('admin','editor'))")
         .bind(org_id).bind(user_id).fetch_one(pool).await?)
+}
+
+pub async fn admin_workspace_ids(
+    pool: &PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, DbError> {
+    Ok(sqlx::query_scalar("SELECT wm.workspace_id FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id AND w.org_id=wm.org_id JOIN organization_members m ON m.org_id=wm.org_id AND m.user_id=wm.user_id AND m.status='active' AND m.role NOT IN ('owner','admin','guest') WHERE wm.org_id=$1 AND wm.user_id=$2 AND wm.role='admin' ORDER BY wm.workspace_id")
+        .bind(org_id).bind(user_id).fetch_all(pool).await?)
 }
 
 /// Result of [`OrgTx::add`].

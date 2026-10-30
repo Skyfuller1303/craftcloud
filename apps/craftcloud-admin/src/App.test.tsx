@@ -252,14 +252,14 @@ describe("organization and workspace selectors", () => {
     renderApp(fetch);
     await waitFor(() => expect(screen.getAllByRole("definition")[2]?.textContent).toContain(`${WS_1.name}Admin`));
 
-    const workspaceButton = screen.getByRole("button", { name: /Workspace/ });
+    const workspaceButton = screen.getByRole("button", { name: `${WS_1.name} Workspace` });
     workspaceButton.focus();
     await user.keyboard("{Enter}");
     const workspaceOption = await screen.findByRole("option", { name: WS_2.name });
     await user.click(workspaceOption);
     await waitFor(() => expect(screen.getAllByRole("definition")[2]?.textContent).toContain(`${WS_2.name}Viewer`));
 
-    const orgButton = screen.getByRole("button", { name: /Organization/ });
+    const orgButton = screen.getByRole("button", { name: `${ORG_A.name} Organization` });
     orgButton.focus();
     await user.keyboard("{Enter}");
     await user.click(await screen.findByRole("option", { name: ORG_B.name }));
@@ -557,7 +557,7 @@ describe("accessibility (axe-core)", () => {
     renderApp(fetch, { language: "de" });
     await waitFor(() => expect(screen.getAllByRole("definition")[2]?.textContent).toContain(`${WS_1.name}Administrator`));
     await expectNoAxeViolations();
-    await user.click(screen.getByRole("button", { name: /Organisation/ }));
+    await user.click(screen.getByRole("button", { name: `${ORG_A.name} Organisation` }));
     await screen.findByRole("option", { name: ORG_B.name });
     await expectNoAxeViolations();
   });

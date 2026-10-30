@@ -120,6 +120,13 @@ pub struct SharedWithMeItem {
     pub file_name: Option<String>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct OrganizationGrant {
+    #[sqlx(flatten)]
+    pub grant: Grant,
+    pub target_name: String,
+}
+
 const SELECT: &str = "SELECT g.id,g.org_id,g.workspace_id,g.target_kind,g.target_id,g.grantee_user_id,u.display_name,u.normalized_email AS email,g.role,g.created_by_user_id,g.created_at,g.revoked_at,g.version FROM grants g JOIN users u ON u.id=g.grantee_user_id";
 
 pub async fn locate(pool: &PgPool, id: Uuid) -> Result<Option<(Target, Uuid, i64, bool)>, DbError> {
@@ -147,6 +154,28 @@ pub async fn locate(pool: &PgPool, id: Uuid) -> Result<Option<(Target, Uuid, i64
 pub async fn list(pool: &PgPool, scope: &OrgScope, target: Target) -> Result<Vec<Grant>, DbError> {
     Ok(sqlx::query_as::<_, Grant>(&format!("{SELECT} WHERE g.org_id=$1 AND g.workspace_id=$2 AND g.target_kind=$3 AND g.target_id=$4 AND g.revoked_at IS NULL ORDER BY g.created_at,g.id"))
         .bind(scope.org_id()).bind(target.workspace_id).bind(target.kind.as_str()).bind(target.id).fetch_all(pool).await?)
+}
+
+pub struct OrganizationGrantList<'a> {
+    pub workspaces: &'a [Uuid],
+    pub workspace_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub target_kind: Option<&'a str>,
+    pub limit: u32,
+    pub after: Option<(OffsetDateTime, Uuid)>,
+}
+
+pub async fn list_organization(
+    pool: &PgPool,
+    scope: &OrgScope,
+    page: OrganizationGrantList<'_>,
+) -> Result<Vec<OrganizationGrant>, DbError> {
+    Ok(sqlx::query_as::<_, OrganizationGrant>(
+        "SELECT g.id,g.org_id,g.workspace_id,g.target_kind,g.target_id,g.grantee_user_id,u.display_name,u.normalized_email AS email,g.role,g.created_by_user_id,g.created_at,g.revoked_at,g.version, CASE g.target_kind WHEN 'file' THEN f.name ELSE p.name END AS target_name FROM grants g JOIN users u ON u.id=g.grantee_user_id LEFT JOIN files f ON g.target_kind='file' AND f.org_id=g.org_id AND f.workspace_id=g.workspace_id AND f.id=g.target_id LEFT JOIN projects p ON g.target_kind='project' AND p.org_id=g.org_id AND p.workspace_id=g.workspace_id AND p.id=g.target_id WHERE g.org_id=$1 AND g.revoked_at IS NULL AND g.workspace_id=ANY($2) AND ($3::uuid IS NULL OR g.workspace_id=$3) AND ($4::uuid IS NULL OR g.grantee_user_id=$4) AND ($5::text IS NULL OR g.target_kind=$5) AND ($6::timestamptz IS NULL OR (g.created_at,g.id)>($6,$7)) ORDER BY g.created_at,g.id LIMIT $8"
+    )
+    .bind(scope.org_id()).bind(page.workspaces).bind(page.workspace_id).bind(page.user_id).bind(page.target_kind)
+    .bind(page.after.map(|x|x.0)).bind(page.after.map(|x|x.1)).bind(crate::organizations::clamp_page(page.limit))
+    .fetch_all(pool).await?)
 }
 pub async fn role_for(
     pool: &PgPool,

@@ -904,14 +904,15 @@ paths:
       tags: [Members]
       summary: List the members of an organization (any member)
       description: >-
-        Ordered by join time and user id (stable, keyset paginated); cursors contain only a timestamp and ids, never
-        names or e-mail addresses. Only active members are listed. The optional `query` searches names and e-mail
-        addresses and requires grant-management rights in at least one workspace (403 otherwise); searches are rate limited per user (429). Non-members and
-        unknown organizations answer 404.
+        Without administrative filters, preserves the existing active-member list and response shape. Any of `role`, `status`, `two_factor`, or `sort` requires an organization owner or admin and returns administrative status fields; status defaults to `all` in that mode. Sort is allow-listed and keyset paginated with cursors bound to organization and filters; cursors contain ids, never names or e-mail addresses. The optional `query` searches names and e-mail addresses, requires grant-management rights in at least one workspace (403 otherwise), and is rate limited per user (429). Non-members and unknown organizations answer 404.
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
         - {in: query, name: query, required: false, schema: {type: string, minLength: 2, maxLength: 100}}
+        - {in: query, name: role, required: false, schema: {type: string, enum: [owner, admin, member, guest]}}
+        - {in: query, name: status, required: false, schema: {type: string, enum: [active, invited, disabled, all]}}
+        - {in: query, name: two_factor, required: false, schema: {type: string, enum: [enabled, disabled]}}
+        - {in: query, name: sort, required: false, schema: {type: string, enum: [joined_asc, joined_desc, name_asc, name_desc]}}
       responses:
         '200':
           description: One page
@@ -1176,6 +1177,10 @@ paths:
           name: unverified
           required: false
           schema: {type: boolean, default: false}
+        - in: query
+          name: query
+          required: false
+          schema: {type: string, minLength: 2, maxLength: 100}
       responses:
         '200':
           description: One page
@@ -1185,6 +1190,99 @@ paths:
         '400': {$ref: '#/components/responses/InvalidCursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users/{user_id}/devices:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [Admin]
+      summary: List one account's active device sessions (operator only)
+      description: Returns device metadata and opaque device_ref values. Never returns session ids or credentials.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200':
+          description: Active devices
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminDevicePage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users/{user_id}/devices/{device_ref}:
+    parameters:
+      - in: path
+        name: user_id
+        required: true
+        schema: {type: string, format: uuid}
+      - in: path
+        name: device_ref
+        required: true
+        schema: {type: string, pattern: '^ds_[a-f0-9]{64}$'}
+    delete:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Revoke one account device session (operator only)
+      description: Revokes the matching device session, deletes its file leases, and audits the operator actor.
+      responses:
+        '204': {description: Revoked; no response body}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/grants:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Organizations]
+      summary: List active grants in an organization
+      description: Owners/admins see all workspaces; workspace admins see only their own admin workspaces. Other members get 403; non-members and unknown organizations get 404. Cursor binds org and filters.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/WorkspaceIdQuery'}
+        - {$ref: '#/components/parameters/UserIdQuery'}
+        - {in: query, name: target_kind, required: false, schema: {type: string, enum: [project, file]}}
+      responses:
+        '200': {description: One page, newest first, content: {application/json: {schema: {$ref: '#/components/schemas/GrantPage'}}}}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/locks:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Organizations]
+      summary: List active file locks in an organization
+      description: Owners/admins see all workspaces; workspace admins see only their own admin workspaces. Responses omit session ids and credentials.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+        - {$ref: '#/components/parameters/WorkspaceIdQuery'}
+        - {$ref: '#/components/parameters/UserIdQuery'}
+      responses:
+        '200': {description: One page, oldest first, content: {application/json: {schema: {$ref: '#/components/schemas/LockPage'}}}}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -2990,6 +3088,16 @@ components:
       required: false
       schema: {type: string}
       description: Opaque cursor from next_cursor of the previous page; bound to the listing and scope (400 INVALID_CURSOR otherwise).
+    WorkspaceIdQuery:
+      in: query
+      name: workspace_id
+      required: false
+      schema: {type: string, format: uuid}
+    UserIdQuery:
+      in: query
+      name: user_id
+      required: false
+      schema: {type: string, format: uuid}
     AuditAction:
       in: query
       name: action
@@ -3324,12 +3432,15 @@ components:
           maxItems: 100
           items:
             type: object
-            required: [id, slug, name, member_count, created_at]
+            required: [id, slug, name, member_count, committed_bytes, reserved_bytes, quota_bytes, created_at]
             properties:
               id: {type: string, format: uuid}
               slug: {type: string}
               name: {type: string}
               member_count: {type: integer}
+              committed_bytes: {type: integer, format: int64, minimum: 0}
+              reserved_bytes: {type: integer, format: int64, minimum: 0}
+              quota_bytes: {type: [integer, 'null'], format: int64, minimum: 0}
               created_at: {type: string, format: date-time}
         next_cursor: {type: [string, 'null']}
     Member:
@@ -3348,8 +3459,56 @@ components:
         items:
           type: array
           maxItems: 100
-          items: {$ref: '#/components/schemas/Member'}
+          items:
+            anyOf:
+              - {$ref: '#/components/schemas/Member'}
+              - {$ref: '#/components/schemas/AdminMember'}
         next_cursor: {type: [string, 'null']}
+    AdminMember:
+      allOf:
+        - {$ref: '#/components/schemas/Member'}
+        - type: object
+          required: [status, account_disabled, two_factor_enabled]
+          properties:
+            status: {type: string, enum: [active, invited, disabled]}
+            account_disabled: {type: boolean}
+            two_factor_enabled: {type: boolean}
+    GrantPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            allOf:
+              - {$ref: '#/components/schemas/Grant'}
+              - type: object
+                required: [target_name]
+                properties:
+                  target_name: {type: string}
+        next_cursor: {type: [string, 'null']}
+    LockPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/OrganizationLock'}
+        next_cursor: {type: [string, 'null']}
+    OrganizationLock:
+      type: object
+      required: [file_id, file_name, workspace_id, holder_user_id, holder_display_name, since, expires_at, session_kind]
+      properties:
+        file_id: {type: string, format: uuid}
+        file_name: {type: string}
+        workspace_id: {type: string, format: uuid}
+        holder_user_id: {type: string, format: uuid}
+        holder_display_name: {type: string}
+        since: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        session_kind: {type: string, enum: [browser, device]}
     CreateOrganizationRequest:
       type: object
       additionalProperties: false
@@ -3889,6 +4048,24 @@ components:
           type: array
           maxItems: 100
           items: {$ref: '#/components/schemas/AdminUser'}
+        next_cursor: {type: [string, 'null']}
+    AdminDevicePage:
+      type: object
+      required: [devices, next_cursor]
+      properties:
+        devices:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [device_ref, name, client_kind, client_id, created_at, last_used_at]
+            properties:
+              device_ref: {type: string, pattern: '^ds_[a-f0-9]{64}$'}
+              name: {type: string}
+              client_kind: {type: string}
+              client_id: {type: string}
+              created_at: {type: string, format: date-time}
+              last_used_at: {type: string, format: date-time}
         next_cursor: {type: [string, 'null']}
     CreateInvitationRequest:
       type: object

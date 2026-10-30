@@ -217,6 +217,29 @@ pub async fn list_active(
         .bind(user_id).bind(now).fetch_all(pool).await?)
 }
 
+/// List one bounded page of active sessions, newest first.
+pub async fn list_active_page(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    limit: u32,
+    after: Option<(OffsetDateTime, Uuid)>,
+) -> Result<Vec<DeviceSession>, DbError> {
+    let rows = match after {
+        Some((created_at, id)) => sqlx::query_as::<_, DeviceSession>(
+            "SELECT id,user_id,name,client_kind,client_id,created_at,last_used_at,idle_expires_at,absolute_expires_at,access_expires_at FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL AND idle_expires_at>$2 AND absolute_expires_at>$2 AND (created_at,id)<($3,$4) ORDER BY created_at DESC,id DESC LIMIT $5",
+        )
+        .bind(user_id).bind(now).bind(created_at).bind(id).bind(i64::from(limit))
+        .fetch_all(pool).await?,
+        None => sqlx::query_as::<_, DeviceSession>(
+            "SELECT id,user_id,name,client_kind,client_id,created_at,last_used_at,idle_expires_at,absolute_expires_at,access_expires_at FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL AND idle_expires_at>$2 AND absolute_expires_at>$2 ORDER BY created_at DESC,id DESC LIMIT $3",
+        )
+        .bind(user_id).bind(now).bind(i64::from(limit))
+        .fetch_all(pool).await?,
+    };
+    Ok(rows)
+}
+
 pub async fn revoke_owned(
     pool: &PgPool,
     id: Uuid,
@@ -225,28 +248,98 @@ pub async fn revoke_owned(
     reason: &str,
     audit: &AuditCtx,
 ) -> Result<bool, DbError> {
+    Ok(revoke_owned_inner(
+        pool,
+        id,
+        RevokeContext {
+            user_id,
+            actor_id: user_id,
+            now,
+            reason,
+            audit,
+            mode: RevokeAuditMode::Owner,
+        },
+    )
+    .await?
+    .0)
+}
+
+#[derive(Clone, Copy)]
+enum RevokeAuditMode {
+    Owner,
+    Operator,
+}
+
+struct RevokeContext<'a> {
+    user_id: Uuid,
+    actor_id: Uuid,
+    now: OffsetDateTime,
+    reason: &'a str,
+    audit: &'a AuditCtx,
+    mode: RevokeAuditMode,
+}
+
+async fn revoke_owned_inner(
+    pool: &PgPool,
+    id: Uuid,
+    context: RevokeContext<'_>,
+) -> Result<(bool, u64), DbError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
-        .bind(user_id)
+        .bind(context.user_id)
         .fetch_optional(&mut *tx)
         .await?;
     let changed=sqlx::query("UPDATE device_sessions SET revoked_at=$3,revoke_reason=$4,access_hash=NULL,access_expires_at=NULL WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL")
-        .bind(id).bind(user_id).bind(now).bind(reason).execute(&mut *tx).await?.rows_affected()==1;
-    if changed {
-        crate::locks::delete_for_session_tx(&mut tx, id).await?;
+        .bind(id).bind(context.user_id).bind(context.now).bind(context.reason).execute(&mut *tx).await?.rows_affected()==1;
+    let leases_removed = if changed {
+        let count = crate::locks::delete_for_session_tx(&mut tx, id).await?;
         let by = AuditCtx {
-            actor_id: Some(user_id),
-            request_id: audit.request_id.clone(),
+            actor_id: Some(context.actor_id),
+            request_id: context.audit.request_id.clone(),
         };
-        record_in(
-            &mut tx,
-            &by,
-            &NewEvent::new("auth.device_revoked").target("device_session", id),
-        )
-        .await?;
-    }
+        let event = if matches!(context.mode, RevokeAuditMode::Operator) {
+            NewEvent::new("admin.user_device_revoked")
+                .target("user", context.user_id)
+                .detail(
+                    "leases_removed",
+                    crate::audit::Detail::Count(i64::try_from(count).unwrap_or(i64::MAX)),
+                )
+        } else {
+            NewEvent::new("auth.device_revoked").target("device_session", id)
+        };
+        record_in(&mut tx, &by, &event).await?;
+        count
+    } else {
+        0
+    };
     tx.commit().await?;
-    Ok(changed)
+    Ok((changed, leases_removed))
+}
+
+pub async fn revoke_admin_owned(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    actor_id: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<Option<u64>, DbError> {
+    let (changed, leases_removed) = revoke_owned_inner(
+        pool,
+        id,
+        RevokeContext {
+            user_id,
+            actor_id,
+            now,
+            // Persisted reasons are constrained by migration 0015. The audit
+            // mode retains the more specific operator attribution.
+            reason: "security",
+            audit,
+            mode: RevokeAuditMode::Operator,
+        },
+    )
+    .await?;
+    Ok(changed.then_some(leases_removed))
 }
 
 pub async fn revoke_current(
