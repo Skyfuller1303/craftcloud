@@ -38,13 +38,22 @@ pub(crate) struct UserListQuery {
     query: Option<String>,
 }
 
+/// The parameter of the operator's account listing that was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserListError {
+    /// `unverified` is neither `true` nor `false`.
+    Unverified,
+    /// `query` is shorter than 2 or longer than 100 characters.
+    Query,
+}
+
 impl UserListQuery {
     /// Paging parameters and the `unverified` filter (`true` or `false`).
-    pub(crate) fn split(self) -> Result<(PageQuery, bool, Option<String>), PageError> {
+    pub(crate) fn split(self) -> Result<(PageQuery, bool, Option<String>), UserListError> {
         let unverified = match self.unverified.as_deref() {
             None | Some("false") => false,
             Some("true") => true,
-            Some(_) => return Err(PageError::Limit),
+            Some(_) => return Err(UserListError::Unverified),
         };
         let query = self
             .query
@@ -54,7 +63,7 @@ impl UserListQuery {
             .as_ref()
             .is_some_and(|query| query.chars().count() < 2 || query.chars().count() > 100)
         {
-            return Err(PageError::Limit);
+            return Err(UserListError::Query);
         }
         Ok((
             PageQuery {
@@ -187,6 +196,16 @@ pub(crate) fn encode_device_cursor(scope: &str, at: OffsetDateTime, device_ref: 
     ])
 }
 
+/// Whether `value` has the shape `ds_<64 lowercase hex digits>`.
+pub(crate) fn is_device_ref(value: &str) -> bool {
+    value.strip_prefix("ds_").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 pub(crate) fn decode_device_cursor(
     cursor: &str,
     scope: &str,
@@ -200,12 +219,7 @@ pub(crate) fn decode_device_cursor(
         .ok()
         .and_then(from_micros)
         .ok_or(PageError::Cursor)?;
-    let valid_ref = device_ref.strip_prefix("ds_").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    });
+    let valid_ref = is_device_ref(device_ref);
     if !valid_ref {
         return Err(PageError::Cursor);
     }

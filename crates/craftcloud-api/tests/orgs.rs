@@ -298,6 +298,26 @@ mod tests {
             assert_eq!(second.status, StatusCode::OK, "{}", second.text);
             assert_ne!(first.body["items"][0]["id"], second.body["items"][0]["id"]);
         }
+
+        // An out-of-range search term is reported as the `query` field.
+        for bad in ["a", &"x".repeat(101)] {
+            let rejected = call(
+                &world.env.app,
+                Req::new("GET", &format!("/api/v1/admin/users?query={bad}")).session(&world.op),
+            )
+            .await;
+            assert_eq!(
+                rejected.status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{}",
+                rejected.text
+            );
+            assert!(
+                rejected.text.contains("\"query\"") && !rejected.text.contains("unverified"),
+                "{}",
+                rejected.text
+            );
+        }
     }
 
     // ---- operator: create / list ------------------------------------------------

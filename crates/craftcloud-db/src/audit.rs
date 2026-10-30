@@ -93,6 +93,9 @@ pub enum Detail {
     Count(i64),
     /// A flag.
     Flag(bool),
+    /// The opaque `ds_<hex>` reference of a device session: a domain-separated
+    /// SHA-256 digest, never the session identifier itself.
+    DeviceRef([u8; 32]),
 }
 
 /// Who acted and under which request; shared by the events of one request.
@@ -227,6 +230,15 @@ impl<'a> NewEvent<'a> {
                 Detail::Code(code) => Value::String((*code).to_owned()),
                 Detail::Count(n) => Value::Number(Number::from(*n)),
                 Detail::Flag(flag) => Value::Bool(*flag),
+                Detail::DeviceRef(digest) => {
+                    use std::fmt::Write as _;
+                    let mut text = String::with_capacity(67);
+                    text.push_str("ds_");
+                    for byte in digest {
+                        let _ = write!(text, "{byte:02x}");
+                    }
+                    Value::String(text)
+                }
             };
             map.insert((*key).to_owned(), value);
         }

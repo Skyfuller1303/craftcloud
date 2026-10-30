@@ -54,3 +54,12 @@ None of these are implemented by this blueprint. Update this list in the same PR
   - MSRV 1.90 von `craftcloud-client` und `craftcloud-client-native` ist deklariert, aber mangels 1.90-Toolchain nicht gebaut.
   - Der exakte ureq-Pin des SDK (`=3.5.0`) muss mit den Apps zusammen angehoben werden, sonst löst eine App mit anderer ureq-Version nicht auf.
   - Die Einbindung per Pfad-Abhängigkeit in PhotoCraft, FigCraft und Launcher ist noch nicht gebaut; `keyring` 3.6 kommt dort neu in den Abhängigkeitsbaum.
+
+Offen nach AC-07 und AC-08 (2026-10-30):
+
+  - Die Admin-Konsole (AC-08) ist nach den letzten Review-Korrekturen nicht erneut im Browser geprüft (axe, CSP, 360 px, Tastatur). Belegt ist nur der frühere Stand mit 152 Aufnahmen.
+  - Die Geräte-Referenz `ds_<hex>` ist zweimal definiert: als SQL-Ausdruck in `craftcloud-db/src/device_sessions.rs` und in Rust (`admin_device_ref` in `craftcloud-api/src/device.rs`). Beide müssen identisch bleiben; der Integrationstest erkennt eine Abweichung.
+  - Bei `GET /organizations/{id}/members` kommt ein 422 für eine ungültige `query` erst nach dem 403 für unerlaubte Admin-Filter.
+  - Das Admin-Webpaket ist 674,6 kB groß (gzip 196,7 kB) und liegt über Vites Warnschwelle; Code-Splitting fehlt.
+  - Die Übersicht der Admin-Konsole lädt Sammlungen über höchstens 100 Seiten bestehender APIs; für sehr große Organisationen ist ein gemessener Aggregations-Endpunkt offen.
+  - Launcher (AC-07, nur lokal): Öffnen aus der Cloud ist erst mit einer AC-05-App prüfbar, der FigCraft-Livelink erst mit AC-06. Der Gast-Freigabeempfang ist nach dem Serverfix erneut durchgängig zu prüfen. SDK-Lizenz und Verteilung ohne absolute Pfade sind vor einer Einreichung zu klären.

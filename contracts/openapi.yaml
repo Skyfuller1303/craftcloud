@@ -1202,7 +1202,7 @@ paths:
     get:
       tags: [Admin]
       summary: List one account's active device sessions (operator only)
-      description: Returns device metadata and opaque device_ref values. Never returns session ids or credentials.
+      description: Returns device metadata and opaque device_ref values, newest first. Keyset paginated by (creation time, device_ref); a cursor stays valid when its boundary device was revoked in the meantime. Never returns session ids or credentials.
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
@@ -1216,6 +1216,7 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
         '400': {$ref: '#/components/responses/InvalidCursor'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /admin/users/{user_id}/devices/{device_ref}:
@@ -1257,7 +1258,7 @@ paths:
         - {$ref: '#/components/parameters/UserIdQuery'}
         - {in: query, name: target_kind, required: false, schema: {type: string, enum: [project, file]}}
       responses:
-        '200': {description: One page, newest first, content: {application/json: {schema: {$ref: '#/components/schemas/GrantPage'}}}}
+        '200': {description: One page, oldest first, content: {application/json: {schema: {$ref: '#/components/schemas/GrantPage'}}}}
         '400': {$ref: '#/components/responses/InvalidCursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}

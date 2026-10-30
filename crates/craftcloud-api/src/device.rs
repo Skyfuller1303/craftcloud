@@ -21,7 +21,7 @@ use zeroize::Zeroize;
 
 use crate::audit::ctx as audit_ctx;
 use crate::client_ip::TrustedProxy;
-use crate::pagination::{PageQuery, decode_device_cursor, encode_device_cursor};
+use crate::pagination::{PageQuery, decode_device_cursor, encode_device_cursor, is_device_ref};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::services::{IpClass, Services};
 use crate::session::{AuthenticatedSession, CredentialKind, ambiguous_credentials};
@@ -626,31 +626,6 @@ fn admin_device_ref(id: Uuid) -> String {
     out
 }
 
-async fn find_active_by_ref(
-    pool: &sqlx::PgPool,
-    user_id: Uuid,
-    now: OffsetDateTime,
-    device_ref: &str,
-) -> Result<Option<device_sessions::DeviceSession>, DbError> {
-    let mut after = None;
-    loop {
-        let devices = device_sessions::list_active_page(pool, user_id, now, 100, after).await?;
-        if let Some(device) = devices
-            .iter()
-            .find(|device| admin_device_ref(device.id) == device_ref)
-        {
-            return Ok(Some(device.clone()));
-        }
-        let Some(last) = devices.last() else {
-            return Ok(None);
-        };
-        after = Some((last.created_at, last.id));
-        if devices.len() < 100 {
-            return Ok(None);
-        }
-    }
-}
-
 pub(crate) async fn admin_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -661,12 +636,13 @@ pub(crate) async fn admin_list(
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
     };
+    let user_id = Uuid::parse_str(&user_raw).ok();
     if let Err(response) = crate::orgs::operator_only(
         &services,
         &session,
         craftcloud_core::policy::Action::UserDeviceList,
         "admin.user_devices.list",
-        None,
+        user_id,
         &headers,
     )
     .await
@@ -680,7 +656,7 @@ pub(crate) async fn admin_list(
         Ok(limit) => limit,
         Err(error) => return crate::orgs::page_error(error, &headers),
     };
-    let Some(user_id) = Uuid::parse_str(&user_raw).ok() else {
+    let Some(user_id) = user_id else {
         return error_response(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
@@ -705,17 +681,7 @@ pub(crate) async fn admin_list(
         .cursor()
         .map(|cursor| decode_device_cursor(cursor, &scope))
     {
-        Some(Ok((at, device_ref))) => {
-            match find_active_by_ref(&services.pool, user_id, services.clock.now(), &device_ref)
-                .await
-            {
-                Ok(Some(device)) if device.created_at == at => Some((at, device.id)),
-                Ok(_) => {
-                    return crate::orgs::page_error(crate::pagination::PageError::Cursor, &headers);
-                }
-                Err(error) => return db_failure(&error, &headers, "device cursor lookup failed"),
-            }
-        }
+        Some(Ok(position)) => Some(position),
         Some(Err(error)) => return crate::orgs::page_error(error, &headers),
         None => None,
     };
@@ -751,19 +717,20 @@ pub(crate) async fn admin_revoke(
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
     };
+    let user_id = Uuid::parse_str(&user_raw).ok();
     if let Err(response) = crate::orgs::operator_only(
         &services,
         &session,
         craftcloud_core::policy::Action::UserDeviceRevoke,
         "admin.user_device.revoke",
-        None,
+        user_id,
         &headers,
     )
     .await
     {
         return *response;
     }
-    let Some(user_id) = Uuid::parse_str(&user_raw).ok() else {
+    let Some(user_id) = user_id.filter(|_| is_device_ref(&device_ref)) else {
         return error_response(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
@@ -783,7 +750,7 @@ pub(crate) async fn admin_revoke(
         Err(error) => return db_failure(&error, &headers, "account lookup failed"),
         Ok(Some(_)) => {}
     }
-    let device = match find_active_by_ref(
+    let device = match device_sessions::find_active_by_ref(
         &services.pool,
         user_id,
         services.clock.now(),

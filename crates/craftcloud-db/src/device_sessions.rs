@@ -217,27 +217,57 @@ pub async fn list_active(
         .bind(user_id).bind(now).fetch_all(pool).await?)
 }
 
-/// List one bounded page of active sessions, newest first.
+/// SQL digest of a device session id for the operator-facing `ds_<hex>`
+/// reference. It must stay identical to the reference built by the API layer:
+/// SHA-256 over the domain tag, a NUL byte and the 16 UUID bytes.
+const DEVICE_REF_DIGEST_SQL: &str = "sha256(convert_to('craftcloud-admin-device-ref-v1','UTF8') || decode('00','hex') || uuid_send(id))";
+
+const DEVICE_COLUMNS: &str = "id,user_id,name,client_kind,client_id,created_at,last_used_at,idle_expires_at,absolute_expires_at,access_expires_at";
+
+/// List one bounded page of active sessions, newest first. Order and keyset
+/// are `(created_at, device_ref)` descending, where `device_ref` is the opaque
+/// reference computed in SQL, so a cursor stays valid when its boundary
+/// session has since been revoked or has expired.
 pub async fn list_active_page(
     pool: &PgPool,
     user_id: Uuid,
     now: OffsetDateTime,
     limit: u32,
-    after: Option<(OffsetDateTime, Uuid)>,
+    after: Option<(OffsetDateTime, String)>,
 ) -> Result<Vec<DeviceSession>, DbError> {
-    let rows = match after {
-        Some((created_at, id)) => sqlx::query_as::<_, DeviceSession>(
-            "SELECT id,user_id,name,client_kind,client_id,created_at,last_used_at,idle_expires_at,absolute_expires_at,access_expires_at FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL AND idle_expires_at>$2 AND absolute_expires_at>$2 AND (created_at,id)<($3,$4) ORDER BY created_at DESC,id DESC LIMIT $5",
-        )
-        .bind(user_id).bind(now).bind(created_at).bind(id).bind(i64::from(limit))
-        .fetch_all(pool).await?,
-        None => sqlx::query_as::<_, DeviceSession>(
-            "SELECT id,user_id,name,client_kind,client_id,created_at,last_used_at,idle_expires_at,absolute_expires_at,access_expires_at FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL AND idle_expires_at>$2 AND absolute_expires_at>$2 ORDER BY created_at DESC,id DESC LIMIT $3",
-        )
-        .bind(user_id).bind(now).bind(i64::from(limit))
-        .fetch_all(pool).await?,
+    let sql = format!(
+        "SELECT {DEVICE_COLUMNS} FROM (SELECT {DEVICE_COLUMNS}, ('ds_' || encode({DEVICE_REF_DIGEST_SQL},'hex')) COLLATE \"C\" AS device_ref          FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL AND idle_expires_at>$2 AND absolute_expires_at>$2) s          WHERE ($3::timestamptz IS NULL OR (created_at,device_ref) < ($3::timestamptz,$4::text COLLATE \"C\"))          ORDER BY created_at DESC,device_ref DESC LIMIT $5"
+    );
+    let (after_at, after_ref) = match after {
+        Some((at, device_ref)) => (Some(at), Some(device_ref)),
+        None => (None, None),
     };
-    Ok(rows)
+    Ok(sqlx::query_as::<_, DeviceSession>(&sql)
+        .bind(user_id)
+        .bind(now)
+        .bind(after_at)
+        .bind(after_ref)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Find one active session of `user_id` by its opaque `ds_<hex>` reference.
+pub async fn find_active_by_ref(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    device_ref: &str,
+) -> Result<Option<DeviceSession>, DbError> {
+    let sql = format!(
+        "SELECT {DEVICE_COLUMNS} FROM device_sessions WHERE user_id=$1 AND revoked_at IS NULL AND idle_expires_at>$2 AND absolute_expires_at>$2          AND ('ds_' || encode({DEVICE_REF_DIGEST_SQL},'hex'))=$3"
+    );
+    Ok(sqlx::query_as::<_, DeviceSession>(&sql)
+        .bind(user_id)
+        .bind(now)
+        .bind(device_ref)
+        .fetch_optional(pool)
+        .await?)
 }
 
 pub async fn revoke_owned(
@@ -298,8 +328,19 @@ async fn revoke_owned_inner(
             request_id: context.audit.request_id.clone(),
         };
         let event = if matches!(context.mode, RevokeAuditMode::Operator) {
+            let digest: Vec<u8> = sqlx::query_scalar(&format!(
+                "SELECT {DEVICE_REF_DIGEST_SQL} FROM device_sessions WHERE id=$1"
+            ))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let digest =
+                <[u8; 32]>::try_from(digest.as_slice()).map_err(|_| DbError::CheckViolation {
+                    constraint: Some("device_ref_digest_length".to_owned()),
+                })?;
             NewEvent::new("admin.user_device_revoked")
                 .target("user", context.user_id)
+                .detail("device_ref", crate::audit::Detail::DeviceRef(digest))
                 .detail(
                     "leases_removed",
                     crate::audit::Detail::Count(i64::try_from(count).unwrap_or(i64::MAX)),

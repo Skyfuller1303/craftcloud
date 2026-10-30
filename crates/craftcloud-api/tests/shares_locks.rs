@@ -974,7 +974,12 @@ mod tests {
             format!("/api/v1/workspaces/{}", f.workspace),
         ] {
             let response = call(&f.env.app, Req::new("GET", &hidden).session(&guest)).await;
-            assert_eq!(response.status, StatusCode::NOT_FOUND, "{hidden}: {}", response.text);
+            assert_eq!(
+                response.status,
+                StatusCode::NOT_FOUND,
+                "{hidden}: {}",
+                response.text
+            );
         }
         let rename = call(
             &f.env.app,
@@ -1699,6 +1704,33 @@ mod tests {
         )
         .await;
         assert_eq!(list.status, StatusCode::OK, "{}", list.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn refused_admin_filters_do_not_consume_member_search_slots() {
+        let mut settings = crate::common::settings();
+        settings.member_search_limit = 2;
+        let f = fixture_in(
+            TestEnv::with(settings, craftcloud_api::ApiConfig::default()).await,
+            "photocraft",
+        )
+        .await;
+        // A workspace admin may search members but may not use admin filters.
+        let (_, ws_admin) = add_workspace_role(&f, "ac08-search-ws-admin", "admin").await;
+        let filtered = format!(
+            "/api/v1/organizations/{}/members?query=ac&sort=name_asc",
+            f.org
+        );
+        for _ in 0..3 {
+            let refused = call(&f.env.app, Req::new("GET", &filtered).session(&ws_admin)).await;
+            assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.text);
+        }
+        let plain = format!("/api/v1/organizations/{}/members?query=ac", f.org);
+        for _ in 0..2 {
+            let ok = call(&f.env.app, Req::new("GET", &plain).session(&ws_admin)).await;
+            assert_eq!(ok.status, StatusCode::OK, "{}", ok.text);
+        }
     }
 
     #[tokio::test]

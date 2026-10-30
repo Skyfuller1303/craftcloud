@@ -6,7 +6,7 @@ GET /api/v1/admin/maintenance auth=cookie|bearer req=- ok=MaintenanceStatus code
 GET /api/v1/admin/organizations auth=cookie|bearer req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
 GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
-GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,500,503
+GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,422,500,503
 DELETE /api/v1/admin/users/{user_id}/devices/{device_ref} auth=cookie+csrf|bearer req=- ok=- codes=204,401,403,404,500,503
 POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,404,409,500,503
 POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503

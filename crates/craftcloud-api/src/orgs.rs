@@ -657,6 +657,30 @@ pub(crate) async fn list_members(
             None => None,
         }
     };
+    // Authorize the admin filters before the search quota is charged, so a
+    // caller who is refused anyway does not consume a search slot.
+    if admin_filters {
+        let decision = craftcloud_core::policy::can(
+            &actor,
+            Action::MemberAdminList,
+            &Resource::Member {
+                org_id,
+                target: None,
+                role: None,
+            },
+        );
+        match gate(
+            decision,
+            &headers,
+            session.user_id,
+            "member.admin_list",
+            Some(org_id),
+            None,
+        ) {
+            Gate::Open(_) => {}
+            Gate::Closed(response) => return response,
+        }
+    }
     if let Some(term) = &search {
         if term.chars().count() < 2 || term.chars().count() > 100 {
             return validation_failed(&["query"], &headers);
@@ -697,26 +721,6 @@ pub(crate) async fn list_members(
         }
     }
     if admin_filters {
-        let decision = craftcloud_core::policy::can(
-            &actor,
-            Action::MemberAdminList,
-            &Resource::Member {
-                org_id,
-                target: None,
-                role: None,
-            },
-        );
-        match gate(
-            decision,
-            &headers,
-            session.user_id,
-            "member.admin_list",
-            Some(org_id),
-            None,
-        ) {
-            Gate::Open(_) => {}
-            Gate::Closed(response) => return response,
-        }
         let query_term = search.as_deref();
         let filter_scope = format!(
             "{org_id}:{}:{}:{}:{}:{}",
@@ -1358,7 +1362,12 @@ pub(crate) async fn list_all_users(
     };
     let (page, unverified, search) = match query.split() {
         Ok(parts) => parts,
-        Err(_) => return validation_failed(&["unverified"], &headers),
+        Err(crate::pagination::UserListError::Unverified) => {
+            return validation_failed(&["unverified"], &headers);
+        }
+        Err(crate::pagination::UserListError::Query) => {
+            return validation_failed(&["query"], &headers);
+        }
     };
     let limit = match page.limit() {
         Ok(limit) => limit,

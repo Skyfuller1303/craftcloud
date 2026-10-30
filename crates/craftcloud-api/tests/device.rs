@@ -855,7 +855,9 @@ mod tests {
             "{}",
             revoked_anchor.text
         );
-        let invalidated = call(
+        // The boundary device of the cursor is gone; the next page continues
+        // after its position instead of failing, without duplicates or skips.
+        let continued = call(
             &env.app,
             Req::new(
                 "GET",
@@ -867,13 +869,46 @@ mod tests {
             .session(&operator),
         )
         .await;
+        assert_eq!(continued.status, StatusCode::OK, "{}", continued.text);
+        let first_refs: Vec<&str> = admin_list.body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["device_ref"].as_str().unwrap())
+            .collect();
+        let continued_refs: Vec<&str> = continued.body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["device_ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(continued_refs.len(), 5, "{}", continued.text);
+        assert!(continued_refs.iter().all(|r| !first_refs.contains(r)));
+        assert!(continued.body["next_cursor"].is_null());
+        for device in second_page.body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(5)
+        {
+            assert!(continued_refs.contains(&device["device_ref"].as_str().unwrap()));
+        }
+        let malformed_revoke = call(
+            &env.app,
+            Req::new(
+                "DELETE",
+                &format!("/api/v1/admin/users/{owner_id}/devices/not-a-device-ref"),
+            )
+            .session(&operator),
+        )
+        .await;
         assert_eq!(
-            invalidated.status,
-            StatusCode::BAD_REQUEST,
+            malformed_revoke.status,
+            StatusCode::NOT_FOUND,
             "{}",
-            invalidated.text
+            malformed_revoke.text
         );
-        assert_eq!(invalidated.code(), "INVALID_CURSOR");
+        assert_eq!(malformed_revoke.code(), "NOT_FOUND");
         let row = &admin_list.body["devices"][0];
         assert!(row["device_ref"].as_str().unwrap().starts_with("ds_"));
         assert!(!admin_list.text.contains(&device_id.to_string()));
@@ -912,7 +947,7 @@ mod tests {
             .await,
             0
         );
-        let (actor, target, leases): (Uuid, Uuid, i64) = sqlx::query_as("SELECT actor_id,target_id,(details->>'leases_removed')::bigint FROM audit_events WHERE action='admin.user_device_revoked' AND actor_id=$1 AND target_id=$2 ORDER BY created_at DESC,id DESC LIMIT 1")
+        let (actor, target, leases, audited_ref): (Uuid, Uuid, i64, String) = sqlx::query_as("SELECT actor_id,target_id,(details->>'leases_removed')::bigint,details->>'device_ref' FROM audit_events WHERE action='admin.user_device_revoked' AND actor_id=$1 AND target_id=$2 ORDER BY created_at DESC,id DESC LIMIT 1")
             .bind(env.operator_id).bind(owner_id).fetch_one(&env.pool).await.unwrap();
         let device_revoked: bool = sqlx::query_scalar(
             "SELECT revoked_at IS NOT NULL FROM device_sessions WHERE id=$1 AND user_id=$2",
@@ -926,6 +961,8 @@ mod tests {
         assert_eq!(actor, env.operator_id);
         assert_eq!(target, owner_id);
         assert_eq!(leases, 1);
+        assert_eq!(audited_ref, row["device_ref"].as_str().unwrap());
+        assert!(!audited_ref.contains(&device_id.to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
