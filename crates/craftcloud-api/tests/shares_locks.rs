@@ -936,6 +936,58 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn guest_with_file_grant_reads_only_that_file() {
+        // Regression: the read-side actor dropped the guest membership, so a
+        // guest saw a shared file in shared-with-me but got 404 on the file.
+        let f = fixture("photocraft").await;
+        let guest_id = f.env.user("ac03-guest-reader").await;
+        let guest = f.env.login_ok("ac03-guest-reader").await;
+        sqlx::query("INSERT INTO organization_members(org_id,user_id,role,status) VALUES($1,$2,'guest','active')").bind(f.org).bind(guest_id).execute(&f.env.pool).await.unwrap();
+        let granted = call(
+            &f.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/grants", f.file))
+                .session(&f.owner)
+                .json(json!({"user_id":guest_id.to_string(),"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(granted.status, StatusCode::CREATED, "{}", granted.text);
+        let shared = call(
+            &f.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/organizations/{}/shared-with-me", f.org),
+            )
+            .session(&guest),
+        )
+        .await;
+        assert_eq!(shared.status, StatusCode::OK, "{}", shared.text);
+        let file = call(
+            &f.env.app,
+            Req::new("GET", &format!("/api/v1/files/{}", f.file)).session(&guest),
+        )
+        .await;
+        assert_eq!(file.status, StatusCode::OK, "{}", file.text);
+        assert_eq!(uuid(&file.body, "id"), f.file);
+        for hidden in [
+            format!("/api/v1/files/{}", f.sibling),
+            format!("/api/v1/projects/{}", f.project),
+            format!("/api/v1/workspaces/{}", f.workspace),
+        ] {
+            let response = call(&f.env.app, Req::new("GET", &hidden).session(&guest)).await;
+            assert_eq!(response.status, StatusCode::NOT_FOUND, "{hidden}: {}", response.text);
+        }
+        let rename = call(
+            &f.env.app,
+            Req::new("PATCH", &format!("/api/v1/files/{}", f.file))
+                .session(&guest)
+                .json(json!({"name":"Renamed by guest"})),
+        )
+        .await;
+        assert_eq!(rename.status, StatusCode::FORBIDDEN, "{}", rename.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn project_editor_grant_covers_files_but_not_project_management() {
         let f = fixture("photocraft").await;
         let (recipient_id, recipient) = add_member(&f, "ac03-project-editor").await;

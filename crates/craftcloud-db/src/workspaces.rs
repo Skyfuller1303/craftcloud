@@ -125,7 +125,8 @@ pub async fn org_of(pool: &PgPool, workspace_id: Uuid) -> Result<Option<Uuid>, D
 
 /// The user's active organization role and workspace role, for building the
 /// policy actor. Both `None` unless the user is an **active** member of the
-/// organization.
+/// organization. A guest keeps the `Guest` organization role (so file and
+/// project grants can still admit them) but never gets a workspace role.
 ///
 /// # Errors
 ///
@@ -141,7 +142,7 @@ pub async fn roles(
                 (SELECT wm.role FROM workspace_members wm \
                  WHERE wm.workspace_id = $2 AND wm.org_id = $1 AND wm.user_id = $3) \
          FROM organization_members m \
-         WHERE m.org_id = $1 AND m.user_id = $3 AND m.status = 'active' AND m.role <> 'guest'",
+         WHERE m.org_id = $1 AND m.user_id = $3 AND m.status = 'active'",
     )
     .bind(org_id)
     .bind(workspace_id)
