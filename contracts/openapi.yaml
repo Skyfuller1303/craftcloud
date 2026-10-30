@@ -1030,9 +1030,36 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [api_version, features, server_mode]
+                required: [api_version, features, server_mode, server_version, feature_flags, limits, formats]
                 properties:
                   api_version: {type: string, example: '1.0'}
+                  server_version: {type: string, example: '0.0.0'}
+                  feature_flags:
+                    type: object
+                    required: [device_login, two_factor, grants, locks, figcraft_live]
+                    properties:
+                      device_login: {type: boolean}
+                      two_factor: {type: boolean}
+                      grants: {type: boolean}
+                      locks: {type: boolean}
+                      figcraft_live: {type: boolean}
+                  limits:
+                    type: object
+                    required: [max_file_size, block_size]
+                    properties:
+                      max_file_size: {type: integer, minimum: 1, description: Configured maximum file size in bytes}
+                      block_size: {type: integer, minimum: 1, description: Recommended streaming buffer size in bytes; uploads are single streaming PUT requests}
+                  formats:
+                    type: array
+                    description: Descriptive extension registry; generic with an empty extension list accepts unknown formats. Contents remain opaque.
+                    items:
+                      type: object
+                      required: [app, extensions]
+                      properties:
+                        app: {type: string}
+                        extensions:
+                          type: array
+                          items: {type: string}
                   features:
                     type: array
                     items:

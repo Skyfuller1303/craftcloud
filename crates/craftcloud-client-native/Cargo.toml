@@ -1,0 +1,21 @@
+[package]
+name = "craftcloud-client-native"
+version.workspace = true
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+craftcloud-client = { path = "../craftcloud-client" }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+zeroize = "1"
+uuid = { version = "1", features = ["serde"] }
+time.workspace = true
+
+[lints]
+workspace = true
