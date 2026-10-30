@@ -35,6 +35,14 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
+const VERSION: &str = match option_env!("CRAFTCLOUD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+const GIT_COMMIT: &str = match option_env!("CRAFTCLOUD_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
 
 const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin user reset-2fa <email> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>]]\n\
     \n\
@@ -87,6 +95,7 @@ enum Command {
     BackupVerify { dir: String, digest: Option<String> },
     BackupRestore { dir: String, digest: Option<String> },
     Help,
+    Version,
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -95,6 +104,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         [one] if one == "migrate" => Ok(Command::Migrate),
         [one] if one == "healthcheck" => Ok(Command::Healthcheck),
         [one] if one == "--help" || one == "-h" => Ok(Command::Help),
+        [one] if one == "--version" || one == "-V" => Ok(Command::Version),
         [admin, action, flag, email]
             if admin == "admin" && action == "issue-password-reset" && flag == "--email" =>
         {
@@ -204,6 +214,10 @@ async fn main() -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        Ok(Command::Version) => {
+            println!("craftcloud-server {VERSION} (commit {GIT_COMMIT})");
+            return ExitCode::SUCCESS;
+        }
         Ok(Command::Healthcheck) => {
             // Before the configuration: the check only needs CRAFTCLOUD_BIND
             // and must not read secrets or log.
@@ -268,7 +282,9 @@ async fn main() -> ExitCode {
         Command::BackupRestore { dir, digest } => {
             backup_restore(&config, &dir, digest.as_deref()).await
         }
-        Command::Help | Command::Healthcheck | Command::BackupVerify { .. } => Ok(()),
+        Command::Help | Command::Version | Command::Healthcheck | Command::BackupVerify { .. } => {
+            Ok(())
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1215,6 +1231,11 @@ mod tests {
         assert!(
             matches!(parse_args(&args(&["admin", "user", "reset-2fa", "user@example.test"])), Ok(Command::ResetTwoFactor { email }) if email == "user@example.test")
         );
+        assert!(matches!(
+            parse_args(&args(&["--version"])),
+            Ok(Command::Version)
+        ));
+        assert!(matches!(parse_args(&args(&["-V"])), Ok(Command::Version)));
         assert!(parse_args(&args(&["nope"])).is_err());
         assert!(parse_args(&args(&["migrate", "extra"])).is_err());
     }

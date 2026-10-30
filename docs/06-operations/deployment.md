@@ -1,5 +1,7 @@
 # Self-hosting-Deployment (Entwicklungsprototyp, Compose-Vorlage seit CC-P03-07)
 
+Für die Installation aus einem versionierten Quellarchiv beginnen Sie mit der [Installationsanleitung für Betreiber](install.md). Sie beschreibt OPS-01 einschließlich Voraussetzungen, systemd, Updates und täglicher Backups. Diese Seite bleibt die technische Referenz für Konfiguration und die manuelle Entwicklungs-Compose-Vorlage.
+
 ## Zwei-Faktor-Anmeldung (AC-02)
 
 Vor dem Einsatz dieser Version muss `craftcloud-server migrate` die Migration `0017_two_factor.sql` mit den bisherigen Migrationen anwenden. Migrationen starten weiterhin nicht implizit mit dem Server. Die Organisationsrichtlinie ist für bestehende Organisationen zunächst ausgeschaltet; bestehende Konten erhalten nicht automatisch einen zweiten Faktor.

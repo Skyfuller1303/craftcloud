@@ -1,0 +1,16 @@
+[Unit]
+Description=CraftCloud Compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /opt/craftcloud/current/deploy/install/craftcloud-ctl start
+ExecStop=/bin/sh /opt/craftcloud/current/deploy/install/craftcloud-ctl stop
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

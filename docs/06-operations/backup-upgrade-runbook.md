@@ -1,5 +1,7 @@
 # Backup, Restore und Upgrades – Betreiber-Runbook (CC-F14, CC-P03-08)
 
+Für eine Installation aus einem Release-Archiv beschreibt [install.md](install.md) die Befehle `craftcloud-ctl backup`, `upgrade` und `rollback` sowie den systemd-Zeitplan. Die folgenden manuellen Compose-Beispiele beziehen sich auf die Entwicklungs-Vorlage; bei OPS-01 gehören zusätzlich `--env-file /etc/craftcloud/craftcloud.env` und `-f compose.install.yaml` sowie die installierten Datenpfade dazu. Ein Programm-Rollback ersetzt keinen Datenbank-Restore.
+
 Dieses Runbook beschreibt, was `craftcloud-server admin backup create | verify | restore` (PR-019) tut, wie Sie es mit Docker Compose betreiben und was gemessen wurde. Es ist ein Entwicklungsprototyp: Das Verfahren wurde mit kleinen Datenmengen auf einem Entwicklungsrechner geprüft (siehe „Gemessene Werte“), nicht mit großen Beständen oder auf einem Linux-Produktivhost.
 
 ## Was gesichert wird
@@ -54,7 +56,7 @@ Was dabei passiert:
 
 **Backup-Alter:** Der letzte erfolgreiche Lauf erscheint als `backup.last_success_age_seconds` in `GET /api/v1/admin/health` und in der Ansicht „System“. Die Zeit stammt aus dem Audit-Ereignis `backup.created`; löscht die Audit-Aufbewahrung (`CRAFTCLOUD_AUDIT_RETENTION_DAYS`) das Ereignis, verschwindet das Alter, die Aufbewahrung muss also länger sein als das Backup-Intervall (Standard 365 Tage).
 
-**Zeitplan:** Es gibt keinen eingebauten Zeitplan. Starten Sie den Befehl aus Cron oder einem systemd-Timer des Hosts. Aufbewahrung und Rotation alter Backups (und das Löschen auf dem Datenträger) bleiben Ihre Aufgabe.
+**Zeitplan:** Das Serverbinary selbst hat keinen Backup-Zeitplan. OPS-01 installiert einen systemd-Timer für täglich 03:15 mit bis zu 30 Minuten zufälliger Verzögerung und bewahrt standardmäßig sieben erfolgreiche Backups auf (`CRAFTCLOUD_BACKUP_KEEP`, siehe [install.md](install.md)). Bei manueller Compose-Nutzung richten Sie Cron oder einen systemd-Timer und die Rotation selbst ein. Die verschlüsselte Kopie außer Haus bleibt in beiden Fällen Ihre Aufgabe.
 
 ## Prüfen
 

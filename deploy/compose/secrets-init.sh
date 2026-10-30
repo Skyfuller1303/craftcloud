@@ -1,4 +1,5 @@
 #!/bin/sh
+case $- in *x*) set +x ;; esac
 # One-shot secret distribution for the Compose stack (service `secrets-init`).
 #
 # Compose cannot hand secrets from .env to read-only containers, and secret
@@ -32,6 +33,17 @@ umask 077
 OUT=/out
 SRC=/run/secrets
 
+# Installations can use separate Compose volumes instead of volume subpaths.
+out_dir() {
+    case "$1" in
+        db) printf '%s\n' "${OUT_DB:-$OUT/db}" ;;
+        db-init) printf '%s\n' "${OUT_DB_INIT:-$OUT/db-init}" ;;
+        migrate) printf '%s\n' "${OUT_MIGRATE:-$OUT/migrate}" ;;
+        server) printf '%s\n' "${OUT_SERVER:-$OUT/server}" ;;
+        *) exit 1 ;;
+    esac
+}
+
 # Role names and database: keep in sync with db-init.sh and xtask/src/compose.rs.
 OWNER_ROLE=craftcloud_owner
 RUNTIME_ROLE=craftcloud_runtime
@@ -57,7 +69,7 @@ put() {
     uid=$1
     service=$2
     name=$3
-    dir="$OUT/$service"
+    dir=$(out_dir "$service")
     install -d -m 0500 -o "$uid" -g "$uid" "$dir"
     tmp="$dir/.new.$name"
     cat >"$tmp"
@@ -70,11 +82,12 @@ put() {
 prune() {
     service=$1
     shift
-    for path in "$OUT/$service"/* "$OUT/$service"/.[!.]*; do
+    dir=$(out_dir "$service")
+    for path in "$dir"/* "$dir"/.[!.]*; do
         [ -e "$path" ] || continue
         keep=0
         for name in "$@"; do
-            [ "$path" = "$OUT/$service/$name" ] && keep=1
+            [ "$path" = "$dir/$name" ] && keep=1
         done
         [ "$keep" = 1 ] || rm -f -- "$path"
     done

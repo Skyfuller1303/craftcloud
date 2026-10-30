@@ -1,0 +1,3 @@
+# Provide /etc/caddy/fullchain.pem and /etc/caddy/private.key in the persistent
+# Caddy configuration directory. Keep the private key readable only by root.
+tls /etc/caddy/fullchain.pem /etc/caddy/private.key

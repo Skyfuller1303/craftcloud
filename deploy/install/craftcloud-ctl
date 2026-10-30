@@ -1,0 +1,356 @@
+#!/bin/sh
+set -eu
+umask 077
+case $- in *x*) set +x ;; esac
+
+INSTALL_ROOT=${CRAFTCLOUD_INSTALL_ROOT:-/opt/craftcloud}
+CONFIG_DIR=${CRAFTCLOUD_CONFIG_DIR:-/etc/craftcloud}
+saved_data_dir=$(sed -n 's/^CRAFTCLOUD_DATA_DIR=//p' "$CONFIG_DIR/craftcloud.env" 2>/dev/null | tail -n 1)
+if [ -n "${CRAFTCLOUD_DATA_DIR:-}" ] && [ -n "$saved_data_dir" ] && [ "$CRAFTCLOUD_DATA_DIR" != "$saved_data_dir" ]; then
+    printf '%s\n' 'craftcloud-ctl: CRAFTCLOUD_DATA_DIR differs from installed config' >&2
+    exit 1
+fi
+DATA_DIR=${saved_data_dir:-${CRAFTCLOUD_DATA_DIR:-/var/lib/craftcloud}}
+saved_project=$(sed -n 's/^CRAFTCLOUD_PROJECT_NAME=//p' "$CONFIG_DIR/craftcloud.env" 2>/dev/null | tail -n 1)
+saved_caddy_dir=$(sed -n 's/^CRAFTCLOUD_CADDY_CONFIG_DIR=//p' "$CONFIG_DIR/craftcloud.env" 2>/dev/null | tail -n 1)
+if [ -n "$saved_caddy_dir" ] && [ "$saved_caddy_dir" != "$CONFIG_DIR/caddy" ]; then
+    printf '%s\n' 'craftcloud-ctl: Caddy config directory differs from installed config' >&2
+    exit 1
+fi
+if [ -n "${CRAFTCLOUD_PROJECT_NAME:-}" ] && [ -n "$saved_project" ] && [ "$CRAFTCLOUD_PROJECT_NAME" != "$saved_project" ]; then
+    printf '%s\n' 'craftcloud-ctl: CRAFTCLOUD_PROJECT_NAME differs from installed config' >&2
+    exit 1
+fi
+PROJECT=${CRAFTCLOUD_PROJECT_NAME:-${saved_project:-craftcloud}}
+saved_image_prefix=$(sed -n 's/^CRAFTCLOUD_IMAGE_PREFIX=//p' "$CONFIG_DIR/craftcloud.env" 2>/dev/null | tail -n 1)
+if [ -n "${CRAFTCLOUD_IMAGE_PREFIX:-}" ] && [ -n "$saved_image_prefix" ] && [ "$CRAFTCLOUD_IMAGE_PREFIX" != "$saved_image_prefix" ]; then
+    printf '%s\n' 'craftcloud-ctl: CRAFTCLOUD_IMAGE_PREFIX differs from installed config' >&2
+    exit 1
+fi
+IMAGE_PREFIX=${CRAFTCLOUD_IMAGE_PREFIX:-$saved_image_prefix}
+IMAGE_PREFIX=${IMAGE_PREFIX:-craftcloud-server:}
+case $IMAGE_PREFIX in *[!A-Za-z0-9._:/-]*) printf '%s\n' 'craftcloud-ctl: invalid image prefix' >&2; exit 1 ;; esac
+SYSTEMD_DIR=${CRAFTCLOUD_SYSTEMD_DIR:-/etc/systemd/system}
+CURRENT=$INSTALL_ROOT/current
+
+fail() { printf '%s\n' "craftcloud-ctl: $*" >&2; exit 1; }
+systemd_running() {
+    [ -d /run/systemd/system ] || [ "$(cat /proc/1/comm 2>/dev/null || true)" = systemd ]
+}
+valid_semver() {
+    printf '%s\n' "$1" | awk '
+        function identifiers(value, prerelease, parts, count, i) {
+            if (value == "") return 0
+            count = split(value, parts, /\./)
+            for (i = 1; i <= count; i++) {
+                if (parts[i] !~ /^[0-9A-Za-z-]+$/) return 0
+                if (prerelease && parts[i] ~ /^[0-9]+$/ && length(parts[i]) > 1 && substr(parts[i], 1, 1) == "0") return 0
+            }
+            return 1
+        }
+        {
+            value = $0
+            plus = index(value, "+")
+            if (plus) { build = substr(value, plus + 1); value = substr(value, 1, plus - 1); if (index(build, "+") || !identifiers(build, 0)) exit 1 }
+            dash = index(value, "-")
+            if (dash) { prerelease = substr(value, dash + 1); value = substr(value, 1, dash - 1); if (!identifiers(prerelease, 1)) exit 1 }
+            if (split(value, core, /\./) != 3) exit 1
+            for (i = 1; i <= 3; i++) if (core[i] !~ /^[0-9]+$/ || (length(core[i]) > 1 && substr(core[i], 1, 1) == "0")) exit 1
+        }
+    '
+}
+image_tag() { printf '%s\n' "$1" | sed 's/+/_/'; }
+safe_path() {
+    safe_value=$1
+    case $safe_value in /*) ;; *) fail 'install, config, and data paths must be absolute' ;; esac
+    case $safe_value in /|*//*|*/|*/./*|*/../*|*/.|*/..) fail "unsafe path: $safe_value" ;; esac
+    case $safe_value in *[!A-Za-z0-9/._-]*) fail 'paths may contain only letters, digits, slash, dot, underscore, and hyphen' ;; esac
+    safe_rest=${safe_value#/}
+    safe_parent=
+    while [ -n "$safe_rest" ]; do
+        case $safe_rest in */*) safe_part=${safe_rest%%/*}; safe_rest=${safe_rest#*/} ;; *) safe_part=$safe_rest; safe_rest= ;; esac
+        [ -n "$safe_part" ] || fail "unsafe path: $safe_value"
+        safe_parent=$safe_parent/$safe_part
+        [ ! -L "$safe_parent" ] || fail "path contains a symbolic link: $safe_parent"
+    done
+}
+paths_overlap() {
+    case $1/ in "$2/"*) return 0 ;; esac
+    case $2/ in "$1/"*) return 0 ;; esac
+    return 1
+}
+installation_identity() { printf '%s|%s|%s|%s\n' "$INSTALL_ROOT" "$CONFIG_DIR" "$DATA_DIR" "$PROJECT"; }
+require_owned_root() {
+    owned_root=$1
+    owned_marker=$owned_root/.craftcloud-installation
+    case $owned_root in /opt|/etc|/var|/var/lib|/home|/root|/usr|/tmp|/srv|/mnt) fail "refusing broad system directory: $owned_root" ;; esac
+    [ ! -L "$owned_root" ] || fail "installation root is a symbolic link: $owned_root"
+    [ -d "$owned_root" ] || fail "installation root missing: $owned_root"
+    [ -f "$owned_marker" ] && [ ! -L "$owned_marker" ] || fail "installation marker missing: $owned_marker"
+    [ "$(cat "$owned_marker")" = "$(installation_identity)" ] || fail "installation marker does not match this instance: $owned_root"
+}
+verify_archive_checksum() {
+    checksum_file=$(dirname -- "$1")/SHA256SUMS
+    [ -f "$checksum_file" ] || fail 'SHA256SUMS missing beside archive'
+    checksum_name=$(basename -- "$1")
+    checksum_expected=
+    checksum_matches=0
+    while IFS=' ' read -r checksum_hash checksum_file_name checksum_extra || [ -n "${checksum_hash:-}" ]; do
+        case $checksum_file_name in "$checksum_name")
+            checksum_matches=$((checksum_matches + 1))
+            [ -z "${checksum_extra:-}" ] || fail 'malformed checksum entry'
+            [ "${#checksum_hash}" -eq 64 ] || fail 'malformed archive checksum'
+            case $checksum_hash in *[!0-9a-fA-F]*) fail 'malformed archive checksum' ;; esac
+            checksum_expected=$checksum_hash
+            ;;
+        esac
+    done <"$checksum_file"
+    [ "$checksum_matches" -eq 1 ] || fail 'SHA256SUMS must contain exactly one checksum for the archive'
+    checksum_actual=$(sha256sum "$1" | awk '{print $1}')
+    [ "$checksum_actual" = "$checksum_expected" ] || fail 'archive checksum mismatch'
+}
+set_config_image() {
+    env_file=$CONFIG_DIR/craftcloud.env
+    tmp=$env_file.tmp.$$
+    awk '!/^CRAFTCLOUD_IMAGE=/' "$env_file" >"$tmp"
+    tag=$(image_tag "$1")
+    [ "${#tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
+    printf 'CRAFTCLOUD_IMAGE=%s%s\n' "$IMAGE_PREFIX" "$tag" >>"$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$env_file"
+}
+current_release() {
+    [ -L "$CURRENT" ] || fail 'current release symlink missing'
+    target=$(readlink -f "$CURRENT")
+    case $target in "$INSTALL_ROOT"/releases/*) ;; *) fail 'current release points outside releases directory' ;; esac
+    [ -d "$target/deploy/compose" ] || [ -d "$target/craftcloud-$(basename "$target")/deploy/compose" ] || fail 'active release is incomplete'
+    printf '%s\n' "$target"
+}
+release_compose_dir() {
+    if [ -d "$1/deploy/compose" ]; then printf '%s\n' "$1/deploy/compose"
+    else printf '%s\n' "$1/craftcloud-$(basename "$1")/deploy/compose"; fi
+}
+version_of() {
+    name=$(basename -- "$1")
+    printf '%s\n' "$name" | sed 's/^craftcloud-//'
+}
+compose_at() {
+    root=$1; shift
+    dir=$(release_compose_dir "$root")
+    version=$(version_of "$root")
+    tag=$(image_tag "$version")
+    [ "${#tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
+    export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$tag"
+    export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
+    (cd "$dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" -f compose.yaml -f compose.install.yaml "$@")
+}
+compose_at_setup() {
+    root=$1; shift
+    dir=$(release_compose_dir "$root")
+    version=$(version_of "$root")
+    tag=$(image_tag "$version")
+    [ "${#tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
+    export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$tag"
+    export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
+    (cd "$dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" -f compose.yaml -f compose.install.yaml -f compose.setup.yaml "$@")
+}
+compose_for_setup_state() {
+    if [ -f "$CONFIG_DIR/bootstrap-token" ]; then compose_at_setup "$@"
+    else compose_at "$@"; fi
+}
+safe_path "$INSTALL_ROOT"
+safe_path "$CONFIG_DIR"
+safe_path "$DATA_DIR"
+safe_path "$INSTALL_ROOT/releases"
+safe_path "$DATA_DIR/backups"
+if paths_overlap "$INSTALL_ROOT" "$CONFIG_DIR" || paths_overlap "$INSTALL_ROOT" "$DATA_DIR" || paths_overlap "$CONFIG_DIR" "$DATA_DIR"; then
+    fail 'install, config, and data directories must not overlap'
+fi
+require_owned_root "$INSTALL_ROOT"
+require_owned_root "$CONFIG_DIR"
+require_owned_root "$DATA_DIR"
+active=$(current_release)
+
+case ${1:-} in
+    status) compose_at "$active" ps ;;
+    logs) shift; compose_at "$active" logs --follow "$@" ;;
+    backup)
+        need_keep=${CRAFTCLOUD_BACKUP_KEEP:-$(sed -n 's/^CRAFTCLOUD_BACKUP_KEEP=//p' "$CONFIG_DIR/craftcloud.env" | tail -n 1)}
+        need_keep=${need_keep:-7}
+        case $need_keep in *[!0-9]*|'') fail 'CRAFTCLOUD_BACKUP_KEEP must be a positive integer' ;; esac
+        [ "$need_keep" -gt 0 ] || fail 'CRAFTCLOUD_BACKUP_KEEP must be a positive integer'
+        name=$(date -u +%Y%m%dT%H%M%SZ)-$$
+        compose_for_setup_state "$active" run --rm backup admin backup create --out "/backups/$name"
+        backup_path=$DATA_DIR/backups/$name
+        printf '%s\n' "$backup_path" >"$CONFIG_DIR/last-backup"
+        chmod 0600 "$CONFIG_DIR/last-backup"
+        verified_file=$(mktemp "$CONFIG_DIR/.backup-retention.XXXXXX")
+        chmod 0600 "$verified_file"
+        for path in "$DATA_DIR"/backups/*; do
+            [ -d "$path" ] && [ ! -L "$path" ] || continue
+            name=${path##*/}
+            printf '%s\n' "$name" | awk '/^[0-9]{8}T[0-9]{6}Z-[0-9]+$/ {ok=1} END {exit !ok}' || continue
+            [ -f "$path/manifest.json" ] && [ ! -L "$path/manifest.json" ] || continue
+            [ -f "$path/manifest.sha256" ] && [ ! -L "$path/manifest.sha256" ] || continue
+            if compose_for_setup_state "$active" run --rm --no-deps backup admin backup verify "/backups/$name" >/dev/null 2>&1; then
+                printf '%s\n' "$path" >>"$verified_file"
+            fi
+        done
+        count=$(wc -l <"$verified_file")
+        remove_count=$((count - need_keep))
+        while [ "$remove_count" -gt 0 ] && IFS= read -r path; do
+            rm -rf -- "$path"
+            remove_count=$((remove_count - 1))
+        done <"$verified_file"
+        rm -f -- "$verified_file"
+        printf 'Backup created: %s\n' "$backup_path"
+        ;;
+    start)
+        if [ -f "$CONFIG_DIR/bootstrap-token" ]; then compose_at_setup "$active" up -d
+        else compose_at "$active" up -d; fi
+        ;;
+    stop) compose_at "$active" down ;;
+    setup-complete)
+        [ -f "$CONFIG_DIR/bootstrap-token" ] || fail 'bootstrap secret file not present'
+        setup_status=$(compose_at_setup "$active" exec -T caddy wget -qO- http://server:8080/api/v1/setup/status) || fail 'cannot read setup status'
+        case $setup_status in *'"setup_required":false'*) ;; *) fail 'instance setup is not complete' ;; esac
+        env_file=$CONFIG_DIR/craftcloud.env
+        env_backup=$CONFIG_DIR/.craftcloud.env.$$
+        cp "$env_file" "$env_backup"
+        chmod 0600 "$env_backup"
+        env_tmp=$CONFIG_DIR/.craftcloud.env.tmp.$$
+        awk '/^CC_SECRET_BOOTSTRAP=/ {print "CC_SECRET_BOOTSTRAP="; next} {print}' "$env_file" >"$env_tmp"
+        chmod 0600 "$env_tmp"
+        mv -f "$env_tmp" "$env_file"
+        if ! compose_at "$active" up -d; then
+            mv -f "$env_backup" "$env_file"
+            compose_at_setup "$active" up -d || true
+            fail 'could not disable bootstrap; setup overlay restored'
+        fi
+        tries=0
+        until compose_at "$active" exec -T server /usr/local/bin/craftcloud-server healthcheck >/dev/null 2>&1; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 60 ]; then
+                mv -f "$env_backup" "$env_file"
+                compose_at_setup "$active" up -d || true
+                fail 'could not disable bootstrap; setup overlay restored'
+            fi
+            sleep 2
+        done
+        rm -f -- "$CONFIG_DIR/bootstrap-token" "$env_backup"
+        printf '%s\n' 'Bootstrap disabled after completed setup.'
+        ;;
+    upgrade)
+        [ "$#" -eq 2 ] || fail 'usage: craftcloud-ctl upgrade <archive.tar.gz>'
+        archive=$2
+        [ -f "$archive" ] || fail 'archive not found'
+        verify_archive_checksum "$archive"
+        archive_name=$(basename -- "$archive")
+        new_version=$(printf '%s' "$archive_name" | sed -n 's/^craftcloud-\([0-9][0-9A-Za-z.+-]*\)\.tar\.gz$/\1/p')
+        [ -n "$new_version" ] || fail 'invalid release archive name'
+        valid_semver "$new_version" || fail 'release version must be valid SemVer'
+        new_image_tag=$(image_tag "$new_version")
+        [ "${#new_image_tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
+        new_root=$INSTALL_ROOT/releases/$new_version
+        [ "$new_root" != "$active" ] || fail 'release is already active'
+        [ ! -L "$new_root" ] || fail 'release destination is a symbolic link'
+        # A backup must finish before any release or database change.
+        sh "$0" backup
+        backup_path=$(cat "$CONFIG_DIR/last-backup")
+        printf '%s\n' "$backup_path" >"$CONFIG_DIR/upgrade-backup"
+        chmod 0600 "$CONFIG_DIR/upgrade-backup"
+        mkdir -p "$INSTALL_ROOT/releases"
+        if [ ! -e "$new_root" ]; then
+            mkdir "$new_root"
+            archive_entries=$(tar -tzf "$archive") || fail 'cannot read archive table of contents'
+            printf '%s\n' "$archive_entries" | awk -v root="craftcloud-$new_version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
+            archive_types=$(tar -tvzf "$archive") || fail 'cannot inspect archive entry types'
+            printf '%s\n' "$archive_types" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {bad=1} END {exit bad}' || fail 'archive contains links or special files'
+            umask 022
+            tar -xzf "$archive" -C "$new_root" --no-same-owner --strip-components=1
+            umask 077
+        fi
+        new_dir=$(release_compose_dir "$new_root")
+        metadata=$new_root/CRAFTCLOUD-RELEASE.json
+        [ -f "$metadata" ] || metadata=$new_root/craftcloud-$new_version/CRAFTCLOUD-RELEASE.json
+        [ -f "$metadata" ] || fail 'CRAFTCLOUD-RELEASE.json missing'
+        commit=$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$metadata")
+        metaver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$metadata")
+        [ "$metaver" = "$new_version" ] && [ -n "$commit" ] || fail 'release metadata mismatch'
+        export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$new_image_tag" CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
+        (cd "$new_dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" -f compose.yaml -f compose.install.yaml build --build-arg "CRAFTCLOUD_VERSION=$new_version" --build-arg "CRAFTCLOUD_COMMIT=$commit" migrate server backup restore)
+        restore_warning=0
+        trap 'upgrade_status=$?; if [ "$restore_warning" -eq 1 ] && [ "$upgrade_status" -ne 0 ]; then printf "%s\\n" "Upgrade failed after migration attempt. Pre-upgrade backup: $backup_path. Restore manually if needed; see docs/06-operations/backup-upgrade-runbook.md. No automatic restore performed." >&2; fi' 0
+        restore_warning=1
+        if [ -f "$CONFIG_DIR/bootstrap-token" ]; then
+            compose_at_setup "$new_root" run --rm migrate
+        else
+            compose_at "$new_root" run --rm migrate
+        fi
+        previous=$CONFIG_DIR/previous-release
+        printf '%s\n' "$active" >"$previous"
+        chmod 0600 "$previous"
+        set_config_image "$new_version"
+        rm -f -- "$INSTALL_ROOT/current.new"
+        ln -s "$new_root" "$INSTALL_ROOT/current.new"
+        mv -Tf "$INSTALL_ROOT/current.new" "$CURRENT"
+        if ! compose_for_setup_state "$new_root" up -d; then
+            sh "$0" rollback
+            exit 1
+        fi
+        tries=0
+        until compose_at "$new_root" exec -T server /usr/local/bin/craftcloud-server healthcheck >/dev/null 2>&1; do
+            tries=$((tries + 1)); [ "$tries" -lt 60 ] || {
+                sh "$0" rollback
+                exit 1
+            }
+            sleep 2
+        done
+        trap - 0
+        ;;
+    rollback)
+        previous=$CONFIG_DIR/previous-release
+        [ -f "$previous" ] || fail 'no previous release recorded'
+        old=$(cat "$previous")
+        [ -d "$old" ] || fail 'previous release directory missing'
+        case $old in "$INSTALL_ROOT"/releases/*) ;; *) fail 'previous release points outside releases directory' ;; esac
+        old_version=${old##*/}
+        valid_semver "$old_version" || fail 'previous release version is invalid'
+        [ "$old" = "$INSTALL_ROOT/releases/$old_version" ] || fail 'previous release must be a direct child of releases'
+        [ ! -L "$old" ] || fail 'previous release is a symbolic link'
+        set_config_image "$(version_of "$old")"
+        rm -f -- "$INSTALL_ROOT/current.new"
+        ln -s "$old" "$INSTALL_ROOT/current.new"
+        mv -Tf "$INSTALL_ROOT/current.new" "$CURRENT"
+        compose_for_setup_state "$old" up -d
+        printf '%s\n' 'Release rolled back. Database schema was not restored; restore the pre-upgrade backup if the prior release requires it.' >&2
+        ;;
+    uninstall)
+        shift
+        purge=0 confirm=0
+        for arg in "$@"; do case $arg in --purge) purge=1 ;; --confirm-purge) confirm=1 ;; *) fail "unknown uninstall option: $arg" ;; esac; done
+        [ "$confirm" -eq 0 ] || [ "$purge" -eq 1 ] || fail '--confirm-purge requires --purge'
+        if [ "$purge" -eq 1 ] && [ "$confirm" -ne 1 ]; then
+            [ -t 0 ] || fail '--purge requires --confirm-purge on non-interactive input'
+            printf 'Delete all CraftCloud data and config? Type DELETE: '
+            IFS= read -r answer
+            [ "$answer" = DELETE ] || fail 'purge cancelled'
+        fi
+        if [ "${CRAFTCLOUD_SKIP_SYSTEMD:-0}" != 1 ]; then
+            command -v systemctl >/dev/null 2>&1 || fail 'systemctl required for uninstall; set CRAFTCLOUD_SKIP_SYSTEMD=1 only in a test container'
+            systemd_running || fail 'systemd is not running; set CRAFTCLOUD_SKIP_SYSTEMD=1 only in a test container'
+            systemctl disable --now craftcloud-backup.timer craftcloud.service craftcloud-backup.service >/dev/null
+        else
+            systemd_running && fail 'CRAFTCLOUD_SKIP_SYSTEMD=1 is allowed only outside a systemd host'
+        fi
+        if [ "$purge" -eq 1 ]; then compose_at "$active" down --volumes
+        else compose_at "$active" down; fi
+        rm -f "$SYSTEMD_DIR/craftcloud.service" "$SYSTEMD_DIR/craftcloud-backup.service" "$SYSTEMD_DIR/craftcloud-backup.timer"
+        if [ "${CRAFTCLOUD_SKIP_SYSTEMD:-0}" != 1 ]; then systemctl daemon-reload; fi
+        rm -rf -- "$INSTALL_ROOT"
+        if [ "$purge" -eq 1 ]; then
+            rm -rf -- "$DATA_DIR" "$CONFIG_DIR"
+        fi
+        ;;
+    *) fail 'usage: craftcloud-ctl status|logs|backup|upgrade <archive>|rollback|setup-complete|uninstall [--purge --confirm-purge]' ;;
+esac
