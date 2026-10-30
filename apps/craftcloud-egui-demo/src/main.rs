@@ -1519,10 +1519,16 @@ mod tests {
         let (mut app, _requests, _events) = test_app();
         app.picker.files = vec![
             ("original".into(), "Datei.svg".into()),
-            ("copy".into(), "Datei (Kopie von SDK Demo, 2026-10-30) 2.svg".into()),
+            (
+                "copy".into(),
+                "Datei (Kopie von SDK Demo, 2026-10-30) 2.svg".into(),
+            ),
         ];
         app.handle(Action::OpenFile("copy".into()));
-        assert_eq!(app.picker.file_name, "Datei (Kopie von SDK Demo, 2026-10-30) 2.svg");
+        assert_eq!(
+            app.picker.file_name,
+            "Datei (Kopie von SDK Demo, 2026-10-30) 2.svg"
+        );
         app.busy = false;
         app.current_job = None;
         app.handle(Action::OpenFile("original".into()));
