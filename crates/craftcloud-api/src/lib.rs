@@ -14,6 +14,7 @@ mod audit;
 mod auth;
 mod client_ip;
 mod clock;
+mod device;
 mod files;
 mod health;
 mod invitations;
@@ -33,6 +34,7 @@ mod workspaces;
 
 pub use client_ip::ClientIp;
 pub use clock::{Clock, SystemClock};
+pub use device::SecondFactorLogin;
 pub use health::metrics_router;
 pub use observe::Metrics;
 pub use services::{AuthSettings, Services};
@@ -167,6 +169,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/users/{user_id}/disable", &["POST"]),
     ("/api/v1/admin/users/{user_id}/enable", &["POST"]),
     ("/api/v1/auth/login", &["POST"]),
+    ("/api/v1/auth/device/login", &["POST"]),
+    ("/api/v1/auth/device/refresh", &["POST"]),
+    ("/api/v1/auth/device/logout", &["POST"]),
+    ("/api/v1/auth/devices", &["GET"]),
+    ("/api/v1/auth/devices/{id}", &["DELETE"]),
     ("/api/v1/auth/session", &["GET"]),
     ("/api/v1/auth/sessions", &["GET"]),
     ("/api/v1/auth/sessions/{session_id}", &["DELETE"]),
@@ -360,6 +367,11 @@ pub fn router_with_shared(
             post(orgs::enable_user),
         )
         .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/device/login", post(device::login))
+        .route("/api/v1/auth/device/refresh", post(device::refresh))
+        .route("/api/v1/auth/device/logout", post(device::logout))
+        .route("/api/v1/auth/devices", get(device::list))
+        .route("/api/v1/auth/devices/{id}", delete(device::revoke))
         .route("/api/v1/auth/session", get(auth::session))
         .route("/api/v1/auth/sessions", get(auth::list_sessions))
         .route(
@@ -413,8 +425,12 @@ fn with_middleware(
 ) -> Router {
     // Innermost: stores the policy denials (403) that handlers marked.
     let router = router.layer(middleware::from_fn_with_state(
-        audit_services,
+        audit_services.clone(),
         audit::record_denials,
+    ));
+    let router = router.layer(middleware::from_fn_with_state(
+        audit_services,
+        reject_ambiguous_credentials,
     ));
     let router = if streaming {
         router
@@ -432,6 +448,24 @@ fn with_middleware(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store"),
     ))
+}
+
+async fn reject_ambiguous_credentials(
+    State(services): State<Option<Arc<Services>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let settings =
+        services.map_or_else(AuthSettings::default, |services| services.settings.clone());
+    if session::ambiguous_credentials(request.headers(), &settings) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "AMBIGUOUS_CREDENTIALS",
+            "Send either a session cookie or a bearer token, not both.",
+            request.headers(),
+        );
+    }
+    next.run(request).await
 }
 
 /// Request id, tracing and client-address resolution, without any

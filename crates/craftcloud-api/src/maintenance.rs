@@ -1469,6 +1469,10 @@ impl Maintenance {
         if ctx.dry {
             let due = craftcloud_db::audit::count_expired(&self.pool, days).await?;
             report.add("events_due", due);
+            report.add(
+                "device_sessions_due",
+                craftcloud_db::device_sessions::count_expired(&self.pool).await?,
+            );
             return Ok(());
         }
         let batch = self.settings.batch();
@@ -1478,6 +1482,16 @@ impl Maintenance {
             }
             let removed = craftcloud_db::audit::purge(&self.pool, days, batch).await?;
             report.add("purged_events", removed);
+            if i64::try_from(removed).unwrap_or(i64::MAX) < batch {
+                break;
+            }
+        }
+        for _ in 0..20 {
+            if !ctx.go() {
+                break;
+            }
+            let removed = craftcloud_db::device_sessions::delete_expired(&self.pool, batch).await?;
+            report.add("purged_device_sessions", removed);
             if i64::try_from(removed).unwrap_or(i64::MAX) < batch {
                 break;
             }

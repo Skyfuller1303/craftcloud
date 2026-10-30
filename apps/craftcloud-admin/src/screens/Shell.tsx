@@ -13,6 +13,7 @@ import { useRoleNames } from "../roles.ts";
 import type { ThemeChoice } from "../preferences.ts";
 import { usePagedList } from "../usePagedList.ts";
 import { ActivityScreen } from "./ActivityScreen.tsx";
+import { DevicesScreen } from "./DevicesScreen.tsx";
 import { FilesScreen } from "./FilesScreen.tsx";
 import { InvitationsScreen } from "./InvitationsScreen.tsx";
 import { MembersScreen } from "./MembersScreen.tsx";
@@ -286,6 +287,8 @@ export function Shell({
               isOperator={isOperator}
               workspaces={workspaces.items}
             />
+          ) : section === "settings" ? (
+            <DevicesScreen />
           ) : section === "system" ? (
             <SystemScreen isOperator={isOperator} />
           ) : (

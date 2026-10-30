@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::DbError;
 use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
+use crate::device_sessions;
 
 /// Input for [`create`].
 #[derive(Debug, Clone)]
@@ -111,6 +112,11 @@ async fn create_inner(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    let device_audit = audit.cloned().unwrap_or(AuditCtx {
+        actor_id: Some(new.user_id),
+        request_id: None,
+    });
+    device_sessions::revoke_all_for_user_tx(&mut tx, new.user_id, new.now, &device_audit).await?;
     sqlx::query(
         "INSERT INTO password_reset_tokens (id, user_id, token_hash, created_by_user_id, created_at, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6)",
@@ -316,6 +322,11 @@ async fn consume_inner(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    let device_audit = AuditCtx {
+        actor_id: Some(user_id),
+        request_id: audit.and_then(|ctx| ctx.request_id.clone()),
+    };
+    device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &device_audit).await?;
     if let Some(audit) = audit {
         let by = AuditCtx {
             actor_id: Some(user_id),

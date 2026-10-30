@@ -23,7 +23,7 @@ use craftcloud_auth::{
 use craftcloud_core::NormalizedEmail;
 use craftcloud_db::audit::{AggScope, AuditResult, NewEvent};
 use craftcloud_db::password_reset::IssueOutcome;
-use craftcloud_db::{DbError, accounts, password_reset, sessions};
+use craftcloud_db::{DbError, accounts, device_sessions, password_reset, sessions};
 use serde::Deserialize;
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -177,7 +177,11 @@ fn rejected(rejection: AuthRejection, services: &Services, headers: &HeaderMap) 
 /// row, so the log never holds an e-mail address). Nobody is authenticated, so
 /// the row has no actor; the account is the target. Best-effort, in a task of
 /// its own: the answer to the client does not depend on it.
-fn record_login_failure(services: &Services, headers: &HeaderMap, user_id: Option<Uuid>) {
+pub(crate) fn record_login_failure(
+    services: &Services,
+    headers: &HeaderMap,
+    user_id: Option<Uuid>,
+) {
     let mut event = NewEvent::new("auth.login").result(AuditResult::Failed);
     if let Some(user_id) = user_id {
         event = event.target("user", user_id);
@@ -454,13 +458,34 @@ pub(crate) async fn logout(
         Err(rejection) => return rejected(rejection, &services, &headers),
     };
     let now = services.clock.now();
-    if let Err(error) = sessions::revoke(&services.pool, session.session_id, now).await {
-        return db_failure(&error, &headers, "logout failed");
+    if session.credential_kind == crate::session::CredentialKind::Device {
+        match device_sessions::revoke_current(
+            &services.pool,
+            session.session_id,
+            session.user_id,
+            now,
+            &audit_ctx(&headers, Some(session.user_id)),
+        )
+        .await
+        {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => error_response(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHENTICATED",
+                "Authentication is required.",
+                &headers,
+            ),
+            Err(error) => db_failure(&error, &headers, "logout failed"),
+        }
+    } else {
+        if let Err(error) = sessions::revoke(&services.pool, session.session_id, now).await {
+            return db_failure(&error, &headers, "logout failed");
+        }
+        with_cookie(
+            StatusCode::NO_CONTENT.into_response(),
+            cleared_cookie(&services.settings),
+        )
     }
-    with_cookie(
-        StatusCode::NO_CONTENT.into_response(),
-        cleared_cookie(&services.settings),
-    )
 }
 
 pub(crate) async fn logout_all(
@@ -568,32 +593,49 @@ pub(crate) async fn change_password(
         return internal(&headers);
     };
     let now = services.clock.now();
-    match accounts::change_password_audited(
-        &services.pool,
-        session.user_id,
-        &verified_hash,
-        &new_hash,
-        session.session_id,
-        now,
-        &audit_ctx(&headers, Some(session.user_id)),
-    )
-    .await
-    {
+    let changed = if session.credential_kind == crate::session::CredentialKind::Device {
+        accounts::change_password_device_audited(
+            &services.pool,
+            session.user_id,
+            &verified_hash,
+            &new_hash,
+            session.session_id,
+            now,
+            &audit_ctx(&headers, Some(session.user_id)),
+        )
+        .await
+    } else {
+        accounts::change_password_audited(
+            &services.pool,
+            session.user_id,
+            &verified_hash,
+            &new_hash,
+            session.session_id,
+            now,
+            &audit_ctx(&headers, Some(session.user_id)),
+        )
+        .await
+    };
+    match changed {
         Ok(Some(_)) => {
             tracing::info!("password changed; other sessions and pending reset links revoked");
             StatusCode::NO_CONTENT.into_response()
         }
         // The password was changed or reset, or this session was revoked,
         // while the request was being processed: the session is gone (401).
-        Ok(None) => with_cookie(
-            error_response(
+        Ok(None) => {
+            let response = error_response(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHENTICATED",
                 "Authentication is required.",
                 &headers,
-            ),
-            cleared_cookie(&services.settings),
-        ),
+            );
+            if session.credential_kind == crate::session::CredentialKind::Cookie {
+                with_cookie(response, cleared_cookie(&services.settings))
+            } else {
+                response
+            }
+        }
         Err(error) => db_failure(&error, &headers, "password change failed"),
     }
 }

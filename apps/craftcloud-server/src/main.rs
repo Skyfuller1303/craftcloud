@@ -890,6 +890,9 @@ async fn run(config: Config) -> Result<(), Failure> {
     let auth_settings = AuthSettings {
         idle_timeout: config.session_idle_timeout,
         absolute_timeout: config.session_absolute_timeout,
+        device_access_ttl: config.device_access_ttl,
+        device_idle_timeout: config.device_idle_timeout,
+        device_absolute_timeout: config.device_absolute_timeout,
         public_url: config.public_url.clone(),
         public_origin: config.public_origin.clone(),
         cookie_secure: config.cookie_secure,

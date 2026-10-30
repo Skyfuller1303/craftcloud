@@ -39,7 +39,9 @@ use crate::orgs::{
 use crate::pagination::{PageQuery, decode_time_cursor, encode_time_cursor};
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::services::IpClass;
-use crate::session::{AuthRejection, AuthenticatedSession, origin_ok, session_cookie};
+use crate::session::{
+    AuthRejection, AuthenticatedSession, CredentialKind, origin_ok, session_cookie,
+};
 use crate::{ApiState, ClientIp, error_response};
 
 /// Lifetime of an invitation link (ADR-0013 item 9).
@@ -477,7 +479,10 @@ pub(crate) async fn accept_invitation(
         Err(rejection) => return rejection_response(&rejection, &headers),
     };
     // Origin check like login: the anonymous path creates an account and a session.
-    if !origin_ok(&headers, &services.settings) {
+    let bearer_actor = session
+        .as_ref()
+        .is_some_and(|actor| actor.credential_kind == CredentialKind::Device);
+    if !bearer_actor && !origin_ok(&headers, &services.settings) {
         return error_response(
             StatusCode::FORBIDDEN,
             "CSRF_FAILED",

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::DbError;
 use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
+use crate::device_sessions;
 use crate::organizations::{AfterKey, clamp_page};
 
 /// What login needs to know about an account.
@@ -219,6 +220,7 @@ pub async fn change_password(
         verified_hash,
         new_hash,
         keep_session,
+        keep_device_session: false,
         now,
     };
     change_password_inner(pool, &change, None).await
@@ -244,6 +246,28 @@ pub async fn change_password_audited(
         verified_hash,
         new_hash,
         keep_session,
+        keep_device_session: false,
+        now,
+    };
+    change_password_inner(pool, &change, Some(audit)).await
+}
+
+/// Changes password from a device bearer actor and revokes every browser and device session.
+pub async fn change_password_device_audited(
+    pool: &PgPool,
+    user_id: Uuid,
+    verified_hash: &str,
+    new_hash: &str,
+    keep_session: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<Option<u64>, DbError> {
+    let change = PasswordChange {
+        user_id,
+        verified_hash,
+        new_hash,
+        keep_session,
+        keep_device_session: true,
         now,
     };
     change_password_inner(pool, &change, Some(audit)).await
@@ -254,6 +278,7 @@ struct PasswordChange<'a> {
     verified_hash: &'a str,
     new_hash: &'a str,
     keep_session: Uuid,
+    keep_device_session: bool,
     now: OffsetDateTime,
 }
 
@@ -267,6 +292,7 @@ async fn change_password_inner(
         verified_hash,
         new_hash,
         keep_session,
+        keep_device_session,
         now,
     } = *change;
     let mut tx = pool.begin().await?;
@@ -281,25 +307,44 @@ async fn change_password_inner(
     if updated != 1 {
         return Ok(None);
     }
-    let session_alive: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL FOR UPDATE",
-    )
-    .bind(keep_session)
-    .bind(user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let session_alive: Option<Uuid> = if keep_device_session {
+        sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND access_expires_at>$3 AND idle_expires_at>$3 AND absolute_expires_at>$3 FOR UPDATE")
+            .bind(keep_session).bind(user_id).bind(now).fetch_optional(&mut *tx).await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL FOR UPDATE",
+        )
+        .bind(keep_session)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
     if session_alive.is_none() {
         return Ok(None);
     }
-    let revoked = sqlx::query(
-        "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL AND id <> $3",
-    )
-    .bind(user_id)
-    .bind(now)
-    .bind(keep_session)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let revoked = if keep_device_session {
+        sqlx::query("UPDATE sessions SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL")
+            .bind(user_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+    } else {
+        sqlx::query(
+            "UPDATE sessions SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL AND id<>$3",
+        )
+        .bind(user_id)
+        .bind(now)
+        .bind(keep_session)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+    };
+    let device_audit = audit.cloned().unwrap_or(AuditCtx {
+        actor_id: Some(user_id),
+        request_id: None,
+    });
+    device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &device_audit).await?;
     // A pending reset link must not outlive the password change.
     sqlx::query(
         "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
@@ -432,6 +477,11 @@ async fn set_disabled_inner(
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            let device_audit = audit.cloned().unwrap_or(AuditCtx {
+                actor_id: Some(user_id),
+                request_id: None,
+            });
+            device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &device_audit).await?;
             sqlx::query(
                 "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
             )

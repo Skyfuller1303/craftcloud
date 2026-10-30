@@ -6,8 +6,9 @@
 //! client. A malformed or oversized header, or a header from an untrusted
 //! peer, is ignored and the peer address is used.
 //!
-//! `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto` and `Forwarded` are never
-//! used: absolute URLs come only from the operator-configured public URL.
+//! `Host`, `X-Forwarded-Host` and `Forwarded` are never used. `X-Forwarded-Proto`
+//! is used only by device sign-in routes and only when the TCP peer is a
+//! configured trusted proxy. Absolute URLs come from the configured public URL.
 //! The resolved address is a personal datum and is not logged by default.
 
 use std::net::{IpAddr, SocketAddr};
@@ -32,6 +33,10 @@ const MAX_HOPS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
+/// Whether the TCP peer is an operator-configured reverse proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrustedProxy(pub bool);
+
 pub(crate) async fn resolve_client_ip(
     State(trusted): State<Arc<Vec<IpNet>>>,
     mut request: Request,
@@ -41,6 +46,8 @@ pub(crate) async fn resolve_client_ip(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
+    let trusted_peer = peer.is_some_and(|peer| is_trusted(&trusted, peer));
+    request.extensions_mut().insert(TrustedProxy(trusted_peer));
     if let Some(peer) = peer {
         let chain = forwarded_chain(request.headers());
         let ip = resolve(peer, &trusted, chain.as_deref());

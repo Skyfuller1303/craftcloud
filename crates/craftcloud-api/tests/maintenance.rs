@@ -1988,6 +1988,120 @@ mod tests {
         assert_eq!(purged.count("purge_trash", "purged_files"), 1);
     }
 
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn device_session_cleanup_uses_database_clock_and_deletes_history_in_batches() {
+        let mut w = W::new().await;
+        let now: time::OffsetDateTime = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let fresh_id = Uuid::new_v4();
+        let expired_id = Uuid::new_v4();
+        let family_fresh = Uuid::new_v4();
+        let family_expired = Uuid::new_v4();
+        let expired_id_2 = Uuid::new_v4();
+        let pool = w.env.pool.clone();
+        let user_id = w.owner.0;
+        let insert = |id: Uuid,
+                      family: Uuid,
+                      refresh: [u8; 32],
+                      created: time::OffsetDateTime,
+                      idle: time::OffsetDateTime,
+                      absolute: time::OffsetDateTime,
+                      access_expiry: Option<time::OffsetDateTime>,
+                      access_hash: Option<Vec<u8>>,
+                      revoked: Option<time::OffsetDateTime>,
+                      reason: Option<&str>| {
+            let pool = pool.clone();
+            let reason = reason.map(str::to_owned);
+            async move {
+                sqlx::query("INSERT INTO device_sessions (id,user_id,name,client_kind,client_id,refresh_hash,refresh_family,access_hash,access_expires_at,created_at,last_used_at,idle_expires_at,absolute_expires_at,revoked_at,revoke_reason) VALUES ($1,$2,'Test device','cli','maintenance-test',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+                .bind(id).bind(user_id).bind(refresh.as_slice()).bind(family).bind(access_hash).bind(access_expiry)
+                .bind(created).bind(created).bind(idle).bind(absolute).bind(revoked).bind(reason)
+                .execute(&pool).await.unwrap();
+            }
+        };
+        insert(
+            fresh_id,
+            family_fresh,
+            [1; 32],
+            now - time::Duration::days(1),
+            now + time::Duration::hours(1),
+            now + time::Duration::days(89),
+            Some(now + time::Duration::minutes(15)),
+            Some(vec![2; 32]),
+            None,
+            None,
+        )
+        .await;
+        insert(
+            expired_id,
+            family_expired,
+            [3; 32],
+            now - time::Duration::days(60),
+            now - time::Duration::days(31),
+            now - time::Duration::days(31),
+            None,
+            None,
+            Some(now - time::Duration::days(31)),
+            Some("security"),
+        )
+        .await;
+        insert(
+            expired_id_2,
+            Uuid::new_v4(),
+            [5; 32],
+            now - time::Duration::days(60),
+            now - time::Duration::days(31),
+            now - time::Duration::days(31),
+            None,
+            None,
+            Some(now - time::Duration::days(31)),
+            Some("security"),
+        )
+        .await;
+        sqlx::query("INSERT INTO device_refresh_history(device_session_id,refresh_hash,rotated_at) VALUES($1,$2,$3)")
+            .bind(expired_id).bind([4_u8;32].as_slice()).bind(now - time::Duration::days(40))
+            .execute(&w.env.pool).await.unwrap();
+
+        w.age(180).await;
+        let mut checked = settings(1024);
+        checked.max_clock_drift = Some(Duration::from_secs(300));
+        checked.batch_size = 1;
+        let job = w.job_with(checked).await;
+        let report = run(&job).await;
+        assert_eq!(report.count("purge_audit", "purged_device_sessions"), 2);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM device_sessions WHERE id='{fresh_id}' AND revoked_at IS NULL"
+            ))
+            .await,
+            1
+        );
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM device_sessions WHERE id='{expired_id}'"
+            ))
+            .await,
+            0
+        );
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM device_sessions WHERE id='{expired_id_2}'"
+            ))
+            .await,
+            0
+        );
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM device_refresh_history WHERE device_session_id='{expired_id}'"
+            ))
+            .await,
+            0
+        );
+    }
+
     // ---- epoch, small-store brake, poisoned head ------------------------------------------------------
 
     async fn marker_epoch(w: &W) -> u64 {

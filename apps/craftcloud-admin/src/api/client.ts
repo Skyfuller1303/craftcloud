@@ -8,6 +8,7 @@ import type {
   CreateFileRequest,
   CreateInvitationRequest,
   CreatedInvitation,
+  DeviceSession,
   ErrorBody,
   FileRecord,
   FileVersion,
@@ -44,6 +45,8 @@ export const ENDPOINTS = {
   setupComplete: { method: "POST", path: "/setup/complete" },
   login: { method: "POST", path: "/auth/login" },
   session: { method: "GET", path: "/auth/session" },
+  listDevices: { method: "GET", path: "/auth/devices" },
+  revokeDevice: { method: "DELETE", path: "/auth/devices/{id}" },
   logout: { method: "POST", path: "/auth/logout" },
   listOrganizations: { method: "GET", path: "/organizations" },
   listWorkspaces: { method: "GET", path: "/organizations/{org_id}/workspaces" },
@@ -244,6 +247,8 @@ export interface ApiClient {
    * is kept so that the call can be repeated.
    */
   logout(): Promise<void>;
+  listDevices(): Promise<DeviceSession[]>;
+  revokeDevice(id: string): Promise<void>;
   listOrganizations(cursor?: string): Promise<Page<Organization>>;
   listWorkspaces(orgId: string, cursor?: string): Promise<Page<Workspace>>;
   acceptInvitation(body: AcceptInvitationRequest): Promise<AcceptedInvitation>;
@@ -453,6 +458,11 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       }
       csrfToken = null;
     },
+    async listDevices() {
+      const result = await call<{ devices: DeviceSession[] }>(ENDPOINTS.listDevices);
+      return result.devices;
+    },
+    revokeDevice: (id) => call(ENDPOINTS.revokeDevice, { params: { id } }),
     listOrganizations: (cursor) =>
       call(ENDPOINTS.listOrganizations, { query: { limit: "100", cursor } }),
     listWorkspaces: (orgId, cursor) =>

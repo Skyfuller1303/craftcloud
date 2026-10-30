@@ -372,14 +372,17 @@ describe("organization and workspace selectors", () => {
     expect(await screen.findByRole("heading", { name: "Log in" })).toBeTruthy();
   });
 
-  it("navigates placeholder sections and marks the current one", async () => {
-    const { fetch } = mockFetch(loggedInRoutes());
+  it("navigates settings and marks the current section", async () => {
+    const { fetch } = mockFetch(loggedInRoutes({
+      "GET /auth/devices": { body: { devices: [] } },
+    }));
     const user = userEvent.setup();
     renderApp(fetch);
     await user.click(await screen.findByRole("button", { name: "Settings" }));
     expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
-    expect(screen.getByText("This view is not available yet.")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 2, name: "Devices" })).toBeTruthy();
+    expect(screen.getByText("There are no registered devices.")).toBeTruthy();
   });
 });
 

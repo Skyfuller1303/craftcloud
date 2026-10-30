@@ -164,7 +164,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("no request line for {id}:\n{text}"))
         };
         let info = line_for("json-req-1");
-        assert_eq!(info["fields"]["status"], 200);
+        // AC-01 rejects the intentionally mixed credentials before serving the route.
+        assert_eq!(info["fields"]["status"], 400);
         assert_eq!(info["span"]["route"], "/api/v1/info");
         assert_eq!(info["span"]["method"], "GET");
         assert!(info["fields"]["latency_ms"].is_u64());
@@ -172,7 +173,7 @@ mod tests {
         assert_eq!(info["fields"]["org_id"], "-");
         assert_eq!(info["level"], "INFO");
         let missing = line_for("json-req-2");
-        assert_eq!(missing["fields"]["status"], 404);
+        assert_eq!(missing["fields"]["status"], 400);
         assert_eq!(missing["span"]["route"], "unmatched");
         // Health probes stay out of the default (info) log.
         assert!(
@@ -409,11 +410,21 @@ mod tests {
             .send(
                 Req::new("GET", "/api/v1/auth/session")
                     .header("x-request-id", "flow-401")
+                    .header("authorization", "Bearer AUTHHEADERSECRET-4455"),
+            )
+            .await;
+        assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
+        // Mixed credentials add an AC-01 error path without losing the 401 coverage.
+        let mixed = w
+            .send(
+                Req::new("GET", "/api/v1/auth/session")
+                    .header("x-request-id", "flow-400")
                     .header("authorization", "Bearer AUTHHEADERSECRET-4455")
                     .header("cookie", "__Host-craftcloud_session=BOGUSCOOKIEVALUE-6677"),
             )
             .await;
-        assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(mixed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(mixed.code(), "AMBIGUOUS_CREDENTIALS");
         let forbidden = w
             .send(
                 Req::new("GET", "/api/v1/admin/health")
@@ -490,6 +501,7 @@ mod tests {
         assert!(line("flow-422").contains("status=422"));
         assert!(line("flow-403").contains("status=403"));
         assert!(line("flow-401").contains("status=401"));
+        assert!(line("flow-400").contains("status=400"));
 
         // No concrete path with an id, no query string, no fragment.
         for concrete in [

@@ -15,6 +15,7 @@
 
 pub mod accounts;
 pub mod audit;
+pub mod device_sessions;
 mod error;
 pub mod files;
 pub mod invitations;

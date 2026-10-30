@@ -649,6 +649,7 @@ struct Finish {
     expected: Sha256Digest,
     user_id: Uuid,
     login_session_id: Uuid,
+    credential_kind: crate::session::CredentialKind,
     org_id: Uuid,
     workspace_id: Uuid,
     upload_id: Uuid,
@@ -670,6 +671,7 @@ async fn finish_upload(finish: Finish) -> Response {
         expected,
         user_id,
         login_session_id,
+        credential_kind,
         org_id,
         workspace_id,
         upload_id,
@@ -706,7 +708,15 @@ async fn finish_upload(finish: Finish) -> Response {
     // The request was authenticated when it started; the account may have been
     // disabled or the session revoked while the body streamed in.
     let now = services.clock.now();
-    match tx.session_valid(login_session_id, user_id, now).await {
+    match tx
+        .session_valid(
+            login_session_id,
+            user_id,
+            now,
+            credential_kind == crate::session::CredentialKind::Device,
+        )
+        .await
+    {
         Ok(true) => {}
         Ok(false) => {
             fail_in_tx(tx, &services, org_id, upload_id, now).await;
@@ -1011,6 +1021,7 @@ pub(crate) async fn put_content(
         expected,
         user_id: session.user_id,
         login_session_id: session.session_id,
+        credential_kind: session.credential_kind,
         org_id,
         workspace_id: resolved.workspace_id,
         upload_id,

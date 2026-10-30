@@ -24,6 +24,9 @@ Alle Schlüssel tragen das Präfix `CRAFTCLOUD_`. Unbekannte `CRAFTCLOUD_*`-Vari
 | `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE` | nicht gesetzt (Setup deaktiviert) | absoluter Pfad einer Secret-Datei mit dem Bootstrap-Token (mindestens 32 Zeichen nach dem Trimmen); erfordert `CRAFTCLOUD_DATABASE_URL_FILE` |
 | `CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES` | `480` (8 h) | 5 bis 4320; nicht größer als die absolute Dauer |
 | `CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS` | `168` (7 Tage) | 1 bis 720 |
+| `CRAFTCLOUD_DEVICE_ACCESS_TTL` | `900` (15 Minuten) | Ganze Sekunden, 60 bis 3600; Lebensdauer eines Geräte-Zugriffstokens |
+| `CRAFTCLOUD_DEVICE_IDLE_DAYS` | `30` | Ganze Tage, 1 bis 90; nicht größer als die absolute Gerätedauer |
+| `CRAFTCLOUD_DEVICE_ABSOLUTE_DAYS` | `90` | Ganze Tage, 1 bis 365; maximale Dauer seit der Geräte-Anmeldung |
 | `CRAFTCLOUD_TRASH_RETENTION_DAYS` | `30` | 1 bis 3650; so lange bleiben in den Papierkorb verschobene Projekte und Dateien wiederherstellbar (ADR-0014). Danach löscht der Wartungsjob sie endgültig (siehe Abschnitt Wartungsjob) |
 | `CRAFTCLOUD_STORAGE_DIR` | nicht gesetzt (Dateispeicher nicht verfügbar) | absoluter Pfad eines Verzeichnisses für Dateiinhalte. Beim Start geprüft: vorhanden, Verzeichnis, beschreibbar, kein Symlink/Reparse-Point; `objects` und `tmp` darunter werden angelegt und müssen auf demselben Dateisystem liegen (Probe mit Anlegen und Hard-Link; das Dateisystem muss Hard-Links unterstützen, z. B. NTFS, ext4, XFS, nicht FAT/exFAT). Bei einem Fehler beendet sich der Server mit Exit 1 |
 | `CRAFTCLOUD_MAX_FILE_SIZE_BYTES` | `5368709120` (5 GiB) | 1048576 bis 1099511627776; größte erlaubte Dateigröße (ADR-0014) |
@@ -59,6 +62,14 @@ CRAFTCLOUD_LOG_FORMAT=json
 ```
 
 ### Anmeldung, Sitzungen und CSRF
+
+**Desktop-Anmeldung (AC-01):** Apps, Launcher und CLI verwenden eigene Geräte-Sitzungen gemäß [ADR-0018](../09-decisions/adr-0018-device-sessions.md). `POST /api/v1/auth/device/login` nimmt E-Mail, Passwort und Geräte-Metadaten entgegen. Der Client speichert ausschließlich das Erneuerungstoken im Betriebssystem-Schlüsselbund; das Zugriffstoken gehört in den Arbeitsspeicher. Geräte-Tokens dürfen nicht an andere Apps weitergereicht werden. Der Server speichert nur SHA-256-Hashes und zeigt im Webpanel unter Einstellungen die eigenen Geräte mit einer Abmeldeaktion.
+
+Für `POST /auth/device/*` ist TLS Pflicht; nur eine ausdrücklich konfigurierte Loopback-Instanz erlaubt HTTP. Bei TLS-Terminierung muss der Proxy in `CRAFTCLOUD_TRUSTED_PROXIES` stehen und den ursprünglichen Transport vertrauenswürdig weitergeben. Ungeprüfte Forwarded-Header sind kein TLS-Nachweis. Proxy-Zugriffslogs dürfen keine Authorization-Header, Request-Bodies oder Token-Querys speichern.
+
+Der Client sendet `Authorization: Bearer ccd_at_…` ohne Cookie. Bearer-Anfragen brauchen weder CSRF-Token noch Origin; Cookie-Anfragen behalten beide Prüfungen. Gemischte Credentials ergeben `400 AMBIGUOUS_CREDENTIALS`. `POST /auth/device/refresh` ersetzt beide Tokens atomar. Eine erneute Verwendung eines alten Erneuerungstokens widerruft die Familie sofort (`401 REFRESH_TOKEN_INVALID`, Audit `auth.device_refresh_reuse`). Es gibt keine Gnadenfrist und keinen automatischen Refresh-Retry; Clients serialisieren Erneuerungen. Geht eine erfolgreiche Antwort verloren, meldet sich der Client erneut an.
+
+Passwortänderung, Passwort-Reset, Konto-Deaktivierung, „Überall abmelden“ und Entfernen aus der letzten Organisation widerrufen alle Geräte-Sitzungen atomar. Geräte-Sitzungen und ihre Refresh-Historie sind vom Backup ausgeschlossen. Der Wartungsjob löscht sie 30 Tage nach Ablauf oder Widerruf. Migration 0015 muss vor dem Start angewendet werden; ein Rollback auf einen älteren Server erfolgt über ein geprüftes Backup, nicht durch Rückwärtsmigration.
 
 - **`CRAFTCLOUD_PUBLIC_URL` ist für Browser-Betrieb Pflicht.** Daraus ergeben sich die erlaubte `Origin` (CSRF-Prüfung) und die Reset-Links. Ohne gesetzte URL lehnt der Server jede Anfrage mit `Origin`-Header (also jeden Browser) ab und warnt beim Start; Clients ohne `Origin` (curl, Skripte) funktionieren weiter.
 - **Cookie:** `__Host-craftcloud_session` mit `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, ohne `Domain`. Nur wenn `CRAFTCLOUD_PUBLIC_URL` ein `http://`-Loopback-Host ist (lokale Entwicklung), heißt das Cookie `craftcloud_session` und hat kein `Secure`, weil Browser `__Host-`/`Secure` über http nicht zuverlässig akzeptieren. Produktiv immer `https` über den vertrauenswürdigen Proxy.

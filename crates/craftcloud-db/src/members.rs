@@ -330,6 +330,21 @@ impl OrgTx {
         scope: &OrgScope,
         user_id: Uuid,
     ) -> Result<RemoveOutcome, DbError> {
+        self.remove_audited(scope, user_id, &crate::audit::AuditCtx::system())
+            .await
+    }
+
+    /// Removes a membership and attributes resulting device revocations to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only; a failed audit write rolls back with the transaction.
+    pub async fn remove_audited(
+        &mut self,
+        scope: &OrgScope,
+        user_id: Uuid,
+        audit: &crate::audit::AuditCtx,
+    ) -> Result<RemoveOutcome, DbError> {
         self.check(scope, Action::MemberRemove)?;
         if self.stored_role_of(user_id).await?.is_none() {
             return Ok(RemoveOutcome::NotMember);
@@ -337,6 +352,10 @@ impl OrgTx {
         if self.would_orphan(user_id).await? {
             return Ok(RemoveOutcome::LastOwner);
         }
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *self.tx)
+            .await?;
         sqlx::query("DELETE FROM workspace_members WHERE org_id = $1 AND user_id = $2")
             .bind(self.org_id)
             .bind(user_id)
@@ -347,6 +366,19 @@ impl OrgTx {
             .bind(user_id)
             .execute(&mut *self.tx)
             .await?;
+        let memberships: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM organization_members WHERE user_id=$1 AND status='active'",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if memberships == 0 {
+            let now: OffsetDateTime = sqlx::query_scalar("SELECT now()")
+                .fetch_one(&mut *self.tx)
+                .await?;
+            crate::device_sessions::revoke_all_for_user_tx(&mut self.tx, user_id, now, audit)
+                .await?;
+        }
         Ok(RemoveOutcome::Removed)
     }
 

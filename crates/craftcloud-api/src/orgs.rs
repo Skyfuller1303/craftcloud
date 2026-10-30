@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::audit::{Change, Denied, commit_audited};
+use crate::audit::{Change, Denied, commit_audited, ctx as audit_ctx};
 use crate::pagination::{
     PageError, PageQuery, UserListQuery, decode_time_cursor, encode_time_cursor,
 };
@@ -845,7 +845,14 @@ pub(crate) async fn remove_member(
     let Some(scope) = OrgScope::from_permit(&permit) else {
         return internal(&headers);
     };
-    match tx.remove(&scope, target_id).await {
+    match tx
+        .remove_audited(
+            &scope,
+            target_id,
+            &audit_ctx(&headers, Some(session.user_id)),
+        )
+        .await
+    {
         Ok(RemoveOutcome::Removed) => {
             if let Err(error) = commit_audited(
                 tx,

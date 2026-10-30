@@ -74,6 +74,8 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
 pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("sessions", 4),
     ("password_reset_tokens", 4),
+    ("device_sessions", 15),
+    ("device_refresh_history", 15),
     ("storage_binding", 10),
     ("maintenance_runs", 10),
 ];
@@ -82,6 +84,8 @@ pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
 pub const EXCLUDED_TABLES: &[&str] = &[
     "sessions",
     "password_reset_tokens",
+    "device_sessions",
+    "device_refresh_history",
     "storage_binding",
     "maintenance_runs",
 ];
@@ -166,7 +170,16 @@ mod tests {
             BACKUP_TABLES.len()
         );
         assert_eq!(backup_tables_for(14).unwrap().len(), BACKUP_TABLES.len());
-        assert_eq!(excluded_tables_for(14), EXCLUDED_TABLES);
+        assert_eq!(
+            excluded_tables_for(14),
+            [
+                "sessions",
+                "password_reset_tokens",
+                "storage_binding",
+                "maintenance_runs"
+            ]
+        );
+        assert_eq!(excluded_tables_for(15), EXCLUDED_TABLES);
         // Older schemas are refused with a clear reason.
         let error = backup_tables_for(MIN_BACKUP_MIGRATION - 1).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Format);

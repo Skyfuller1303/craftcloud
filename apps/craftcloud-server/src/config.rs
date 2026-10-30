@@ -48,6 +48,12 @@ const DEFAULT_QUARANTINE_DAYS: u64 = 30;
 const QUARANTINE_DAYS_RANGE: (u64, u64) = (1, 3650);
 const DEFAULT_AUDIT_RETENTION_DAYS: u64 = 365;
 const AUDIT_RETENTION_DAYS_RANGE: (u64, u64) = (30, 3650);
+const DEFAULT_DEVICE_ACCESS_TTL_SECS: u64 = 900;
+const DEVICE_ACCESS_TTL_SECS_RANGE: (u64, u64) = (60, 3600);
+const DEFAULT_DEVICE_IDLE_DAYS: u64 = 30;
+const DEVICE_IDLE_DAYS_RANGE: (u64, u64) = (1, 90);
+const DEFAULT_DEVICE_ABSOLUTE_DAYS: u64 = 90;
+const DEVICE_ABSOLUTE_DAYS_RANGE: (u64, u64) = (1, 365);
 const DEFAULT_VERIFY_BYTES_PER_RUN: u64 = 1024 * 1024 * 1024;
 const VERIFY_BYTES_PER_RUN_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 
@@ -60,7 +66,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 29] = [
+const SUPPORTED_KEYS: [&str; 32] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -90,6 +96,9 @@ const SUPPORTED_KEYS: [&str; 29] = [
     "DATABASE_RUNTIME_ROLE",
     "METRICS_ADDR",
     "METRICS_TOKEN_FILE",
+    "DEVICE_ACCESS_TTL",
+    "DEVICE_IDLE_DAYS",
+    "DEVICE_ABSOLUTE_DAYS",
 ];
 
 /// Log output format.
@@ -178,6 +187,12 @@ pub struct Config {
     pub session_idle_timeout: Duration,
     /// Session absolute timeout.
     pub session_absolute_timeout: Duration,
+    /// Device access-token lifetime, configured in seconds.
+    pub device_access_ttl: Duration,
+    /// Device-session idle timeout, configured in days.
+    pub device_idle_timeout: Duration,
+    /// Device-session absolute timeout, configured in days.
+    pub device_absolute_timeout: Duration,
     /// How long soft-deleted projects and files stay restorable (ADR-0014).
     pub trash_retention: Duration,
     /// Directory of the local object store, if configured. Validated when the
@@ -393,6 +408,18 @@ impl Config {
             |key, raw| parse_ranged(key, raw, SESSION_ABSOLUTE_HOURS_RANGE),
         )
         .unwrap_or(DEFAULT_SESSION_ABSOLUTE_HOURS);
+        let device_access_ttl = field(&mut errors, env, "DEVICE_ACCESS_TTL", |key, raw| {
+            parse_ranged(key, raw, DEVICE_ACCESS_TTL_SECS_RANGE)
+        })
+        .unwrap_or(DEFAULT_DEVICE_ACCESS_TTL_SECS);
+        let device_idle_days = field(&mut errors, env, "DEVICE_IDLE_DAYS", |key, raw| {
+            parse_ranged(key, raw, DEVICE_IDLE_DAYS_RANGE)
+        })
+        .unwrap_or(DEFAULT_DEVICE_IDLE_DAYS);
+        let device_absolute_days = field(&mut errors, env, "DEVICE_ABSOLUTE_DAYS", |key, raw| {
+            parse_ranged(key, raw, DEVICE_ABSOLUTE_DAYS_RANGE)
+        })
+        .unwrap_or(DEFAULT_DEVICE_ABSOLUTE_DAYS);
         let trash_retention_days = field(&mut errors, env, "TRASH_RETENTION_DAYS", |key, raw| {
             parse_ranged(key, raw, TRASH_RETENTION_DAYS_RANGE)
         })
@@ -512,6 +539,12 @@ impl Config {
                 "must not exceed CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS",
             ));
         }
+        if device_idle_days > device_absolute_days {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}DEVICE_IDLE_DAYS"),
+                "must not exceed CRAFTCLOUD_DEVICE_ABSOLUTE_DAYS",
+            ));
+        }
         let (public_origin, cookie_secure) = public_url
             .as_deref()
             .and_then(|raw| Url::parse(raw).ok())
@@ -547,6 +580,9 @@ impl Config {
                 cookie_secure,
                 session_idle_timeout: Duration::from_secs(session_idle_minutes * 60),
                 session_absolute_timeout: Duration::from_secs(session_absolute_hours * 3600),
+                device_access_ttl: Duration::from_secs(device_access_ttl),
+                device_idle_timeout: Duration::from_secs(device_idle_days * 24 * 3600),
+                device_absolute_timeout: Duration::from_secs(device_absolute_days * 24 * 3600),
                 trash_retention: Duration::from_secs(trash_retention_days * 24 * 3600),
                 storage_dir,
                 max_file_size_bytes,
@@ -826,6 +862,15 @@ mod tests {
             defaults.session_absolute_timeout,
             Duration::from_secs(7 * 24 * 3600)
         );
+        assert_eq!(defaults.device_access_ttl, Duration::from_secs(15 * 60));
+        assert_eq!(
+            defaults.device_idle_timeout,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert_eq!(
+            defaults.device_absolute_timeout,
+            Duration::from_secs(90 * 24 * 3600)
+        );
         assert_eq!(defaults.public_origin, None);
         assert!(defaults.cookie_secure);
 
@@ -1035,6 +1080,41 @@ mod tests {
             ("CRAFTCLOUD_SESSION_ABSOLUTE_TIMEOUT_HOURS", "5"),
         ]);
         assert_eq!(keys(&errors), ["CRAFTCLOUD_SESSION_IDLE_TIMEOUT_MINUTES"]);
+    }
+
+    #[test]
+    fn device_session_lifetimes_are_bounded_and_ordered() {
+        let custom = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_DEVICE_ACCESS_TTL", "3600"),
+            ("CRAFTCLOUD_DEVICE_IDLE_DAYS", "60"),
+            ("CRAFTCLOUD_DEVICE_ABSOLUTE_DAYS", "180"),
+        ]))
+        .unwrap();
+        assert_eq!(custom.device_access_ttl, Duration::from_secs(3600));
+        assert_eq!(
+            custom.device_idle_timeout,
+            Duration::from_secs(60 * 24 * 3600)
+        );
+        assert_eq!(
+            custom.device_absolute_timeout,
+            Duration::from_secs(180 * 24 * 3600)
+        );
+        for (key, bad) in [
+            ("CRAFTCLOUD_DEVICE_ACCESS_TTL", "59"),
+            ("CRAFTCLOUD_DEVICE_ACCESS_TTL", "3601"),
+            ("CRAFTCLOUD_DEVICE_ACCESS_TTL", "x"),
+            ("CRAFTCLOUD_DEVICE_IDLE_DAYS", "0"),
+            ("CRAFTCLOUD_DEVICE_IDLE_DAYS", "91"),
+            ("CRAFTCLOUD_DEVICE_ABSOLUTE_DAYS", "0"),
+            ("CRAFTCLOUD_DEVICE_ABSOLUTE_DAYS", "366"),
+        ] {
+            assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
+        }
+        let errors = errors_of(&[
+            ("CRAFTCLOUD_DEVICE_IDLE_DAYS", "31"),
+            ("CRAFTCLOUD_DEVICE_ABSOLUTE_DAYS", "30"),
+        ]);
+        assert_eq!(keys(&errors), ["CRAFTCLOUD_DEVICE_IDLE_DAYS"]);
     }
 
     #[test]

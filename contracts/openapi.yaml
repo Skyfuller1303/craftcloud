@@ -9,6 +9,7 @@ servers:
   - url: https://craftcloud.example.invalid/api/v1
 security:
   - cookieAuth: []
+  - bearerAuth: []
 tags:
   - name: Health
   - name: Setup
@@ -204,12 +205,134 @@ paths:
         '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/device/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Create a desktop device session (AC-01)
+      description: >-
+        Requires TLS, except for an explicitly configured loopback public URL. Trusted-proxy rules apply.
+        Uses the same password verification, unknown-account timing and rate-limit counters as browser login.
+        No cookie is set. Both tokens contain 256 random bits and are stored only as SHA-256 hashes.
+        SECOND_FACTOR_REQUIRED with a short-lived challenge_id is reserved for AC-02; AC-01 only provides
+        the extension point and never issues a second-factor challenge. Cookie plus Bearer is rejected
+        with 400 AMBIGUOUS_CREDENTIALS. Responses must not be cached or logged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeviceLoginRequest'}
+      responses:
+        '200':
+          description: Device session created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceLoginResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401':
+          description: INVALID_CREDENTIALS (SECOND_FACTOR_REQUIRED reserved for AC-02)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/device/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Rotate a device session's access and refresh tokens
+      description: >-
+        Requires TLS except for an explicitly configured loopback instance. Rotation is atomic. The previous
+        access token stops working immediately. Reusing any rotated refresh token revokes the whole family
+        with reason refresh_reuse. There is no grace period or automatic retry: clients must serialize refresh
+        requests and sign in again after a lost response. Refresh idle lifetime is extended to at most the
+        original absolute expiry. Unknown, malformed, expired, revoked and reused tokens all answer
+        401 REFRESH_TOKEN_INVALID. A refresh token is accepted only in the body, never in a URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string, writeOnly: true}
+      responses:
+        '200':
+          description: Replacement tokens; retain the new refresh token in the operating system keychain
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceTokenResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/RefreshTokenInvalid'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/device/logout:
+    post:
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      summary: Revoke the device session authenticated by Bearer
+      description: Requires TLS except for an explicitly configured loopback instance. Cookie authentication alone is not accepted.
+      responses:
+        '204': {description: Device session revoked}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/devices:
+    get:
+      tags: [Auth]
+      summary: List the own active desktop devices
+      description: Contains display metadata only, never token hashes or tokens. No operator or organization-admin override.
+      responses:
+        '200':
+          description: Own devices
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceList'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/devices/{id}:
+    delete:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+        - bearerAuth: []
+      summary: Revoke one of the own desktop device sessions
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '204': {description: Device revoked}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/CsrfFailed'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /auth/session:
     get:
       tags: [Auth]
       summary: Current session (CC-F02)
       description: Returns the authenticated account and the CSRF token. 401 UNAUTHENTICATED without a valid, unexpired, unrevoked session.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Current session
           content:
@@ -226,6 +349,7 @@ paths:
         Active (not revoked, not expired) sessions of the current user, newest first, at most 100. Contains no
         network or device data (no IP address, no user agent) and never a token.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Own active sessions
           content:
@@ -240,6 +364,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Revoke one of the own sessions
       description: >-
         Only own sessions can be revoked. Another user's, unknown and already revoked sessions all answer 404.
@@ -250,6 +375,7 @@ paths:
           required: true
           schema: {type: string, format: uuid}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Session revoked}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/CsrfFailed'}
@@ -262,11 +388,13 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Log out the current session
       description: >-
         Revokes the session and clears the cookie. A 401 answer also carries a Set-Cookie that clears the
         stale cookie.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Logged out; Set-Cookie clears the session cookie}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/CsrfFailed'}
@@ -278,9 +406,11 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Log out all sessions of the account
       description: Revokes every session of the account and clears the cookie (also on a 401 answer).
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: All sessions of the account revoked; the cookie is cleared}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/CsrfFailed'}
@@ -292,11 +422,12 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Change the own password
       description: >-
         Requires the current password (wrong: 403 INVALID_CURRENT_PASSWORD; rate limited to 5 per minute and
-        user). Revokes all other sessions of the account and voids pending reset links; the current session
-        stays valid. Policy violations of the new password answer 422 VALIDATION_ERROR with details.fields
+        user). Revokes all other sessions of the account and voids pending reset links; the current browser session
+        stays valid. All device sessions, including the caller when using Bearer, are revoked. Policy violations of the new password answer 422 VALIDATION_ERROR with details.fields
         ["new_password"].
       requestBody:
         required: true
@@ -304,6 +435,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/ChangePasswordRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Password changed}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
@@ -356,6 +488,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Issue a password reset link (instance operator only)
       description: >-
         Until the policy engine (PR-006) only the instance operator recorded by the one-time setup may call
@@ -366,6 +499,7 @@ paths:
         AUTH_UNAVAILABLE). Disabled accounts: 409 ACCOUNT_DISABLED. Offline alternative:
         craftcloud-server admin issue-password-reset --email <address>.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Reset link issued
           content:
@@ -390,9 +524,11 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Void pending password reset links (instance operator only)
       description: Voids every unused reset link of the account without touching its sessions. Idempotent.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Pending links voided (or none existed)}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
@@ -429,6 +565,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Create an organization (instance operator only)
       description: >-
         Creates the organization and the owner membership of owner_user_id (an existing, enabled user; may be the
@@ -441,6 +578,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CreateOrganizationRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Created
           headers:
@@ -469,6 +607,7 @@ paths:
         Non-members, the instance operator without membership and unknown ids all answer an identical 404
         NOT_FOUND (no existence leak). The ETag is the version for PATCH.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The organization with the caller's role
           headers:
@@ -485,6 +624,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Rename an organization (owner and admin)
       description: >-
         Order of checks: authentication and CSRF, 404 (not a member), 403 FORBIDDEN (plain member), 422 invalid
@@ -501,6 +641,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/UpdateOrganizationRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Updated; the new ETag is in the header
           headers:
@@ -555,6 +696,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Add an existing user as member (owner and admin)
       description: >-
         Owners may assign any role; admins only member and admin, never owner (403). Plain members: 403,
@@ -567,6 +709,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/AddMemberRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Added
           content:
@@ -597,6 +740,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Change a member's role (owner and admin)
       description: >-
         Owners may set any role. Admins may set member/admin on members and admins (including themselves) and never
@@ -610,6 +754,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/ChangeRoleRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Role changed (or already set)
           content:
@@ -633,12 +778,14 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Remove a member or leave the organization
       description: >-
         Owners may remove anybody, admins members and admins (not owners), and every member may remove themselves
         (leave). The user's workspace grants in the organization are removed with the membership. The last owner
         cannot be removed (409 LAST_OWNER). A membership row of any status (also invited or disabled) can be removed.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Removed}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -682,6 +829,7 @@ paths:
         of steps that failed (`DATABASE_ERROR`). `last_run` is null until a run has finished; dry runs are not recorded.
         The report contains counts and error codes only: no organization, file, user or storage data. Other callers: 403.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The status
           content:
@@ -704,6 +852,7 @@ paths:
         null when it cannot be measured (the server asks `df`; not available on Windows or in an image without it).
         Other callers: 403; anonymous callers: 401. Not cached.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The health view
           content:
@@ -810,6 +959,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Disable an account (operator only)
       description: >-
         Revokes every session of the account, voids its pending reset links and refuses further logins. Idempotent.
@@ -821,6 +971,7 @@ paths:
       parameters:
         - {in: path, name: user_id, required: true, schema: {type: string, format: uuid}}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Disabled (or already disabled); lists organizations without an enabled owner
           content:
@@ -849,11 +1000,13 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Enable an account (operator only)
       description: Idempotent. Earlier sessions stay revoked.
       parameters:
         - {in: path, name: user_id, required: true, schema: {type: string, format: uuid}}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Enabled (or already enabled)}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -919,6 +1072,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Create a workspace (organization owner and admin)
       description: >-
         Other members: 403, non-members and unknown organizations: 404. Invalid name/slug or a taken slug answer 422
@@ -929,6 +1083,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CreateWorkspaceRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Created
           headers:
@@ -954,6 +1109,7 @@ paths:
         The organization is taken from the workspace, never from the client. Unknown ids, workspaces of other
         organizations and workspaces the caller may not see are indistinguishable: 404.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The workspace
           headers:
@@ -970,6 +1126,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Rename a workspace (workspace admin, organization owner and admin)
       description: >-
         Requires If-Match with the current ETag (428 PRECONDITION_REQUIRED without, 412 VERSION_CONFLICT with a stale
@@ -986,6 +1143,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/UpdateWorkspaceRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Updated; the new ETag is in the header
           headers:
@@ -1039,6 +1197,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Add an organization member to a workspace
       description: >-
         Organization owners and admins may assign any workspace role. A workspace admin may assign editor and viewer
@@ -1051,6 +1210,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/AddWorkspaceMemberRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Added
           content:
@@ -1081,6 +1241,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Change a workspace role
       description: >-
         Organization owners and admins may set any role. A workspace admin may set editor/viewer on editors and
@@ -1092,6 +1253,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/ChangeWorkspaceRoleRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Role changed (or already set)
           content:
@@ -1110,10 +1272,12 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Remove a workspace member or leave the workspace
       description: >-
         Same limits as the role change; every member may remove themselves (leave), including workspace admins.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Removed}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -1151,6 +1315,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Create a project (organization owner/admin, workspace admin and editor)
       description: >-
         Viewers: 403; callers who cannot see the workspace: 404. The name follows the display-name rules after NFC
@@ -1162,6 +1327,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CreateProjectRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Created
           headers:
@@ -1192,6 +1358,7 @@ paths:
         The workspace and organization come from the project row. Unknown ids, ids of other tenants and projects in
         workspaces the caller cannot see are indistinguishable: 404.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The project
           headers:
@@ -1208,6 +1375,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Rename a project (organization owner/admin, workspace admin and editor)
       description: >-
         Requires If-Match (428 PRECONDITION_REQUIRED without, 412 VERSION_CONFLICT with a stale or malformed value; the
@@ -1224,6 +1392,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/UpdateProjectRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Renamed
           headers:
@@ -1259,12 +1428,14 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Move a project to the trash (organization owner/admin and workspace admin)
       description: >-
         Soft delete; idempotent (an already deleted project answers 204 and is not changed). Editors and viewers: 403.
         The files stay with the project; a project in the trash is read-only. Restorable for the retention period
         (`CRAFTCLOUD_TRASH_RETENTION_DAYS`, default 30); nothing is purged yet.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: In the trash}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -1279,11 +1450,13 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Restore a project from the trash (organization owner/admin and workspace admin)
       description: >-
         Within the retention period only (410 RETENTION_EXPIRED afterwards); 409 PROJECT_NAME_TAKEN when a live
         project took the name meanwhile. Restoring a live project changes nothing (200).
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Restored
           headers:
@@ -1336,6 +1509,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Create file metadata (organization owner/admin, workspace admin and editor)
       description: >-
         Metadata only; contents and versions follow with the upload feature. The name is untrusted display metadata,
@@ -1351,6 +1525,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CreateFileRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Created
           headers:
@@ -1381,6 +1556,7 @@ paths:
         Organization, workspace and project come from the file row. Unknown ids, ids of other tenants, ids of other
         kinds (a project id) and files in workspaces the caller cannot see are indistinguishable: 404.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The file metadata
           headers:
@@ -1397,6 +1573,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Rename a file (organization owner/admin, workspace admin and editor)
       description: >-
         Requires If-Match (428 without, 412 VERSION_CONFLICT with a stale or malformed value; the response carries the
@@ -1413,6 +1590,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/UpdateFileRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Renamed
           headers:
@@ -1448,11 +1626,13 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Move a file to the trash (organization owner/admin, workspace admin and editor)
       description: >-
         Soft delete; idempotent. Restorable for the retention period; nothing is purged yet. Viewers: 403. A file of
         a project in the trash answers 409 PROJECT_DELETED.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: In the trash}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -1472,12 +1652,14 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Restore a file from the trash (organization owner/admin, workspace admin and editor)
       description: >-
         Within the retention period only (410 RETENTION_EXPIRED afterwards); 409 FILE_NAME_TAKEN when a live file took
         the name meanwhile; 409 PROJECT_DELETED when the project is in the trash. Restoring a live file changes
         nothing (200).
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Restored
           headers:
@@ -1508,6 +1690,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Create an upload session and reserve its quota (organization owner/admin, workspace admin and editor)
       description: >-
         Declares size and SHA-256 of the content that will follow with `PUT /uploads/{upload_id}/content`. Reserves
@@ -1529,6 +1712,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CreateUploadRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Created
           content:
@@ -1566,6 +1750,7 @@ paths:
         An open session past its expiry is closed first (state `expired`). Unknown ids, ids of other tenants and
         sessions in workspaces the caller cannot see are indistinguishable: 404. Other members of the workspace: 403.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The session
           content:
@@ -1581,12 +1766,14 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Abort an upload session (creator, workspace admin, organization owner/admin)
       description: >-
         Releases the reservation; a stored but uncommitted blob becomes orphaned (removed later by the cleanup job).
         Idempotent for closed sessions. While content is being received: 409 UPLOAD_IN_PROGRESS; after a commit:
         409 UPLOAD_CLOSED.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Aborted}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -1606,6 +1793,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Send the content of an upload (the creator, while still editor or better)
       description: >-
         Raw body (any content type), streamed into object storage. There is no global body limit or handler timeout on
@@ -1770,6 +1958,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Set the storage quota of a workspace (organization owner and admin)
       description: >-
         `quota_bytes` is required: a number of bytes or null for unlimited. A value above the organization quota is
@@ -1780,6 +1969,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/QuotaRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Set
           content:
@@ -1801,6 +1991,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Set the storage quota of an organization (instance operator only)
       description: >-
         `quota_bytes` is required: a number of bytes or null for unlimited. Existing data is never deleted by a lower
@@ -1811,6 +2002,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/QuotaRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: Set
           content:
@@ -1853,6 +2045,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Commit a stored upload as the next version (compare-and-set)
       description: >-
         Needs `If-None-Match: *` for the first version or `If-Match: "version:<uuid>"` with the current head (the
@@ -1890,6 +2083,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CommitVersionRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Committed
           headers:
@@ -1941,6 +2135,7 @@ paths:
       summary: Get one version (workspace members, organization owner and admin)
       description: Unknown ids, versions of other files or tenants and callers who cannot see the workspace are indistinguishable (404).
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The version
           headers:
@@ -1961,6 +2156,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Make an older version the head again, as a new version (editor and better)
       description: >-
         Creates a new version that references the blob of the old one (`restored_from_version_id`); no new bytes are
@@ -1974,6 +2170,7 @@ paths:
           schema: {type: string}
           description: The content ETag of the current head
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Restored as a new version
           headers:
@@ -2028,6 +2225,7 @@ paths:
             Honors Range only if it equals exactly the strong content ETag `"version:<uuid>"` of the served version;
             anything else (another tag, weak tags, dates) sends the whole content with 200.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The content
           headers:
@@ -2094,6 +2292,7 @@ paths:
             Honors Range only if it equals exactly the strong content ETag `"version:<uuid>"` of the served version;
             anything else (another tag, weak tags, dates) sends the whole content with 200.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '200':
           description: The content
           headers:
@@ -2168,6 +2367,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Invite a person by link (no e-mail is sent in this phase)
       description: >-
         Owners and admins may invite as admin or member (never owner), optionally with a workspace and any
@@ -2186,6 +2386,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/CreateInvitationRequest'}
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
           description: Created
           content:
@@ -2217,11 +2418,13 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
+        - bearerAuth: []
       summary: Revoke an open invitation
       description: >-
         Organization owners and admins may revoke any open invitation, a workspace admin only invitations they
         created. Unknown, foreign and already closed invitations answer 404.
       responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '204': {description: Revoked}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
@@ -2394,8 +2597,63 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: PLACEHOLDER — not used until the desktop authorization flow (D13) has its own ADR.
+      bearerFormat: opaque ccd_at_ token
+      description: >-
+        AC-01 / ADR-0018: Authorization Bearer with an opaque ccd_at_ access token. Default lifetime 15 minutes.
+        Accepted by the same actor and policy checks as cookie sessions. Bearer requests require neither
+        X-CSRF-Token nor Origin. Cookie plus Bearer always answers 400 AMBIGUOUS_CREDENTIALS; query tokens
+        are never accepted. Device revocation, password change/reset, account disable, logout-all and removal
+        from the final organization revoke access immediately.
   schemas:
+    DeviceLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, client_kind, client_id, device_name]
+      properties:
+        email: {type: string}
+        password: {type: string, writeOnly: true}
+        client_kind: {type: string, enum: [app, launcher, cli]}
+        client_id: {type: string, pattern: '^[a-z0-9-]{1,32}$'}
+        device_name: {type: string, description: Sanitized display name, stored with at most 64 characters}
+    DeviceTokenResponse:
+      type: object
+      required: [access_token, access_expires_at, refresh_token, refresh_expires_at, device_session_id]
+      properties:
+        access_token: {type: string, pattern: '^ccd_at_[A-Za-z0-9_-]{43}$'}
+        access_expires_at: {type: string, format: date-time}
+        refresh_token: {type: string, pattern: '^ccd_rt_[A-Za-z0-9_-]{43}$'}
+        refresh_expires_at: {type: string, format: date-time, description: Earliest of idle and absolute expiry}
+        device_session_id: {type: string, format: uuid}
+    DeviceLoginResponse:
+      allOf:
+        - {$ref: '#/components/schemas/DeviceTokenResponse'}
+        - type: object
+          required: [user]
+          properties:
+            user:
+              type: object
+              required: [user_id, email, display_name, instance_role]
+              properties:
+                user_id: {type: string, format: uuid}
+                email: {type: string}
+                display_name: {type: string}
+                instance_role: {type: [string, 'null'], enum: [operator, null]}
+    DeviceList:
+      type: object
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items:
+            type: object
+            required: [id, name, client_kind, client_id, created_at, last_used_at]
+            properties:
+              id: {type: string, format: uuid}
+              name: {type: string, maxLength: 64}
+              client_kind: {type: string, enum: [app, launcher, cli]}
+              client_id: {type: string, pattern: '^[a-z0-9-]{1,32}$'}
+              created_at: {type: string, format: date-time}
+              last_used_at: {type: string, format: date-time}
     AuditEvent:
       type: object
       required: [id, created_at, last_at, count, org_id, actor_id, action, target, workspace_id, result, request_id, details]
@@ -3071,6 +3329,21 @@ components:
         csrf_token: {type: string, description: Only when an account was created and logged in}
         expires_at: {type: string, format: date-time, description: Session expiry, only when a session was issued}
   responses:
+    AmbiguousCredentials:
+      description: AMBIGUOUS_CREDENTIALS when Cookie and Bearer are supplied together; device POST routes also return DEVICE_TLS_REQUIRED when transport evidence is missing. Use exactly one authentication method.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    DeviceTlsRequired:
+      description: Device credentials require TLS or an explicitly configured loopback instance (DEVICE_TLS_REQUIRED).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    RefreshTokenInvalid:
+      description: Unknown, malformed, expired, revoked or reused refresh token (REFRESH_TOKEN_INVALID).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     ForbiddenOrCsrf:
       description: FORBIDDEN (authenticated but not allowed) or CSRF_FAILED
       content:

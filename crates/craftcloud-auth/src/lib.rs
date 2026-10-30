@@ -5,10 +5,12 @@
 //! are CPU- and memory-heavy and **blocking**; async callers must run them
 //! on a blocking thread pool.
 
+mod device;
 mod opaque;
 mod password;
 mod token;
 
+pub use device::{DeviceToken, DeviceTokenKind};
 pub use opaque::{OPAQUE_TOKEN_CHARS, OpaqueToken, RandomnessError};
 pub use password::{
     HashError, PASSWORD_MAX_CHARS, PASSWORD_MIN_CHARS, PasswordError, dummy_verify, hash_password,

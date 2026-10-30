@@ -5,6 +5,8 @@
 
 > **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-01 Geräte-Sitzungen, AC-02 Zwei-Faktor-Anmeldung).
 
+> **AC-01, 2026-10-30:** Desktop-Anmeldung und getrennte Geräte-Sitzungen sind lokal umgesetzt: opake Bearer-Zugriffstokens, rotierende Erneuerungstokens mit Wiederverwendungserkennung, atomarer Widerruf und eigene Geräteliste in den Web-Einstellungen. Maßgeblich ist [ADR-0018](../09-decisions/adr-0018-device-sessions.md); die untenstehende ursprüngliche Zurückstellung des Desktop-Passwortdialogs ist dadurch ersetzt. Zweifaktor-Anmeldung und Schlüsselbund-Code in Clients bleiben AC-02 beziehungsweise AC-04. Prüfstatus und verbleibende Einschränkungen stehen im AC-01-Abnahmebericht; es wurde nichts veröffentlicht.
+
 ## Problem und Nutzen
 
 Lokales Benutzerkonto für CraftCloud Web-Admin; unabhängig vom optional späteren ArtCraft-Hosted-Account. E-Mail normalisieren, Passwort-Hashes mit Argon2id und wartbaren Parametern, Login-Versuch pro Account/IP begrenzen. Account-Status active/disabled, Passwortwechsel, Logout an allen Geräten, Session-Timeout und eindeutige Revokation.

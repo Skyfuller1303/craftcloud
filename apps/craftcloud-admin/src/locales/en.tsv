@@ -89,6 +89,17 @@
 	Members	Members
 	Invitations	Invitations
 	Settings	Settings
+	Devices	Devices
+	Loading devices…	Loading devices…
+	There are no registered devices.	There are no registered devices.
+	Kind	Kind
+	Last used	Last used
+	Created	Created
+	Application	Application
+	Launcher	Launcher
+	Command line	Command line
+	Signing out…	Signing out…
+	Sign out	Sign out
 	Activity	Activity
 	Organization	Organization
 	Workspace	Workspace

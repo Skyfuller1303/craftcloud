@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::DbError;
 use crate::audit::{AuditCtx, Detail, NewEvent, record_in};
+use crate::device_sessions;
 
 /// Input for [`create`].
 #[derive(Debug, Clone)]
@@ -245,6 +246,10 @@ pub async fn revoke_owned_audited(
     record: bool,
 ) -> Result<bool, DbError> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let revoked = sqlx::query(
         "UPDATE sessions SET revoked_at = $3 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
     )
@@ -309,14 +314,25 @@ pub async fn revoke_all_for_user(
     user_id: Uuid,
     now: OffsetDateTime,
 ) -> Result<u64, DbError> {
-    let result = sqlx::query(
-        "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(user_id)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let result =
+        sqlx::query("UPDATE sessions SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL")
+            .bind(user_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    let audit = AuditCtx {
+        actor_id: Some(user_id),
+        request_id: None,
+    };
+    device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &audit).await?;
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// Like [`revoke_all_for_user`], and records the `auth.logout_all` audit event
@@ -332,6 +348,10 @@ pub async fn revoke_all_for_user_audited(
     audit: &AuditCtx,
 ) -> Result<u64, DbError> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let revoked = sqlx::query(
         "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
     )
@@ -340,6 +360,11 @@ pub async fn revoke_all_for_user_audited(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    let device_audit = AuditCtx {
+        actor_id: Some(user_id),
+        request_id: audit.request_id.clone(),
+    };
+    device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &device_audit).await?;
     let by = AuditCtx {
         actor_id: Some(user_id),
         request_id: audit.request_id.clone(),

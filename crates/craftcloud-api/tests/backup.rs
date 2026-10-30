@@ -462,7 +462,7 @@ mod tests {
         let backup_time = started.elapsed();
         assert!(created.audit_recorded);
         assert_eq!(created.blobs, 5, "{:?}", created.manifest.blobs);
-        assert_eq!(created.manifest.migration_version, 14);
+        assert_eq!(created.manifest.migration_version, 15);
 
         let report = craftcloud_backup::verify(&out, Some(&created.manifest_sha256)).unwrap();
         assert_eq!(report.blobs, 5);
@@ -796,7 +796,7 @@ mod tests {
 
         // Forged manifests with a matching checksum file: unknown versions.
         rewrite_manifest(&out, |m| m["migration_version"] = json!(99));
-        expect(&out, ErrorKind::Format, "only knows up to 14");
+        expect(&out, ErrorKind::Format, "only knows up to 15");
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
             m["format_version"] = json!(2);
@@ -962,10 +962,19 @@ mod tests {
         let w = W::new().await;
         let dir = TempDir::new("backup-older");
         let (out, _) = small_backup(&w, &dir).await;
-        // Migrations 0012 to 0014 change functions, triggers, an index and data,
-        // not tables, so a version 14 export is also a valid version 11 export. (No older
-        // server build exists here to produce a genuine one.)
-        rewrite_manifest(&out, |m| m["migration_version"] = json!(11));
+        // Migration 0015 adds excluded credential tables. A version 15 export
+        // has no rows for them, so remove their version 15 exclusion entries to
+        // model the manifest produced by a version 11 server. (No older server
+        // build exists here to produce a genuine one.)
+        rewrite_manifest(&out, |m| {
+            m["migration_version"] = json!(11);
+            m["excluded_tables"] = json!([
+                "sessions",
+                "password_reset_tokens",
+                "storage_binding",
+                "maintenance_runs"
+            ]);
+        });
         craftcloud_backup::verify(&out, None).unwrap();
 
         let target = Target::new().await;
@@ -980,7 +989,7 @@ mod tests {
 
         // Restore, then migrate.
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 3);
+        assert_eq!(applied.len(), 4);
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         assert_eq!(
             dump(&w.env.pool, "users").await,
@@ -1392,7 +1401,7 @@ mod tests {
         .unwrap();
         assert_eq!((row.0, row.1, row.2.as_str()), (None, None, "success"));
         assert_eq!(row.3["blobs"], 1);
-        assert_eq!(row.3["migration"], 14);
+        assert_eq!(row.3["migration"], 15);
 
         // The manifest holds no secrets: neither a connection string nor the
         // password of the database URL, and no names.

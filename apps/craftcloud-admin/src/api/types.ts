@@ -51,6 +51,15 @@ export interface SessionInfo {
   expires_at: string;
 }
 
+export interface DeviceSession {
+  id: Uuid;
+  name: string;
+  client_kind: "app" | "launcher" | "cli";
+  client_id: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
 export type OrgRole = "owner" | "admin" | "member";
 
 export interface Organization {

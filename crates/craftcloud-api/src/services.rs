@@ -54,6 +54,12 @@ pub struct AuthSettings {
     pub idle_timeout: Duration,
     /// A session expires this long after login regardless of activity.
     pub absolute_timeout: Duration,
+    /// Lifetime of a desktop access token.
+    pub device_access_ttl: Duration,
+    /// Idle lifetime of a desktop device session.
+    pub device_idle_timeout: Duration,
+    /// Absolute lifetime of a desktop device session.
+    pub device_absolute_timeout: Duration,
     /// Minimum time between recorded activity updates of one session.
     pub touch_interval: Duration,
     /// How long soft-deleted projects and files stay restorable.
@@ -112,6 +118,9 @@ impl Default for AuthSettings {
         Self {
             idle_timeout: Duration::from_secs(8 * 3600),
             absolute_timeout: Duration::from_secs(7 * 24 * 3600),
+            device_access_ttl: Duration::from_secs(15 * 60),
+            device_idle_timeout: Duration::from_secs(30 * 24 * 3600),
+            device_absolute_timeout: Duration::from_secs(90 * 24 * 3600),
             touch_interval: Duration::from_secs(60),
             trash_retention: Duration::from_secs(30 * 24 * 3600),
             max_file_size_bytes: 5 * 1024 * 1024 * 1024,

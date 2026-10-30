@@ -224,10 +224,32 @@ mod tests {
                 } else {
                     format!("/api/v1{path}")
                 };
-                let auth = match op.get("security").and_then(Value::as_array) {
-                    None => "cookie",
-                    Some(list) if list.is_empty() => "none",
-                    Some(_) => "cookie+csrf",
+                let security = op.get("security").unwrap_or(&doc["security"]);
+                let auth = match security.as_array() {
+                    None => "none".to_owned(),
+                    Some(list) if list.is_empty() => "none".to_owned(),
+                    Some(list) => list
+                        .iter()
+                        .map(|requirement| {
+                            let names: Vec<_> = requirement
+                                .as_object()
+                                .expect("security requirement")
+                                .keys()
+                                .map(|name| match name.as_str() {
+                                    "cookieAuth" => "cookie",
+                                    "csrfToken" => "csrf",
+                                    "bearerAuth" => "bearer",
+                                    name => name,
+                                })
+                                .collect();
+                            if names.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                names.join("+")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|"),
                 };
                 let request_schema = op
                     .get("requestBody")

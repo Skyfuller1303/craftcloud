@@ -14,6 +14,22 @@ Benutzeridentitäten, Session-/Device-Tokens, Org-/Workspace-Metadaten, private 
 - Fehlkonfigurierter Reverse Proxy: Host-/X-Forwarded-/Cookie-Bypass.
 - Storage-Misconfiguration/Operator error: ungeschützte Buckets, Backup-Verlust.
 
+## Desktop-Geräte-Sitzungen (AC-01)
+
+Die zusätzliche Vertrauensgrenze liegt zwischen einem Desktop-Client und der API. Ein Client mit gültigem Bearer-Token erhält nur die aktuellen Rechte des zugehörigen Kontos. Der Launcher darf keine Tokens an Apps weitergeben; Schlüsselbund-Code folgt in AC-04. [ADR-0018](../09-decisions/adr-0018-device-sessions.md) hält die Entscheidung fest.
+
+| Angriff | Schutz | Nachweis |
+|---|---|---|
+| Gestohlenes Zugriffstoken oder Tokens aus Datenbank/Backup | 256 zufällige Bit, Präfix `ccd_at_`, SHA-256 in der Datenbank, standardmäßig 15 Minuten Gültigkeit, sofortiger Widerruf; Geräte-Sitzungen und Refresh-Historie sind vom Backup ausgeschlossen | Token-Unit-Tests und `crates/craftcloud-api/tests/device.rs` |
+| Wiederverwendung oder konkurrierende Erneuerung | Atomare Rotation unter Benutzer-/Sitzungssperre; alte Refresh-Hashes bleiben bis zur Bereinigung erhalten; Wiederverwendung widerruft die ganze Familie mit `refresh_reuse` | Refresh-/Replay-Tests in `device.rs` |
+| Account-Enumeration und Passwortversuche | Bestehende Argon2-Prüfung einschließlich Dummy-Hash für unbekannte Adressen und gemeinsame Login-Ratenbegrenzungen | Login- und Rate-Limit-Tests in `device.rs` |
+| CSRF über vermischte Cookie-/Bearer-Nachweise | Gemischte Credentials ergeben `400 AMBIGUOUS_CREDENTIALS`; nur explizite Bearer-Anfragen sind von CSRF und Origin ausgenommen; Query-Tokens werden ignoriert | Credential-/CSRF-Tests in `device.rs` |
+| HTTP-Downgrade und gefälschte Proxy-Header | Geräte-POST-Routen verlangen TLS außer bei konfiguriertem Loopback; Forwarded-Angaben gelten nur für konfigurierte vertrauenswürdige Proxys | Transporttests in `device.rs` und `device.rs` im API-Quellmodul |
+| Widerrufenes Gerät beendet einen laufenden Upload oder behält Rechte | Erneute Sitzungsprüfung unter Organisations-, Benutzer- und Sitzungssperre; transaktionaler Widerruf bei Passwortwechsel, Reset, Deaktivierung, Logout-all und letzter Org-Entfernung | Invalidation-/Upload-Tests in `crates/craftcloud-api/tests/device.rs` |
+| Geheimnisse oder personenbezogene Metadaten in Logs/Audit | Ereignisse enthalten feste Aktionscodes und Geräte-IDs; keine Tokens, Passwörter, Namen oder E-Mail-Adressen | Log-/Audit-Test in `device.rs` |
+
+Restrisiken: Ein gestohlenes noch gültiges Token bleibt bis zu Ablauf oder Widerruf verwendbar. Es gibt keine optionale Refresh-Gnadenfrist: Nach einer verlorenen Antwort kann eine erneute Anmeldung nötig sein. TLS schützt nicht vor kompromittierten Clients oder einem kompromittierten Host. Proxy-Logs und Betriebssystem-Schlüsselbund liegen außerhalb dieser Serverimplementierung; TOTP folgt in AC-02. Die Geräte-Namen sind untrusted Anzeigetext und werden bereinigt sowie vom Webpanel als Text gerendert.
+
 ## STRIDE-Matrix
 
 | Risiko | Beispiel | Gegenmaßnahmen | Test |

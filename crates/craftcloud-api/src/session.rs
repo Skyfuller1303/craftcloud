@@ -24,7 +24,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
-use craftcloud_auth::OpaqueToken;
+use craftcloud_auth::{DeviceToken, DeviceTokenKind, OpaqueToken};
 use craftcloud_db::sessions;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -41,6 +41,8 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 pub struct AuthenticatedSession {
     /// Session identifier.
     pub session_id: Uuid,
+    /// Whether the credential is a device access token.
+    pub credential_kind: CredentialKind,
     /// The authenticated account.
     pub user_id: Uuid,
     /// Session creation time.
@@ -49,6 +51,13 @@ pub struct AuthenticatedSession {
     /// (limited by the absolute expiry).
     pub expires_at: OffsetDateTime,
     csrf_token: String,
+}
+
+/// Authentication source for an actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    Cookie,
+    Device,
 }
 
 impl AuthenticatedSession {
@@ -72,6 +81,7 @@ enum Kind {
     CsrfFailed,
     Unavailable,
     Internal,
+    Ambiguous,
 }
 
 impl AuthRejection {
@@ -117,6 +127,11 @@ impl IntoResponse for AuthRejection {
                 "INTERNAL",
                 "An internal error occurred.",
             ),
+            Kind::Ambiguous => (
+                StatusCode::BAD_REQUEST,
+                "AMBIGUOUS_CREDENTIALS",
+                "Send either a session cookie or a bearer token, not both.",
+            ),
         };
         error_response(status, code, message, &self.request_headers)
     }
@@ -132,57 +147,131 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
         let Some(services) = state.services.clone() else {
             return Err(AuthRejection::new(Kind::Unavailable, parts));
         };
-        let Some(token) = session_token(&parts.headers, &services.settings) else {
-            return Err(AuthRejection::new(Kind::Unauthenticated, parts));
-        };
-        let now = services.clock.now();
-        let found = sessions::find_active(
-            &services.pool,
-            &token.hash(),
-            now,
-            services.settings.idle_timeout,
-        )
-        .await;
-        let record = match found {
-            Ok(Some(record)) => record,
-            Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
-            Err(error) => {
-                tracing::error!(%error, "session lookup failed");
-                return Err(AuthRejection::new(Kind::Internal, parts));
-            }
-        };
-
-        crate::observe::note_actor(record.user_id);
-        if !is_safe_method(&parts.method) && !csrf_ok(&parts.headers, &services.settings, &token) {
-            return Err(AuthRejection::new(Kind::CsrfFailed, parts));
+        let cookie_present = session_cookie_presented(&parts.headers, &services.settings);
+        let (bearer, bearer_presented) = device_access_token(&parts.headers);
+        if cookie_present && bearer_presented {
+            return Err(AuthRejection::new(Kind::Ambiguous, parts));
         }
+        let now = services.clock.now();
+        let (session_id, user_id, created_at, expires_at, csrf_token, credential_kind) =
+            if let Some(token) = bearer {
+                let found = craftcloud_db::device_sessions::find_active_access(
+                    &services.pool,
+                    &token.hash(),
+                    now,
+                    services.settings.touch_interval,
+                    services.settings.device_idle_timeout,
+                )
+                .await;
+                let record = match found {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
+                    Err(error) => {
+                        tracing::error!(%error, "device session lookup failed");
+                        return Err(AuthRejection::new(Kind::Internal, parts));
+                    }
+                };
+                (
+                    record.id,
+                    record.user_id,
+                    record.created_at,
+                    record
+                        .access_expires_at
+                        .min(record.idle_expires_at)
+                        .min(record.absolute_expires_at),
+                    String::new(),
+                    CredentialKind::Device,
+                )
+            } else {
+                let Some(token) = session_token(&parts.headers, &services.settings) else {
+                    return Err(AuthRejection::new(Kind::Unauthenticated, parts));
+                };
+                let found = sessions::find_active(
+                    &services.pool,
+                    &token.hash(),
+                    now,
+                    services.settings.idle_timeout,
+                )
+                .await;
+                let record = match found {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
+                    Err(error) => {
+                        tracing::error!(%error, "session lookup failed");
+                        return Err(AuthRejection::new(Kind::Internal, parts));
+                    }
+                };
+                if !is_safe_method(&parts.method)
+                    && !csrf_ok(&parts.headers, &services.settings, &token)
+                {
+                    return Err(AuthRejection::new(Kind::CsrfFailed, parts));
+                }
+                let touched = match sessions::touch(
+                    &services.pool,
+                    record.id,
+                    now,
+                    services.settings.touch_interval,
+                )
+                .await
+                {
+                    Ok(wrote) => wrote,
+                    Err(error) => {
+                        tracing::warn!(%error, "session activity update failed");
+                        false
+                    }
+                };
+                let last_seen = if touched { now } else { record.last_seen_at };
+                (
+                    record.id,
+                    record.user_id,
+                    record.created_at,
+                    (last_seen + services.settings.idle_timeout).min(record.absolute_expires_at),
+                    token.csrf_token(),
+                    CredentialKind::Cookie,
+                )
+            };
 
-        // Throttled activity update; failure must not fail the request.
-        let touched = match sessions::touch(
-            &services.pool,
-            record.id,
-            now,
-            services.settings.touch_interval,
-        )
-        .await
-        {
-            Ok(wrote) => wrote,
-            Err(error) => {
-                tracing::warn!(%error, "session activity update failed");
-                false
-            }
-        };
-        // Expiry from the activity time that is actually recorded.
-        let last_seen = if touched { now } else { record.last_seen_at };
-        let idle_expiry = last_seen + services.settings.idle_timeout;
+        crate::observe::note_actor(user_id);
         Ok(Self {
-            session_id: record.id,
-            user_id: record.user_id,
-            created_at: record.created_at,
-            expires_at: idle_expiry.min(record.absolute_expires_at),
-            csrf_token: token.csrf_token(),
+            session_id,
+            credential_kind,
+            user_id,
+            created_at,
+            expires_at,
+            csrf_token,
         })
     }
+}
+
+fn device_access_token(headers: &HeaderMap) -> (Option<DeviceToken>, bool) {
+    let values: Vec<_> = headers.get_all(header::AUTHORIZATION).iter().collect();
+    let bearer_presented = values.iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| value.split_once(' '))
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+    });
+    if values.len() != 1 {
+        return (None, bearer_presented);
+    }
+    let Some(value) = values.first().and_then(|v| v.to_str().ok()) else {
+        return (None, false);
+    };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return (None, false);
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return (None, false);
+    }
+    if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace()) {
+        return (None, true);
+    }
+    (DeviceToken::parse(token, DeviceTokenKind::Access), true)
+}
+
+pub(crate) fn ambiguous_credentials(headers: &HeaderMap, settings: &AuthSettings) -> bool {
+    session_cookie_presented(headers, settings) && device_access_token(headers).1
 }
 
 fn is_safe_method(method: &Method) -> bool {

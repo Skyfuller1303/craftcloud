@@ -2,6 +2,8 @@
 
 ## Blocking decisions
 
+AC-01 (2026-10-30) ergänzt lokal Desktop-Geräte-Sitzungen, Bearer-Authentifizierung und eine Geräteliste in den Web-Einstellungen; die historischen Lücken zur Desktop-Anmeldung und Geräteliste sind damit teilweise geschlossen. Offen bleiben AC-02 (TOTP), AC-04 (Schlüsselbund und Client-SDK), fremde Geräte durch Administratoren, Browser-Device-Flow und OIDC. Refresh verwendet bewusst keine optionale Gnadenfrist: Ein wiederholter Versuch nach einer verlorenen Antwort widerruft die Familie und erfordert eine erneute Anmeldung. Die zusätzlichen Sicherheitstests verwenden synthetische Daten; reale Clients, Proxy-Deployments und assistive Technologien benötigen weiterhin eigene Abnahme.
+
 1. `craftrules` inaccessible via public GitHub; confirm shared standards.
 2. Official repository/name and licensing consent absent.
 3. Identity provider strategy and role matrix not reviewed.

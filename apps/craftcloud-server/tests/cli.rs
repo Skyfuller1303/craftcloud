@@ -284,8 +284,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 5"));
         assert!(text(&out).contains("applied migration 9"));
         assert!(text(&out).contains("applied migration 10"));
-        assert!(text(&out).contains("applied migration 14"));
-        assert!(text(&out).contains("applied 14 migration(s)"));
+        assert!(text(&out).contains("applied migration 15"));
+        assert!(text(&out).contains("applied 15 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));

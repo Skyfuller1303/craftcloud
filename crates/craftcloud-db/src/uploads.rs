@@ -703,6 +703,7 @@ impl OrgTx {
         session_id: Uuid,
         user_id: Uuid,
         now: OffsetDateTime,
+        device: bool,
     ) -> Result<bool, DbError> {
         let enabled: Option<bool> =
             sqlx::query_scalar("SELECT disabled_at IS NULL FROM users WHERE id = $1 FOR SHARE")
@@ -712,15 +713,13 @@ impl OrgTx {
         if enabled != Some(true) {
             return Ok(false);
         }
-        let live: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL \
-             AND absolute_expires_at > $3 FOR SHARE",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(now)
-        .fetch_optional(&mut *self.tx)
-        .await?;
+        let live: Option<Uuid> = if device {
+            sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND access_expires_at>$3 AND idle_expires_at>$3 AND absolute_expires_at>$3 FOR SHARE")
+                .bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *self.tx).await?
+        } else {
+            sqlx::query_scalar("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE")
+                .bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *self.tx).await?
+        };
         Ok(live.is_some())
     }
 
