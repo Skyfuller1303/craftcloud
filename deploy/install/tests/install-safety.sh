@@ -220,8 +220,11 @@ fi
 mkdir "$TMP/plus/opt/craftcloud/releases/1.2.4"
 (cd "$TMP/output" && sha256sum craftcloud-1.2.4.tar.gz >SHA256SUMS)
 PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
-CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
+CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" DOCKER_LOG="$TMP/docker.log" \
 sh "$ROOT/deploy/install/craftcloud-ctl" upgrade "$TMP/output/craftcloud-1.2.4.tar.gz" >"$TMP/plus-upgrade.log" 2>&1
+# The proxy is recreated once after the refreshed Caddy file.
+recreate_after_upgrade=$(grep -c 'force-recreate --no-deps caddy' "$TMP/docker.log")
+[ "$recreate_after_upgrade" -ge 1 ]
 plus_key=$(sed -n 's/^CC_SECRET_TWO_FACTOR_KEY=//p' "$TMP/plus/etc/craftcloud/craftcloud.env")
 [ "${#plus_key}" -eq 44 ]
 grep -F 'v2' "$TMP/plus/etc/craftcloud/caddy/tls-custom.caddy" >/dev/null
@@ -234,11 +237,20 @@ grep -F 'v2' "$TMP/plus/etc/craftcloud/caddy/Caddyfile.new" >/dev/null
 grep -F 'Caddyfile was changed locally' "$TMP/plus-upgrade.log" >/dev/null
 [ "$(cat "$TMP/plus/etc/craftcloud/caddy/fullchain.pem")" = 'operator certificate' ]
 PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
-CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
+CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" DOCKER_LOG="$TMP/docker.log" \
 sh "$ROOT/deploy/install/craftcloud-ctl" rollback >"$TMP/plus-rollback.log" 2>&1
+# The rollback re-syncs Caddy files from the release that becomes active again and
+# recreates the proxy a second time.
+[ "$(grep -c 'force-recreate --no-deps caddy' "$TMP/docker.log")" -eq "$((recreate_after_upgrade + 1))" ]
+if grep -F 'v2' "$TMP/plus/etc/craftcloud/caddy/tls-custom.caddy" >/dev/null; then
+    echo 'rollback left the newer Caddy file in place' >&2
+    exit 1
+fi
+grep -F '# local edit' "$TMP/plus/etc/craftcloud/caddy/Caddyfile" >/dev/null
+[ "$(cat "$TMP/plus/etc/craftcloud/caddy/fullchain.pem")" = 'operator certificate' ]
 [ "$(basename "$(readlink -f "$TMP/plus/opt/craftcloud/current")")" = '1.2.3+build.7' ]
 PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
-CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
+CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" DOCKER_LOG="$TMP/docker.log" \
 sh "$ROOT/deploy/install/craftcloud-ctl" uninstall --purge --confirm-purge >/dev/null 2>&1
 if grep -E 'CC_SECRET_|bootstrap-token=' "$TMP/install.log" >/dev/null; then
     echo 'installer output/log contains secret material' >&2
@@ -287,6 +299,14 @@ if command -v flock >/dev/null 2>&1; then
         exit 1
     fi
     grep -F 'another craftcloud-ctl' "$TMP/locked-backup.log" >/dev/null
+    # setup-complete (which rewrites the environment file) and uninstall take the same lock.
+    for locked_command in setup-complete uninstall; do
+        if main_ctl "$locked_command" >"$TMP/locked-$locked_command.log" 2>&1; then
+            echo "$locked_command ran while the ctl lock was held" >&2
+            exit 1
+        fi
+        grep -F 'another craftcloud-ctl' "$TMP/locked-$locked_command.log" >/dev/null
+    done
     wait "$lock_holder"
     main_ctl backup >"$TMP/unlocked-backup.log" 2>&1
 else

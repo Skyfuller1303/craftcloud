@@ -171,9 +171,13 @@ extract_release() {
     ex_version=$2
     ex_dest=$3
     ex_stage=$INSTALL_ROOT/releases/.tmp-$ex_version.$$
+    rm -rf -- "$INSTALL_ROOT/releases/.tmp-$ex_version".*
     rm -rf -- "$ex_stage"
     mkdir "$ex_stage"
     trap 'rm -rf -- "$ex_stage"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     ex_entries=$(tar -tzf "$ex_archive") || fail 'cannot read archive table of contents'
     printf '%s\n' "$ex_entries" | awk -v root="craftcloud-$ex_version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
     ex_types=$(tar -tvzf "$ex_archive") || fail 'cannot inspect archive entry types'
@@ -183,7 +187,7 @@ extract_release() {
     umask 077
     release_complete "$ex_stage" "$ex_version" || fail 'release archive is incomplete (deploy/compose or CRAFTCLOUD-RELEASE.json missing)'
     mv -T "$ex_stage" "$ex_dest"
-    trap - 0
+    trap - 0 HUP INT TERM
 }
 # sync_caddy_config <shipped-dir> <config-dir>
 # Refreshes release-shipped Caddy files. Operator-owned files (fullchain.pem,
@@ -196,6 +200,7 @@ sync_caddy_config() {
     sync_dest=$2
     sync_manifest=$sync_dest/.shipped-sha256
     sync_next=$sync_manifest.tmp.$$
+    CADDY_CHANGED=0
     : >"$sync_next"
     for sync_file in "$sync_src"/*; do
         [ -f "$sync_file" ] && [ ! -L "$sync_file" ] || continue
@@ -210,6 +215,7 @@ sync_caddy_config() {
             [ -z "$sync_old" ] || printf '%s  %s\n' "$sync_old" "$sync_name" >>"$sync_next"
         elif [ ! -e "$sync_target" ]; then
             cp "$sync_file" "$sync_target"
+            CADDY_CHANGED=1
             printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
         else
             sync_cur=$(sha256sum "$sync_target" | awk '{print $1}')
@@ -219,6 +225,7 @@ sync_caddy_config() {
             elif [ -n "$sync_old" ] && [ "$sync_old" = "$sync_cur" ]; then
                 cp "$sync_file" "$sync_target.tmp.$$"
                 mv -f "$sync_target.tmp.$$" "$sync_target"
+                CADDY_CHANGED=1
                 rm -f -- "$sync_target.new"
                 printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
                 printf '%s\n' "craftcloud: refreshed Caddy file $sync_name"
@@ -251,13 +258,20 @@ ensure_two_factor_key() {
     mv -f "$ensure_tmp" "$ensure_env"
     printf '%s\n' "craftcloud-ctl: generated a two-factor encryption key in $ensure_env (keep a separate protected copy; backups do not contain it)"
 }
-# Mutating commands (backup, upgrade, rollback) exclude each other. Child
+# Recreates the proxy so that refreshed Caddy files take effect (the directory is a
+# read-only bind mount; Caddy reads it at start).
+recreate_caddy_if_changed() {
+    [ "${CADDY_CHANGED:-0}" -eq 1 ] || return 0
+    compose_for_setup_state "$1" up -d --force-recreate --no-deps caddy || printf '%s\n' 'craftcloud-ctl: warning: could not recreate the proxy; restart it to load the refreshed Caddy files' >&2
+}
+# Commands that change the installation (backup, upgrade, rollback, setup-complete,
+# uninstall) exclude each other. Child
 # invocations of this script started by a locked command skip the lock.
 acquire_lock() {
     [ "${CRAFTCLOUD_CTL_LOCK_HELD:-0}" != 1 ] || return 0
-    command -v flock >/dev/null 2>&1 || fail 'flock (util-linux) is required to serialize backup, upgrade and rollback'
+    command -v flock >/dev/null 2>&1 || fail 'flock (util-linux) is required to serialize commands that change the installation'
     exec 9>"$CONFIG_DIR/.ctl.lock"
-    flock -n 9 || fail 'another craftcloud-ctl backup, upgrade or rollback is running; retry when it has finished'
+    flock -n 9 || fail 'another craftcloud-ctl command that changes the installation is running; retry when it has finished'
     CRAFTCLOUD_CTL_LOCK_HELD=1
     export CRAFTCLOUD_CTL_LOCK_HELD
 }
@@ -323,6 +337,7 @@ case ${1:-} in
         ;;
     stop) compose_at "$active" down ;;
     setup-complete)
+        acquire_lock
         [ -f "$CONFIG_DIR/bootstrap-token" ] || fail 'bootstrap secret file not present'
         setup_status=$(compose_at_setup "$active" exec -T caddy wget -qO- http://server:8080/api/v1/setup/status) || fail 'cannot read setup status'
         case $setup_status in *'"setup_required":false'*) ;; *) fail 'instance setup is not complete' ;; esac
@@ -419,6 +434,7 @@ case ${1:-} in
             }
             sleep 2
         done
+        recreate_caddy_if_changed "$new_root"
         trap - 0
         ;;
     rollback)
@@ -436,10 +452,14 @@ case ${1:-} in
         rm -f -- "$INSTALL_ROOT/current.new"
         ln -s "$old" "$INSTALL_ROOT/current.new"
         mv -Tf "$INSTALL_ROOT/current.new" "$CURRENT"
+        # The proxy configuration follows the release that becomes active again.
+        sync_caddy_config "$(release_compose_dir "$old")/caddy" "$CONFIG_DIR/caddy"
         compose_for_setup_state "$old" up -d
+        recreate_caddy_if_changed "$old"
         printf '%s\n' 'Release rolled back. Database schema was not restored; restore the pre-upgrade backup if the prior release requires it.' >&2
         ;;
     uninstall)
+        acquire_lock
         shift
         purge=0 confirm=0
         for arg in "$@"; do case $arg in --purge) purge=1 ;; --confirm-purge) confirm=1 ;; *) fail "unknown uninstall option: $arg" ;; esac; done

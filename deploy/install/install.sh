@@ -157,9 +157,13 @@ extract_release() {
     ex_version=$2
     ex_dest=$3
     ex_stage=$INSTALL_ROOT/releases/.tmp-$ex_version.$$
+    rm -rf -- "$INSTALL_ROOT/releases/.tmp-$ex_version".*
     rm -rf -- "$ex_stage"
     mkdir "$ex_stage"
     trap 'rm -rf -- "$ex_stage"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     ex_entries=$(tar -tzf "$ex_archive") || fail 'cannot read archive table of contents'
     printf '%s\n' "$ex_entries" | awk -v root="craftcloud-$ex_version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
     ex_types=$(tar -tvzf "$ex_archive") || fail 'cannot inspect archive entry types'
@@ -169,7 +173,7 @@ extract_release() {
     umask 077
     release_complete "$ex_stage" "$ex_version" || fail 'release archive is incomplete (deploy/compose or CRAFTCLOUD-RELEASE.json missing)'
     mv -T "$ex_stage" "$ex_dest"
-    trap - 0
+    trap - 0 HUP INT TERM
 }
 # sync_caddy_config <shipped-dir> <config-dir>
 # Refreshes release-shipped Caddy files. Operator-owned files (fullchain.pem,
@@ -467,6 +471,9 @@ if [ ! -e "$env_file" ]; then
     secret_two_factor=$(generate_two_factor_key)
     env_tmp=$env_file.tmp.$$
     trap 'rm -f -- "$env_tmp"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     {
         printf 'CRAFTCLOUD_DOMAIN=%s\nCRAFTCLOUD_PUBLIC_URL=%s\n' "$DOMAIN" "$public_url"
         printf 'CRAFTCLOUD_HTTP_PORT=%s\nCRAFTCLOUD_HTTPS_PORT=%s\nCRAFTCLOUD_TLS_MODE=%s\nCRAFTCLOUD_ACME_EMAIL=%s\n' "$HTTP_PORT" "$HTTPS_PORT" "$tls_mode" "$ACME_EMAIL"
@@ -481,7 +488,7 @@ if [ ! -e "$env_file" ]; then
     } >"$env_tmp"
     chmod 0600 "$env_tmp"
     mv -f "$env_tmp" "$env_file"
-    trap - 0
+    trap - 0 HUP INT TERM
     printf '%s' "$bootstrap_token" >"$CONFIG_DIR/bootstrap-token"
     chmod 0600 "$CONFIG_DIR/bootstrap-token"
 fi
