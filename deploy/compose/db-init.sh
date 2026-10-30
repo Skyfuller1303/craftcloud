@@ -1,4 +1,5 @@
 #!/bin/sh
+case $- in *x*) set +x ;; esac
 # One-shot role setup for the Compose stack (service `db-init`). Runs as the
 # postgres user of the PostgreSQL image, reads the passwords from secret files
 # and never prints them. Idempotent: every run re-applies the passwords and

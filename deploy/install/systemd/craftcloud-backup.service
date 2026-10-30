@@ -1,0 +1,8 @@
+[Unit]
+Description=CraftCloud database and storage backup
+Requires=docker.service craftcloud.service
+After=docker.service craftcloud.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /opt/craftcloud/current/deploy/install/craftcloud-ctl backup

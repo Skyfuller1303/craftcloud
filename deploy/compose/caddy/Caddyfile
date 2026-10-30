@@ -8,6 +8,7 @@
 {
 	# Not exposed: the admin API listens on loopback inside this container only.
 	admin localhost:2019
+	email "{$CRAFTCLOUD_ACME_EMAIL}"
 }
 
 # Plain HTTP: redirect to the configured public URL, which keeps a non-default

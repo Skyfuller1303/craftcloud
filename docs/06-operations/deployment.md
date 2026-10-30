@@ -1,5 +1,7 @@
 # Self-hosting-Deployment (Entwicklungsprototyp, Compose-Vorlage seit CC-P03-07)
 
+Für die Installation aus einem versionierten Quellarchiv beginnen Sie mit der [Installationsanleitung für Betreiber](install.md). Sie beschreibt OPS-01 einschließlich Voraussetzungen, systemd, Updates und täglicher Backups. Diese Seite bleibt die technische Referenz für Konfiguration und die manuelle Entwicklungs-Compose-Vorlage.
+
 ## Minimaler MVP-Stack
 
 - `craftcloud-server`: Rust service (axum, siehe ADR-0010), listens only in private network/loopback; runs as non-root.

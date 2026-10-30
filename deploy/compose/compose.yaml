@@ -250,6 +250,7 @@ services:
       CRAFTCLOUD_DOMAIN: ${CRAFTCLOUD_DOMAIN:?run `cargo xtask compose-secrets` first}
       CRAFTCLOUD_TLS_MODE: ${CRAFTCLOUD_TLS_MODE:-acme}
       CRAFTCLOUD_PUBLIC_URL: ${CRAFTCLOUD_PUBLIC_URL:?run `cargo xtask compose-secrets` first}
+      CRAFTCLOUD_ACME_EMAIL: ${CRAFTCLOUD_ACME_EMAIL:-}
     volumes:
       - ./caddy:/etc/caddy:ro
       - caddy_data:/data

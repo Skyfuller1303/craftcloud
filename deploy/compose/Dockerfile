@@ -26,10 +26,14 @@ RUN npm run typecheck && npm run build
 
 # ---- server -------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS server
+ARG CRAFTCLOUD_VERSION=0.0.0
+ARG CRAFTCLOUD_COMMIT=unknown
 # Docker builds run inside a memory-limited VM: keep the compiler parallelism low.
 ENV CARGO_BUILD_JOBS=2 \
     CARGO_INCREMENTAL=0 \
-    CARGO_PROFILE_RELEASE_STRIP=symbols
+    CARGO_PROFILE_RELEASE_STRIP=symbols \
+    CRAFTCLOUD_VERSION=${CRAFTCLOUD_VERSION} \
+    CRAFTCLOUD_COMMIT=${CRAFTCLOUD_COMMIT}
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY apps/craftcloud-server apps/craftcloud-server

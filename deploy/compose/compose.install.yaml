@@ -1,0 +1,49 @@
+# Host-persistent paths for self-hosted installations. Development continues
+# using the named volumes from compose.yaml.
+services:
+  secrets-init:
+    environment:
+      OUT_DB: /out/db
+      OUT_DB_INIT: /out/db-init
+      OUT_MIGRATE: /out/migrate
+      OUT_SERVER: /out/server
+    volumes:
+      - ./secrets-init.sh:/secrets-init.sh:ro
+      - secrets_db:/out/db
+      - secrets_db_init:/out/db-init
+      - secrets_migrate:/out/migrate
+      - secrets_server:/out/server
+  caddy:
+    volumes:
+      - ${CRAFTCLOUD_CADDY_CONFIG_DIR:-./caddy}:/etc/caddy:ro
+  db:
+    volumes:
+      - ${CRAFTCLOUD_DATA_DIR:?set CRAFTCLOUD_DATA_DIR}/postgres:/var/lib/postgresql
+      - secrets_db:/run/secrets:ro
+  server:
+    volumes:
+      - ${CRAFTCLOUD_DATA_DIR:?set CRAFTCLOUD_DATA_DIR}/storage:/var/lib/craftcloud/store
+      - secrets_server:/run/secrets:ro
+  backup:
+    volumes:
+      - ${CRAFTCLOUD_DATA_DIR:?set CRAFTCLOUD_DATA_DIR}/storage:/var/lib/craftcloud/store
+      - ${CRAFTCLOUD_DATA_DIR:?set CRAFTCLOUD_DATA_DIR}/backups:/backups
+      - secrets_server:/run/secrets:ro
+  restore:
+    volumes:
+      - ${CRAFTCLOUD_DATA_DIR:?set CRAFTCLOUD_DATA_DIR}/storage:/var/lib/craftcloud/store
+      - ${CRAFTCLOUD_DATA_DIR:?set CRAFTCLOUD_DATA_DIR}/backups:/backups:ro
+      - secrets_migrate:/run/secrets:ro
+  db-init:
+    volumes:
+      - ./db-init.sh:/db-init.sh:ro
+      - secrets_db_init:/run/secrets:ro
+  migrate:
+    volumes:
+      - secrets_migrate:/run/secrets:ro
+
+volumes:
+  secrets_db: {}
+  secrets_db_init: {}
+  secrets_migrate: {}
+  secrets_server: {}
