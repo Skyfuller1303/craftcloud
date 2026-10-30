@@ -25,6 +25,12 @@ Ein Backup ist ein Verzeichnis. Es enthält zusammengehörig:
 
 Das Backup enthält **alles, was ein Datenbankadministrator lesen kann**: Passwort-Hashes (Argon2), E-Mail-Adressen, Namen, das Audit-Log und sämtliche Dateiinhalte im Klartext. Es wird mit Modus `0700` (Verzeichnisse) und `0600` (Dateien) auf unix geschrieben, ist aber **nicht verschlüsselt** (siehe „Off-site-Kopie und Verschlüsselung“). Das Manifest enthält keine Zugangsdaten.
 
+### Schlüssel der Zwei-Faktor-Anmeldung separat sichern
+
+Die TOTP-Geheimnisse stehen verschlüsselt im Backup; der Schlüssel dazu nicht. Bei einer Installation mit `install.sh` steht er als `CC_SECRET_TWO_FACTOR_KEY` (Base64 von 32 Zufallsbytes) in `/etc/craftcloud/craftcloud.env`; `secrets-init` legt ihn für den Server als `two_factor_key` ab und der Server liest ihn über `CRAFTCLOUD_SECRET_KEY_FILE=/run/secrets/two_factor_key`. `craftcloud-ctl backup` nennt nach jedem Lauf nur diesen Ort, niemals den Wert; `craftcloud-ctl status` meldet, ob der Schlüssel vorhanden ist. Bewahren Sie eine geschützte Kopie getrennt vom Backup auf (Passwortmanager oder verschlüsselter Tresor des Betreibers) und halten Sie fest, welcher Schlüssel zu welchen Backups gehört.
+
+Ein Restore benötigt **denselben** Schlüssel: Tragen Sie ihn vor dem ersten Start der wiederhergestellten Instanz als `CC_SECRET_TWO_FACTOR_KEY` in deren Umgebungsdatei ein (beim Installer vor dem ersten `install.sh`-Lauf in einer vorbereiteten `craftcloud.env`, sonst durch Ersetzen des Werts in der bereits erzeugten Konfiguration). Ein neu erzeugter Schlüssel öffnet die gesicherten Geheimnisse nicht; die betroffenen Personen müssten 2FA neu einrichten. Die Rotation mit altem Schlüssel (`CRAFTCLOUD_SECRET_KEY_OLD_FILE`, siehe [deployment.md](deployment.md)) ist in diesem Prototyp nicht durch den Installer automatisiert; sie erfordert eine eigene Compose-Ergänzung des Betreibers und ist eine offene Lücke.
+
 ## Backup erstellen
 
 Bei aktivem 2FA ist die Wiederherstellbarkeit von [Schlüsseldateien und Rotation](deployment.md#backup-und-restore-mit-2fa) Teil jeder Restore-Probe. Nach einem produktiven Restore sind auch Wiederherstellungscodes wieder im Zustand des Backupzeitpunkts; lassen Sie sie neu erzeugen. Ein verlorener Entschlüsselungsschlüssel darf nicht durch Abschalten der Login-Prüfung umgangen werden; der gezielte Operator-Reset verlangt eine erneute Einrichtung.

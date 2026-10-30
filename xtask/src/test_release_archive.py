@@ -6,6 +6,7 @@ import json
 import pathlib
 import tarfile
 import tempfile
+import time
 import unittest
 from io import BytesIO
 
@@ -76,6 +77,43 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue(sums.startswith(hashlib.sha256(archive.read_bytes()).hexdigest()))
             self.assertIn(archive.name, sums)
             self.assertEqual(len(sums.splitlines()), 2)
+
+    def test_same_input_gives_identical_archive_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            raw_tar = root / "source.tar"
+            root_name = "craftcloud-0.1.0"
+            cargo_lock = b'version = 4\n\n[[package]]\nname = "crate-a"\nversion = "1.2.3"\n'
+            npm_lock = json.dumps({"lockfileVersion": 3, "packages": {"": {}}}).encode("utf-8")
+            with tarfile.open(raw_tar, "w:") as tar:
+                for name, payload in [
+                    (f"{root_name}/tracked.txt", b"tracked fixture\n"),
+                    (f"{root_name}/Cargo.lock", cargo_lock),
+                    (f"{root_name}/apps/craftcloud-admin/package-lock.json", npm_lock),
+                ]:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(payload)
+                    info.mtime = 1_700_000_000
+                    info.uid = 1234
+                    info.gid = 4321
+                    info.uname = "builder"
+                    info.gname = "builders"
+                    tar.addfile(info, BytesIO(payload))
+            digests = []
+            for run in ("a", "b"):
+                staging = root / f"stage-{run}"
+                staging.mkdir()
+                release_archive.make_archive(
+                    raw_tar, staging, root / f"dist-{run}", "0.1.0", "0123456789ab", f"{root_name}.tar.gz"
+                )
+                archive = root / f"dist-{run}" / f"{root_name}.tar.gz"
+                digests.append(hashlib.sha256(archive.read_bytes()).hexdigest())
+                if run == "a":
+                    time.sleep(2)  # a gzip header timestamp would differ between runs
+                    with tarfile.open(archive, "r:gz") as tar:
+                        for member in tar:
+                            self.assertEqual((member.uid, member.gid, member.uname, member.gname), (0, 0, "", ""))
+            self.assertEqual(digests[0], digests[1])
 
 
 if __name__ == "__main__":

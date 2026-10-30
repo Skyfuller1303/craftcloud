@@ -13,6 +13,8 @@ Installation und Steuerung erfolgen mit POSIX-sh-Skripten. Geheimnisse werden ü
 
 systemd startet den Stack und plant täglich um 03:15 mit bis zu 30 Minuten Verzögerung ein Backup. Standardmäßig bleiben sieben erfolgreiche Backups erhalten. Verschlüsselte Kopien außer Haus und regelmäßige Restore-Proben verantwortet der Betreiber. SMTP, Windows Server, Hochverfügbarkeit und automatische Restores bleiben außerhalb von OPS-01.
 
+Review-Korrekturen: Archive werden zuerst in ein Staging-Verzeichnis entpackt, geprüft und atomar umbenannt, damit ein fehlgeschlagener Lauf wiederholbar bleibt. Das Archiv ist reproduzierbar (feste gzip-Kopfzeit, normalisierte Eigentümer). Der Schlüssel der Zwei-Faktor-Anmeldung wird einmalig erzeugt, nie überschrieben und ist bewusst nicht Teil des Datenbank-Backups. `craftcloud-ctl` serialisiert Backup, Upgrade und Rollback mit `flock`. Beim Upgrade werden unveränderte mitgelieferte Caddy-Dateien erneuert; Betreiberänderungen bleiben, die neue Fassung liegt als `.new` daneben.
+
 ## Alternativen und Folgen
 
 Vorgebaute Registry-Images würden die Installation beschleunigen, benötigen aber eine zusätzliche Veröffentlichungs- und Lieferkettenentscheidung. Debian-Pakete und Kubernetes erhöhen den Betriebsumfang und werden hier nicht eingeführt. Lokale Builds benötigen Netzwerkzugriff, Arbeitsspeicher und Zeit; Prüfsummen schützen ohne getrennt vertrauenswürdigen Bezug nicht gegen einen ausgetauschten Download. Echte VM- und Architekturprüfungen bleiben Voraussetzungen für eine belastbare Betriebsfreigabe.

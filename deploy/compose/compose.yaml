@@ -42,6 +42,7 @@ services:
       - db_runtime_password
       - bootstrap_token
       - metrics_token
+      - two_factor_key
     volumes:
       - ./secrets-init.sh:/secrets-init.sh:ro
       - secrets:/out
@@ -212,6 +213,8 @@ services:
       # Only the proxy network: the address Caddy connects from.
       CRAFTCLOUD_TRUSTED_PROXIES: ${CRAFTCLOUD_FRONTEND_SUBNET:-172.29.205.0/24}
       CRAFTCLOUD_DATABASE_URL_FILE: /run/secrets/db_runtime_url
+      # Encrypts two-factor secrets; written by secrets-init from CC_SECRET_TWO_FACTOR_KEY.
+      CRAFTCLOUD_SECRET_KEY_FILE: /run/secrets/two_factor_key
       # CRAFTCLOUD_BIND, CRAFTCLOUD_ADMIN_DIR, CRAFTCLOUD_STORAGE_DIR and
       # CRAFTCLOUD_LOG_FORMAT come from the image.
     volumes:
@@ -303,3 +306,4 @@ secrets:
   db_runtime_password: {environment: CC_SECRET_DB_RUNTIME_PASSWORD}
   bootstrap_token: {environment: CC_SECRET_BOOTSTRAP}
   metrics_token: {environment: CC_SECRET_METRICS_TOKEN}
+  two_factor_key: {environment: CC_SECRET_TWO_FACTOR_KEY}

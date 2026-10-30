@@ -144,6 +144,91 @@ verify_archive_checksum() {
     [ "$checksum_actual" = "$checksum_expected" ] || fail 'archive checksum mismatch'
 }
 
+release_complete() {
+    # release_complete <release-dir> <version>
+    if [ -d "$1/deploy/compose" ] && [ -f "$1/CRAFTCLOUD-RELEASE.json" ]; then return 0; fi
+    [ -d "$1/craftcloud-$2/deploy/compose" ] && [ -f "$1/craftcloud-$2/CRAFTCLOUD-RELEASE.json" ]
+}
+# extract_release <archive> <version> <destination>
+# Unpacks into a staging directory next to the destination and renames it only
+# after the content is validated, so a failed run never leaves a partial release.
+extract_release() {
+    ex_archive=$1
+    ex_version=$2
+    ex_dest=$3
+    ex_stage=$INSTALL_ROOT/releases/.tmp-$ex_version.$$
+    rm -rf -- "$INSTALL_ROOT/releases/.tmp-$ex_version".*
+    rm -rf -- "$ex_stage"
+    mkdir "$ex_stage"
+    trap 'rm -rf -- "$ex_stage"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    ex_entries=$(tar -tzf "$ex_archive") || fail 'cannot read archive table of contents'
+    printf '%s\n' "$ex_entries" | awk -v root="craftcloud-$ex_version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
+    ex_types=$(tar -tvzf "$ex_archive") || fail 'cannot inspect archive entry types'
+    printf '%s\n' "$ex_types" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {bad=1} END {exit bad}' || fail 'archive contains links or special files'
+    umask 022
+    tar -xzf "$ex_archive" -C "$ex_stage" --no-same-owner --strip-components=1
+    umask 077
+    release_complete "$ex_stage" "$ex_version" || fail 'release archive is incomplete (deploy/compose or CRAFTCLOUD-RELEASE.json missing)'
+    mv -T "$ex_stage" "$ex_dest"
+    trap - 0 HUP INT TERM
+}
+# sync_caddy_config <shipped-dir> <config-dir>
+# Refreshes release-shipped Caddy files. Operator-owned files (fullchain.pem,
+# private.key, and anything the release does not ship) are never touched. A
+# shipped file the operator changed is kept and the new version is written
+# beside it as <name>.new. Hashes of the shipped versions are recorded in
+# .shipped-sha256 to tell an unmodified file from an edited one.
+sync_caddy_config() {
+    sync_src=$1
+    sync_dest=$2
+    sync_manifest=$sync_dest/.shipped-sha256
+    sync_next=$sync_manifest.tmp.$$
+    : >"$sync_next"
+    for sync_file in "$sync_src"/*; do
+        [ -f "$sync_file" ] && [ ! -L "$sync_file" ] || continue
+        sync_name=${sync_file##*/}
+        case $sync_name in fullchain.pem|private.key|*.new) continue ;; esac
+        sync_target=$sync_dest/$sync_name
+        sync_new=$(sha256sum "$sync_file" | awk '{print $1}')
+        sync_old=
+        [ ! -f "$sync_manifest" ] || sync_old=$(awk -v n="$sync_name" '$2 == n {print $1}' "$sync_manifest")
+        if [ -L "$sync_target" ]; then
+            printf '%s\n' "craftcloud: warning: $sync_target is a symbolic link; not refreshed" >&2
+            [ -z "$sync_old" ] || printf '%s  %s\n' "$sync_old" "$sync_name" >>"$sync_next"
+        elif [ ! -e "$sync_target" ]; then
+            cp "$sync_file" "$sync_target"
+            printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
+        else
+            sync_cur=$(sha256sum "$sync_target" | awk '{print $1}')
+            if [ "$sync_cur" = "$sync_new" ]; then
+                rm -f -- "$sync_target.new"
+                printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
+            elif [ -n "$sync_old" ] && [ "$sync_old" = "$sync_cur" ]; then
+                cp "$sync_file" "$sync_target.tmp.$$"
+                mv -f "$sync_target.tmp.$$" "$sync_target"
+                rm -f -- "$sync_target.new"
+                printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
+                printf '%s\n' "craftcloud: refreshed Caddy file $sync_name"
+            else
+                cp "$sync_file" "$sync_target.new"
+                printf '%s\n' "craftcloud: warning: Caddy file $sync_name was changed locally and is kept; the new shipped version is $sync_target.new. Compare and merge it." >&2
+                [ -z "$sync_old" ] || printf '%s  %s\n' "$sync_old" "$sync_name" >>"$sync_next"
+            fi
+        fi
+    done
+    chmod 0600 "$sync_next"
+    mv -f "$sync_next" "$sync_manifest"
+}
+# Generates the Base64 two-factor key (32 random bytes) and prints it.
+generate_two_factor_key() {
+    gen_key=$(head -c 32 /dev/urandom | base64 | tr -d '\n') || fail 'cannot generate two-factor key'
+    [ "${#gen_key}" -eq 44 ] || fail 'cannot generate two-factor key'
+    printf '%s' "$gen_key"
+}
+
 while [ "$#" -gt 0 ]; do
     case $1 in
         --domain) [ "$#" -ge 2 ] || fail '--domain needs a value'; DOMAIN=$2; DOMAIN_SET=1; shift 2 ;;
@@ -211,7 +296,7 @@ case $DOMAIN in *[!A-Za-z0-9.-]*|'') fail 'invalid domain' ;; esac
 newline='
 '
 case $DATA_DIR in *:*|*=*|*"$newline"*) fail 'data directory contains unsupported characters' ;; esac
-if [ -n "$ACME_EMAIL" ]; then case $ACME_EMAIL in *[!A-Za-z0-9._+-@]*|'') fail 'invalid ACME email' ;; esac; fi
+if [ -n "$ACME_EMAIL" ]; then case $ACME_EMAIL in *[!A-Za-z0-9._+@-]*|'') fail 'invalid ACME email' ;; esac; fi
 case $PROJECT in *[!A-Za-z0-9_-]*|'') fail 'invalid Compose project name' ;; esac
 case $HTTP_PORT:$HTTPS_PORT in *[!0-9:]*|:*|*:) fail 'ports must be numeric' ;; esac
 [ "$HTTP_PORT" -ge 1 ] && [ "$HTTP_PORT" -le 65535 ] || fail 'invalid HTTP port'
@@ -222,7 +307,7 @@ safe_path "$DATA_DIR"
 if paths_overlap "$INSTALL_ROOT" "$CONFIG_DIR" || paths_overlap "$INSTALL_ROOT" "$DATA_DIR" || paths_overlap "$CONFIG_DIR" "$DATA_DIR"; then
     fail 'install, config, and data directories must not overlap'
 fi
-need tar; need sha256sum; need awk; need sed; need docker; need readlink; need df; need chown
+need tar; need sha256sum; need awk; need sed; need docker; need readlink; need df; need chown; need base64; need head; need od; need tr; need grep
 if [ "$SKIP_SYSTEMD" = 1 ]; then
     systemd_running && fail 'CRAFTCLOUD_SKIP_SYSTEMD=1 is allowed only outside a systemd host'
 else
@@ -321,8 +406,19 @@ release_exists=0
 if [ -e "$release" ]; then
     [ ! -L "$release" ] || fail "release path is a symbolic link: $version"
     current_release=$(readlink -f "$INSTALL_ROOT/current" 2>/dev/null || true)
-    [ "$current_release" = "$(readlink -f "$release")" ] || fail "release already exists and is not active: $version"
-    release_exists=1
+    if [ "$current_release" = "$(readlink -f "$release")" ]; then
+        release_exists=1
+    elif [ ! -e "$INSTALL_ROOT/current" ] && [ ! -L "$INSTALL_ROOT/current" ]; then
+        # A failed first install: nothing is active. Reuse a complete release
+        # directory; an incomplete one is a leftover of an interrupted older run.
+        if release_complete "$release" "$version"; then
+            release_exists=1
+        else
+            rm -rf -- "$release"
+        fi
+    else
+        fail "release already exists and is not active: $version"
+    fi
 fi
 
 mkdir -p "$INSTALL_ROOT/releases" "$CONFIG_DIR" "$DATA_DIR/storage" "$DATA_DIR/postgres" "$DATA_DIR/backups"
@@ -334,14 +430,7 @@ chmod 0700 "$CONFIG_DIR" "$DATA_DIR" "$DATA_DIR/storage" "$DATA_DIR/postgres" "$
 chown 65532:65532 "$DATA_DIR/storage" "$DATA_DIR/backups"
 chown 999:999 "$DATA_DIR/postgres"
 if [ "$release_exists" -eq 0 ]; then
-    mkdir "$release"
-    archive_entries=$(tar -tzf "$ARCHIVE") || fail 'cannot read archive table of contents'
-    printf '%s\n' "$archive_entries" | awk -v root="craftcloud-$version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
-    archive_types=$(tar -tvzf "$ARCHIVE") || fail 'cannot inspect archive entry types'
-    printf '%s\n' "$archive_types" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {bad=1} END {exit bad}' || fail 'archive contains links or special files'
-    umask 022
-    tar -xzf "$ARCHIVE" -C "$release" --no-same-owner --strip-components=1
-    umask 077
+    extract_release "$ARCHIVE" "$version" "$release"
 fi
 if [ -d "$release/deploy/compose" ]; then compose_dir=$release/deploy/compose
 elif [ -d "$release/craftcloud-$version/deploy/compose" ]; then compose_dir=$release/craftcloud-$version/deploy/compose
@@ -362,28 +451,54 @@ fresh_config=0
 if [ ! -e "$env_file" ]; then
     fresh_config=1
     [ -n "$ACME_EMAIL" ] || ACME_EMAIL=admin@$DOMAIN
-    secret() { od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; }
+    secret() {
+        secret_value=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+        [ "${#secret_value}" -eq 64 ] || fail 'cannot read random data'
+        printf '%s' "$secret_value"
+    }
+    # Everything that can fail is checked before the environment file is written.
+    version_image_tag=$(image_tag "$version")
+    [ "${#version_image_tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
+    public_url=https://$DOMAIN
+    [ "$HTTPS_PORT" = 443 ] || public_url=https://$DOMAIN:$HTTPS_PORT
+    tls_mode=acme
+    [ "$DOMAIN" != localhost ] || tls_mode=internal
     bootstrap_token=$(secret)
+    secret_db_superuser=$(secret)
+    secret_db_owner=$(secret)
+    secret_db_runtime=$(secret)
+    secret_metrics=$(secret)
+    secret_two_factor=$(generate_two_factor_key)
+    env_tmp=$env_file.tmp.$$
+    trap 'rm -f -- "$env_tmp"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     {
-        public_url=https://$DOMAIN
-        [ "$HTTPS_PORT" = 443 ] || public_url=https://$DOMAIN:$HTTPS_PORT
         printf 'CRAFTCLOUD_DOMAIN=%s\nCRAFTCLOUD_PUBLIC_URL=%s\n' "$DOMAIN" "$public_url"
-        tls_mode=acme
-        [ "$DOMAIN" != localhost ] || tls_mode=internal
-        printf 'CRAFTCLOUD_HTTP_PORT=%s\nCRAFTCLOUD_HTTPS_PORT=%s\nCRAFTCLOUD_TLS_MODE=%s\nCRAFTCLOUD_ACME_EMAIL=%s\n' "$HTTP_PORT" "$HTTPS_PORT" "$tls_mode" "${ACME_EMAIL:-admin@$DOMAIN}"
+        printf 'CRAFTCLOUD_HTTP_PORT=%s\nCRAFTCLOUD_HTTPS_PORT=%s\nCRAFTCLOUD_TLS_MODE=%s\nCRAFTCLOUD_ACME_EMAIL=%s\n' "$HTTP_PORT" "$HTTPS_PORT" "$tls_mode" "$ACME_EMAIL"
         printf 'CRAFTCLOUD_DATA_DIR=%s\nCRAFTCLOUD_CONFIG_DIR=%s\nCRAFTCLOUD_PROJECT_NAME=%s\nCRAFTCLOUD_BACKUP_KEEP=%s\n' "$DATA_DIR" "$CONFIG_DIR" "$PROJECT" "${CRAFTCLOUD_BACKUP_KEEP:-7}"
-        version_image_tag=$(image_tag "$version")
-        [ "${#version_image_tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
         printf 'CRAFTCLOUD_IMAGE_PREFIX=%s\nCRAFTCLOUD_IMAGE=%s\n' "$IMAGE_PREFIX" "$IMAGE_PREFIX$version_image_tag"
-        printf 'CC_SECRET_DB_SUPERUSER_PASSWORD=%s\n' "$(secret)"
-        printf 'CC_SECRET_DB_OWNER_PASSWORD=%s\n' "$(secret)"
-        printf 'CC_SECRET_DB_RUNTIME_PASSWORD=%s\n' "$(secret)"
+        printf 'CC_SECRET_DB_SUPERUSER_PASSWORD=%s\n' "$secret_db_superuser"
+        printf 'CC_SECRET_DB_OWNER_PASSWORD=%s\n' "$secret_db_owner"
+        printf 'CC_SECRET_DB_RUNTIME_PASSWORD=%s\n' "$secret_db_runtime"
         printf 'CC_SECRET_BOOTSTRAP=%s\n' "$bootstrap_token"
-        printf 'CC_SECRET_METRICS_TOKEN=%s\n' "$(secret)"
-    } >"$env_file"
-    chmod 0600 "$env_file"
+        printf 'CC_SECRET_METRICS_TOKEN=%s\n' "$secret_metrics"
+        printf 'CC_SECRET_TWO_FACTOR_KEY=%s\n' "$secret_two_factor"
+    } >"$env_tmp"
+    chmod 0600 "$env_tmp"
+    mv -f "$env_tmp" "$env_file"
+    trap - 0 HUP INT TERM
     printf '%s' "$bootstrap_token" >"$CONFIG_DIR/bootstrap-token"
     chmod 0600 "$CONFIG_DIR/bootstrap-token"
+fi
+# Configurations from before the two-factor key existed get one; an existing key is kept.
+if ! grep -q '^CC_SECRET_TWO_FACTOR_KEY=.' "$env_file"; then
+    ensure_key=$(generate_two_factor_key)
+    ensure_tmp=$env_file.tmp.$$
+    { awk '!/^CC_SECRET_TWO_FACTOR_KEY=/' "$env_file"; printf 'CC_SECRET_TWO_FACTOR_KEY=%s\n' "$ensure_key"; } >"$ensure_tmp"
+    chmod 0600 "$ensure_tmp"
+    mv -f "$ensure_tmp" "$env_file"
 fi
 chmod 0600 "$env_file"
 if ! grep -q '^CRAFTCLOUD_CADDY_CONFIG_DIR=' "$env_file"; then printf 'CRAFTCLOUD_CADDY_CONFIG_DIR=%s\n' "$CADDY_CONFIG_DIR" >>"$env_file"; fi
@@ -396,8 +511,10 @@ if [ ! -e "$CADDY_CONFIG_DIR/Caddyfile" ]; then
         break
     done
     [ "$caddy_empty" -eq 1 ] || fail 'Caddy config dir has files but no Caddyfile'
-    cp -R "$compose_dir/caddy/." "$CADDY_CONFIG_DIR/"
 fi
+# Copies missing shipped files, refreshes unmodified ones and keeps operator edits
+# (the new version is written as <name>.new).
+sync_caddy_config "$compose_dir/caddy" "$CADDY_CONFIG_DIR"
 chmod 0700 "$CADDY_CONFIG_DIR"
 if [ -f "$CADDY_CONFIG_DIR/private.key" ]; then chmod 0600 "$CADDY_CONFIG_DIR/private.key"; fi
 version_image_tag=$(image_tag "$version")

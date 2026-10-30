@@ -4,7 +4,8 @@
 //!
 //! The file holds the public settings (domain, ports, TLS mode, public URL)
 //! and freshly generated random secrets: three database passwords, the
-//! bootstrap token and the metrics token. The database URLs are not stored:
+//! bootstrap token, the metrics token and the Base64 key that encrypts the
+//! two-factor secrets (`CC_SECRET_TWO_FACTOR_KEY`, 32 random bytes). The database URLs are not stored:
 //! `deploy/compose/secrets-init.sh` builds them from the role passwords. Compose hands
 //! each secret to a service as a file in `/run/secrets` (see `compose.yaml`).
 //! The command never overwrites an existing file, creates it with mode 0600
@@ -125,7 +126,10 @@ fn render_env(options: &Options, secrets: &Secrets) -> String {
          CC_SECRET_DB_OWNER_PASSWORD={owner}\n\
          CC_SECRET_DB_RUNTIME_PASSWORD={runtime}\n\
          CC_SECRET_BOOTSTRAP={bootstrap}\n\
-         CC_SECRET_METRICS_TOKEN={metrics}\n",
+         CC_SECRET_METRICS_TOKEN={metrics}\n\
+         # Encrypts two-factor secrets. A restored database needs this same key: keep a\n\
+         # separate protected copy, it is not part of any backup.\n\
+         CC_SECRET_TWO_FACTOR_KEY={two_factor_key}\n",
         domain = options.domain,
         http = options.http_port,
         https = options.https_port,
@@ -134,6 +138,7 @@ fn render_env(options: &Options, secrets: &Secrets) -> String {
         runtime = secrets.runtime,
         bootstrap = secrets.bootstrap,
         metrics = secrets.metrics,
+        two_factor_key = secrets.two_factor_key,
     );
     out
 }
@@ -144,11 +149,30 @@ struct Secrets {
     runtime: String,
     bootstrap: String,
     metrics: String,
+    /// Standard Base64 (with padding) of 32 random bytes, the format of
+    /// `CRAFTCLOUD_SECRET_KEY_FILE`.
+    two_factor_key: String,
+}
+
+/// Re-encodes a 43-character URL-safe, unpadded Base64 string of 32 bytes
+/// (the shape of `OpaqueToken`) as standard padded Base64.
+fn standard_base64(url_safe: &str) -> String {
+    let mut out: String = url_safe
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
+    out.push('=');
+    out
 }
 
 impl Secrets {
-    /// Five independent 256-bit values (43 URL-safe characters each, which
-    /// also satisfies the 32-character minimum of the bootstrap and metrics tokens).
+    /// Six independent 256-bit values (43 URL-safe characters each, which
+    /// also satisfies the 32-character minimum of the bootstrap and metrics tokens;
+    /// the two-factor key is the same entropy in standard Base64).
     fn generate() -> Result<Self, String> {
         let one = || {
             OpaqueToken::generate()
@@ -161,6 +185,7 @@ impl Secrets {
             runtime: one()?,
             bootstrap: one()?,
             metrics: one()?,
+            two_factor_key: standard_base64(&one()?),
         })
     }
 }
@@ -249,6 +274,7 @@ mod tests {
             runtime: "R".into(),
             bootstrap: "B".into(),
             metrics: "M".into(),
+            two_factor_key: "K".into(),
         }
     }
 
@@ -385,6 +411,21 @@ mod tests {
                 assert_ne!(value, other);
             }
         }
+    }
+
+    #[test]
+    fn two_factor_key_is_standard_base64_of_32_bytes() {
+        let secrets = Secrets::generate().unwrap();
+        let key = &secrets.two_factor_key;
+        assert_eq!(key.len(), 44);
+        assert!(key.ends_with('='));
+        assert!(
+            key[..43]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        );
+        assert_ne!(key, &secrets.metrics);
+        assert_eq!(standard_base64("-_-_"), "+/+/=");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 """Package a git archive and lockfile inventories using Python's stdlib."""
 
+import gzip
 import hashlib
 import json
 import os
@@ -74,8 +75,18 @@ def make_archive(raw_tar, staging, output, version, commit, filename):
     with tarfile.open(raw_tar, "r:") as source:
         cargo_lock = lockfile_bytes(source, f"{root_name}/Cargo.lock")
         npm_lock = lockfile_bytes(source, f"{root_name}/apps/craftcloud-admin/package-lock.json")
-        with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as target:
+        # Reproducible output: the gzip header carries no file name or time, and
+        # tar members keep the commit time from git archive but no owner data.
+        with open(archive_path, "wb") as raw, gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0
+        ) as compressed, tarfile.open(
+            fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
+        ) as target:
             for member in source:
+                member.uid = 0
+                member.gid = 0
+                member.uname = ""
+                member.gname = ""
                 target.addfile(member, source.extractfile(member) if member.isfile() else None)
             info = tarfile.TarInfo(f"{root_name}/CRAFTCLOUD-RELEASE.json")
             info.size = len(metadata)
@@ -148,6 +159,9 @@ def publish_outputs(staging, output, root_name, filename):
 
 
 def main(args):
+    if sys.version_info < (3, 11):
+        found = ".".join(str(part) for part in sys.version_info[:3])
+        raise SystemExit(f"release_archive.py needs Python 3.11 or newer (tomllib); this is Python {found}")
     if len(args) != 7:
         raise SystemExit("usage: release_archive.py <tar> <staging-dir> <output-dir> <version> <commit> <filename>")
     raw_tar = pathlib.Path(args[1])

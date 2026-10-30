@@ -158,6 +158,123 @@ compose_for_setup_state() {
     if [ -f "$CONFIG_DIR/bootstrap-token" ]; then compose_at_setup "$@"
     else compose_at "$@"; fi
 }
+release_complete() {
+    # release_complete <release-dir> <version>
+    if [ -d "$1/deploy/compose" ] && [ -f "$1/CRAFTCLOUD-RELEASE.json" ]; then return 0; fi
+    [ -d "$1/craftcloud-$2/deploy/compose" ] && [ -f "$1/craftcloud-$2/CRAFTCLOUD-RELEASE.json" ]
+}
+# extract_release <archive> <version> <destination>
+# Unpacks into a staging directory next to the destination and renames it only
+# after the content is validated, so a failed run never leaves a partial release.
+extract_release() {
+    ex_archive=$1
+    ex_version=$2
+    ex_dest=$3
+    ex_stage=$INSTALL_ROOT/releases/.tmp-$ex_version.$$
+    rm -rf -- "$INSTALL_ROOT/releases/.tmp-$ex_version".*
+    rm -rf -- "$ex_stage"
+    mkdir "$ex_stage"
+    trap 'rm -rf -- "$ex_stage"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    ex_entries=$(tar -tzf "$ex_archive") || fail 'cannot read archive table of contents'
+    printf '%s\n' "$ex_entries" | awk -v root="craftcloud-$ex_version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
+    ex_types=$(tar -tvzf "$ex_archive") || fail 'cannot inspect archive entry types'
+    printf '%s\n' "$ex_types" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {bad=1} END {exit bad}' || fail 'archive contains links or special files'
+    umask 022
+    tar -xzf "$ex_archive" -C "$ex_stage" --no-same-owner --strip-components=1
+    umask 077
+    release_complete "$ex_stage" "$ex_version" || fail 'release archive is incomplete (deploy/compose or CRAFTCLOUD-RELEASE.json missing)'
+    mv -T "$ex_stage" "$ex_dest"
+    trap - 0 HUP INT TERM
+}
+# sync_caddy_config <shipped-dir> <config-dir>
+# Refreshes release-shipped Caddy files. Operator-owned files (fullchain.pem,
+# private.key, and anything the release does not ship) are never touched. A
+# shipped file the operator changed is kept and the new version is written
+# beside it as <name>.new. Hashes of the shipped versions are recorded in
+# .shipped-sha256 to tell an unmodified file from an edited one.
+sync_caddy_config() {
+    sync_src=$1
+    sync_dest=$2
+    sync_manifest=$sync_dest/.shipped-sha256
+    sync_next=$sync_manifest.tmp.$$
+    CADDY_CHANGED=0
+    : >"$sync_next"
+    for sync_file in "$sync_src"/*; do
+        [ -f "$sync_file" ] && [ ! -L "$sync_file" ] || continue
+        sync_name=${sync_file##*/}
+        case $sync_name in fullchain.pem|private.key|*.new) continue ;; esac
+        sync_target=$sync_dest/$sync_name
+        sync_new=$(sha256sum "$sync_file" | awk '{print $1}')
+        sync_old=
+        [ ! -f "$sync_manifest" ] || sync_old=$(awk -v n="$sync_name" '$2 == n {print $1}' "$sync_manifest")
+        if [ -L "$sync_target" ]; then
+            printf '%s\n' "craftcloud: warning: $sync_target is a symbolic link; not refreshed" >&2
+            [ -z "$sync_old" ] || printf '%s  %s\n' "$sync_old" "$sync_name" >>"$sync_next"
+        elif [ ! -e "$sync_target" ]; then
+            cp "$sync_file" "$sync_target"
+            CADDY_CHANGED=1
+            printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
+        else
+            sync_cur=$(sha256sum "$sync_target" | awk '{print $1}')
+            if [ "$sync_cur" = "$sync_new" ]; then
+                rm -f -- "$sync_target.new"
+                printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
+            elif [ -n "$sync_old" ] && [ "$sync_old" = "$sync_cur" ]; then
+                cp "$sync_file" "$sync_target.tmp.$$"
+                mv -f "$sync_target.tmp.$$" "$sync_target"
+                CADDY_CHANGED=1
+                rm -f -- "$sync_target.new"
+                printf '%s  %s\n' "$sync_new" "$sync_name" >>"$sync_next"
+                printf '%s\n' "craftcloud: refreshed Caddy file $sync_name"
+            else
+                cp "$sync_file" "$sync_target.new"
+                printf '%s\n' "craftcloud: warning: Caddy file $sync_name was changed locally and is kept; the new shipped version is $sync_target.new. Compare and merge it." >&2
+                [ -z "$sync_old" ] || printf '%s  %s\n' "$sync_old" "$sync_name" >>"$sync_next"
+            fi
+        fi
+    done
+    chmod 0600 "$sync_next"
+    mv -f "$sync_next" "$sync_manifest"
+}
+# Generates the Base64 two-factor key (32 random bytes) and prints it.
+generate_two_factor_key() {
+    gen_key=$(head -c 32 /dev/urandom | base64 | tr -d '\n') || fail 'cannot generate two-factor key'
+    [ "${#gen_key}" -eq 44 ] || fail 'cannot generate two-factor key'
+    printf '%s' "$gen_key"
+}
+# Adds CC_SECRET_TWO_FACTOR_KEY to an environment file written before the key
+# existed. An existing non-empty value is never changed.
+ensure_two_factor_key() {
+    ensure_env=$CONFIG_DIR/craftcloud.env
+    if grep -q '^CC_SECRET_TWO_FACTOR_KEY=.' "$ensure_env"; then return 0; fi
+    command -v base64 >/dev/null 2>&1 || fail 'required command missing: base64'
+    ensure_key=$(generate_two_factor_key)
+    ensure_tmp=$ensure_env.tmp.$$
+    { awk '!/^CC_SECRET_TWO_FACTOR_KEY=/' "$ensure_env"; printf 'CC_SECRET_TWO_FACTOR_KEY=%s\n' "$ensure_key"; } >"$ensure_tmp"
+    chmod 0600 "$ensure_tmp"
+    mv -f "$ensure_tmp" "$ensure_env"
+    printf '%s\n' "craftcloud-ctl: generated a two-factor encryption key in $ensure_env (keep a separate protected copy; backups do not contain it)"
+}
+# Recreates the proxy so that refreshed Caddy files take effect (the directory is a
+# read-only bind mount; Caddy reads it at start).
+recreate_caddy_if_changed() {
+    [ "${CADDY_CHANGED:-0}" -eq 1 ] || return 0
+    compose_for_setup_state "$1" up -d --force-recreate --no-deps caddy || printf '%s\n' 'craftcloud-ctl: warning: could not recreate the proxy; restart it to load the refreshed Caddy files' >&2
+}
+# Commands that change the installation (backup, upgrade, rollback, setup-complete,
+# uninstall) exclude each other. Child
+# invocations of this script started by a locked command skip the lock.
+acquire_lock() {
+    [ "${CRAFTCLOUD_CTL_LOCK_HELD:-0}" != 1 ] || return 0
+    command -v flock >/dev/null 2>&1 || fail 'flock (util-linux) is required to serialize commands that change the installation'
+    exec 9>"$CONFIG_DIR/.ctl.lock"
+    flock -n 9 || fail 'another craftcloud-ctl command that changes the installation is running; retry when it has finished'
+    CRAFTCLOUD_CTL_LOCK_HELD=1
+    export CRAFTCLOUD_CTL_LOCK_HELD
+}
 safe_path "$INSTALL_ROOT"
 safe_path "$CONFIG_DIR"
 safe_path "$DATA_DIR"
@@ -172,9 +289,17 @@ require_owned_root "$DATA_DIR"
 active=$(current_release)
 
 case ${1:-} in
-    status) compose_at "$active" ps ;;
+    status)
+        compose_at "$active" ps
+        if grep -q '^CC_SECRET_TWO_FACTOR_KEY=.' "$CONFIG_DIR/craftcloud.env"; then
+            printf '%s\n' "Two-factor key: present in $CONFIG_DIR/craftcloud.env"
+        else
+            printf '%s\n' "Two-factor key: MISSING in $CONFIG_DIR/craftcloud.env (two-factor setup is unavailable until it exists)"
+        fi
+        ;;
     logs) shift; compose_at "$active" logs --follow "$@" ;;
     backup)
+        acquire_lock
         need_keep=${CRAFTCLOUD_BACKUP_KEEP:-$(sed -n 's/^CRAFTCLOUD_BACKUP_KEEP=//p' "$CONFIG_DIR/craftcloud.env" | tail -n 1)}
         need_keep=${need_keep:-7}
         case $need_keep in *[!0-9]*|'') fail 'CRAFTCLOUD_BACKUP_KEEP must be a positive integer' ;; esac
@@ -204,6 +329,7 @@ case ${1:-} in
         done <"$verified_file"
         rm -f -- "$verified_file"
         printf 'Backup created: %s\n' "$backup_path"
+        printf '%s\n' "The backup does not contain the two-factor encryption key. It lives in $CONFIG_DIR/craftcloud.env (CC_SECRET_TWO_FACTOR_KEY); keep a separate protected copy, a restore needs the same key."
         ;;
     start)
         if [ -f "$CONFIG_DIR/bootstrap-token" ]; then compose_at_setup "$active" up -d
@@ -211,6 +337,7 @@ case ${1:-} in
         ;;
     stop) compose_at "$active" down ;;
     setup-complete)
+        acquire_lock
         [ -f "$CONFIG_DIR/bootstrap-token" ] || fail 'bootstrap secret file not present'
         setup_status=$(compose_at_setup "$active" exec -T caddy wget -qO- http://server:8080/api/v1/setup/status) || fail 'cannot read setup status'
         case $setup_status in *'"setup_required":false'*) ;; *) fail 'instance setup is not complete' ;; esac
@@ -241,6 +368,7 @@ case ${1:-} in
         printf '%s\n' 'Bootstrap disabled after completed setup.'
         ;;
     upgrade)
+        acquire_lock
         [ "$#" -eq 2 ] || fail 'usage: craftcloud-ctl upgrade <archive.tar.gz>'
         archive=$2
         [ -f "$archive" ] || fail 'archive not found'
@@ -254,21 +382,20 @@ case ${1:-} in
         new_root=$INSTALL_ROOT/releases/$new_version
         [ "$new_root" != "$active" ] || fail 'release is already active'
         [ ! -L "$new_root" ] || fail 'release destination is a symbolic link'
+        # Environment files from before the two-factor key existed get one now.
+        ensure_two_factor_key
         # A backup must finish before any release or database change.
         sh "$0" backup
         backup_path=$(cat "$CONFIG_DIR/last-backup")
         printf '%s\n' "$backup_path" >"$CONFIG_DIR/upgrade-backup"
         chmod 0600 "$CONFIG_DIR/upgrade-backup"
         mkdir -p "$INSTALL_ROOT/releases"
+        if [ -e "$new_root" ] && ! release_complete "$new_root" "$new_version"; then
+            # Leftover of an interrupted older run; it is not active (checked above).
+            rm -rf -- "$new_root"
+        fi
         if [ ! -e "$new_root" ]; then
-            mkdir "$new_root"
-            archive_entries=$(tar -tzf "$archive") || fail 'cannot read archive table of contents'
-            printf '%s\n' "$archive_entries" | awk -v root="craftcloud-$new_version" '($0 != root "/" && index($0, root "/") != 1) || /^\// || /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || fail 'archive contains unsafe paths'
-            archive_types=$(tar -tvzf "$archive") || fail 'cannot inspect archive entry types'
-            printf '%s\n' "$archive_types" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" {bad=1} END {exit bad}' || fail 'archive contains links or special files'
-            umask 022
-            tar -xzf "$archive" -C "$new_root" --no-same-owner --strip-components=1
-            umask 077
+            extract_release "$archive" "$new_version" "$new_root"
         fi
         new_dir=$(release_compose_dir "$new_root")
         metadata=$new_root/CRAFTCLOUD-RELEASE.json
@@ -287,6 +414,7 @@ case ${1:-} in
         else
             compose_at "$new_root" run --rm migrate
         fi
+        sync_caddy_config "$new_dir/caddy" "$CONFIG_DIR/caddy"
         previous=$CONFIG_DIR/previous-release
         printf '%s\n' "$active" >"$previous"
         chmod 0600 "$previous"
@@ -306,9 +434,11 @@ case ${1:-} in
             }
             sleep 2
         done
+        recreate_caddy_if_changed "$new_root"
         trap - 0
         ;;
     rollback)
+        acquire_lock
         previous=$CONFIG_DIR/previous-release
         [ -f "$previous" ] || fail 'no previous release recorded'
         old=$(cat "$previous")
@@ -322,10 +452,14 @@ case ${1:-} in
         rm -f -- "$INSTALL_ROOT/current.new"
         ln -s "$old" "$INSTALL_ROOT/current.new"
         mv -Tf "$INSTALL_ROOT/current.new" "$CURRENT"
+        # The proxy configuration follows the release that becomes active again.
+        sync_caddy_config "$(release_compose_dir "$old")/caddy" "$CONFIG_DIR/caddy"
         compose_for_setup_state "$old" up -d
+        recreate_caddy_if_changed "$old"
         printf '%s\n' 'Release rolled back. Database schema was not restored; restore the pre-upgrade backup if the prior release requires it.' >&2
         ;;
     uninstall)
+        acquire_lock
         shift
         purge=0 confirm=0
         for arg in "$@"; do case $arg in --purge) purge=1 ;; --confirm-purge) confirm=1 ;; *) fail "unknown uninstall option: $arg" ;; esac; done
@@ -339,7 +473,11 @@ case ${1:-} in
         if [ "${CRAFTCLOUD_SKIP_SYSTEMD:-0}" != 1 ]; then
             command -v systemctl >/dev/null 2>&1 || fail 'systemctl required for uninstall; set CRAFTCLOUD_SKIP_SYSTEMD=1 only in a test container'
             systemd_running || fail 'systemd is not running; set CRAFTCLOUD_SKIP_SYSTEMD=1 only in a test container'
-            systemctl disable --now craftcloud-backup.timer craftcloud.service craftcloud-backup.service >/dev/null
+            # Units are missing when an installation stopped before systemd setup.
+            for unit in craftcloud-backup.timer craftcloud.service craftcloud-backup.service; do
+                [ -e "$SYSTEMD_DIR/$unit" ] || continue
+                systemctl disable --now "$unit" >/dev/null || printf '%s\n' "craftcloud-ctl: warning: could not disable $unit" >&2
+            done
         else
             systemd_running && fail 'CRAFTCLOUD_SKIP_SYSTEMD=1 is allowed only outside a systemd host'
         fi
