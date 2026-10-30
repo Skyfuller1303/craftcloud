@@ -47,3 +47,5 @@ None of these are implemented by this blueprint. Update this list in the same PR
   - Nach SIGKILL zurückgebliebene `releases/.tmp-*`-Verzeichnisse werden erst beim nächsten Staging derselben Version entfernt.
   - `cargo xtask db-test` bricht beim ersten fehlschlagenden Testbinary ab (kein `--no-fail-fast`), spätere Binaries laufen dann nicht.
   - Der Webtest `activity.test.tsx` („is reachable and operable by keyboard“) schlug einmal unter Last fehl und lief bei Wiederholung durch; möglicher Flake.
+  - Ein hängender Download hält seinen Lesethread bis zum Socket-Timeout von ureq; der Aufrufer bricht nach seinem Budget ab, der Thread endet später.
+  - Bleibt die Refresh-Sperrdatei länger als 10 s belegt, erneuert der Client nur unter der Prozesssperre; eine Token-Wiederverwendung zwischen Prozessen ist dann möglich, dafür blockiert die Anmeldung nie.

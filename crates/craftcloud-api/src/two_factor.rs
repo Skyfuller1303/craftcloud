@@ -50,6 +50,26 @@ fn management_failure(
     crate::auth::record_two_factor_failure(services, headers, session.user_id);
     invalid(headers)
 }
+
+/// A wrong second-factor proof on a management route: counts toward the persistent
+/// per-account cap in addition to the management budget.
+async fn proof_failure(
+    services: &Services,
+    reservation: crate::ratelimit::Reservation,
+    session: &AuthenticatedSession,
+    headers: &HeaderMap,
+) -> Response {
+    if let Err(error) = two_factor::record_failed_proof(
+        &services.pool,
+        session.user_id,
+        &crate::audit::ctx(headers, Some(session.user_id)),
+    )
+    .await
+    {
+        return failed(&error, headers);
+    }
+    management_failure(services, reservation, session, headers)
+}
 use crate::client_ip::TrustedProxy;
 
 pub(crate) async fn issue_login_challenge(
@@ -450,6 +470,10 @@ pub(crate) async fn disable(
         Ok(_) => return invalid(&headers),
         Err(error) => return failed(&error, &headers),
     };
+    if record.failed_attempts >= two_factor::MAX_FAILED_ATTEMPTS {
+        // Locked until an operator resets the factor; same answer as a wrong proof.
+        return management_failure(&services, reservation, &session, &headers);
+    }
     let proof = match (body.code.as_deref(), body.recovery_code.as_deref()) {
         (Some(code), None) => {
             let Some(secret) =
@@ -471,7 +495,7 @@ pub(crate) async fn disable(
         _ => None,
     };
     let Some(proof) = proof else {
-        return management_failure(&services, reservation, &session, &headers);
+        return proof_failure(&services, reservation, &session, &headers).await;
     };
     match two_factor::reset_for_user(
         &services.pool,
@@ -546,6 +570,10 @@ pub(crate) async fn regenerate(
         Ok(_) => return invalid(&headers),
         Err(error) => return failed(&error, &headers),
     };
+    if record.failed_attempts >= two_factor::MAX_FAILED_ATTEMPTS {
+        // Locked until an operator resets the factor; same answer as a wrong proof.
+        return management_failure(&services, reservation, &session, &headers);
+    }
     let proof = match (body.code.as_deref(), body.recovery_code.as_deref()) {
         (Some(code), None) => {
             let Some(secret) =
@@ -567,7 +595,7 @@ pub(crate) async fn regenerate(
         _ => None,
     };
     let Some(proof) = proof else {
-        return management_failure(&services, reservation, &session, &headers);
+        return proof_failure(&services, reservation, &session, &headers).await;
     };
     let codes = match recovery_codes() {
         Ok(value) => value,
@@ -679,6 +707,8 @@ async fn validate_challenge(
     if factor.failed_attempts >= two_factor::MAX_FAILED_ATTEMPTS {
         // Locked until an operator resets the factor; same shape as a wrong code.
         reservation.record_failure(services.now_secs());
+        // Keep the failure visible in the audit trail; the counter stays capped.
+        crate::auth::record_two_factor_failure(services, headers, challenge.user_id);
         return Err(Box::new(invalid(headers)));
     }
     let Some(secret) = decrypt_for_keys(services, challenge.user_id, &factor.secret_ciphertext)

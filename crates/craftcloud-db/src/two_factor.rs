@@ -433,8 +433,8 @@ pub async fn replace_recovery_codes_verified(
     if live_session.is_none() {
         return Ok(false);
     }
-    let current_ciphertext: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL FOR UPDATE")
-        .bind(user_id).fetch_optional(&mut *tx).await?;
+    let current_ciphertext: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
+        .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
     if current_ciphertext.as_deref() != Some(expected_ciphertext) {
         return Ok(false);
     }
@@ -529,8 +529,9 @@ pub async fn reset_for_user(
         }
     }
     if let Some(expected_ciphertext) = expected_ciphertext {
-        let current_ciphertext: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL FOR UPDATE")
-            .bind(user_id).fetch_optional(&mut *tx).await?;
+        // A locked account is only released by the operator path (no expected ciphertext).
+        let current_ciphertext: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
+            .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
         if current_ciphertext.as_deref() != Some(expected_ciphertext) {
             return Ok(false);
         }

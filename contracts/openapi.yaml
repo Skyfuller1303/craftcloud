@@ -405,7 +405,11 @@ paths:
           csrfToken: []
         - bearerAuth: []
       summary: Disable own second factor with password and a second-factor proof
-      description: Invalidates enrollment and recovery codes and revokes other browser and device sessions atomically.
+      description: >-
+        Invalidates enrollment and recovery codes and revokes other browser and device sessions atomically.
+        A wrong proof counts toward the persistent per-account failure cap (100, see the login second-factor
+        routes). While the account is locked this route answers 401 INVALID_CREDENTIALS even with a valid
+        proof; only an operator reset clears the factor.
       requestBody:
         required: true
         content:
@@ -434,6 +438,8 @@ paths:
       description: >-
         Accepts exactly one TOTP code or an unused recovery code. Invalidates every old recovery code
         and returns ten new codes once. Only salted hashes are stored; plaintext codes are never retrievable.
+        A wrong proof counts toward the persistent 100-failure account cap, and a locked account is refused
+        with 401 INVALID_CREDENTIALS until an operator reset.
       requestBody:
         required: true
         content:

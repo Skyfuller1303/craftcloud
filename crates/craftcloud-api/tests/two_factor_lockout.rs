@@ -55,6 +55,7 @@ mod tests {
         user_id: Uuid,
         secret: String,
         recovery_codes: Vec<String>,
+        session: Session,
     }
 
     async fn enroll(env: &TestEnv, app: &Router, name: &str) -> Enrolled {
@@ -89,6 +90,7 @@ mod tests {
             user_id,
             secret,
             recovery_codes,
+            session,
         }
     }
 
@@ -236,6 +238,60 @@ mod tests {
         .await;
         assert_eq!(setup.status, StatusCode::OK, "{}", setup.text);
         assert_eq!(failed_attempts(&env, account.user_id).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn management_proof_failures_count_and_a_locked_account_cannot_disable_or_regenerate() {
+        let env = TestEnv::new().await;
+        let app = app(&env).await;
+        let account = enroll(&env, &app, "mfa-manage").await;
+        let wrong = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/2fa/disable")
+                .session(&account.session)
+                .json(json!({"password":PASSWORD,"code":"abcdef"})),
+        )
+        .await;
+        assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{}", wrong.text);
+        assert_eq!(failed_attempts(&env, account.user_id).await, 1);
+        let wrong = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/2fa/recovery-codes")
+                .session(&account.session)
+                .json(json!({"recovery_code":"AAAAAAAAAA"})),
+        )
+        .await;
+        assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{}", wrong.text);
+        assert_eq!(failed_attempts(&env, account.user_id).await, 2);
+
+        sqlx::query("UPDATE user_two_factor SET failed_attempts=100 WHERE user_id=$1")
+            .bind(account.user_id)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let now = env.clock.now().unix_timestamp();
+        for request in [
+            Req::new("POST", "/api/v1/auth/2fa/disable")
+                .session(&account.session)
+                .json(json!({"password":PASSWORD,"code":otp(&account.secret, now)})),
+            Req::new("POST", "/api/v1/auth/2fa/disable")
+                .session(&account.session)
+                .json(json!({"password":PASSWORD,"recovery_code":account.recovery_codes[0]})),
+            Req::new("POST", "/api/v1/auth/2fa/recovery-codes")
+                .session(&account.session)
+                .json(json!({"code":otp(&account.secret, now)})),
+        ] {
+            let refused = call(&app, request).await;
+            assert_eq!(
+                (refused.status, refused.code()),
+                (StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS"),
+                "{}",
+                refused.text
+            );
+        }
+        // Still enabled, counter stays at the cap.
+        assert_eq!(failed_attempts(&env, account.user_id).await, 100);
     }
 
     #[tokio::test]

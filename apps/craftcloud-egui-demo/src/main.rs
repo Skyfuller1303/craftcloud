@@ -15,7 +15,7 @@ use craftcloud_client::{CloudClient, CloudError, Proof, UploadContent};
 use craftcloud_client_native::{
     CloudLink, FileLeaseHeartbeat, KeychainTokenStore, LinksStore, NewFile, SaveOutcome,
     UreqTransport, VersionCache, cache_extension, overwrite_local_first_with_cancel,
-    save_local_first_with_cancel, save_new_local_first_with_cancel,
+    save_local_first_with_cancel, save_new_local_first_with_cancel, wait_for_release,
 };
 use craftcloud_egui::{
     Action, DefaultTranslator, Dialog, Language, PickerState, SecondFactorInput,
@@ -783,7 +783,28 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
     let mut client: Option<std::sync::Arc<CloudClient<UreqTransport>>> = None;
     let mut server = String::new();
     let mut leases: HashMap<Uuid, FileLeaseHeartbeat> = HashMap::new();
-    let data_dir = app_data_dir();
+    let data_dir = match app_data_dir() {
+        Ok(dir) => dir,
+        Err(message) => {
+            // Without a private data directory nothing may be stored: answer every
+            // request with the reason instead of falling back to a shared location.
+            while let Ok(job) = requests.recv() {
+                let shutdown = matches!(&job.request, Request::Shutdown);
+                let _ = events.send(WorkerEvent {
+                    id: Some(job.id),
+                    event: if shutdown {
+                        Event::Closed
+                    } else {
+                        Event::Failed(message.clone())
+                    },
+                });
+                if shutdown {
+                    break;
+                }
+            }
+            return;
+        }
+    };
     let cache = VersionCache::new(data_dir.join("CraftCloud"));
     let keychain = KeychainTokenStore::new("craftcloud");
     let links = LinksStore::new(&data_dir);
@@ -1257,13 +1278,20 @@ fn open_file(
         .map_err(|error| error.to_string())?;
     let mut lease = None;
     if !read_only && file.app != "figcraft" {
+        // An earlier lease on this file may still be releasing (the heartbeat thread does
+        // that after its current call). Acquiring first would let that release drop the
+        // new lease.
+        if !wait_for_release(id, std::time::Duration::from_secs(5)) {
+            return Err("The previous cloud lease on this file is still being released; try again in a moment".into());
+        }
         match active.acquire_lock(file_id, "craftcloud-egui-demo") {
             Ok(_) => {
                 let heartbeat_client = std::sync::Arc::clone(active);
                 let release_client = std::sync::Arc::clone(active);
                 let notification_sender = events.clone();
                 let notification_file_id = file_id.to_string();
-                lease = Some(FileLeaseHeartbeat::start(
+                lease = Some(FileLeaseHeartbeat::start_keyed(
+                    file_id.to_string(),
                     move || {
                         if let Err(error) =
                             heartbeat_client.acquire_lock(file_id, "craftcloud-egui-demo")
@@ -1529,14 +1557,51 @@ fn hex_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn app_data_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("CRAFTCLOUD_DEMO_DATA_DIR") {
-        return PathBuf::from(path);
+/// Where the demo keeps links, cache and lock files. Always a per-user directory: there is
+/// no fallback to a shared temporary directory, where another user could plant or lock
+/// files. `CRAFTCLOUD_DEMO_DATA_DIR` overrides it (for isolated runs).
+fn app_data_dir() -> Result<PathBuf, String> {
+    let platform = if cfg!(windows) {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else {
+        Platform::Unix
+    };
+    resolve_data_dir(platform, |name| std::env::var_os(name))
+}
+
+#[derive(Clone, Copy)]
+enum Platform {
+    Windows,
+    MacOs,
+    Unix,
+}
+
+fn resolve_data_dir(
+    platform: Platform,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let absolute = |name: &str| {
+        env(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    if let Some(path) = env("CRAFTCLOUD_DEMO_DATA_DIR") {
+        return Ok(PathBuf::from(path));
     }
-    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("XDG_DATA_HOME"));
-    base.map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("CraftCloudDemo")
+    let base = match platform {
+        Platform::Windows => absolute("LOCALAPPDATA").or_else(|| absolute("APPDATA")),
+        Platform::MacOs => {
+            absolute("HOME").map(|home| home.join("Library").join("Application Support"))
+        }
+        Platform::Unix => absolute("XDG_DATA_HOME")
+            .or_else(|| absolute("HOME").map(|home| home.join(".local").join("share"))),
+    };
+    base.map(|dir| dir.join("CraftCloudDemo")).ok_or_else(|| {
+        "No per-user data directory found; set CRAFTCLOUD_DEMO_DATA_DIR to a private folder"
+            .to_owned()
+    })
 }
 
 fn copy_name(name: &str, person: &str) -> String {
@@ -2080,5 +2145,60 @@ mod tests {
             "{:?}",
             app.picker.error
         );
+    }
+
+    #[test]
+    fn data_dir_is_per_user_and_never_a_shared_temp_fallback() {
+        let env = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            move |name: &str| {
+                owned
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        };
+        let home = if cfg!(windows) {
+            "C:\\Users\\a"
+        } else {
+            "/home/a"
+        };
+        let local = if cfg!(windows) {
+            "C:\\Users\\a\\AppData\\Local"
+        } else {
+            "/local"
+        };
+        let data = if cfg!(windows) {
+            "C:\\private"
+        } else {
+            "/private"
+        };
+        assert!(
+            resolve_data_dir(Platform::Windows, env(&[("LOCALAPPDATA", local)]))
+                .is_ok_and(|dir| dir.ends_with("CraftCloudDemo") && dir.starts_with(local))
+        );
+        assert!(
+            resolve_data_dir(Platform::Unix, env(&[("HOME", home)]))
+                .is_ok_and(|dir| dir.starts_with(home) && dir.ends_with("CraftCloudDemo"))
+        );
+        assert!(
+            resolve_data_dir(Platform::MacOs, env(&[("HOME", home)]))
+                .is_ok_and(|dir| dir.to_string_lossy().contains("Application Support"))
+        );
+        assert_eq!(
+            resolve_data_dir(Platform::Unix, env(&[("CRAFTCLOUD_DEMO_DATA_DIR", data)])).ok(),
+            Some(PathBuf::from(data))
+        );
+        // Nothing usable: an error, not the temp directory. Relative values do not count.
+        for platform in [Platform::Windows, Platform::MacOs, Platform::Unix] {
+            let result = resolve_data_dir(platform, env(&[("HOME", "relative"), ("APPDATA", "x")]));
+            assert!(
+                result.is_err_and(|message| message.contains("CRAFTCLOUD_DEMO_DATA_DIR")),
+                "relative or missing variables must fail"
+            );
+        }
     }
 }

@@ -27,10 +27,15 @@ use zeroize::Zeroize;
 /// Longest wait for name resolution and for connecting (including the TLS handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Longest wait for the request head to be written once connected.
-const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest wait for the response head after the request was sent. The server answers an
+const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest wait for the response head of a content transfer. The server answers an
 /// upload only after it has read, verified and stored the content, so this is generous.
-const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+const TRANSFER_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Total deadline of every request that is not a content transfer (login, refresh,
+/// listings, commits). A token refresh holds the refresh locks for this long at most.
+const SHORT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest wait for the response head of such a request.
+const SHORT_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Slowest sustained transfer rate a body transfer must keep up (bytes per second).
 const MIN_BODY_RATE: u64 = 32 * 1024;
 /// Fixed allowance added to the size-dependent body budget.
@@ -44,36 +49,115 @@ fn body_budget(bytes: u64) -> Duration {
     BODY_BASE_TIMEOUT + Duration::from_secs((bytes / MIN_BODY_RATE).min(24 * 3600))
 }
 
-/// Separates failures that provably happened before any request byte left this host
-/// (nothing can have changed on the server) from failures with an unknown outcome.
+/// Content uploads and downloads (`.../content`) are the only requests with large bodies.
+fn is_content_transfer(path: &str) -> bool {
+    path.split(['?', '#'])
+        .next()
+        .is_some_and(|path| path.ends_with("/content"))
+}
+
+/// How long the response body may take once its head arrived. A declared
+/// `Content-Length` sets the budget (it has to fit `max_response_bytes`, otherwise the
+/// body is refused); without it only a download may use the full allowance, anything else
+/// gets the short fixed one.
+fn response_budget(
+    method: &str,
+    path: &str,
+    content_length: Option<u64>,
+    max_response_bytes: u64,
+) -> Result<Duration, CloudError> {
+    match content_length {
+        Some(length) if length > max_response_bytes => Err(CloudError::InvalidResponse),
+        Some(length) if is_content_transfer(path) => Ok(body_budget(length)),
+        Some(_) => Ok(BODY_BASE_TIMEOUT),
+        None if method.eq_ignore_ascii_case("GET") && is_content_transfer(path) => {
+            Ok(body_budget(max_response_bytes))
+        }
+        None => Ok(BODY_BASE_TIMEOUT),
+    }
+}
+
+/// Separates failures that provably happened while connecting, before any request byte
+/// left this host (nothing can have changed on the server), from failures with an unknown
+/// outcome. Other I/O errors, even "unreachable" ones, may occur after the request was sent.
 fn classify_ureq_error(error: &ureq::Error) -> CloudError {
-    use std::io::ErrorKind;
     match error {
         ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => CloudError::Unreachable,
         ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
-            CloudError::Unreachable
-        }
-        ureq::Error::Io(io)
-            if matches!(
-                io.kind(),
-                ErrorKind::ConnectionRefused
-                    | ErrorKind::HostUnreachable
-                    | ErrorKind::NetworkUnreachable
-                    | ErrorKind::AddrNotAvailable
-            ) =>
-        {
             CloudError::Unreachable
         }
         _ => CloudError::Offline,
     }
 }
 
+/// Reads `reader` to its end on a helper thread and gives up after `budget`, so a stalled
+/// peer cannot keep the caller (and the locks it holds) beyond the budget. The helper
+/// ends when its socket read fails or the transport's own backstop timeout fires.
+fn read_with_deadline<R: Read + Send + 'static>(
+    mut reader: R,
+    max_bytes: usize,
+    budget: Duration,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<u8>, CloudError> {
+    let abort = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&abort);
+    let (done, result) = mpsc::channel();
+    thread::Builder::new()
+        .name("craftcloud-body-reader".into())
+        .spawn(move || {
+            let mut body = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            let outcome = loop {
+                if flag.load(Ordering::Acquire) {
+                    break Err(CloudError::Cancelled);
+                }
+                match reader.read(&mut chunk) {
+                    Ok(0) => break Ok(body),
+                    Ok(count) => {
+                        if body.len().saturating_add(count) > max_bytes {
+                            break Err(CloudError::InvalidResponse);
+                        }
+                        match chunk.get(..count) {
+                            Some(part) => body.extend_from_slice(part),
+                            None => break Err(CloudError::InvalidResponse),
+                        }
+                    }
+                    Err(error) => break Err(CloudError::Io(error.to_string())),
+                }
+            };
+            let _ = done.send(outcome);
+        })
+        .map_err(|error| CloudError::Io(error.to_string()))?;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match result.recv_timeout(Duration::from_millis(50)) {
+            Ok(outcome) => return outcome,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CloudError::Io("body reader stopped".into()));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) {
+                    abort.store(true, Ordering::Release);
+                    return Err(CloudError::Cancelled);
+                }
+                if std::time::Instant::now() >= deadline {
+                    abort.store(true, Ordering::Release);
+                    // Part of the body may have arrived; the outcome is unknown.
+                    return Err(CloudError::Offline);
+                }
+            }
+        }
+    }
+}
+
 /// Blocking ureq transport. Redirects are disabled; response bodies are capped.
 ///
-/// Timeouts: connecting, sending the request head and waiting for the response head have
-/// fixed limits. Body transfers have no fixed total deadline; each gets a budget that
-/// scales with its size (see [`body_budget`]). ureq 3.4 offers no per-read idle timeout,
-/// so this is the closest bound that still ends a stalled transfer.
+/// Timeouts: connecting and sending the request head have fixed limits. Requests that are
+/// not content transfers (login, refresh, listings, commits) have a short total deadline of
+/// 60 s. Content transfers have no fixed total deadline: the upload gets a budget that
+/// scales with its size, the download one that scales with its `Content-Length` (see
+/// [`body_budget`]). ureq 3.4 offers no per-read idle timeout, so this is the closest
+/// bound that still ends a stalled transfer.
 pub struct UreqTransport {
     agent: Agent,
     max_response_bytes: u64,
@@ -91,7 +175,7 @@ impl UreqTransport {
             .timeout_resolve(Some(CONNECT_TIMEOUT))
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_send_request(Some(SEND_REQUEST_TIMEOUT))
-            .timeout_recv_response(Some(RESPONSE_HEAD_TIMEOUT))
+            .timeout_recv_response(Some(TRANSFER_HEAD_TIMEOUT))
             .build();
         Self {
             agent: config.into(),
@@ -125,15 +209,25 @@ impl CloudTransport for UreqTransport {
                 .map_err(|_| CloudError::InvalidResponse)?;
             request.headers_mut().append(name, value);
         }
-        let send_budget = body_budget(u64::try_from(request.body().len()).unwrap_or(u64::MAX));
-        let receive_budget = body_budget(self.max_response_bytes);
-        let request = self
-            .agent
-            .configure_request(request)
-            .timeout_send_body(Some(send_budget))
-            .timeout_recv_body(Some(receive_budget))
-            .build();
-        let mut response = self
+        let transfer = is_content_transfer(req.path.as_str());
+        let request = if transfer {
+            let send_budget = body_budget(u64::try_from(request.body().len()).unwrap_or(u64::MAX));
+            // Backstop only: the body read below enforces the real budget and gives up
+            // earlier, once the response head has told the length.
+            let receive_backstop = body_budget(self.max_response_bytes);
+            self.agent
+                .configure_request(request)
+                .timeout_send_body(Some(send_budget))
+                .timeout_recv_body(Some(receive_backstop))
+                .build()
+        } else {
+            self.agent
+                .configure_request(request)
+                .timeout_global(Some(SHORT_CALL_TIMEOUT))
+                .timeout_recv_response(Some(SHORT_HEAD_TIMEOUT))
+                .build()
+        };
+        let response = self
             .agent
             .run(request)
             .map_err(|error| classify_ureq_error(&error))?;
@@ -150,31 +244,22 @@ impl CloudTransport for UreqTransport {
                 ))
             })
             .collect::<Result<Vec<_>, CloudError>>()?;
-        let mut body = Vec::new();
-        let mut reader = response.body_mut().as_reader();
-        let mut chunk = [0_u8; 8192];
-        loop {
-            if req
-                .cancelled
-                .as_ref()
-                .is_some_and(|c| c.load(Ordering::Acquire))
-            {
-                return Err(CloudError::Cancelled);
-            }
-            let count = reader
-                .read(&mut chunk)
-                .map_err(|e| CloudError::Io(e.to_string()))?;
-            if count == 0 {
-                break;
-            }
-            if body.len().saturating_add(count)
-                > usize::try_from(self.max_response_bytes).unwrap_or(usize::MAX)
-            {
-                return Err(CloudError::InvalidResponse);
-            }
-            let part = chunk.get(..count).ok_or(CloudError::InvalidResponse)?;
-            body.extend_from_slice(part);
-        }
+        let content_length = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<u64>().ok());
+        let budget = response_budget(
+            req.method.as_str(),
+            req.path.as_str(),
+            content_length,
+            self.max_response_bytes,
+        )?;
+        let body = read_with_deadline(
+            response.into_body().into_reader(),
+            usize::try_from(self.max_response_bytes).unwrap_or(usize::MAX),
+            budget,
+            req.cancelled.as_ref(),
+        )?;
         Ok(Response {
             status,
             headers,
@@ -269,9 +354,12 @@ impl KeychainTokenStore {
             account: account.into(),
             app: app.into(),
             lock_dir: None,
+            lock_wait: REFRESH_LOCK_WAIT,
         }
     }
 }
+/// How long a refresh waits for the lock file held by another process.
+const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// Serializes refresh rotation of every client in this process.
 static REFRESH_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -287,6 +375,7 @@ pub struct BoundKeychainTokenStore {
     account: String,
     app: String,
     lock_dir: Option<PathBuf>,
+    lock_wait: Duration,
 }
 impl BoundKeychainTokenStore {
     pub fn load(&self) -> Result<Option<craftcloud_client::Secret>, CloudError> {
@@ -299,6 +388,32 @@ impl BoundKeychainTokenStore {
     pub fn with_lock_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.lock_dir = Some(dir.into());
         self
+    }
+    /// Opens the lock file and takes the exclusive lock, polling until `lock_wait` passed.
+    fn lock_file(&self, dir: &Path) -> Result<fs::File, CloudError> {
+        fs::create_dir_all(dir).map_err(|e| CloudError::Io(e.to_string()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.lock_path(dir))
+            .map_err(|e| CloudError::Io(e.to_string()))?;
+        let deadline = std::time::Instant::now() + self.lock_wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(CloudError::Io("refresh lock busy".into()));
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(CloudError::Io(error.to_string()));
+                }
+            }
+        }
     }
     fn lock_path(&self, dir: &Path) -> PathBuf {
         dir.join(format!(
@@ -320,24 +435,18 @@ impl craftcloud_client::RefreshTokenStore for BoundKeychainTokenStore {
         BoundKeychainTokenStore::load(self)
     }
     fn lock_exclusive(&self) -> Result<Box<dyn std::any::Any>, CloudError> {
+        // A holder that panicked leaves the mutex poisoned; the data is `()`, so recover.
         let process = REFRESH_PROCESS_LOCK
             .lock()
-            .map_err(|_| CloudError::Io("refresh lock poisoned".into()))?;
-        let file = match &self.lock_dir {
-            Some(dir) => {
-                fs::create_dir_all(dir).map_err(|e| CloudError::Io(e.to_string()))?;
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(self.lock_path(dir))
-                    .map_err(|e| CloudError::Io(e.to_string()))?;
-                file.lock().map_err(|e| CloudError::Io(e.to_string()))?;
-                Some(file)
-            }
-            None => None,
-        };
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The file lock only adds protection against other processes. When it cannot be
+        // had in time (another process holds it, directory unusable), continue with the
+        // process lock: a refresh then risks the reuse case that the lock prevents, but a
+        // blocked sign-in is worse.
+        let file = self
+            .lock_dir
+            .as_deref()
+            .and_then(|dir| self.lock_file(dir).ok());
         Ok(Box::new(RefreshLockGuard {
             _file: file,
             _process: process,
@@ -744,23 +853,41 @@ impl VersionCache {
 
 /// Interval between lease refreshes.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-/// How long dropping waits for a heartbeat call that is still in flight.
-const HEARTBEAT_STOP_GRACE: Duration = Duration::from_secs(1);
-/// How long dropping waits for the release call before leaving it to finish alone.
+/// How long dropping waits for the lease to be released.
 const RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// Keys of leases whose release has not finished yet, so that a reopen of the same file
+/// can wait for it (see [`wait_for_release`]).
+static RELEASING: (Mutex<Vec<String>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+
+/// Waits until a lease started with [`FileLeaseHeartbeat::start_keyed`] under `key` has
+/// been released, at most `timeout`. Returns false when the release is still pending.
+/// Call this before acquiring the same file again so the old release cannot drop the
+/// new lease.
+pub fn wait_for_release(key: &str, timeout: Duration) -> bool {
+    let (lock, changed) = &RELEASING;
+    let guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (guard, _) = changed
+        .wait_timeout_while(guard, timeout, |keys| keys.iter().any(|k| k == key))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !guard.iter().any(|k| k == key)
+}
 
 /// Keeps a file lease alive every 60 seconds until dropped. Drop attempts release.
 ///
-/// Dropping never waits for a network call longer than a few seconds: a heartbeat that
-/// is stuck in a slow request is abandoned (it ends on its own and finds the stop flag
-/// set), and the release runs on its own thread that is not waited for beyond
-/// [`RELEASE_WAIT`]. A release that does not finish is covered by the lease expiry.
+/// The release is performed by the heartbeat thread itself, after its current heartbeat
+/// call has returned, so it can never overtake an in-flight heartbeat (which would renew
+/// the lease again right after the release). Dropping waits at most [`RELEASE_WAIT`] for
+/// that; a call stuck in a slow request is left to finish alone, and the lease expiry
+/// covers a release that never happens.
 pub struct FileLeaseHeartbeat {
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<()>, Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
     finished: Option<mpsc::Receiver<()>>,
-    release: Option<Box<dyn FnOnce() + Send>>,
+    key: Option<String>,
 }
 impl FileLeaseHeartbeat {
     pub fn start<F, R>(heartbeat: F, release: R) -> Self
@@ -768,9 +895,18 @@ impl FileLeaseHeartbeat {
         F: FnMut() + Send + 'static,
         R: FnOnce() + Send + 'static,
     {
-        Self::start_with_interval(HEARTBEAT_INTERVAL, heartbeat, release)
+        Self::spawn(None, HEARTBEAT_INTERVAL, heartbeat, release)
     }
-    fn start_with_interval<F, R>(interval: Duration, mut heartbeat: F, release: R) -> Self
+    /// Like [`start`](Self::start); `key` (for example the file id) lets
+    /// [`wait_for_release`] wait for this lease's release.
+    pub fn start_keyed<F, R>(key: impl Into<String>, heartbeat: F, release: R) -> Self
+    where
+        F: FnMut() + Send + 'static,
+        R: FnOnce() + Send + 'static,
+    {
+        Self::spawn(Some(key.into()), HEARTBEAT_INTERVAL, heartbeat, release)
+    }
+    fn spawn<F, R>(key: Option<String>, interval: Duration, mut heartbeat: F, release: R) -> Self
     where
         F: FnMut() + Send + 'static,
         R: FnOnce() + Send + 'static,
@@ -779,28 +915,33 @@ impl FileLeaseHeartbeat {
         let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let flag = Arc::clone(&stop);
         let signal = Arc::clone(&wake);
+        let release_key = key.clone();
         // The sender is dropped when the thread ends, which the receiver observes.
         let (done, finished) = mpsc::channel::<()>();
         let thread = thread::spawn(move || {
             let _done = done;
             loop {
                 let (lock, cv) = &*signal;
-                let guard = match lock.lock() {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
+                let Ok(guard) = lock.lock() else { break };
                 if flag.load(Ordering::Acquire) {
-                    return;
+                    break;
                 }
-                let (guard, _) = match cv.wait_timeout(guard, interval) {
-                    Ok(v) => v,
-                    Err(_) => return,
+                let Ok((guard, _)) = cv.wait_timeout(guard, interval) else {
+                    break;
                 };
                 drop(guard);
                 if flag.load(Ordering::Acquire) {
-                    return;
+                    break;
                 }
                 heartbeat()
+            }
+            release();
+            if let Some(key) = release_key {
+                let (lock, changed) = &RELEASING;
+                lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|k| *k != key);
+                changed.notify_all();
             }
         });
         Self {
@@ -808,12 +949,19 @@ impl FileLeaseHeartbeat {
             wake,
             thread: Some(thread),
             finished: Some(finished),
-            release: Some(Box::new(release)),
+            key,
         }
     }
 }
 impl Drop for FileLeaseHeartbeat {
     fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            RELEASING
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key.clone());
+        }
         let (lock, cv) = &*self.wake;
         if let Ok(_guard) = lock.lock() {
             self.stop.store(true, Ordering::Release);
@@ -822,11 +970,9 @@ impl Drop for FileLeaseHeartbeat {
             self.stop.store(true, Ordering::Release);
             cv.notify_all();
         }
-        // Join only a thread that has ended (or ends within the grace period); a thread
-        // inside a slow request is detached instead of blocking the caller.
         let ended = self.finished.take().is_none_or(|finished| {
             matches!(
-                finished.recv_timeout(HEARTBEAT_STOP_GRACE),
+                finished.recv_timeout(RELEASE_WAIT),
                 Err(mpsc::RecvTimeoutError::Disconnected)
             )
         });
@@ -834,18 +980,6 @@ impl Drop for FileLeaseHeartbeat {
             && ended
         {
             let _ = t.join();
-        }
-        if let Some(release) = self.release.take() {
-            let (done, finished) = mpsc::channel::<()>();
-            let spawned = thread::Builder::new()
-                .name("craftcloud-lease-release".into())
-                .spawn(move || {
-                    release();
-                    let _ = done.send(());
-                });
-            if spawned.is_ok() {
-                let _ = finished.recv_timeout(RELEASE_WAIT);
-            }
         }
     }
 }
@@ -1151,29 +1285,34 @@ mod tests {
         assert_eq!(timeouts.global, None);
         assert_eq!(timeouts.per_call, None);
         assert_eq!(timeouts.connect, Some(CONNECT_TIMEOUT));
-        assert_eq!(timeouts.recv_response, Some(RESPONSE_HEAD_TIMEOUT));
+        assert_eq!(timeouts.recv_response, Some(TRANSFER_HEAD_TIMEOUT));
     }
 
     #[test]
-    fn only_failures_before_the_request_left_are_classified_as_unreachable() {
+    fn only_connect_phase_failures_are_classified_as_unreachable() {
         use std::io::{Error, ErrorKind};
         assert_eq!(
             classify_ureq_error(&ureq::Error::HostNotFound),
             CloudError::Unreachable
         );
         assert_eq!(
-            classify_ureq_error(&ureq::Error::Timeout(ureq::Timeout::Connect)),
+            classify_ureq_error(&ureq::Error::ConnectionFailed),
             CloudError::Unreachable
         );
-        assert_eq!(
-            classify_ureq_error(&ureq::Error::Io(Error::from(ErrorKind::ConnectionRefused))),
-            CloudError::Unreachable
-        );
-        // Anything that can happen after request bytes were sent stays uncertain.
+        for phase in [ureq::Timeout::Connect, ureq::Timeout::Resolve] {
+            assert_eq!(
+                classify_ureq_error(&ureq::Error::Timeout(phase)),
+                CloudError::Unreachable
+            );
+        }
+        // Anything else may have happened after request bytes were sent.
         for error in [
             ureq::Error::Timeout(ureq::Timeout::RecvResponse),
             ureq::Error::Timeout(ureq::Timeout::SendBody),
             ureq::Error::Io(Error::from(ErrorKind::ConnectionReset)),
+            ureq::Error::Io(Error::from(ErrorKind::HostUnreachable)),
+            ureq::Error::Io(Error::from(ErrorKind::NetworkUnreachable)),
+            ureq::Error::Io(Error::from(ErrorKind::ConnectionRefused)),
             ureq::Error::Io(Error::from(ErrorKind::UnexpectedEof)),
         ] {
             assert_eq!(classify_ureq_error(&error), CloudError::Offline);
@@ -1181,9 +1320,74 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_connection_is_reported_as_unreachable() {
+    fn response_budget_follows_content_length_and_stays_short_elsewhere() {
+        let max = 128 * 1024 * 1024;
+        let download = "/api/v1/files/x/versions/y/content";
+        // A declared length sets the budget of a download: 100 MiB is far beyond 60 s.
+        let hundred = 100 * 1024 * 1024;
+        assert!(
+            response_budget("GET", download, Some(hundred), max)
+                .is_ok_and(|b| b == body_budget(hundred))
+        );
+        // A length above the cap is refused before anything is read.
+        assert_eq!(
+            response_budget("GET", download, Some(max + 1), max),
+            Err(CloudError::InvalidResponse)
+        );
+        // Without a length only a download gets the full allowance.
+        assert_eq!(
+            response_budget("GET", download, None, max),
+            Ok(body_budget(max))
+        );
+        for (method, path, length) in [
+            ("GET", "/api/v1/organizations", None),
+            ("POST", "/api/v1/auth/device/refresh", None),
+            ("POST", "/api/v1/auth/device/refresh", Some(500)),
+            ("PUT", "/api/v1/uploads/u/content", None),
+            ("GET", "/api/v1/info?x=/content", None),
+        ] {
+            assert_eq!(
+                response_budget(method, path, length, max),
+                Ok(BODY_BASE_TIMEOUT),
+                "{method} {path}"
+            );
+        }
+        assert!(is_content_transfer("/api/v1/uploads/u/content"));
+        assert!(!is_content_transfer("/api/v1/files/x/content/list"));
+    }
+
+    #[test]
+    fn a_stalled_body_is_abandoned_after_its_budget() {
+        struct Stall;
+        impl Read for Stall {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                thread::sleep(Duration::from_secs(5));
+                Ok(0)
+            }
+        }
+        let started = std::time::Instant::now();
+        let result = read_with_deadline(Stall, 1024, Duration::from_millis(300), None);
+        assert_eq!(result, Err(CloudError::Offline));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A prompt body is returned whole, and an oversized one is refused.
+        assert_eq!(
+            read_with_deadline(&b"hello"[..], 1024, Duration::from_secs(5), None),
+            Ok(b"hello".to_vec())
+        );
+        assert_eq!(
+            read_with_deadline(&b"hello"[..], 3, Duration::from_secs(5), None),
+            Err(CloudError::InvalidResponse)
+        );
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            read_with_deadline(Stall, 1024, Duration::from_secs(5), Some(&cancel)),
+            Err(CloudError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_refused_connection_is_an_uncertain_failure() {
         use std::net::TcpListener;
-        // Bind and close a port so that nothing listens on it.
         let port = TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
             .map(|address| address.port());
@@ -1196,9 +1400,10 @@ mod tests {
                 body: Vec::new(),
                 cancelled: None,
             };
-            assert_eq!(
-                UreqTransport::default().send(request).map(|_| ()),
-                Err(CloudError::Unreachable)
+            let result = UreqTransport::default().send(request).map(|_| ());
+            assert!(
+                matches!(result, Err(CloudError::Offline | CloudError::Unreachable)),
+                "{result:?}"
             );
         }
     }
@@ -1246,31 +1451,88 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_lease_does_not_wait_for_slow_network_calls() {
-        let released = Arc::new(AtomicBool::new(false));
-        let release_flag = Arc::clone(&released);
+    fn release_runs_after_an_in_flight_heartbeat_and_dropping_does_not_wait_for_it() {
         let in_call = Arc::new(AtomicBool::new(false));
-        let call_flag = Arc::clone(&in_call);
-        let lease = FileLeaseHeartbeat::start_with_interval(
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let (call_flag, overlap_flag, release_flag) = (
+            Arc::clone(&in_call),
+            Arc::clone(&overlapped),
+            Arc::clone(&released),
+        );
+        let in_call_for_release = Arc::clone(&in_call);
+        let lease = FileLeaseHeartbeat::spawn(
+            None,
             Duration::from_millis(10),
             move || {
-                call_flag.store(true, Ordering::Release);
-                thread::sleep(Duration::from_secs(8));
+                call_flag.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(4500));
+                call_flag.store(false, Ordering::SeqCst);
             },
             move || {
-                release_flag.store(true, Ordering::Release);
-                thread::sleep(Duration::from_secs(8));
+                if in_call_for_release.load(Ordering::SeqCst) {
+                    overlap_flag.store(true, Ordering::SeqCst);
+                }
+                release_flag.store(true, Ordering::SeqCst);
             },
         );
-        while !in_call.load(Ordering::Acquire) {
+        while !in_call.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(5));
         }
         let started = std::time::Instant::now();
         drop(lease);
-        let elapsed = started.elapsed();
-        assert!(released.load(Ordering::Acquire));
-        // Grace for the heartbeat plus the wait for the release, not the 16 s of calls.
-        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+        // Drop gave up after the release wait, long before the call ended.
+        assert!(
+            started.elapsed() < Duration::from_millis(4200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!released.load(Ordering::SeqCst));
+        // The release follows the call, never overlaps it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !released.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(released.load(Ordering::SeqCst));
+        assert!(!overlapped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_reopen_can_wait_for_the_release_of_the_same_file() {
+        let released = Arc::new(AtomicBool::new(false));
+        let release_flag = Arc::clone(&released);
+        let lease = FileLeaseHeartbeat::spawn(
+            Some("file-wait-test".into()),
+            Duration::from_millis(10),
+            || {},
+            move || {
+                thread::sleep(Duration::from_millis(600));
+                release_flag.store(true, Ordering::SeqCst);
+            },
+        );
+        // Drop returns after the bounded wait or when the release is done.
+        drop(lease);
+        assert!(wait_for_release("file-wait-test", Duration::from_secs(5)));
+        assert!(released.load(Ordering::SeqCst));
+        // An unknown key never blocks.
+        assert!(wait_for_release("never-started", Duration::from_millis(10)));
+
+        // A release that outlasts the wait reports false.
+        let slow = FileLeaseHeartbeat::spawn(
+            Some("file-slow-test".into()),
+            Duration::from_millis(10),
+            || {},
+            || thread::sleep(Duration::from_millis(5000)),
+        );
+        thread::sleep(Duration::from_millis(50));
+        let handle = thread::spawn(move || drop(slow));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!wait_for_release(
+            "file-slow-test",
+            Duration::from_millis(100)
+        ));
+        let _ = handle.join();
+        assert!(wait_for_release("file-slow-test", Duration::from_secs(5)));
     }
 
     #[test]
@@ -1408,5 +1670,54 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_busy_lock_file_falls_back_to_the_process_lock_after_the_wait() {
+        use craftcloud_client::RefreshTokenStore;
+        let d = std::env::temp_dir().join(format!("cc-refresh-busy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let mut store = KeychainTokenStore::new("test")
+            .bound("https://s", "busy@example.test", "app")
+            .with_lock_dir(&d);
+        store.lock_wait = Duration::from_millis(200);
+        assert!(fs::create_dir_all(&d).is_ok());
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.lock_path(&d));
+        assert!(holder.is_ok());
+        if let Ok(holder) = holder {
+            assert!(holder.lock().is_ok());
+            let started = std::time::Instant::now();
+            let guard = store.lock_exclusive();
+            assert!(guard.is_ok(), "must not fail when the file lock is busy");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            drop(guard);
+        }
+        // An unusable directory degrades the same way.
+        let blocked = std::env::temp_dir().join(format!("cc-refresh-file-{}", std::process::id()));
+        assert!(fs::write(&blocked, b"x").is_ok());
+        let unusable = KeychainTokenStore::new("test")
+            .bound("https://s", "busy@example.test", "app")
+            .with_lock_dir(blocked.join("sub"));
+        assert!(unusable.lock_exclusive().is_ok());
+        let _ = fs::remove_file(blocked);
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // Poisons the lock on purpose.
+    fn a_poisoned_process_lock_is_recovered() {
+        use craftcloud_client::RefreshTokenStore;
+        let poisoner = thread::spawn(|| {
+            let _guard = REFRESH_PROCESS_LOCK.lock();
+            panic!("poison the refresh lock");
+        });
+        assert!(poisoner.join().is_err());
+        let store = KeychainTokenStore::new("test").bound("https://s", "p@example.test", "app");
+        assert!(store.lock_exclusive().is_ok());
     }
 }
