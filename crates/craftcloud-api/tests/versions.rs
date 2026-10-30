@@ -178,12 +178,17 @@ mod tests {
         }
 
         async fn file(&self, actor: &Session, project: Uuid, name: &str) -> Uuid {
+            self.file_of_app(actor, project, name, "figcraft").await
+        }
+
+        /// A file of an app whose files support edit leases (FigCraft files do not).
+        async fn file_of_app(&self, actor: &Session, project: Uuid, name: &str, app: &str) -> Uuid {
             let r = self
                 .json(
                     "POST",
                     &format!("/api/v1/projects/{project}/files"),
                     actor,
-                    json!({"name": name, "app": "figcraft", "format": "fig"}),
+                    json!({"name": name, "app": app, "format": "fig"}),
                 )
                 .await;
             assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
@@ -461,8 +466,17 @@ mod tests {
         assert_eq!(saved.status, StatusCode::CREATED, "{}", saved.text);
         assert_eq!(saved.body["file_id"], copy.to_string());
         assert_eq!(saved.body["size_bytes"], 700);
-        // Retrying the loser's original commit after it was used elsewhere is not a replay for this file.
-        hidden(&w.next_commit(&c.editor2.1, c.file, up_d, v2_id).await);
+        // The loser's upload cannot be moved to another file, so it stays unused.
+        let untouched: String =
+            sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id = $1")
+                .bind(up_d)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            untouched, "stored",
+            "the cross-file attempt changed nothing"
+        );
 
         // Rebased on the new head the other lost upload goes through.
         let rebased = w.next_commit(&c.editor2.1, c.file, up_b, v2_id).await;
@@ -475,24 +489,27 @@ mod tests {
     async fn lease_blocks_version_commit_and_restore_but_allows_reads() {
         let w = W::new().await;
         let c = cast(&w).await;
-        let v1 = w.push(&c.editor.1, c.file, &pattern(128, 1)).await;
-        let v2 = w.push(&c.editor.1, c.file, &pattern(256, 2)).await;
-        let upload = w.stored_upload(&c.editor.1, c.file, &pattern(512, 3)).await;
+        let file = w
+            .file_of_app(&c.owner.1, c.project, "lease.pcf", "photocraft")
+            .await;
+        let v1 = w.push(&c.editor.1, file, &pattern(128, 1)).await;
+        let v2 = w.push(&c.editor.1, file, &pattern(256, 2)).await;
+        let upload = w.stored_upload(&c.editor.1, file, &pattern(512, 3)).await;
         let lease = w
             .send(
-                Req::new("POST", &format!("/api/v1/files/{}/lock", c.file))
+                Req::new("POST", &format!("/api/v1/files/{}/lock", file))
                     .session(&c.editor2.1)
                     .json(json!({"client_id":"version-owner"})),
             )
             .await;
         assert_eq!(lease.status, StatusCode::OK, "{}", lease.text);
-        let commit = w.next_commit(&c.editor.1, c.file, upload, v2).await;
+        let commit = w.next_commit(&c.editor.1, file, upload, v2).await;
         assert_status(&commit, StatusCode::LOCKED, "FILE_LOCKED");
         let restore = w
             .send(
                 Req::new(
                     "POST",
-                    &format!("/api/v1/files/{}/versions/{v1}/restore", c.file),
+                    &format!("/api/v1/files/{}/versions/{v1}/restore", file),
                 )
                 .session(&c.editor.1)
                 .header("If-Match", &tag(v2)),
@@ -500,7 +517,7 @@ mod tests {
             .await;
         assert_status(&restore, StatusCode::LOCKED, "FILE_LOCKED");
         assert_eq!(
-            w.get(&c.editor.1, &format!("/api/v1/files/{}/versions", c.file))
+            w.get(&c.editor.1, &format!("/api/v1/files/{}/versions", file))
                 .await
                 .status,
             StatusCode::OK
@@ -508,7 +525,7 @@ mod tests {
         assert_eq!(
             w.download(
                 &c.editor.1,
-                &format!("/api/v1/files/{}/content", c.file),
+                &format!("/api/v1/files/{}/content", file),
                 None
             )
             .await
@@ -516,7 +533,7 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            w.delete(&c.editor2.1, &format!("/api/v1/files/{}/lock", c.file))
+            w.delete(&c.editor2.1, &format!("/api/v1/files/{}/lock", file))
                 .await
                 .status,
             StatusCode::NO_CONTENT
@@ -525,7 +542,7 @@ mod tests {
             .send(
                 Req::new(
                     "POST",
-                    &format!("/api/v1/files/{}/versions/{v1}/restore", c.file),
+                    &format!("/api/v1/files/{}/versions/{v1}/restore", file),
                 )
                 .session(&c.editor.1)
                 .header("If-Match", &tag(v2)),
@@ -578,7 +595,9 @@ mod tests {
     async fn an_upload_is_bound_to_its_file_even_with_a_foreign_target_lease() {
         let w = W::new().await;
         let c = cast(&w).await;
-        let other_file = w.file(&c.editor.1, c.project, "other.fig").await;
+        let other_file = w
+            .file_of_app(&c.editor.1, c.project, "other.fig", "photocraft")
+            .await;
         let upload = w
             .stored_upload(&c.editor.1, c.file, &pattern(128, 42))
             .await;

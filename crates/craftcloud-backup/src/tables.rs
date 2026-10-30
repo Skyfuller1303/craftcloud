@@ -173,7 +173,10 @@ mod tests {
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
             BACKUP_TABLES.len() - 1
         );
-        assert_eq!(backup_tables_for(14).unwrap().len(), BACKUP_TABLES.len() - 1);
+        assert_eq!(
+            backup_tables_for(14).unwrap().len(),
+            BACKUP_TABLES.len() - 1
+        );
         assert_eq!(
             excluded_tables_for(14),
             [

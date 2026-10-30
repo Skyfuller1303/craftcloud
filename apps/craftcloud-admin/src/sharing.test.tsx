@@ -180,7 +180,7 @@ it("shows only shared navigation and same-user other-session lock", async () => 
   renderApp(fetch, { language });
   await user.click(await screen.findByRole("button", { name: sharedName }));
   expect(screen.queryByRole("button", { name: /Members|Invitations|Projects/ })).toBeNull();
-  expect(screen.getByText(language === "en" ? /In progress by Ada/ : /In Bearbeitung von Ada/)).toBeTruthy();
+  expect(await screen.findByText(language === "en" ? /In progress by Ada/ : /In Bearbeitung von Ada/)).toBeTruthy();
   await expectNoAxeViolations();
   await user.click(screen.getByRole("button", { name: language === "en" ? /Versions/ : /Versionen/ }));
   await screen.findByRole("dialog");

@@ -1231,7 +1231,15 @@ mod tests {
             "{}",
             invitation.text
         );
-        let invitation_id = Uuid::parse_str(invitation.body["id"].as_str().unwrap()).unwrap();
+        let invitation_id =
+            Uuid::parse_str(invitation.body["invitation_id"].as_str().unwrap()).unwrap();
+        // Migration 0016 forbids a workspace role on guest invitations, so a row
+        // from before that rule is modelled by lifting the check in this test
+        // database only.
+        sqlx::query("ALTER TABLE invitations DROP CONSTRAINT invitations_workspace_pair")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE invitations SET workspace_role='editor' WHERE id=$1")
             .bind(invitation_id)
             .execute(&w.env.pool)

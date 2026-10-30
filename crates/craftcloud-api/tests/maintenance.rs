@@ -1844,8 +1844,11 @@ mod tests {
         let project = w.project("Copies").await;
         let a = w.file(project, "a.fig").await;
         let b = w.file(project, "b.fig").await;
-        // The upload was created for a but became the first version of b.
-        let upload = w.stored_upload(a, &pattern(77, 3)).await;
+        // The upload was created for a but became the first version of b. The
+        // API no longer commits an upload into a file it was not created for
+        // (AC-03), so the state is built through b and the session is re-pointed
+        // at a, as data from before that rule can look.
+        let upload = w.stored_upload(b, &pattern(77, 3)).await;
         let commit = w
             .send(
                 Req::new("POST", &format!("/api/v1/files/{b}/versions"))
@@ -1855,6 +1858,12 @@ mod tests {
             )
             .await;
         assert_eq!(commit.status, StatusCode::CREATED, "{}", commit.text);
+        sqlx::query("UPDATE upload_sessions SET file_id = $2 WHERE id = $1")
+            .bind(upload)
+            .bind(a)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
         assert!(
             w.delete(&format!("/api/v1/files/{a}"))
                 .await

@@ -21,7 +21,7 @@ describe.each([["en", "Settings", "Devices"], ["de", "Einstellungen", "Geräte"]
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    await user.click(within(nav).getByRole("button", { name: navLabel }));
+    await user.click(await within(nav).findByRole("button", { name: navLabel }));
     const table = await screen.findByRole("table", { name: title });
     expect(within(table).getByText("PhotoCraft on LAPTOP-7")).toBeTruthy();
     expect(within(table).getByText("photocraft")).toBeTruthy();
@@ -39,7 +39,7 @@ describe.each([["en", "Settings", "Devices"], ["de", "Einstellungen", "Geräte"]
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    await user.click(within(nav).getByRole("button", { name: navLabel }));
+    await user.click(await within(nav).findByRole("button", { name: navLabel }));
     await screen.findByText(language === "en" ? "There are no registered devices." : "Es sind keine Geräte registriert.");
     await expectNoAxeViolations();
   });
@@ -53,7 +53,7 @@ it("shows a recoverable device-list error", async () => {
   const user = userEvent.setup();
   renderApp(fetch);
   const nav = await screen.findByRole("navigation");
-  await user.click(within(nav).getByRole("button", { name: "Settings" }));
+  await user.click(await within(nav).findByRole("button", { name: "Settings" }));
   const alert = await screen.findByRole("alert");
   await expectNoAxeViolations();
   fail = false;
