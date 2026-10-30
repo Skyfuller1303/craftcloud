@@ -79,12 +79,13 @@ pub struct Organization {
     pub version: i64,
     /// Whether workspace admins may invite people into their workspace.
     pub workspace_admin_invites_enabled: bool,
+    /// Whether active members must set up two-factor authentication.
+    pub require_two_factor: bool,
     /// Creation time (UTC).
     pub created_at: OffsetDateTime,
 }
 
-const COLUMNS: &str =
-    "id, slug, name, owner_user_id, version, workspace_admin_invites_enabled, created_at";
+const COLUMNS: &str = "id, slug, name, owner_user_id, version, workspace_admin_invites_enabled, require_two_factor, created_at";
 
 /// Creates an organization without membership (low-level helper for tests
 /// and tooling; the API uses [`create_with_owner`]).
@@ -286,6 +287,8 @@ pub struct MyOrganization {
     pub created_at: OffsetDateTime,
     /// The member's role (`owner`, `admin`, `member`).
     pub role: String,
+    /// Whether this organization requires two-factor authentication.
+    pub require_two_factor: bool,
 }
 
 /// Lists the organizations the user is an active member of, ordered by
@@ -301,7 +304,7 @@ pub async fn list_for_user(
     after: Option<AfterKey>,
 ) -> Result<Vec<MyOrganization>, DbError> {
     Ok(sqlx::query_as::<_, MyOrganization>(
-        "SELECT o.id, o.slug, o.name, o.version, o.created_at, m.role \
+        "SELECT o.id, o.slug, o.name, o.version, o.created_at, m.role, o.require_two_factor \
          FROM organization_members m JOIN organizations o ON o.id = m.org_id \
          WHERE m.user_id = $1 AND m.status = 'active' \
            AND ($2::timestamptz IS NULL OR (o.created_at, o.id) > ($2::timestamptz, $3::uuid)) \

@@ -101,6 +101,13 @@
 .bullets { margin: 0; padding: 0; list-style: none; }
 .bullets li { padding: var(--space-2) 0; border-top: var(--hairline) solid var(--line); }
 
+.two-factor-form, .two-factor-enrollment, .two-factor-codes { width: min(100%, var(--form-max)); }
+.two-factor-qr { display: grid; place-items: center; width: fit-content; padding: var(--space-3); border: var(--hairline) solid var(--line); background: var(--qr-bg); }
+.two-factor-secret { overflow-wrap: anywhere; font: var(--text-code)/1.4 var(--font-mono); }
+.two-factor-policy { display: flex; align-items: center; gap: var(--space-3); min-height: var(--control-height); }
+.two-factor-policy input { inline-size: 18px; block-size: 18px; margin: 0; accent-color: var(--ink-strong); }
+.two-factor-policy input:focus-visible { outline: var(--focus-ring) solid var(--focus-ink); outline-offset: 2px; }
+
 @media (max-width: 68.75rem) {
   .shell__user-name { display: none; }
 }
@@ -127,3 +134,5 @@
   .form--inline > * { flex: 1 1 100%; }
   .shell__context > * { flex: 1 1 50%; min-width: 0; }
 }
+
+.two-factor-enrollment .button { width: 100%; min-height: var(--control-height); height: auto; line-height: 1.3; white-space: normal; }

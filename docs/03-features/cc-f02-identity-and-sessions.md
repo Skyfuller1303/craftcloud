@@ -7,6 +7,10 @@
 
 > **AC-01, 2026-10-30:** Desktop-Anmeldung und getrennte Geräte-Sitzungen sind lokal umgesetzt: opake Bearer-Zugriffstokens, rotierende Erneuerungstokens mit Wiederverwendungserkennung, atomarer Widerruf und eigene Geräteliste in den Web-Einstellungen. Maßgeblich ist [ADR-0018](../09-decisions/adr-0018-device-sessions.md); die untenstehende ursprüngliche Zurückstellung des Desktop-Passwortdialogs ist dadurch ersetzt. Zweifaktor-Anmeldung und Schlüsselbund-Code in Clients bleiben AC-02 beziehungsweise AC-04. Prüfstatus und verbleibende Einschränkungen stehen im AC-01-Abnahmebericht; es wurde nichts veröffentlicht.
 
+## AC-02: TOTP für Browser und Geräte
+
+Der Ausbau folgt [AC-02](../12-app-cloud/ac-02-two-factor.md) und [ADR-0019](../09-decisions/adr-0019-two-factor.md): verschlüsselte TOTP-Geheimnisse, einmalige Wiederherstellungscodes, zweistufige Browser-/Geräte-Anmeldung, Organisationspflicht, Operator-Reset und Widerruf anderer Sitzungen bei Sicherheitsänderungen. Die Web-Einstellungen erzeugen QR-Codes lokal und bieten einmalige Anzeige beziehungsweise lokalen Download der Wiederherstellungscodes. Passkeys und Client-Schlüsselbund bleiben separate Vorhaben. Verifizierter Implementierungs- und Prüfstand steht im AC-02-Abschlussbericht; diese Statusnotiz ersetzt keinen Testnachweis.
+
 ## Problem und Nutzen
 
 Lokales Benutzerkonto für CraftCloud Web-Admin; unabhängig vom optional späteren ArtCraft-Hosted-Account. E-Mail normalisieren, Passwort-Hashes mit Argon2id und wartbaren Parametern, Login-Versuch pro Account/IP begrenzen. Account-Status active/disabled, Passwortwechsel, Logout an allen Geräten, Session-Timeout und eindeutige Revokation.

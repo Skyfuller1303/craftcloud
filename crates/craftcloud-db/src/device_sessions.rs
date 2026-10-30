@@ -65,6 +65,25 @@ pub async fn create_for_verified_login(
     let mut tx = pool.begin().await?;
     let id = Uuid::new_v4();
     let family = Uuid::new_v4();
+    let user: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE id=$1 AND password_hash=$2 AND disabled_at IS NULL FOR SHARE",
+    )
+    .bind(new.user_id)
+    .bind(verified_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if user.is_none() {
+        return Ok(None);
+    }
+    let factor_enabled: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
+    )
+    .bind(new.user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if factor_enabled {
+        return Ok(None);
+    }
     let inserted = sqlx::query(
         "INSERT INTO device_sessions (id,user_id,name,client_kind,client_id,refresh_hash,refresh_family,access_hash,access_expires_at,created_at,last_used_at,idle_expires_at,absolute_expires_at) \
          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12 \
@@ -271,6 +290,37 @@ pub async fn revoke_all_for_user_tx(
         .bind(user_id).bind(now).fetch_all(&mut **tx).await?;
     crate::locks::delete_for_user_tx(tx, user_id, crate::locks::LockSessionKind::Device, None)
         .await?;
+    let by = AuditCtx {
+        actor_id: audit.actor_id,
+        request_id: audit.request_id.clone(),
+    };
+    for id in &ids {
+        record_in(
+            tx,
+            &by,
+            &NewEvent::new("auth.device_revoked").target("device_session", *id),
+        )
+        .await?;
+    }
+    Ok(ids.len() as u64)
+}
+
+pub async fn revoke_other_for_user_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+    keep_id: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+) -> Result<u64, DbError> {
+    let ids: Vec<Uuid> = sqlx::query_scalar("UPDATE device_sessions SET revoked_at=$3,revoke_reason='security',access_hash=NULL,access_expires_at=NULL WHERE user_id=$1 AND id<>$2 AND revoked_at IS NULL RETURNING id")
+        .bind(user_id).bind(keep_id).bind(now).fetch_all(&mut **tx).await?;
+    crate::locks::delete_for_user_tx(
+        tx,
+        user_id,
+        crate::locks::LockSessionKind::Device,
+        Some(keep_id),
+    )
+    .await?;
     let by = AuditCtx {
         actor_id: audit.actor_id,
         request_id: audit.request_id.clone(),

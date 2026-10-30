@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "react-aria-components";
-import type { OrgMember, Page, WorkspaceMember, WorkspaceRole } from "../api/types.ts";
+import type { IssuedPasswordReset, OrgMember, Page, WorkspaceMember, WorkspaceRole } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
 import { Badge } from "../components/Badge.tsx";
 import { NativeSelect } from "../components/ContextSelect.tsx";
 import { AppModal, ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
+import { Alert } from "../components/forms.tsx";
 import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { RoleDialog } from "../components/RoleDialog.tsx";
 import { formatDateTime } from "../format.ts";
@@ -29,24 +30,30 @@ type Dialog =
   | { kind: "org-remove"; member: OrgMember }
   | { kind: "ws-role"; member: WorkspaceMember }
   | { kind: "ws-remove"; member: WorkspaceMember }
+  | { kind: "account-reset"; member: OrgMember }
   | { kind: "ws-add" };
 
 export function MembersScreen({
   scope,
   onOrganizationsChanged,
   onWorkspacesChanged,
+  isOperator,
 }: {
   scope: Scope;
   /** The own organization role or membership changed (role change, leaving). */
   onOrganizationsChanged: () => void;
   /** The own workspace role or membership changed, or the own organization role did. */
   onWorkspacesChanged: () => void;
+  isOperator: boolean;
 }) {
   const { t, language } = useI18n();
   const { api } = useAuth();
   const announce = useAnnounce();
   const names = useRoleNames();
   const [dialog, setDialog] = useState<Dialog | null>(null);
+  const [resetTwoFactor, setResetTwoFactor] = useState(false);
+  const [resetResult, setResetResult] = useState<{ member: OrgMember; result: IssuedPasswordReset } | null>(null);
+  const [resetError, setResetError] = useState<unknown>(null);
   const action = useAction();
 
   const orgId = scope.organization?.id ?? null;
@@ -68,6 +75,8 @@ export function MembersScreen({
   const close = useCallback(() => {
     setDialog(null);
     action.clear();
+    setResetTwoFactor(false);
+    setResetError(null);
   }, [action]);
 
   if (scope.organization === null || orgId === null) {
@@ -75,6 +84,30 @@ export function MembersScreen({
   }
 
   const canManageWs = canManageWorkspaceMembers(scope);
+
+  async function issueMemberReset(member: OrgMember) {
+    if (action.pending) return;
+    setResetError(null);
+    let requestError: unknown = null;
+    const result = await action.run(async () => {
+      try {
+        return await api.issuePasswordReset(member.user_id, {
+          reset_two_factor: resetTwoFactor,
+        });
+      } catch (error) {
+        requestError = error;
+        throw error;
+      }
+    });
+    if (result === undefined) {
+      setResetError(requestError ?? action.error);
+      return;
+    }
+    action.clear();
+    setDialog(null);
+    setResetTwoFactor(false);
+    setResetResult({ member, result });
+  }
 
   return (
     <>
@@ -129,6 +162,19 @@ export function MembersScreen({
                               onPress={() => setDialog({ kind: "org-remove", member })}
                             >
                               {self ? t("Leave") : t("Remove")}
+                            </Button>
+                          )}
+                          {isOperator && (
+                            <Button
+                              className="button button--sm"
+                              aria-label={t("Reset account: issue a password reset link for {name}", { name: member.display_name })}
+                              onPress={() => {
+                                setResetTwoFactor(false);
+                                setResetError(null);
+                                setDialog({ kind: "account-reset", member });
+                              }}
+                            >
+                              {t("Reset account")}
                             </Button>
                           )}
                         </div>
@@ -378,6 +424,45 @@ export function MembersScreen({
           }}
           onClose={close}
         />
+      )}
+
+      {dialog?.kind === "account-reset" && (
+        <AppModal title={t("Issue account reset link")} onClose={close} busy={action.pending} size="md">
+          <p>{t("Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.")}</p>
+          <label className="two-factor-policy">
+            <input
+              type="checkbox"
+              checked={resetTwoFactor}
+              disabled={action.pending}
+              onChange={(event) => setResetTwoFactor(event.currentTarget.checked)}
+            />
+            <span>{t("Also reset two-factor authentication")}</span>
+          </label>
+          {resetError !== null && <ErrorNotice error={resetError} onRetry={() => void issueMemberReset(dialog.member)} />}
+          <div className="form__actions">
+            <Button className="button" onPress={close} isDisabled={action.pending}>{t("Cancel")}</Button>
+            <Button className="button button--primary" onPress={() => void issueMemberReset(dialog.member)} isDisabled={action.pending}>
+              {action.pending ? t("Issuing…") : t("Issue reset link")}
+            </Button>
+          </div>
+        </AppModal>
+      )}
+
+      {resetResult !== null && (
+        <AppModal title={t("Password reset link")} onClose={() => setResetResult(null)} size="md">
+          <Alert tone="info">
+            {t("Copy this link now. It is shown once and expires at {expires}.", {
+              expires: formatDateTime(language, resetResult.result.expires_at),
+            })}
+          </Alert>
+          <label className="field">
+            <span className="field__label">{t("One-time reset link")}</span>
+            <input className="field__input field__input--mono" readOnly value={resetResult.result.reset_url} onFocus={(event) => event.currentTarget.select()} />
+          </label>
+          <div className="form__actions">
+            <Button className="button button--primary" onPress={() => setResetResult(null)}>{t("Close")}</Button>
+          </div>
+        </AppModal>
       )}
     </>
   );

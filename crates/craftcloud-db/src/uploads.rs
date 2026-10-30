@@ -735,6 +735,18 @@ impl OrgTx {
         if enabled != Some(true) {
             return Ok(false);
         }
+        let require_two_factor: bool =
+            sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
+                .bind(self.org_id)
+                .fetch_one(&mut *self.tx)
+                .await?;
+        if require_two_factor {
+            let factor_enabled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)")
+                .bind(user_id).fetch_one(&mut *self.tx).await?;
+            if !factor_enabled {
+                return Ok(false);
+            }
+        }
         let live: Option<Uuid> = if device {
             sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE")
                 .bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *self.tx).await?
@@ -743,6 +755,20 @@ impl OrgTx {
                 .bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *self.tx).await?
         };
         Ok(live.is_some())
+    }
+
+    pub async fn two_factor_setup_required(&mut self, user_id: Uuid) -> Result<bool, DbError> {
+        let required: bool =
+            sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
+                .bind(self.org_id)
+                .fetch_one(&mut *self.tx)
+                .await?;
+        if !required {
+            return Ok(false);
+        }
+        let enabled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)")
+            .bind(user_id).fetch_one(&mut *self.tx).await?;
+        Ok(!enabled)
     }
 
     /// Records the published object as a staged blob and the session as

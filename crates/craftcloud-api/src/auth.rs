@@ -78,6 +78,13 @@ pub(crate) struct ResetPasswordRequest {
     new_password: String,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminPasswordResetRequest {
+    #[serde(default)]
+    reset_two_factor: bool,
+}
+
 impl Drop for ResetPasswordRequest {
     fn drop(&mut self) {
         self.token.zeroize();
@@ -85,7 +92,7 @@ impl Drop for ResetPasswordRequest {
     }
 }
 
-fn rfc3339(time: OffsetDateTime) -> String {
+pub(crate) fn rfc3339(time: OffsetDateTime) -> String {
     time.format(&Rfc3339).unwrap_or_default()
 }
 
@@ -125,7 +132,10 @@ fn not_found(headers: &HeaderMap) -> Response {
     )
 }
 
-fn with_cookie(mut response: Response, cookie: Option<axum::http::HeaderValue>) -> Response {
+pub(crate) fn with_cookie(
+    mut response: Response,
+    cookie: Option<axum::http::HeaderValue>,
+) -> Response {
     if let Some(cookie) = cookie {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
@@ -134,13 +144,16 @@ fn with_cookie(mut response: Response, cookie: Option<axum::http::HeaderValue>) 
 
 /// Removes long-expired rows; failures are ignored (best effort). Runs at
 /// most once per ten minutes per process.
-async fn cleanup(services: &Services) {
+pub(crate) async fn cleanup(services: &Services) {
     if !services.cleanup_due() {
         return;
     }
     let cutoff = services.clock.now() - CLEANUP_GRACE;
     let _ = sessions::delete_expired(&services.pool, cutoff).await;
     let _ = password_reset::delete_expired(&services.pool, cutoff).await;
+    let _ =
+        craftcloud_db::two_factor::delete_expired_challenges(&services.pool, services.clock.now())
+            .await;
 }
 
 fn client_ip_of(ip: Option<Extension<ClientIp>>) -> Option<std::net::IpAddr> {
@@ -186,6 +199,18 @@ pub(crate) fn record_login_failure(
     if let Some(user_id) = user_id {
         event = event.target("user", user_id);
     }
+    record_lossy(
+        services,
+        &audit_ctx(headers, None),
+        &event,
+        Some(AggScope::Target),
+    );
+}
+
+pub(crate) fn record_two_factor_failure(services: &Services, headers: &HeaderMap, user_id: Uuid) {
+    let event = NewEvent::new("auth.two_factor_failed")
+        .result(AuditResult::Failed)
+        .target("user", user_id);
     record_lossy(
         services,
         &audit_ctx(headers, None),
@@ -263,6 +288,30 @@ pub(crate) async fn login(
         return invalid_credentials(&headers);
     };
 
+    match crate::two_factor::issue_login_challenge(
+        &services,
+        account.user_id,
+        &stored_hash,
+        "browser",
+        ip.map(ClientIp),
+        None,
+    )
+    .await
+    {
+        Ok(Some(challenge_id)) => {
+            drop(reservation);
+            return crate::error_response_with_details(
+                StatusCode::UNAUTHORIZED,
+                "SECOND_FACTOR_REQUIRED",
+                "A second factor is required.",
+                &headers,
+                Some(json!({ "challenge_id": challenge_id.to_string() })),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return db_failure(&error, &headers, "two-factor challenge issuance failed"),
+    }
+
     // The session is only created if the account still has exactly the
     // verified password hash and is enabled at the moment of the insert; a
     // reset or password change that committed meanwhile makes this fail.
@@ -287,6 +336,31 @@ pub(crate) async fn login(
     match created {
         Ok(Some(_)) => {}
         Ok(None) => {
+            match crate::two_factor::issue_login_challenge(
+                &services,
+                account.user_id,
+                &stored_hash,
+                "browser",
+                ip.map(ClientIp),
+                None,
+            )
+            .await
+            {
+                Ok(Some(challenge_id)) => {
+                    drop(reservation);
+                    return crate::error_response_with_details(
+                        StatusCode::UNAUTHORIZED,
+                        "SECOND_FACTOR_REQUIRED",
+                        "A second factor is required.",
+                        &headers,
+                        Some(json!({"challenge_id": challenge_id})),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return db_failure(&error, &headers, "two-factor challenge issuance failed");
+                }
+            }
             if let Some(reservation) = reservation {
                 reservation.record_failure(services.now_secs());
             }
@@ -674,6 +748,7 @@ pub(crate) async fn issue_password_reset(
     headers: HeaderMap,
     session: AuthenticatedSession,
     Path(target): Path<String>,
+    body: Result<Option<Json<AdminPasswordResetRequest>>, JsonRejection>,
 ) -> Response {
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
@@ -690,6 +765,11 @@ pub(crate) async fn issue_password_reset(
     {
         Ok(id) => id,
         Err(response) => return *response,
+    };
+    let reset_two_factor = match body {
+        Ok(Some(Json(body))) => body.reset_two_factor,
+        Ok(None) => false,
+        Err(error) => return rejection_response(&error, &headers),
     };
     let Some(public_url) = services.settings.public_url.clone() else {
         return error_response(
@@ -712,6 +792,7 @@ pub(crate) async fn issue_password_reset(
             user_id,
             token_hash: token.hash(),
             created_by: Some(session.user_id),
+            reset_two_factor,
             now,
             expires_at,
         },

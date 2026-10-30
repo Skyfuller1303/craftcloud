@@ -800,6 +800,16 @@ async fn finish_upload(finish: Finish) -> Response {
     {
         Ok(true) => {}
         Ok(false) => {
+            let setup_required = match tx.two_factor_setup_required(user_id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    guard.key = None;
+                    drop(tx);
+                    delete_object(&services, &key).await;
+                    fail_session(&services, org_id, upload_id).await;
+                    return db_failure(&error, &headers, "two-factor policy check failed");
+                }
+            };
             fail_in_tx(tx, &services, org_id, upload_id, now).await;
             guard.key = None;
             delete_object(&services, &key).await;
@@ -811,12 +821,21 @@ async fn finish_upload(finish: Finish) -> Response {
                 Some(upload_id),
                 "unauthenticated",
             );
-            let mut response = error_response(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHENTICATED",
-                "Authentication is required.",
-                &headers,
-            );
+            let mut response = if setup_required {
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "TWO_FACTOR_SETUP_REQUIRED",
+                    "Set up two-factor authentication to access this organization.",
+                    &headers,
+                )
+            } else {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHENTICATED",
+                    "Authentication is required.",
+                    &headers,
+                )
+            };
             // Stored as an aggregated `denied` audit row by `record_denials`.
             response.extensions_mut().insert(Denied {
                 actor: user_id,

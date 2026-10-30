@@ -66,7 +66,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 32] = [
+const SUPPORTED_KEYS: [&str; 34] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -99,6 +99,8 @@ const SUPPORTED_KEYS: [&str; 32] = [
     "DEVICE_ACCESS_TTL",
     "DEVICE_IDLE_DAYS",
     "DEVICE_ABSOLUTE_DAYS",
+    "SECRET_KEY_FILE",
+    "SECRET_KEY_OLD_FILE",
 ];
 
 /// Log output format.
@@ -177,6 +179,10 @@ pub struct Config {
     /// Absolute path of the bootstrap token secret file. `None` disables the
     /// one-time instance setup. Requires a configured database.
     pub bootstrap_secret_file: Option<PathBuf>,
+    /// Current Base64-encoded 32-byte TOTP encryption key file.
+    pub secret_key_file: Option<PathBuf>,
+    /// Previous key used only to decrypt secrets during rotation.
+    pub secret_key_old_file: Option<PathBuf>,
     /// Origin (`scheme://host[:port]`) of the public URL, used for the CSRF
     /// Origin check.
     pub public_origin: Option<String>,
@@ -387,6 +393,9 @@ impl Config {
             "BOOTSTRAP_SECRET_FILE",
             parse_absolute_path,
         );
+        let secret_key_file = field(&mut errors, env, "SECRET_KEY_FILE", parse_absolute_path);
+        let secret_key_old_file =
+            field(&mut errors, env, "SECRET_KEY_OLD_FILE", parse_absolute_path);
         if bootstrap_secret_file.is_some() && db_url_file.is_none() {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}BOOTSTRAP_SECRET_FILE"),
@@ -576,6 +585,8 @@ impl Config {
                     runtime_role,
                 },
                 bootstrap_secret_file,
+                secret_key_file,
+                secret_key_old_file,
                 public_origin,
                 cookie_secure,
                 session_idle_timeout: Duration::from_secs(session_idle_minutes * 60),

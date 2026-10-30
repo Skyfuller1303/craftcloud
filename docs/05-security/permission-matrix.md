@@ -113,6 +113,18 @@ Lease gehört einer aktiven Browser- oder Geräte-Sitzung (AC-01) und läuft nac
 
 Die vollständige Grant-Aktionsmatrix liegt in `craftcloud-core/src/policy.rs::object_grant_matrix_is_scoped_and_never_grants_management`; Gäste-MemberList in `member_list`. HTTP-Abdeckung: `craftcloud-api/tests/shares_locks.rs::file_grant_does_not_reveal_project_or_sibling_and_shared_item_is_minimal`, `project_editor_grant_covers_files_but_not_project_management`, `leases_guard_writes_project_restore_and_audit_only_state_changes`. Upload-Zulassung und Entzug während des Streams: `craftcloud-api/tests/uploads.rs::file_grant_editor_can_upload_and_revocation_during_stream_is_rechecked`. Datei-Bindung beim Commit: `craftcloud-api/tests/versions.rs::an_upload_is_bound_to_its_file_even_with_a_foreign_target_lease`. DB-Rennen, Projekt-Lease-Suche und Grant-Demotion/Revoke-Cleanup: `craftcloud-db/tests/integration.rs::migration_0016_grant_shape_keys_and_shared_projection_are_valid`.
 
-## Negativtests
+## AC-02: Zweiter Faktor und Organisationspflicht
+
+Persönliche 2FA-Einrichtung und Status liegen im Kontoscope und bleiben auch dann erreichbar, wenn eine Organisation die Einrichtung verlangt. Setup verlangt eine erneute Passwortprüfung, Bestätigung den ersten TOTP-Code, Deaktivierung Passwort und zweiten Faktor, neue Wiederherstellungscodes einen gültigen zweiten Faktor. Eine bestehende Sitzung allein genügt nicht für diese Sicherheitsänderungen.
+
+Die zusätzliche zentrale Aktion für `require_two_factor` ist ausschließlich für Owner und Admin der jeweiligen Organisation zulässig. Wer die Pflicht einschaltet, benötigt selbst aktives 2FA. Eine Mitgliedschaft oder ein Datei-/Projekt-Grant ohne eingerichteten zweiten Faktor umgeht die Pflicht nicht. Sichtbare Ressourcen der verpflichtenden Organisation antworten bis zur Einrichtung mit `403 TWO_FACTOR_SETUP_REQUIRED`; nicht sichtbare oder fremde Ressourcen behalten ihre bisherigen `404`-Grenzen. Andere Organisationen ohne Pflicht bleiben unverändert nutzbar.
+
+Der bestehende Instanz-Operator kann beim Ausstellen eines Passwortresetlinks optional den zweiten Faktor zurücksetzen. Organisations- und Workspace-Administratoren erhalten dadurch keine neuen Rechte zum Zurücksetzen fremder Konten. Der Offline-Befehl `craftcloud-server admin user reset-2fa <email>` setzt Host- und Datenbankzugriff voraus. Änderungen und Reset widerrufen andere Browser- und Geräte-Sitzungen und werden ohne Geheimnisse auditiert. Siehe [ADR-0019](../09-decisions/adr-0019-two-factor.md).
+
+## Zusätzliche Negativtests für AC-02
+
+TOTP-Wiederholung, doppelte Recovery-Code-Nutzung, gleichzeitige Challenge-Einlösung, falsche Adresse oder Anmeldeart, Challenge-Ablauf und Versuchsgrenze, Passwortwechsel beziehungsweise Reset während einer Anmeldung sowie 2FA-Pflicht bei Grants und laufenden Uploads müssen serverseitig abgedeckt werden. Aktuelle Testergebnisse werden im AC-02-Abnahmebericht festgehalten.
+
+## Allgemeine Negativtests
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.

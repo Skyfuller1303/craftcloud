@@ -79,8 +79,10 @@ describe("members", () => {
     renderApp(fetch);
     await openSection(user, "Members");
     await screen.findAllByText("bob@example.test");
-    expect(within(row(/Ada/)).queryByRole("button")).toBeNull(); // owner
-    expect(within(row(/Owen/)).queryByRole("button")).toBeNull(); // owner
+    expect(within(row(/Ada/)).getByRole("button", { name: "Reset account: issue a password reset link for Ada" })).toBeTruthy();
+    expect(within(row(/Ada/)).queryByRole("button", { name: "Change role: Ada" })).toBeNull(); // owner
+    expect(within(row(/Owen/)).getByRole("button", { name: "Reset account: issue a password reset link for Owen" })).toBeTruthy();
+    expect(within(row(/Owen/)).queryByRole("button", { name: "Change role: Owen" })).toBeNull(); // owner
     const bob = within(row(/Bob/));
     expect(bob.getByRole("button", { name: "Change role: Bob" })).toBeTruthy();
     expect(bob.getByRole("button", { name: "Remove Bob" })).toBeTruthy();
@@ -101,7 +103,8 @@ describe("members", () => {
     renderApp(fetch);
     await openSection(user, "Members");
     await screen.findAllByText("bob@example.test");
-    expect(within(row(/Bob/)).queryByRole("button")).toBeNull();
+    expect(within(row(/Bob/)).queryByRole("button", { name: "Change role: Bob" })).toBeNull();
+    expect(within(row(/Bob/)).queryByRole("button", { name: "Remove Bob" })).toBeNull();
     expect(within(row(/Ada/)).getByRole("button", { name: "Leave organization" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Add to workspace" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Change role in workspace/ })).toBeNull();

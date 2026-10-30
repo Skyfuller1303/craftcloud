@@ -184,6 +184,10 @@ paths:
         still valid session cookie revokes that old session. The session is only created if the password hash
         is still the verified one (a reset that commits meanwhile makes the login fail with 401). The Origin
         check applies (login CSRF); there is no CSRF token yet. No hard lockout.
+        With enabled TOTP, password verification only creates a five-minute challenge and returns
+        401 SECOND_FACTOR_REQUIRED with error.details.challenge_id. No session is issued until
+        POST /auth/login/second-factor succeeds. Challenges are bound to the account, client address and
+        login kind, permit at most five attempts and are single use. Codes and challenge IDs must not be logged.
       requestBody:
         required: true
         content:
@@ -197,7 +201,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/LoginResponse'}
-        '401': {$ref: '#/components/responses/InvalidCredentials'}
+        '401': {$ref: '#/components/responses/LoginChallengeOrInvalid'}
         '403': {$ref: '#/components/responses/CsrfFailed'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '415': {$ref: '#/components/responses/UnsupportedMediaType'}
@@ -214,8 +218,10 @@ paths:
         Requires TLS, except for an explicitly configured loopback public URL. Trusted-proxy rules apply.
         Uses the same password verification, unknown-account timing and rate-limit counters as browser login.
         No cookie is set. Both tokens contain 256 random bits and are stored only as SHA-256 hashes.
-        SECOND_FACTOR_REQUIRED with a short-lived challenge_id is reserved for AC-02; AC-01 only provides
-        the extension point and never issues a second-factor challenge. Cookie plus Bearer is rejected
+        With enabled TOTP, returns 401 SECOND_FACTOR_REQUIRED with error.details.challenge_id instead of
+        tokens. The challenge lasts five minutes, permits five attempts and binds the validated device metadata,
+        account, client address and device login kind. Complete it at /auth/device/login/second-factor.
+        Browser challenges cannot be used here or vice versa. Cookie plus Bearer is rejected
         with 400 AMBIGUOUS_CREDENTIALS. Responses must not be cached or logged.
       requestBody:
         required: true
@@ -230,10 +236,212 @@ paths:
               schema: {$ref: '#/components/schemas/DeviceLoginResponse'}
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401':
-          description: INVALID_CREDENTIALS (SECOND_FACTOR_REQUIRED reserved for AC-02)
+          description: INVALID_CREDENTIALS or SECOND_FACTOR_REQUIRED with error.details.challenge_id
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/login/second-factor:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Complete a browser login with TOTP or a recovery code (AC-02)
+      description: >-
+        Requires the unexpired browser challenge issued after password verification, from the same client
+        address. Accepts exactly one of code or recovery_code. Successful proof atomically consumes the
+        challenge and the TOTP timestep or recovery code before issuing the browser session.
+        Origin checks and existing per-account and per-address login limits apply. Failed proofs count
+        toward the login limits and the five-attempt challenge budget. Challenges invalidated by credential
+        changes, reset or account disabling cannot create a session. Response is never cacheable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SecondFactorLoginRequest'}
+      responses:
+        '200':
+          description: Logged in; Set-Cookie carries the new session cookie
+          headers:
+            Set-Cookie: {schema: {type: string}, description: Session cookie}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LoginResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/InvalidCredentials'}
+        '403': {$ref: '#/components/responses/CsrfFailed'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/device/login/second-factor:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Complete a device login with TOTP or a recovery code (AC-02)
+      description: >-
+        Requires TLS except for a configured loopback instance, and a device challenge from the same
+        client address. Device name, client kind and client id were validated and captured at the initial
+        password step and cannot be replaced here. Browser challenges are rejected. Challenge lifetime,
+        one-time proof consumption and login rate limits match the browser second-factor route.
+        No cookie is issued; keep the resulting refresh token in the operating system keychain.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SecondFactorLoginRequest'}
+      responses:
+        '200':
+          description: Device session created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceLoginResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/InvalidCredentials'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/2fa:
+    get:
+      tags: [Auth]
+      summary: Read own second-factor status without secrets
+      responses:
+        '200':
+          description: Current enrollment, server availability and remaining recovery-code count
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TwoFactorStatus'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/2fa/setup:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Start own TOTP enrollment after password reauthentication
+      description: >-
+        Generates a fresh 160-bit secret and stores it encrypted. Enrollment is not active until confirm.
+        Render the otpauth URL as a QR code locally; never send it to an external QR service or persist it
+        in browser storage. Missing current encryption key returns 503 TWO_FACTOR_UNAVAILABLE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TwoFactorSetupRequest'}
+      responses:
+        '200':
+          description: Pending enrollment secret; no-store and never log this response
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TwoFactorSetupResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/TwoFactorForbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/2fa/confirm:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Activate pending TOTP enrollment and return recovery codes once
+      description: >-
+        Verifies RFC-6238 HMAC-SHA-1 TOTP, six digits, 30-second period, plus or minus one step.
+        The accepted timestep cannot be reused. Activation and revocation of other browser and device
+        sessions commit atomically. Ten recovery codes are returned exactly once; keep them offline.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TwoFactorConfirmRequest'}
+      responses:
+        '200':
+          description: Enabled; recovery codes shown only in this response
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RecoveryCodesResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/TwoFactorForbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/2fa/disable:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Disable own second factor with password and a second-factor proof
+      description: Invalidates enrollment and recovery codes and revokes other browser and device sessions atomically.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TwoFactorDisableRequest'}
+      responses:
+        '204': {description: Second factor disabled}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/TwoFactorForbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/2fa/recovery-codes:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Replace all own recovery codes after second-factor verification
+      description: >-
+        Accepts exactly one TOTP code or an unused recovery code. Invalidates every old recovery code
+        and returns ten new codes once. Only salted hashes are stored; plaintext codes are never retrievable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SecondFactorProof'}
+      responses:
+        '200':
+          description: Replacement recovery codes shown once
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RecoveryCodesResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/TwoFactorForbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '415': {$ref: '#/components/responses/UnsupportedMediaType'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
@@ -498,6 +706,15 @@ paths:
         not sent to servers or in Referer headers. Requires CRAFTCLOUD_PUBLIC_URL (otherwise 503
         AUTH_UNAVAILABLE). Disabled accounts: 409 ACCOUNT_DISABLED. Offline alternative:
         craftcloud-server admin issue-password-reset --email <address>.
+        Optional reset_two_factor=true also clears the target's TOTP enrollment and recovery codes
+        when issuing the link, in the same transaction, and records auth.two_factor_reset.
+        Omission preserves the existing second factor. Offline second-factor reset:
+        craftcloud-server admin user reset-2fa <email>.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IssuePasswordResetRequest'}
       responses:
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
@@ -2803,6 +3020,77 @@ components:
         are never accepted. Device revocation, password change/reset, account disable, logout-all and removal
         from the final organization revoke access immediately.
   schemas:
+    TwoFactorStatus:
+      type: object
+      required: [enabled, available, recovery_codes_remaining]
+      properties:
+        enabled: {type: boolean}
+        available: {type: boolean, description: Whether a current encryption key is available for enrollment}
+        recovery_codes_remaining: {type: integer, minimum: 0, maximum: 10}
+    TwoFactorSetupRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password: {type: string, writeOnly: true}
+    TwoFactorSetupResponse:
+      type: object
+      required: [secret, otpauth_url]
+      properties:
+        secret: {type: string, minLength: 32, maxLength: 32, description: Base32-encoded 160-bit secret for manual entry; never log or persist in browser storage}
+        otpauth_url: {type: string, description: Render as a QR code locally in the browser; never send to a third-party service}
+    TwoFactorConfirmRequest:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+    SecondFactorProof:
+      type: object
+      additionalProperties: false
+      properties:
+        code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+        recovery_code: {type: string, minLength: 10, maxLength: 10, writeOnly: true}
+      oneOf:
+        - required: [code]
+        - required: [recovery_code]
+    SecondFactorLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [challenge_id]
+      properties:
+        challenge_id: {type: string, writeOnly: true, description: Opaque single-use challenge; expires after five minutes and five failed attempts}
+        code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+        recovery_code: {type: string, minLength: 10, maxLength: 10, writeOnly: true}
+      oneOf:
+        - required: [code]
+        - required: [recovery_code]
+    TwoFactorDisableRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password: {type: string, writeOnly: true}
+        code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+        recovery_code: {type: string, minLength: 10, maxLength: 10, writeOnly: true}
+      oneOf:
+        - required: [code]
+        - required: [recovery_code]
+    RecoveryCodesResponse:
+      type: object
+      required: [recovery_codes]
+      properties:
+        recovery_codes:
+          type: array
+          minItems: 10
+          maxItems: 10
+          description: One-time display; download locally and keep offline. The server stores salted hashes only.
+          items: {type: string, minLength: 10, maxLength: 10}
+    IssuePasswordResetRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reset_two_factor: {type: boolean, default: false, description: Also clear TOTP and recovery codes atomically when issuing the reset link}
     DeviceLoginRequest:
       type: object
       additionalProperties: false
@@ -2958,7 +3246,7 @@ components:
         expires_at: {type: string, format: date-time}
     Organization:
       type: object
-      required: [id, slug, name, role, version, workspace_admin_invites_enabled, created_at]
+      required: [id, slug, name, role, version, workspace_admin_invites_enabled, require_two_factor, created_at]
       properties:
         id: {type: string, format: uuid}
         slug: {type: string}
@@ -2966,6 +3254,7 @@ components:
         role: {type: string, enum: [owner, admin, member, guest], description: The caller's role}
         version: {type: integer, minimum: 1}
         workspace_admin_invites_enabled: {type: boolean, description: Whether workspace admins may invite into their own workspace}
+        require_two_factor: {type: boolean, description: Members without enabled TOTP must enroll before accessing this organization's resources}
         created_at: {type: string, format: date-time}
     CreatedOrganization:
       type: object
@@ -3036,6 +3325,7 @@ components:
       properties:
         name: {type: string, minLength: 1, maxLength: 100}
         workspace_admin_invites_enabled: {type: boolean}
+        require_two_factor: {type: boolean, description: Owner or admin only; enabling requires an enabled second factor on the caller's account}
     AddMemberRequest:
       type: object
       additionalProperties: false
@@ -3439,8 +3729,13 @@ components:
         checked_at: {type: string, format: date-time}
         components:
           type: object
-          required: [database, migrations, storage]
+          required: [database, migrations, storage, two_factor]
           properties:
+            two_factor:
+              type: object
+              required: [status]
+              properties:
+                status: {type: string, enum: [ok, not_configured], description: Availability of the current second-factor encryption key; never includes key material or file paths}
             database:
               type: object
               required: [status, pool]
@@ -3615,6 +3910,19 @@ components:
         csrf_token: {type: string, description: Only when an account was created and logged in}
         expires_at: {type: string, format: date-time, description: Session expiry, only when a session was issued}
   responses:
+    LoginChallengeOrInvalid:
+      description: >-
+        INVALID_CREDENTIALS for unknown account, wrong password or disabled account; or
+        SECOND_FACTOR_REQUIRED after a correct password when TOTP is enabled, with the opaque
+        challenge in error.details.challenge_id. No session or access token is issued by the challenge response.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TwoFactorForbidden:
+      description: CSRF_FAILED. Invalid passwords and second-factor proofs return 401 INVALID_CREDENTIALS; no submitted value is echoed.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     AmbiguousCredentials:
       description: AMBIGUOUS_CREDENTIALS when Cookie and Bearer are supplied together; device POST routes also return DEVICE_TLS_REQUIRED when transport evidence is missing. Use exactly one authentication method.
       content:
@@ -3631,7 +3939,7 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     ForbiddenOrCsrf:
-      description: FORBIDDEN (authenticated but not allowed) or CSRF_FAILED
+      description: FORBIDDEN (authenticated but not allowed), CSRF_FAILED, or TWO_FACTOR_SETUP_REQUIRED for a visible organization that requires enrollment
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
@@ -3656,7 +3964,7 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     ServiceUnavailable:
-      description: AUTH_UNAVAILABLE (no database configured or reachable, or CRAFTCLOUD_PUBLIC_URL missing where a link must be built) or TIMEOUT (handler timeout)
+      description: AUTH_UNAVAILABLE (no database configured or reachable, or CRAFTCLOUD_PUBLIC_URL missing where a link must be built), TWO_FACTOR_UNAVAILABLE (required encryption key unavailable), or TIMEOUT (handler timeout)
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
@@ -3691,7 +3999,8 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
     Unauthorized:
       description: >-
-        No valid session (UNAUTHENTICATED): missing, malformed, expired (idle 8 h or absolute 7 d by default) or revoked
+        No valid session (UNAUTHENTICATED): missing, malformed, expired (idle 8 h or absolute 7 d by default) or revoked.
+        Credential verification endpoints return INVALID_CREDENTIALS for an invalid password, second-factor proof or challenge.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

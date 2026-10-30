@@ -491,6 +491,7 @@ pub(crate) async fn get_health(
                 },
             },
             "migrations": { "status": snapshot.migrations.as_str() },
+            "two_factor": { "status": if services.two_factor_available() { "ok" } else { "not_configured" } },
             "storage": {
                 "status": snapshot.storage.as_str(),
                 "binding": snapshot.binding,

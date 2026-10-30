@@ -1146,7 +1146,6 @@ mod tests {
             "nobody@example.test".to_owned(),
             "user_id".to_owned(),
             "org_id".to_owned(),
-            "actor".to_owned(),
         ] {
             assert!(!text.contains(&forbidden), "metrics expose {forbidden}");
         }
@@ -1158,6 +1157,14 @@ mod tests {
             let (series, value) = line.rsplit_once(' ').expect(line);
             assert!(value.parse::<f64>().is_ok(), "bad sample {line}");
             assert!(series.starts_with("craftcloud_"), "{line}");
+            if let Some((_, labels)) = series.split_once('{') {
+                for label in labels.trim_end_matches('}').split(',') {
+                    let (key, _) = label.split_once('=').expect("label assignment");
+                    // Check label keys: the fixed class "two_factor_management"
+                    // contains "actor" but carries no actor identifier.
+                    assert!(!key.contains("actor"), "metrics expose actor label {key}");
+                }
+            }
         }
     }
 

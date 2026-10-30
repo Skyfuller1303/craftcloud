@@ -209,6 +209,7 @@ pub(crate) fn org_json(org: &Organization, role: Option<OrgRole>) -> Value {
         "role": role.map(OrgRole::as_str),
         "version": org.version,
         "workspace_admin_invites_enabled": org.workspace_admin_invites_enabled,
+        "require_two_factor": org.require_two_factor,
         "created_at": rfc3339(org.created_at),
     })
 }
@@ -276,6 +277,7 @@ pub(crate) async fn list_mine(
             json!({
                 "id": o.id.to_string(), "slug": o.slug, "name": o.name, "role": o.role,
                 "version": o.version, "created_at": rfc3339(o.created_at),
+                "require_two_factor": o.require_two_factor,
             })
         })
         .collect();
@@ -337,6 +339,7 @@ pub(crate) async fn get_org(
 pub(crate) struct UpdateOrgRequest {
     name: Option<String>,
     workspace_admin_invites_enabled: Option<bool>,
+    require_two_factor: Option<bool>,
 }
 
 pub(crate) async fn update_org(
@@ -397,8 +400,35 @@ pub(crate) async fn update_org(
         Some(Err(_)) => return validation_failed(&["name"], &headers),
         None => None,
     };
-    if name.is_none() && request.workspace_admin_invites_enabled.is_none() {
-        return validation_failed(&["name", "workspace_admin_invites_enabled"], &headers);
+    if name.is_none()
+        && request.workspace_admin_invites_enabled.is_none()
+        && request.require_two_factor.is_none()
+    {
+        return validation_failed(
+            &[
+                "name",
+                "workspace_admin_invites_enabled",
+                "require_two_factor",
+            ],
+            &headers,
+        );
+    }
+    if request.require_two_factor.is_some() {
+        let policy = craftcloud_core::policy::can(
+            &actor,
+            Action::OrganizationTwoFactorPolicyUpdate,
+            &Resource::Organization { org_id },
+        );
+        if let Gate::Closed(response) = gate(
+            policy,
+            &headers,
+            session.user_id,
+            "org.two_factor_policy_changed",
+            Some(org_id),
+            None,
+        ) {
+            return response;
+        }
     }
     // Optimistic concurrency (ADR-0009): the version the client last saw.
     let Some(if_match) = headers.get(header::IF_MATCH) else {
@@ -420,37 +450,58 @@ pub(crate) async fn update_org(
         Ok(value) => value,
         Err(error) => return db_failure(&error, &headers, "organization update failed"),
     };
+    let two_factor_before = match tx.require_two_factor().await {
+        Ok(value) => value,
+        Err(error) => return db_failure(&error, &headers, "organization update failed"),
+    };
+    if request.require_two_factor == Some(true) && !two_factor_before {
+        match tx.user_two_factor_enabled(session.user_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "TWO_FACTOR_SETUP_REQUIRED",
+                    "Set up two-factor authentication before requiring it for this organization.",
+                    &headers,
+                );
+            }
+            Err(error) => return db_failure(&error, &headers, "two-factor policy update failed"),
+        }
+    }
     match tx
         .update_settings(
             &scope,
             name.as_ref().map(DisplayName::as_str),
             request.workspace_admin_invites_enabled,
+            request.require_two_factor,
             expected,
         )
         .await
     {
         Ok(UpdateOutcome::Updated(org)) => {
+            let action = if request
+                .require_two_factor
+                .is_some_and(|value| value != two_factor_before)
+            {
+                "org.two_factor_policy_changed"
+            } else {
+                "organization.update"
+            };
             if let Err(error) = commit_audited(
                 tx,
-                Change::new(
-                    &headers,
-                    session.user_id,
-                    "organization.update",
-                    org_id,
-                    Some(org_id),
-                )
-                .detail(
-                    "name_changed",
-                    Detail::Flag(name.as_ref().is_some_and(|n| n.as_str() != name_before)),
-                )
-                .detail(
-                    "invites_setting_changed",
-                    Detail::Flag(
-                        request
-                            .workspace_admin_invites_enabled
-                            .is_some_and(|value| value != invites_before),
+                Change::new(&headers, session.user_id, action, org_id, Some(org_id))
+                    .detail(
+                        "name_changed",
+                        Detail::Flag(name.as_ref().is_some_and(|n| n.as_str() != name_before)),
+                    )
+                    .detail(
+                        "invites_setting_changed",
+                        Detail::Flag(
+                            request
+                                .workspace_admin_invites_enabled
+                                .is_some_and(|value| value != invites_before),
+                        ),
                     ),
-                ),
             )
             .await
             {

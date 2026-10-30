@@ -9,13 +9,20 @@ GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,
 POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,404,409,500,503
 POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
 DELETE /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
-POST /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=- ok=ResetLinkResponse codes=201,400,401,403,404,409,500,503
+POST /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=IssuePasswordResetRequest ok=ResetLinkResponse codes=201,400,401,403,404,409,500,503
+GET /api/v1/auth/2fa auth=cookie|bearer req=- ok=TwoFactorStatus codes=200,400,401,500,503
+POST /api/v1/auth/2fa/confirm auth=cookie+csrf|bearer req=TwoFactorConfirmRequest ok=RecoveryCodesResponse codes=200,400,401,403,409,413,415,422,429,500,503
+POST /api/v1/auth/2fa/disable auth=cookie+csrf|bearer req=TwoFactorDisableRequest ok=- codes=204,400,401,403,409,413,415,422,429,500,503
+POST /api/v1/auth/2fa/recovery-codes auth=cookie+csrf|bearer req=SecondFactorProof ok=RecoveryCodesResponse codes=200,400,401,403,409,413,415,422,429,500,503
+POST /api/v1/auth/2fa/setup auth=cookie+csrf|bearer req=TwoFactorSetupRequest ok=TwoFactorSetupResponse codes=200,400,401,403,409,413,415,422,429,500,503
 POST /api/v1/auth/device/login auth=none req=DeviceLoginRequest ok=DeviceLoginResponse codes=200,400,401,413,415,422,429,500,503
+POST /api/v1/auth/device/login/second-factor auth=none req=SecondFactorLoginRequest ok=DeviceLoginResponse codes=200,400,401,413,415,422,429,500,503
 POST /api/v1/auth/device/logout auth=bearer req=- ok=- codes=204,400,401,500,503
 POST /api/v1/auth/device/refresh auth=none req=- ok=DeviceTokenResponse codes=200,400,401,413,415,422,429,500,503
 GET /api/v1/auth/devices auth=cookie|bearer req=- ok=DeviceList codes=200,400,401,500,503
 DELETE /api/v1/auth/devices/{id} auth=cookie+csrf|bearer|bearer req=- ok=- codes=204,400,401,403,404,500,503
 POST /api/v1/auth/login auth=none req=LoginRequest ok=LoginResponse codes=200,401,403,413,415,422,429,500,503
+POST /api/v1/auth/login/second-factor auth=none req=SecondFactorLoginRequest ok=LoginResponse codes=200,400,401,403,413,415,422,429,500,503
 POST /api/v1/auth/logout auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,500,503
 POST /api/v1/auth/logout-all auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,500,503
 POST /api/v1/auth/password-reset auth=none req=ResetPasswordRequest ok=- codes=204,400,413,415,422,429,500,503
@@ -119,6 +126,7 @@ GrantCreateRequest
 HealthLevel
 Invitation
 InvitationPage
+IssuePasswordResetRequest
 LockAcquireRequest
 LoginRequest
 LoginResponse
@@ -134,13 +142,21 @@ ProjectPage
 QuotaRequest
 QuotaResponse
 Readiness
+RecoveryCodesResponse
 ResetLinkResponse
 ResetPasswordRequest
+SecondFactorLoginRequest
+SecondFactorProof
 SessionInfo
 SessionList
 SetupCompleteRequest
 SharedTarget
 SharedWithMeResponse
+TwoFactorConfirmRequest
+TwoFactorDisableRequest
+TwoFactorSetupRequest
+TwoFactorSetupResponse
+TwoFactorStatus
 UpdateFileRequest
 UpdateOrganizationRequest
 UpdateProjectRequest

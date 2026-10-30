@@ -400,7 +400,7 @@ mod tests {
         // Migration 15 is reserved for AC-01; AC-03 adds migration 16 independently.
         assert_eq!(
             embedded_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
     }
 
@@ -410,6 +410,7 @@ mod tests {
         assert_eq!(migrator_up_to(0).iter().count(), 0);
         assert_eq!(migrator_up_to(15).iter().count(), 15);
         assert_eq!(migrator_up_to(16).iter().count(), 16);
-        assert_eq!(migrator_up_to(99).iter().count(), 16);
+        assert_eq!(migrator_up_to(17).iter().count(), 17);
+        assert_eq!(migrator_up_to(99).iter().count(), 17);
     }
 }

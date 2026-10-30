@@ -32,6 +32,7 @@ pub mod recovery;
 mod scope;
 pub mod sessions;
 pub mod setup;
+pub mod two_factor;
 pub mod uploads;
 pub mod users;
 pub mod versions;

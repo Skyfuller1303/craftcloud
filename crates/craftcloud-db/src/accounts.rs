@@ -307,6 +307,10 @@ async fn change_password_inner(
     if updated != 1 {
         return Ok(None);
     }
+    sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
     let session_alive: Option<Uuid> = if keep_device_session {
         sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND access_expires_at>$3 AND idle_expires_at>$3 AND absolute_expires_at>$3 FOR UPDATE")
             .bind(keep_session).bind(user_id).bind(now).fetch_optional(&mut *tx).await?

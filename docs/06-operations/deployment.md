@@ -1,5 +1,38 @@
 # Self-hosting-Deployment (Entwicklungsprototyp, Compose-Vorlage seit CC-P03-07)
 
+## Zwei-Faktor-Anmeldung (AC-02)
+
+Vor dem Einsatz dieser Version muss `craftcloud-server migrate` die Migration `0017_two_factor.sql` mit den bisherigen Migrationen anwenden. Migrationen starten weiterhin nicht implizit mit dem Server. Die Organisationsrichtlinie ist für bestehende Organisationen zunächst ausgeschaltet; bestehende Konten erhalten nicht automatisch einen zweiten Faktor.
+
+| Variable | Inhalt und Verhalten |
+|---|---|
+| `CRAFTCLOUD_SECRET_KEY_FILE` | Absoluter Pfad zu einer geschützten Datei mit einem Base64-kodierten, kryptografisch zufälligen 32-Byte-Schlüssel. Der Schlüssel selbst gehört weder in die Umgebungsvariable noch in Logs oder das Repository. |
+| `CRAFTCLOUD_SECRET_KEY_OLD_FILE` | Optionaler absoluter Pfad zur geschützten Datei mit dem vorherigen Schlüssel. Dieser dient ausschließlich zum Entschlüsseln bestehender Geheimnisse während einer Rotation. |
+
+Ohne verfügbaren aktuellen Schlüssel startet der Server weiter. `GET /api/v1/auth/2fa` meldet die eingeschränkte Einrichtungsverfügbarkeit, die Betreiberansicht `GET /api/v1/admin/health` den Zustand der Zwei-Faktor-Komponente. Neue Einrichtungen antworten mit `503 TWO_FACTOR_UNAVAILABLE`. Das Fehlen eines Schlüssels deaktiviert niemals bestehendes 2FA und erlaubt keine Anmeldung nur mit Passwort. Dateizugriff ist auf das Dienstkonto zu begrenzen; unter Windows sind entsprechende ACLs zu setzen, unter Unix etwa Modus 0600.
+
+Im Webpanel richtet die Person TOTP unter Einstellungen ein, bestätigt den ersten sechsstelligen Code und bewahrt die zehn einmal angezeigten Wiederherstellungscodes außerhalb des Browsers auf. Die QR-Erzeugung erfolgt lokal; TOTP-URI und Geheimnis dürfen niemals in einen externen QR-Dienst eingegeben werden. TOTP verwendet SHA-1, sechs Stellen, 30 Sekunden und ±1 Zeitschritt. Ein angenommener Zeitschritt kann nicht erneut verwendet werden; für eine unmittelbar folgende Aktion ist der nächste Code abzuwarten. Die Serverzeit muss synchronisiert sein.
+
+Browser und Geräte-Anmeldung liefern nach korrektem Passwort bei aktiviertem 2FA zunächst `401 SECOND_FACTOR_REQUIRED` mit `error.details.challenge_id`. Erst der passende zweite Anmeldeschritt stellt eine Sitzung aus. Challenges laufen nach fünf Minuten ab, sind an Konto, Anmeldeart und Client-Adresse gebunden und erlauben höchstens fünf Versuche. Ein Wechsel der Client-Adresse kann deshalb einen neuen Passwortschritt erfordern. Geräte-Metadaten werden im ersten Schritt festgehalten. Wiederholungsversuche mit ungültigen Codes zählen in die bestehenden Login-Sperren.
+
+Owner und Admin können `require_two_factor` an ihrer Organisation aktivieren, wenn sie selbst 2FA eingerichtet haben. Nicht eingerichtete Mitglieder können ihre persönlichen Sicherheitseinstellungen und andere Organisationen weiterhin verwenden; geschützte Routen der verpflichtenden Organisation antworten mit `403 TWO_FACTOR_SETUP_REQUIRED`. Ein Objekt-Grant aus AC-03 hebt diese Pflicht nicht auf.
+
+### Wiederherstellung und Schlüsselrotation
+
+Die optionale Auswahl zum Zurücksetzen von 2FA beim Ausstellen eines Admin-Passwortresetlinks wirkt bereits beim Ausstellen des Links. Sie entfernt den zweiten Faktor und die Wiederherstellungscodes atomar mit der Sicherheitsreaktion und schreibt `auth.two_factor_reset`. Ohne die Auswahl bleibt der zweite Faktor bestehen. Der Operator prüft die Identität der betroffenen Person außerhalb des Systems, bevor er diese Funktion verwendet.
+
+Falls keine passende Web-Sitzung mehr verfügbar ist, kann der Hostbetreiber mit Datenbankzugriff `craftcloud-server admin user reset-2fa <email>` verwenden. Danach muss die Person 2FA erneut einrichten; bei Organisationspflicht erhält sie bis dahin keinen Zugriff auf die betroffene Organisation. Aktivierung, Deaktivierung und Reset widerrufen andere Browser- und Geräte-Sitzungen. Ein Offline-Reset hat keine aktuelle Sitzung zu erhalten und widerruft sämtliche Sitzungen des Zielkontos.
+
+Für eine Rotation wird der bisherige Schlüssel geschützt als alter Schlüssel aufbewahrt und ein neuer zufälliger Schlüssel als aktueller eingerichtet. Beide Dateien werden über die genannten Variablen bereitgestellt. Bestehende Geheimnisse müssen mit dem alten Schlüssel lesbar bleiben; neue Verschlüsselungen verwenden ausschließlich den aktuellen Schlüssel. Entfernen Sie den alten Schlüssel erst, wenn keine aktiven Geheimnisse und keine aufzubewahrenden Backups mehr davon abhängen. Eine Rotation ist keine Wiederherstellung nach einer Schlüsselkompromittierung: In diesem Fall sind betroffene Faktoren zurückzusetzen und neu einzurichten.
+
+AC-02 verschlüsselt bestehende Datensätze beim Lesen nicht automatisch neu. Zum vollständigen Ablösen eines alten Schlüssels müssen die betroffenen Konten ihre Faktoren unter dem neuen Schlüssel neu einrichten; eine spätere gesonderte Datenmigration ist ebenfalls möglich, gehört aber nicht zu diesem Schritt. Vor einer weiteren Rotation darf kein aktiver Faktor mehr einen Schlüssel benötigen, der dann aus den zwei konfigurierten Schlüsselplätzen herausfallen würde. Historische Schlüssel für aufzubewahrende Backups bleiben separat archiviert. Geänderte Schlüsseldateien werden erst nach einem Serverneustart geladen.
+
+### Backup und Restore mit 2FA
+
+Die Datenbank-Sicherung enthält die verschlüsselten TOTP-Geheimnisse und die gehashten Wiederherstellungscodes, aber keine Schlüsseldateien. **Ein Restore benötigt denselben zu den gesicherten Geheimnissen passenden `CRAFTCLOUD_SECRET_KEY_FILE` beziehungsweise den passenden alten Schlüssel.** Neu erzeugte Datenbankpasswörter ersetzen diesen Schlüssel nicht. Bewahren Sie die Schlüssel getrennt und geschützt zusammen mit einer Zuordnung zu den Backup-Zeitpunkten auf. Testen Sie nach einem Restore eine Anmeldung mit zweitem Faktor auf einer isolierten Instanz; verwenden Sie keine Produktionscodes in Testlogs. Ein Restore kann den früheren Zustand bereits verwendeter Wiederherstellungscodes zurückbringen; erneuern Sie sie nach einer produktiven Wiederherstellung.
+
+Ein Downgrade auf eine Version ohne AC-02 ist kein unterstützter Rückweg: Alte Server verstehen weder die 2FA-Anmeldepflicht noch das neue Schema. Ein geplanter Rückweg erfordert eine isolierte Wiederherstellung eines passenden früheren Backups und eine ausdrückliche Sicherheitsentscheidung; entfernen Sie nicht bloß Tabellen oder Spalten aus der laufenden Instanz. Weitere Restore-Grenzen stehen im [Backup-Runbook](backup-upgrade-runbook.md).
+
 ## Minimaler MVP-Stack
 
 - `craftcloud-server`: Rust service (axum, siehe ADR-0010), listens only in private network/loopback; runs as non-root.

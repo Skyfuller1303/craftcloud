@@ -14,8 +14,11 @@ import type {
   FileLock,
   FileVersion,
   Invitation,
+  IssuePasswordResetRequest,
+  IssuedPasswordReset,
   LoginRequest,
   LoginResponse,
+  SecondFactorLoginRequest,
   OrgMember,
   OrgRole,
   Organization,
@@ -29,6 +32,9 @@ import type {
   SetupCompleteRequest,
   SetupCompleteResponse,
   SetupStatus,
+  RecoveryCodesResponse,
+  TwoFactorSetup,
+  TwoFactorStatus,
   Upload,
   Workspace,
   WorkspaceMember,
@@ -49,11 +55,19 @@ export const ENDPOINTS = {
   serverInfo: { method: "GET", path: "/info" },
   setupComplete: { method: "POST", path: "/setup/complete" },
   login: { method: "POST", path: "/auth/login" },
+  loginSecondFactor: { method: "POST", path: "/auth/login/second-factor" },
+  twoFactorStatus: { method: "GET", path: "/auth/2fa" },
+  twoFactorSetup: { method: "POST", path: "/auth/2fa/setup" },
+  twoFactorConfirm: { method: "POST", path: "/auth/2fa/confirm" },
+  twoFactorDisable: { method: "POST", path: "/auth/2fa/disable" },
+  regenerateRecoveryCodes: { method: "POST", path: "/auth/2fa/recovery-codes" },
+  issuePasswordReset: { method: "POST", path: "/admin/users/{user_id}/password-reset" },
   session: { method: "GET", path: "/auth/session" },
   listDevices: { method: "GET", path: "/auth/devices" },
   revokeDevice: { method: "DELETE", path: "/auth/devices/{id}" },
   logout: { method: "POST", path: "/auth/logout" },
   listOrganizations: { method: "GET", path: "/organizations" },
+  updateOrganization: { method: "PATCH", path: "/organizations/{org_id}" },
   listWorkspaces: { method: "GET", path: "/organizations/{org_id}/workspaces" },
   acceptInvitation: { method: "POST", path: "/invitations/accept" },
   resetPassword: { method: "POST", path: "/auth/password-reset" },
@@ -256,6 +270,13 @@ export interface ApiClient {
   serverInfo(): Promise<ServerInfo>;
   setupComplete(body: SetupCompleteRequest): Promise<SetupCompleteResponse>;
   login(body: LoginRequest): Promise<LoginResponse>;
+  loginSecondFactor(body: SecondFactorLoginRequest): Promise<LoginResponse>;
+  getTwoFactorStatus(): Promise<TwoFactorStatus>;
+  setupTwoFactor(password: string): Promise<TwoFactorSetup>;
+  confirmTwoFactor(code: string): Promise<RecoveryCodesResponse>;
+  disableTwoFactor(body: { password: string; code?: string; recovery_code?: string }): Promise<void>;
+  regenerateRecoveryCodes(body: { code?: string; recovery_code?: string }): Promise<RecoveryCodesResponse>;
+  issuePasswordReset(userId: string, body: IssuePasswordResetRequest): Promise<IssuedPasswordReset>;
   session(): Promise<SessionInfo>;
   /**
    * Ends the session. The CSRF token is dropped only when the server confirmed
@@ -266,6 +287,7 @@ export interface ApiClient {
   listDevices(): Promise<DeviceSession[]>;
   revokeDevice(id: string): Promise<void>;
   listOrganizations(cursor?: string): Promise<Page<Organization>>;
+  updateOrganizationTwoFactor(orgId: string, organizationVersion: number, required: boolean): Promise<Organization>;
   listWorkspaces(orgId: string, cursor?: string): Promise<Page<Workspace>>;
   acceptInvitation(body: AcceptInvitationRequest): Promise<AcceptedInvitation>;
   resetPassword(body: ResetPasswordRequest): Promise<void>;
@@ -359,6 +381,7 @@ interface CallConfig {
 
 /** Strong entity tags the server derives from the `version` field of a row or a version id. */
 export const etag = {
+  organization: (version: number) => `"org-v${version}"`,
   project: (version: number) => `"prj-v${version}"`,
   grant: (version: number) => `"grant-v${version}"`,
   content: (versionId: string) => `"version:${versionId}"`,
@@ -468,6 +491,18 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       csrfToken = result.csrf_token;
       return result;
     },
+    async loginSecondFactor(body) {
+      const result = await call<LoginResponse>(ENDPOINTS.loginSecondFactor, { body, anonymous: true });
+      csrfToken = result.csrf_token;
+      return result;
+    },
+    getTwoFactorStatus: () => call(ENDPOINTS.twoFactorStatus),
+    setupTwoFactor: (password) => call(ENDPOINTS.twoFactorSetup, { body: { password } }),
+    confirmTwoFactor: (code) => call(ENDPOINTS.twoFactorConfirm, { body: { code } }),
+    disableTwoFactor: (body) => call(ENDPOINTS.twoFactorDisable, { body }),
+    regenerateRecoveryCodes: (body) => call(ENDPOINTS.regenerateRecoveryCodes, { body }),
+    issuePasswordReset: (userId, body) =>
+      call(ENDPOINTS.issuePasswordReset, { params: { user_id: userId }, body }),
     async session() {
       const result = await call<SessionInfo>(ENDPOINTS.session, { anonymous: true });
       csrfToken = result.csrf_token;
@@ -493,6 +528,12 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     revokeDevice: (id) => call(ENDPOINTS.revokeDevice, { params: { id } }),
     listOrganizations: (cursor) =>
       call(ENDPOINTS.listOrganizations, { query: { limit: "100", cursor } }),
+    updateOrganizationTwoFactor: (orgId, version, required) =>
+      call(ENDPOINTS.updateOrganization, {
+        params: { org_id: orgId },
+        body: { require_two_factor: required },
+        headers: { "If-Match": etag.organization(version) },
+      }),
     listWorkspaces: (orgId, cursor) =>
       call(ENDPOINTS.listWorkspaces, {
         params: { org_id: orgId },

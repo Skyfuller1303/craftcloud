@@ -442,3 +442,53 @@
 	Release lock for {name}	Sperre aufheben für {name}
 	Release edit lock	Bearbeitungssperre aufheben
 	Release the edit lock held by {name}?	Die Bearbeitungssperre von {name} aufheben?
+
+# Zwei-Faktor-Anmeldung (AC-02)
+	Two-factor authentication	Zwei-Faktor-Anmeldung
+	Loading two-factor status…	Status der Zwei-Faktor-Anmeldung wird geladen …
+	Use an authenticator app to protect browser and device sign-ins.	Schütze Browser- und Geräteanmeldungen mit einer Authenticator-App.
+	Enabled	Aktiviert
+	Not enabled	Nicht aktiviert
+	{count} recovery codes remain.	Noch {count} Wiederherstellungscodes verfügbar.
+	Two-factor authentication is unavailable because the server secret key is not configured.	Die Zwei-Faktor-Anmeldung ist nicht verfügbar, weil der Serverschlüssel nicht eingerichtet ist.
+	Save these recovery codes now. They will only be shown once.	Speichere diese Wiederherstellungscodes jetzt. Sie werden nur einmal angezeigt.
+	Recovery codes	Wiederherstellungscodes
+	Download recovery codes	Wiederherstellungscodes herunterladen
+	I have saved the codes	Ich habe die Codes gespeichert
+	Current password	Aktuelles Passwort
+	Preparing…	Wird vorbereitet …
+	Set up two-factor authentication	Zwei-Faktor-Anmeldung einrichten
+	Scan this QR code with your authenticator app, or enter the secret manually.	Scanne diesen QR-Code mit deiner Authenticator-App oder gib das Geheimnis manuell ein.
+	Authenticator setup QR code	QR-Code zur Authenticator-Einrichtung
+	Secret	Geheimnis
+	Authentication code	Authentifizierungscode
+	Confirm and show recovery codes	Bestätigen und Wiederherstellungscodes anzeigen
+	Cancel setup	Einrichtung abbrechen
+	Recovery code	Wiederherstellungscode
+	Generate new recovery codes	Neue Wiederherstellungscodes erstellen
+	Use an authentication code	Authentifizierungscode verwenden
+	Use a recovery code	Wiederherstellungscode verwenden
+	Disable two-factor authentication	Zwei-Faktor-Anmeldung deaktivieren
+	Organization policy	Organisationsrichtlinie
+	Select an organization to manage its sign-in policy.	Wähle eine Organisation, um ihre Anmelderichtlinie zu verwalten.
+	Require two-factor authentication for organization access.	Zwei-Faktor-Anmeldung für den Zugriff auf die Organisation verlangen.
+	Set up two-factor authentication on your account before enabling this policy.	Richte die Zwei-Faktor-Anmeldung für dein Konto ein, bevor du diese Richtlinie aktivierst.
+	Make two-factor authentication mandatory	Zwei-Faktor-Anmeldung verpflichtend machen
+	Only organization owners and admins can change this policy.	Nur Organisationsinhaber und Admins können diese Richtlinie ändern.
+	Enter a code from your authenticator app to finish signing in.	Gib zum Abschließen der Anmeldung einen Code aus deiner Authenticator-App ein.
+	The authentication code or recovery code is incorrect.	Der Authentifizierungscode oder Wiederherstellungscode ist falsch.
+	Checking…	Wird geprüft …
+	Verify and log in	Prüfen und anmelden
+	Back to password	Zurück zum Passwort
+	This organization requires two-factor authentication. Set it up to continue here; other organizations remain available.	Diese Organisation verlangt die Zwei-Faktor-Anmeldung. Richte sie hier ein. Andere Organisationen bleiben verfügbar.
+	Open two-factor settings	Einstellungen zur Zwei-Faktor-Anmeldung öffnen
+	Reset account: issue a password reset link for {name}	Konto zurücksetzen: Passwort-Zurücksetzlink für {name} ausstellen
+	Reset account	Konto zurücksetzen
+	Issue account reset link	Link zum Kontozurücksetzen ausstellen
+	Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.	Ein Zurücksetzlink meldet das Konto auf allen Geräten ab. Der Link wird einmal angezeigt und muss sicher weitergegeben werden.
+	Also reset two-factor authentication	Auch die Zwei-Faktor-Anmeldung zurücksetzen
+	Issuing…	Wird ausgestellt …
+	Issue reset link	Zurücksetzlink ausstellen
+	Password reset link	Passwort-Zurücksetzlink
+	Copy this link now. It is shown once and expires at {expires}.	Kopiere diesen Link jetzt. Er wird nur einmal angezeigt und läuft ab: {expires}.
+	One-time reset link	Einmaliger Zurücksetzlink

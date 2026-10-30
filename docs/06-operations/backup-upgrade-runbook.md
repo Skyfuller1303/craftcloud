@@ -8,22 +8,24 @@ Ein Backup ist ein Verzeichnis. Es enthält zusammengehörig:
 
 | Inhalt | Datei | Hinweis |
 | --- | --- | --- |
-| 13 Tabellen der Datenbank (Benutzer, Organisationen, Mitgliedschaften, Workspaces, Einladungen, Instanz-Setup, Projekte, Dateien, Blobs, Upload-Sitzungen, Versionen, Audit-Log) | `tables/<Tabelle>.copy` (PostgreSQL-`COPY`-Textformat) | aus **einem** Snapshot (`REPEATABLE READ`, nur lesend) |
+| Persistente Tabellen laut `crates/craftcloud-backup/src/tables.rs`, einschließlich Freigaben, verschlüsselter TOTP-Geheimnisse und gehashter Wiederherstellungscodes | `tables/<Tabelle>.copy` (PostgreSQL-`COPY`-Textformat) | aus **einem** Snapshot (`REPEATABLE READ`, nur lesend) |
 | die Bytes aller `committed` Blobs | `blobs/<xx>/<Schlüssel>` | jeder Blob wird beim Kopieren gegen Größe und SHA-256 aus der Datenbank geprüft |
 | Blobliste | `blobs.jsonl` | eine Zeile je Blob, aufsteigend nach Schlüssel |
 | Manifest | `manifest.json`, `manifest.sha256` | Format- und Migrationsversion, Serverversion, Zeitpunkt des Snapshots (Recovery-Punkt), je Tabelle Zeilenzahl, Größe, SHA-256, Quell-Speicherkennung; Prüfsumme des Manifests |
 
 **Nicht** im Backup (mit Absicht):
 
-- `sessions`: Nach einem Restore sind **alle Sitzungen ungültig**, alle Personen melden sich neu an. Ein gestohlenes Backup enthält so keine verwendbaren Sitzungen.
+- Browser- und Geräte-Sitzungen, Refresh-Historie, kurzlebige Zwei-Faktor-Challenges und Bearbeitungsleases: Nach einem Restore sind **alle Sitzungen ungültig**, alle Personen melden sich neu an. Ein gestohlenes Backup enthält so keine verwendbaren Sitzungen.
 - `password_reset_tokens`: Einmal-Links; nach dem Restore neue ausstellen (`admin issue-password-reset`).
 - `storage_binding` und `maintenance_runs`: Die wiederhergestellte Instanz bekommt eine **neue Speicherkennung** (Marker-Datei und Datenbankzeile, Epoche 0) und baut ihren Wartungsverlauf neu auf.
 - Blobs, die zum Snapshot nicht `committed` waren (laufende Uploads, `orphaned`, `corrupt`, `deleting`). Eine zum Backupzeitpunkt **laufende Upload-Sitzung** wird beim Restore auf `aborted` gesetzt (ihr Blob auf `orphaned`; die Reservierung bleibt für die Bytes dieser verwaisten Blobs bestehen, bis der nächste Wartungslauf sie einsammelt und freigibt, alle anderen Reservierungen sind 0); der Client lädt neu hoch. Gibt es Versionen, deren Blob nicht `committed` war (zum Beispiel `corrupt`), warnt `backup create` (`unavailable_version_blobs` im Manifest).
-- **Geheimnisse:** Datenbankpasswörter, Bootstrap-Token, Metrik-Token (`.env` und Volume `secrets` des Compose-Stacks), TLS-Zertifikate (`caddy_data`). Der Server hat keinen eigenen Verschlüsselungs- oder Signaturschlüssel, der gesichert werden müsste; Sitzungs- und Reset-Token liegen nur als Hash in der Datenbank. Wer die Compose-Instanz neu aufbaut, erzeugt neue Secrets (`cargo xtask compose-secrets`). `caddy_data` sichern Sie getrennt, sonst drohen Rate-Limits der CA.
+- **Geheimnisse:** Datenbankpasswörter, Bootstrap-Token, Metrik-Token (`.env` und Volume `secrets` des Compose-Stacks), TLS-Zertifikate (`caddy_data`) sowie die Dateien `CRAFTCLOUD_SECRET_KEY_FILE` und `CRAFTCLOUD_SECRET_KEY_OLD_FILE`. Sitzungs- und Reset-Token liegen nur als Hash in der Datenbank. Wer die Compose-Instanz neu aufbaut, erzeugt neue Infrastruktur-Secrets (`cargo xtask compose-secrets`). **Für vorhandene TOTP-Geheimnisse muss dagegen derselbe passende Entschlüsselungsschlüssel wieder bereitgestellt werden.** Bewahren Sie ihn getrennt und geschützt auf; ein neuer zufälliger Schlüssel entschlüsselt das Backup nicht. `caddy_data` sichern Sie getrennt, sonst drohen Rate-Limits der CA.
 
 Das Backup enthält **alles, was ein Datenbankadministrator lesen kann**: Passwort-Hashes (Argon2), E-Mail-Adressen, Namen, das Audit-Log und sämtliche Dateiinhalte im Klartext. Es wird mit Modus `0700` (Verzeichnisse) und `0600` (Dateien) auf unix geschrieben, ist aber **nicht verschlüsselt** (siehe „Off-site-Kopie und Verschlüsselung“). Das Manifest enthält keine Zugangsdaten.
 
 ## Backup erstellen
+
+Bei aktivem 2FA ist die Wiederherstellbarkeit von [Schlüsseldateien und Rotation](deployment.md#backup-und-restore-mit-2fa) Teil jeder Restore-Probe. Nach einem produktiven Restore sind auch Wiederherstellungscodes wieder im Zustand des Backupzeitpunkts; lassen Sie sie neu erzeugen. Ein verlorener Entschlüsselungsschlüssel darf nicht durch Abschalten der Login-Prüfung umgangen werden; der gezielte Operator-Reset verlangt eine erneute Einrichtung.
 
 Voraussetzungen: Datenbank migriert, der Server lief mindestens einmal (Datenbank und Speicherverzeichnis sind aneinander gebunden, siehe „Wartungsjob“ in `deployment.md`), `CRAFTCLOUD_DATABASE_URL_FILE` und `CRAFTCLOUD_STORAGE_DIR` gesetzt. Das Zielverzeichnis darf nicht existieren oder muss leer sein; ein Backup schreibt nie in vorhandene Daten. Ein vorhandenes leeres Verzeichnis wird unter unix auf Modus 0700 gesetzt (es enthält später alles). Scheitert ein Backup, werden die von ihm geschriebenen Einträge entfernt: ein neu angelegtes Verzeichnis ganz, ein vorhandenes leeres bleibt leer bestehen.
 
