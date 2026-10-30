@@ -3,6 +3,8 @@
 > **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P5 (Collaboration / Launcher). **Priorität:** später / nur nach Gate.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+> **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-07; der Launcher darf jetzt ein eigenes Konto mit Anmeldung per E-Mail und Passwort halten, gibt aber keine Tokens an Apps weiter).
+
 ## Problem und Nutzen
 
 Launcher bleibt App-Übersicht zuerst, ohne Login-Schranke. Später kann eine **optionale** Verbindungsverwaltung in Einstellungen integriert werden: CraftCloud-Server auswählen, Status prüfen und ggf. zur Browser-Anmeldung führen. Keine Veränderung des Install-/Update-Pfads, kein ungeprüfter Remote-Build-Download, kein React/TS innerhalb des Launchers.

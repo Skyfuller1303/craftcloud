@@ -3,6 +3,8 @@
 > **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P5 (Collaboration / Launcher). **Priorität:** später / nur nach Gate.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+> **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-06).
+
 ## Problem und Nutzen
 
 `figcraft-server` ist ein eigenständiger live-edit WebSocket-Server mit persistenten Dateien, Revocable Share Links und Token/Owner-Key-Modell. CraftCloud soll dessen Design nicht neu erfinden und vor allem nicht vorgeben, bereits Nutzerberechtigungen im FigCraft-Protokoll zu besitzen. Adapter verbindet langfristig Workspace-ACL und FigCraft-Session-Lifecycle nach expliziter Zustimmung der FigCraft-Maintainer.

@@ -33,6 +33,7 @@ Die `docs/`-Schreibweise ist bewusst **lowercase**, entsprechend den sichtbaren 
 ### 02-architecture
 
 - [Admin-UI-Designsystem](11-design/README.md)
+- [App-Cloud: Craft-Apps, Freigaben, FigCraft-Live, Launcher-Konto, 2FA](12-app-cloud/README.md)
 - [Api Conventions](02-architecture/api-conventions.md)
 - [Domain Model](02-architecture/domain-model.md)
 - [Reliability And Operating Model](02-architecture/reliability-and-operating-model.md)

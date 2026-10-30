@@ -3,6 +3,8 @@
 > **Status:** Policy-Engine und Org-Rollen lokal umgesetzt (PR-006, Review offen): reine Funktion `can(actor, action, resource)`, Actor pro Request frisch aus der Datenbank, Tabellentests, Scope nur aus `Allow`-Permit. Letzter-Owner-Regel zählt nur aktivierte Owner (Break-glass-CLI `admin set-org-owner`). Workspace-Aktionen sind in der Policy hinterlegt, ihre Routen kommen mit PR-007; Audit-Speicher folgt mit CC-F11 (bis dahin strukturierte `audit`-Logereignisse). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+> **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-03 Freigaben an Personen, Gastrolle und Bearbeitungssperre).
+
 ## Problem und Nutzen
 
 Zentrales Berechtigungsmodell mit Instanzadmin als Operator, Org-Owner, Org-Admin, Workspace-Admin, Editor, Viewer. Rollen sind **Scopes**, nicht globale Strings, und werden innerhalb der Autorisierungsservice-Schicht geprüft. Kein freies Merge von mehreren Rollen ohne definierten Vorrang. Alle Daten-APIs filtern schon in DB-Anfragen nach Tenant und erlaubtem Projekt.

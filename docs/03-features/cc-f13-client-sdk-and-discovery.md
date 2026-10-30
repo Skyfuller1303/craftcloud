@@ -3,6 +3,8 @@
 > **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P4 (Client SDK / first app). **Priorität:** später / nur nach Gate.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+> **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-04, AC-05).
+
 ## Problem und Nutzen
 
 Craft-Apps erhalten einen kleinen Rust-Client mit Discovery, authentifizierten Requests, Workspaces/Files, Upload-Resume, CAS-Speichern, Timeout, Cancel und verständlichen Fehlertypen. SDK darf App-Modelle nicht enthalten und keine globale Cloudpflicht erzeugen. Base URL ist vom Nutzer/Unternehmen konfiguriert und wird nach URL/Origin-/TLS-Policy validiert.

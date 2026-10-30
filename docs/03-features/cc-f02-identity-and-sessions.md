@@ -3,6 +3,8 @@
 > **Status:** Umsetzung lokal vorhanden (PR-005, Review offen): Login/Logout, serverseitige Cookie-Sitzungen mit CSRF- und Origin-Prüfung, Rate-Limiting, Passwortänderung, Reset-Links (Operator-API und Offline-CLI). Geräteliste (`GET /auth/sessions`, `DELETE /auth/sessions/{id}`) vorhanden. Offen: Konto-Deaktivierung per API (PR-006), Einladungen (PR-007), Policy-Anbindung (PR-006). Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P1 (Backend Foundations). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
+> **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-01 Geräte-Sitzungen, AC-02 Zwei-Faktor-Anmeldung).
+
 ## Problem und Nutzen
 
 Lokales Benutzerkonto für CraftCloud Web-Admin; unabhängig vom optional späteren ArtCraft-Hosted-Account. E-Mail normalisieren, Passwort-Hashes mit Argon2id und wartbaren Parametern, Login-Versuch pro Account/IP begrenzen. Account-Status active/disabled, Passwortwechsel, Logout an allen Geräten, Session-Timeout und eindeutige Revokation.

@@ -3,6 +3,8 @@
 > **Code:** P5. **Goal:** Integrate with existing ecosystem rather than duplicating.  
 > **Status:** geplant / offen, keine abgeschlossenen Arbeiten behauptet.
 
+> **Neuplanung 2026-10-30:** Die Tickets dieser Phase werden über die Briefings in [docs/12-app-cloud](../12-app-cloud/README.md) umgesetzt (AC-03, AC-06, AC-07). Die Exit-Gates unten gelten weiter.
+
 ## Eintrittsvoraussetzungen
 
 Vorherige Phasen-Gates sind nachweislich erfüllt; Owner, Testumgebung, CI und Migrationsstrategie stehen fest. Keine Abkürzung bei Threat Review oder API-Vertrag.
