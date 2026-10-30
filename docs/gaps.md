@@ -34,3 +34,16 @@ None of these are implemented by this blueprint. Update this list in the same PR
 - Open after PR-020 (CC-P03-09 part 1, findings SR-01 to SR-04 fixed): (a) the bytes of an aborted or expired `stored` upload keep counting against the quota until the garbage collection claims the blob (upload TTL plus one hour after the blob was created, plus the maintenance interval), so an honest client that aborts a stored upload cannot reuse that quota for about a day; an immediate crash-safe delete on abort would shorten this. (b) The reservation of an orphaned blob is released when the garbage collection claims it, just before the object is deleted; if the deletion keeps failing (for example an open handle on Windows) the blob stays `deleting` and its bytes are no longer counted. (c) A disabled account or a revoked session is only detected when the upload stream ends, not during it; the existing idle timeout, rate floor and session expiry still bound a running stream, and nothing is stored. (d) The external operator setup test of CC-P03-09 is still open.
 
 - Einladungsbereinigung (künftig): Einladungen, aus denen ein Konto entstand, sind über `users.created_via_invitation_id` (ON DELETE RESTRICT) referenziert; eine Bereinigung muss sie überspringen oder der Schlüssel wird auf `ON DELETE SET NULL` umgestellt.
+
+- Offen nach der Integration von AC-02, AC-04 und OPS-01 (2026-10-30):
+  - Der native SDK-Transport (ureq 3.4) hat keinen Leerlauf-Timeout pro Lesevorgang; Übertragungen enden erst nach einem größenabhängigen Gesamtbudget (30 s plus Größe bei 32 KiB/s). Ein echter Leerlauf-Timeout braucht einen eigenen Connector.
+  - Die prozessübergreifende Refresh-Sperre greift nur, wenn die App `BoundKeychainTokenStore::with_lock_dir` setzt; ohne sie werden nur Clients im selben Prozess serialisiert. AC-05 und AC-07 müssen das setzen.
+  - Verwaltungsrouten für 2FA (Deaktivieren, Codes neu erzeugen, Bestätigen) zählen nicht zur dauerhaften Grenze von 100 Fehlversuchen; sie haben ein eigenes Budget pro Prozess.
+  - Wer das Passwort kennt, kann den zweiten Faktor eines Kontos absichtlich sperren, bis ein Operator ihn zurücksetzt (nach NIST SP 800-63B hingenommen, im Threat Model dokumentiert).
+  - Eigene `Translator`-Implementierungen der egui-Crate müssen `Text::SecondFactorHint` abdecken.
+  - Schlüsselrotation für 2FA (`CRAFTCLOUD_SECRET_KEY_OLD_FILE`) wird weder von der Compose-Vorlage noch vom Installer bereitgestellt; derzeit eine Betreiberaufgabe mit eigenem Compose-Overlay.
+  - Der 2FA-Schlüssel ist nicht im Backup; Aufbewahrung beim Betreiber und Restore mit demselben Schlüssel sind dokumentiert, aber noch nicht auf einer echten VM durchgespielt.
+  - Bestehende Entwicklungs-`.env` ohne `CC_SECRET_TWO_FACTOR_KEY` lassen `secrets-init` abbrechen; Wert per `cargo xtask compose-secrets` neu erzeugen oder von Hand ergänzen.
+  - Nach SIGKILL zurückgebliebene `releases/.tmp-*`-Verzeichnisse werden erst beim nächsten Staging derselben Version entfernt.
+  - `cargo xtask db-test` bricht beim ersten fehlschlagenden Testbinary ab (kein `--no-fail-fast`), spätere Binaries laufen dann nicht.
+  - Der Webtest `activity.test.tsx` („is reachable and operable by keyboard“) schlug einmal unter Last fehl und lief bei Wiederholung durch; möglicher Flake.
