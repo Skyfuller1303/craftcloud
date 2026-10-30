@@ -24,6 +24,7 @@ mod locks;
 pub mod maintenance;
 mod observe;
 mod orgs;
+mod overview;
 mod pagination;
 mod projects;
 mod ratelimit;
@@ -167,6 +168,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/uploads/{upload_id}", &["GET", "DELETE"]),
     ("/api/v1/uploads/{upload_id}/content", &["PUT"]),
     ("/api/v1/organizations/{org_id}/usage", &["GET"]),
+    ("/api/v1/organizations/{org_id}/overview", &["GET"]),
     ("/api/v1/workspaces/{workspace_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations/{org_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations", &["GET"]),
@@ -198,6 +200,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/auth/devices", &["GET"]),
     ("/api/v1/auth/devices/{id}", &["DELETE"]),
     ("/api/v1/auth/session", &["GET"]),
+    ("/api/v1/auth/profile", &["PATCH"]),
     ("/api/v1/auth/sessions", &["GET"]),
     ("/api/v1/auth/sessions/{session_id}", &["DELETE"]),
     ("/api/v1/auth/logout", &["POST"]),
@@ -385,6 +388,10 @@ pub fn router_with_shared(
             get(uploads::get_usage),
         )
         .route(
+            "/api/v1/organizations/{org_id}/overview",
+            get(overview::get_overview),
+        )
+        .route(
             "/api/v1/workspaces/{workspace_id}/quota",
             put(uploads::set_workspace_quota),
         )
@@ -448,6 +455,7 @@ pub fn router_with_shared(
         .route("/api/v1/auth/devices", get(device::list))
         .route("/api/v1/auth/devices/{id}", delete(device::revoke))
         .route("/api/v1/auth/session", get(auth::session))
+        .route("/api/v1/auth/profile", patch(auth::update_profile))
         .route("/api/v1/auth/sessions", get(auth::list_sessions))
         .route(
             "/api/v1/auth/sessions/{session_id}",

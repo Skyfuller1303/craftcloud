@@ -25,6 +25,7 @@ import type {
   OrgMember,
   OrganizationGrant,
   OrganizationLock,
+  OrganizationOverview,
   OrganizationUsage,
   OrgRole,
   Organization,
@@ -69,6 +70,8 @@ export const ENDPOINTS = {
   regenerateRecoveryCodes: { method: "POST", path: "/auth/2fa/recovery-codes" },
   issuePasswordReset: { method: "POST", path: "/admin/users/{user_id}/password-reset" },
   session: { method: "GET", path: "/auth/session" },
+  updateProfile: { method: "PATCH", path: "/auth/profile" },
+  orgOverview: { method: "GET", path: "/organizations/{org_id}/overview" },
   listDevices: { method: "GET", path: "/auth/devices" },
   revokeDevice: { method: "DELETE", path: "/auth/devices/{id}" },
   logout: { method: "POST", path: "/auth/logout" },
@@ -297,6 +300,10 @@ export interface ApiClient {
   regenerateRecoveryCodes(body: { code?: string; recovery_code?: string }): Promise<RecoveryCodesResponse>;
   issuePasswordReset(userId: string, body: IssuePasswordResetRequest): Promise<IssuedPasswordReset>;
   session(): Promise<SessionInfo>;
+  /** Changes the own display name (AC-08b); answers like `session()`. */
+  updateProfile(displayName: string): Promise<SessionInfo>;
+  /** Aggregate counts of an organization (owner and admin only). */
+  getOrganizationOverview(orgId: string): Promise<OrganizationOverview>;
   /**
    * Ends the session. The CSRF token is dropped only when the server confirmed
    * it (success or 401); on any other failure the promise rejects and the token
@@ -542,6 +549,8 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       csrfToken = result.csrf_token;
       return result;
     },
+    updateProfile: (displayName) => call(ENDPOINTS.updateProfile, { body: { display_name: displayName } }),
+    getOrganizationOverview: (orgId) => call(ENDPOINTS.orgOverview, { params: { org_id: orgId } }),
     async logout() {
       try {
         await call<void>(ENDPOINTS.logout, { anonymous: true });

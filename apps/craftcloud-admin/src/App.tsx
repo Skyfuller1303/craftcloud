@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { lazy, useState } from "react";
 import { Button } from "react-aria-components";
 import { describeError } from "./api/errors.ts";
 import type { ApiClient } from "./api/client.ts";
@@ -13,7 +13,11 @@ import { InviteScreen } from "./screens/InviteScreen.tsx";
 import { LoginScreen } from "./screens/LoginScreen.tsx";
 import { ResetPasswordScreen } from "./screens/ResetPasswordScreen.tsx";
 import { SetupScreen } from "./screens/SetupScreen.tsx";
-import { Shell } from "./screens/Shell.tsx";
+import { ScreenBoundary } from "./components/ScreenBoundary.tsx";
+
+// The signed-in dashboard is loaded on demand; login, setup and the token
+// screens stay in the entry chunk.
+const Shell = lazy(() => import("./screens/Shell.tsx").then((m) => ({ default: m.Shell })));
 
 const INVITE_PATH = /\/invite\/?$/;
 const RESET_PATH = /\/reset-password\/?$/;
@@ -158,13 +162,15 @@ function Screens({
     content = <LoginScreen notice={loginNotice} invitePending={inviteToken !== null} />;
   } else {
     content = (
-      <Shell
-        session={state.session}
-        notice={shellNotice}
-        preferredOrganizationId={joinedOrganization}
-        theme={theme}
-        onThemeChange={changeTheme}
-      />
+      <ScreenBoundary>
+        <Shell
+          session={state.session}
+          notice={shellNotice}
+          preferredOrganizationId={joinedOrganization}
+          theme={theme}
+          onThemeChange={changeTheme}
+        />
+      </ScreenBoundary>
     );
   }
 

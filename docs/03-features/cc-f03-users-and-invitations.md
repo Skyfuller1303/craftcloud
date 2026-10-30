@@ -7,6 +7,10 @@
 
 AC-08 ergänzt den Organisations-Ownern und -Admins vorbehaltenen Verwaltungsmodus der Personenliste: Rollen-, Status- und 2FA-Filter, Sortierung und Cursor-Paginierung. Einzelne Rollenänderungen, Entfernen und Einladungen bleiben bestehende API-Operationen; die Konsole zeigt Ergebnisse je Person und unterstützt höchstens 50 eingefügte Einladungsadressen pro Durchgang. Die gewöhnliche Mitgliedersuche für Freigaben erhält dadurch keine zusätzlichen Kontosicherheitsdaten. Entscheidungen und Prüfstatus: [ADR-0024](../09-decisions/adr-0024-admin-console.md) und AC-08-Abnahmebericht.
 
+## AC-08b: Anzeigename und E-Mail-Adresse
+
+Personen ändern ihren Anzeigenamen selbst über `PATCH /auth/profile` (siehe CC-F02) und im Webpanel unter Einstellungen > Profil. Die E-Mail-Adresse bleibt Operator-Sache, bis der Server E-Mails versenden und eine neue Adresse bestätigen kann; das Webpanel zeigt sie schreibgeschützt mit Hinweis.
+
 ## Problem und Nutzen
 
 Organisationsadministrator lädt Nutzer per E-Mail zu einer Organisation oder konkret zu einem Workspace ein. Externe E-Mail-Sendeinfrastruktur ist optional; MVP kann einen einmalig kopierbaren Invite-Link bereitstellen, wenn Mailserver nicht konfiguriert ist. Mitgliedsstatus invited/active/disabled und sichtbare Einladungsübersicht im Adminpanel.

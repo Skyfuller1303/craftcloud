@@ -269,6 +269,8 @@ pub enum Action {
     OrganizationGrantList,
     /// List organization file locks, including workspace-admin scope.
     OrganizationLockList,
+    /// Read the aggregate overview (counts, storage, activity) of an organization.
+    OrganizationOverviewRead,
     /// Create a grant.
     GrantCreate,
     /// Change a grant role or revoke a grant.
@@ -318,6 +320,7 @@ impl Action {
             | Self::GrantList
             | Self::OrganizationGrantList
             | Self::OrganizationLockList
+            | Self::OrganizationOverviewRead
             | Self::SharedWithMe
             | Self::MemberSearch => false,
             Self::OrganizationUpdate
@@ -362,7 +365,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 67] = [
+    pub const ALL: [Action; 68] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -423,6 +426,7 @@ impl Action {
         Action::GrantList,
         Action::OrganizationGrantList,
         Action::OrganizationLockList,
+        Action::OrganizationOverviewRead,
         Action::GrantCreate,
         Action::GrantChange,
         Action::SharedWithMe,
@@ -697,13 +701,14 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             Some(_) => allow(action, Some(*org_id)),
             None => Decision::Hidden,
         },
-        (A::OrganizationGrantList | A::OrganizationLockList, Resource::Organization { org_id }) => {
-            match role_in(actor, *org_id) {
-                Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-                Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
-                None => Decision::Hidden,
-            }
-        }
+        (
+            A::OrganizationGrantList | A::OrganizationLockList | A::OrganizationOverviewRead,
+            Resource::Organization { org_id },
+        ) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+            Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
+            None => Decision::Hidden,
+        },
         (A::OrganizationUpdate, Resource::Organization { org_id }) => {
             match role_in(actor, *org_id) {
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
@@ -1368,6 +1373,34 @@ mod tests {
     fn organization_read_and_update() {
         check(Action::OrganizationRead, org(), [H, Y, Y, Y]);
         check(Action::OrganizationUpdate, org(), [H, F, Y, Y]);
+        // The overview is owner/admin only; a workspace admin is still a plain
+        // organization member, a guest sees nothing, and the operator flag
+        // grants no organization data.
+        check(Action::OrganizationOverviewRead, org(), [H, F, Y, Y]);
+        assert_eq!(
+            outcome(can(
+                &actor(Some(OrgRole::Guest), false),
+                Action::OrganizationOverviewRead,
+                &org()
+            )),
+            F
+        );
+        assert_eq!(
+            outcome(can(
+                &with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Admin),
+                Action::OrganizationOverviewRead,
+                &org()
+            )),
+            F
+        );
+        assert_eq!(
+            outcome(can(
+                &actor(Some(OrgRole::Owner), false),
+                Action::OrganizationOverviewRead,
+                &Resource::Organization { org_id: OTHER_ORG }
+            )),
+            H
+        );
         check(
             Action::OrganizationTwoFactorPolicyUpdate,
             org(),
@@ -1850,6 +1883,7 @@ mod tests {
             Action::GrantList,
             Action::OrganizationGrantList,
             Action::OrganizationLockList,
+            Action::OrganizationOverviewRead,
             Action::GrantCreate,
             Action::GrantChange,
             Action::SharedWithMe,
@@ -1923,6 +1957,7 @@ mod tests {
                 | Action::GrantList
                 | Action::OrganizationGrantList
                 | Action::OrganizationLockList
+                | Action::OrganizationOverviewRead
                 | Action::GrantCreate
                 | Action::GrantChange
                 | Action::SharedWithMe
@@ -1972,6 +2007,7 @@ mod tests {
                 Action::GrantList,
                 Action::OrganizationGrantList,
                 Action::OrganizationLockList,
+                Action::OrganizationOverviewRead,
                 Action::SharedWithMe,
                 Action::MemberSearch,
             ]

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "react-aria-components";
 import type { Organization, Project, ServerInfo, SessionInfo, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
@@ -12,15 +12,26 @@ import { useI18n } from "../i18n/index.tsx";
 import { useRoleNames } from "../roles.ts";
 import type { ThemeChoice } from "../preferences.ts";
 import { usePagedList } from "../usePagedList.ts";
-import { ActivityScreen } from "./ActivityScreen.tsx";
-import { FilesScreen } from "./FilesScreen.tsx";
-import { InvitationsScreen } from "./InvitationsScreen.tsx";
-import { MembersScreen } from "./MembersScreen.tsx";
-import { ProjectsScreen } from "./ProjectsScreen.tsx";
-import { SystemScreen } from "./SystemScreen.tsx";
-import { SharedWithMeScreen } from "./SharedWithMeScreen.tsx";
-import { TwoFactorSettingsScreen } from "./TwoFactorSettingsScreen.tsx";
-import { AdminGrantsScreen, AdminLocksScreen, AdminOperatorScreen, AdminOverview, AdminPeopleScreen, AdminWorkspacesScreen } from "./AdminScreens.tsx";
+import { ScreenBoundary } from "../components/ScreenBoundary.tsx";
+import { ProfileSection } from "./ProfileSection.tsx";
+
+// Every screen is its own chunk, loaded on first use, so the first paint only
+// needs the shell (code splitting; the strict CSP forbids inline code, and a
+// chunk is a plain same-origin script).
+const ActivityScreen = lazy(() => import("./ActivityScreen.tsx").then((m) => ({ default: m.ActivityScreen })));
+const FilesScreen = lazy(() => import("./FilesScreen.tsx").then((m) => ({ default: m.FilesScreen })));
+const InvitationsScreen = lazy(() => import("./InvitationsScreen.tsx").then((m) => ({ default: m.InvitationsScreen })));
+const MembersScreen = lazy(() => import("./MembersScreen.tsx").then((m) => ({ default: m.MembersScreen })));
+const ProjectsScreen = lazy(() => import("./ProjectsScreen.tsx").then((m) => ({ default: m.ProjectsScreen })));
+const SystemScreen = lazy(() => import("./SystemScreen.tsx").then((m) => ({ default: m.SystemScreen })));
+const SharedWithMeScreen = lazy(() => import("./SharedWithMeScreen.tsx").then((m) => ({ default: m.SharedWithMeScreen })));
+const TwoFactorSettingsScreen = lazy(() => import("./TwoFactorSettingsScreen.tsx").then((m) => ({ default: m.TwoFactorSettingsScreen })));
+const AdminGrantsScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminGrantsScreen })));
+const AdminLocksScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminLocksScreen })));
+const AdminOperatorScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminOperatorScreen })));
+const AdminOverview = lazy(() => import("./OverviewScreen.tsx").then((m) => ({ default: m.AdminOverview })));
+const AdminPeopleScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminPeopleScreen })));
+const AdminWorkspacesScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminWorkspacesScreen })));
 
 /**
  * Dashboard sections. Settings follows with a later ticket and stays a
@@ -245,11 +256,13 @@ export function Shell({
       setSection("shared");
     }
   }, [isGuest, isOperator, section]);
+  const sharingEnabled = serverInfo?.features.includes("sharing.grants") === true;
   const visibleContentSections = CONTENT_SECTIONS.filter((key) =>
     key === "overview"
-      ? !orgAdmin
+      // A guest has nothing to see on the account overview: "Shared with me" is the home page.
+      ? !orgAdmin && !(isGuest && sharingEnabled && !isOperator)
       : key === "shared"
-      ? serverInfo?.features.includes("sharing.grants") === true
+      ? sharingEnabled
       : key === "members"
         ? workspace !== null
         : key === "invitations"
@@ -269,9 +282,9 @@ export function Shell({
     if (workspaceId !== null && !workspaceRouteResolved) return;
     if (organizations.status === "ready" && organizationId !== null && organization === null) return;
     if (organizations.status === "ready" && !validSection) {
-      setSection(isOperator ? "instance-organizations" : "overview");
+      setSection(isOperator ? "instance-organizations" : isGuest && sharingEnabled ? "shared" : "overview");
     }
-  }, [validSection, isOperator, organizations.status, organizationId, organization]);
+  }, [validSection, isOperator, isGuest, sharingEnabled, organizations.status, organizationId, organization]);
 
   return (
     <div className="shell">
@@ -430,6 +443,7 @@ export function Shell({
             </Button>
           )}
 
+          <ScreenBoundary>
           {section === "admin-overview" ? (
             <AdminOverview key={organizationId} organization={orgAdmin ? organization : null} workspaces={workspaces.items} />
           ) : section === "admin-people" ? (
@@ -499,13 +513,16 @@ export function Shell({
               workspaces={workspaces.items}
             />
           ) : section === "settings" ? (
-            <TwoFactorSettingsScreen
-              organization={organization}
-              onFactorChanged={refreshTwoFactor}
-              onOrganizationUpdated={(updated) => {
-                organizations.mutate((items) => items.map((item) => item.id === updated.id ? updated : item));
-              }}
-            />
+            <div className="stack">
+              <ProfileSection session={session} />
+              <TwoFactorSettingsScreen
+                organization={organization}
+                onFactorChanged={refreshTwoFactor}
+                onOrganizationUpdated={(updated) => {
+                  organizations.mutate((items) => items.map((item) => item.id === updated.id ? updated : item));
+                }}
+              />
+            </div>
           ) : section === "system" ? (
             <>
               <SystemScreen isOperator={isOperator} />
@@ -515,10 +532,11 @@ export function Shell({
               </section>}
             </>
           ) : section === "shared" ? (
-            <SharedWithMeScreen organizationId={organizationId} />
+            <SharedWithMeScreen organizationId={organizationId} hideWorkspace={isGuest} />
           ) : (
             <EmptyState>{t("This view is not available yet.")}</EmptyState>
           )}
+          </ScreenBoundary>
         </main>
       </div>
     </div>

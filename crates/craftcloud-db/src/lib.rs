@@ -25,6 +25,7 @@ pub mod maintenance;
 pub mod members;
 pub mod migrate;
 pub mod organizations;
+pub mod overview;
 pub mod password_reset;
 mod pool;
 pub mod projects;

@@ -30,6 +30,8 @@ interface AuthValue {
    * `authenticated`, so the caller can show the error and offer a retry.
    */
   logout: () => Promise<void>;
+  /** Replaces the signed-in session data, for example after a profile change. */
+  replaceSession: (session: SessionInfo) => void;
 }
 
 const AuthContext = createContext<AuthValue | null>(null);
@@ -88,7 +90,14 @@ export function AuthProvider({
     setState({ phase: "anonymous", sessionEnded: false });
   }, [api]);
 
-  const value = useMemo(() => ({ state, api, refresh, logout }), [state, api, refresh, logout]);
+  const replaceSession = useCallback((session: SessionInfo) => {
+    setState((current) => (current.phase === "authenticated" ? { phase: "authenticated", session } : current));
+  }, []);
+
+  const value = useMemo(
+    () => ({ state, api, refresh, logout, replaceSession }),
+    [state, api, refresh, logout, replaceSession],
+  );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 

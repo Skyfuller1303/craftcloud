@@ -501,7 +501,6 @@
 	Storage used	Belegter Speicher
 	Active locks	Aktive Sperren
 	Two-factor coverage	Abdeckung der Zwei-Faktor-Anmeldung
-	Some totals are incomplete because the listing limit was reached.	Einige Summen sind unvollständig, weil das Listenlimit erreicht wurde.
 	Workspace storage	Workspace-Speicher
 	Used	Belegt
 	Recent activity	Letzte Aktivität
@@ -605,3 +604,25 @@
 	Quota unavailable	Kontingent nicht verfügbar
 	Since	Seit
 	Account	Konto
+
+# Profile and organization overview (AC-08b)
+	Profile	Profil
+	Display name	Anzeigename
+	Save display name	Anzeigenamen speichern
+	Profile saved.	Profil gespeichert.
+	Shown to other people in members lists, locks and activity.	Wird anderen Personen in Mitgliederlisten, Sperren und Aktivitäten angezeigt.
+	Enter a name of 1 to 100 characters without control characters.	Gib einen Namen mit 1 bis 100 Zeichen ohne Steuerzeichen ein.
+	Your e-mail address can only be changed by an instance operator for now.	Deine E-Mail-Adresse kann vorerst nur von einer Instanz-Betreiberin oder einem Instanz-Betreiber geändert werden.
+	Account security	Kontosicherheit
+	Active grants	Aktive Freigaben
+	Activity trend	Aktivitätsverlauf
+	Activity in the last 30 days	Aktivität in den letzten 30 Tagen
+	No activity in the last 30 days.	Keine Aktivität in den letzten 30 Tagen.
+	{total} events in the last 30 days. Busiest day: {date} with {count}.	{total} Ereignisse in den letzten 30 Tagen. Aktivster Tag: {date} mit {count}.
+	Peak: {count} per day	Spitze: {count} pro Tag
+	Show data as table	Daten als Tabelle anzeigen
+	Date	Datum
+	Members by role	Mitglieder nach Rolle
+	Members by status	Mitglieder nach Status
+	No workspaces yet.	Noch keine Workspaces.
+	Updated {time}	Aktualisiert {time}

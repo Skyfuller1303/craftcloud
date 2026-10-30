@@ -20,7 +20,7 @@ use craftcloud_auth::{
     OpaqueToken, PASSWORD_RESET_TTL, hash_password, needs_rehash, validate_password,
     verify_or_dummy,
 };
-use craftcloud_core::NormalizedEmail;
+use craftcloud_core::{DisplayName, NormalizedEmail};
 use craftcloud_db::audit::{AggScope, AuditResult, NewEvent};
 use craftcloud_db::password_reset::IssueOutcome;
 use craftcloud_db::{DbError, accounts, device_sessions, password_reset, sessions};
@@ -69,6 +69,13 @@ impl Drop for ChangePasswordRequest {
         self.current_password.zeroize();
         self.new_password.zeroize();
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateProfileRequest {
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -432,10 +439,18 @@ pub(crate) async fn session(
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
     };
+    session_response(&services, &headers, &session).await
+}
+
+async fn session_response(
+    services: &Services,
+    headers: &HeaderMap,
+    session: &AuthenticatedSession,
+) -> Response {
     let account = match accounts::get(&services.pool, session.user_id).await {
         Ok(Some(account)) => account,
-        Ok(None) => return invalid_credentials(&headers),
-        Err(error) => return db_failure(&error, &headers, "account lookup failed"),
+        Ok(None) => return invalid_credentials(headers),
+        Err(error) => return db_failure(&error, headers, "account lookup failed"),
     };
     Json(json!({
         "user_id": account.id.to_string(),
@@ -447,6 +462,43 @@ pub(crate) async fn session(
         "expires_at": rfc3339(session.expires_at),
     }))
     .into_response()
+}
+
+// ---- PATCH /auth/profile ---------------------------------------------------
+
+/// Changes the display name of the calling account (cookie session with CSRF
+/// token or device bearer). Only the caller's own account is addressed, so no
+/// resource policy applies; the e-mail address stays operator-managed. The
+/// audit event `auth.profile_updated` never contains the name.
+pub(crate) async fn update_profile(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    body: Result<Json<UpdateProfileRequest>, JsonRejection>,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => return rejection_response(&rejection, &headers),
+    };
+    let Some(Ok(name)) = request.display_name.as_deref().map(DisplayName::parse) else {
+        return validation_failed(&["display_name"], &headers);
+    };
+    match accounts::update_display_name_audited(
+        &services.pool,
+        session.user_id,
+        name.as_str(),
+        &audit_ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return invalid_credentials(&headers),
+        Err(error) => return db_failure(&error, &headers, "profile update failed"),
+    }
+    session_response(&services, &headers, &session).await
 }
 
 // ---- GET /auth/sessions, DELETE /auth/sessions/{id} -----------------------

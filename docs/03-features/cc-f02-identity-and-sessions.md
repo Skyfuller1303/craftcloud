@@ -15,6 +15,10 @@ Der Ausbau folgt [AC-02](../12-app-cloud/ac-02-two-factor.md) und [ADR-0019](../
 
 Die Instanzkonsole ergänzt die operatorgeschützte Liste und den Einzelwiderruf fremder Geräte. Die Antwort enthält eine opaque Verwaltungsreferenz und keine interne Sitzungs-ID; Organisationsadmins erhalten keine fremden Gerätenamen. Ein Widerruf entfernt atomar die Sitzungssperren und wird mit dem Operator als Akteur auditiert. Die persönliche Geräteliste bleibt unverändert. Siehe [ADR-0024](../09-decisions/adr-0024-admin-console.md); Prüfbelege stehen im AC-08-Abnahmebericht.
 
+## AC-08b: Eigenes Profil
+
+`PATCH /auth/profile` ändert den eigenen Anzeigenamen (Cookie-Sitzung mit CSRF-Token oder Geräte-Bearer-Token; zugeschnitten, 1 bis 100 Zeichen, keine Steuer- oder unsichtbaren Formatzeichen; Fehler `422` mit Feld `display_name`) und antwortet wie `GET /auth/session`. Das Audit-Ereignis `auth.profile_updated` enthält den Namen nicht. Die E-Mail-Adresse ist nicht selbst änderbar: Eine Änderung bleibt bis zu einem E-Mail-Versand (Bestätigung der neuen, Benachrichtigung der alten Adresse) dem Instanz-Operator vorbehalten. Siehe [ADR-0024](../09-decisions/adr-0024-admin-console.md).
+
 ## Problem und Nutzen
 
 Lokales Benutzerkonto für CraftCloud Web-Admin; unabhängig vom optional späteren ArtCraft-Hosted-Account. E-Mail normalisieren, Passwort-Hashes mit Argon2id und wartbaren Parametern, Login-Versuch pro Account/IP begrenzen. Account-Status active/disabled, Passwortwechsel, Logout an allen Geräten, Session-Timeout und eindeutige Revokation.

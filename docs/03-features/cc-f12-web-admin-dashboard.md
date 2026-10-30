@@ -9,6 +9,10 @@ Gestaltung: verbindlich nach [Admin-UI-Designsystem](../11-design/README.md).
 
 AC-08 ergänzt lokal eine Organisationsverwaltung mit Übersicht, gefilterter Personenliste, einzeln ausgeführten Mehrfachaktionen, Einladungslisten, Personendetails, Workspaces, Freigaben, Sperren, Aktivität und Einstellungen. Der getrennte Instanzbereich bündelt Organisationen, Konten einschließlich Gerätewiderruf und Systemzustand. Workspace-Admins sehen ausschließlich Freigaben und Sperren ihrer eigenen Admin-Workspaces; Organisationsrechte vermitteln keinen Zugriff auf kontoweite Geräte. Die neuen Verträge und Sicherheitsgrenzen stehen in [ADR-0024](../09-decisions/adr-0024-admin-console.md) und der [Berechtigungsmatrix](../05-security/permission-matrix.md). Verifizierter Prüfstand und verbleibende Einschränkungen stehen im AC-08-Abnahmebericht; es wurde nichts veröffentlicht.
 
+## AC-08b: Feinschliff des Webpanels
+
+Das Webpanel lädt Bildschirme per Codeaufteilung nach (kein Baustein über 500 kB, strenge CSP unverändert). Die Organisationsübersicht nutzt `GET /organizations/{id}/overview` (Zähler in SQL, Aktivitätsverlauf der letzten 30 UTC-Tage als SVG-Balkendiagramm mit Datentabelle) statt bis zu 100 Seiten je Liste abzurufen. Unter Einstellungen gibt es den Abschnitt Profil (Anzeigename ändern, E-Mail schreibgeschützt, Verweise auf Zwei-Faktor-Anmeldung und Geräte). Gäste sehen nur „Mit mir geteilt“ mit Details, Download und Versionen der freigegebenen Datei. Siehe [ADR-0024](../09-decisions/adr-0024-admin-console.md), Abschnitt „Ergänzung AC-08b“.
+
 ## Problem und Nutzen
 
 Das Webinterface ist Verwaltungswerkzeug: Setup, sichere Anmeldung, Org/Workspace-Auswahl, Projektliste, Dateien/Versionen, Mitglieder und Invites, Rollen/Quota, Storage-Health und Audit. Es soll den Craft-Stil in abstrahierten Tokens aufnehmen, aber keine fremden Assets kopieren. Für einen separaten Server ist React+TypeScript pragmatisch; NICHT in Rust-only Launcher integrieren.

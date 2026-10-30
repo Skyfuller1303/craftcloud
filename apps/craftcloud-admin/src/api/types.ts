@@ -153,6 +153,21 @@ export interface WorkspaceUsage {
   reserved_bytes: number; committed_bytes: number;
 }
 export interface UsageEntry { quota_bytes: number | null; reserved_bytes: number; committed_bytes: number; }
+export interface OrganizationOverview {
+  members: {
+    total: number;
+    by_status: { active: number; invited: number; disabled: number };
+    by_role: { owner: number; admin: number; member: number; guest: number };
+  };
+  two_factor: { active_members: number; enrolled: number };
+  counts: {
+    workspaces: number; projects: number; files: number;
+    active_locks: number; active_grants: number; pending_invitations: number;
+  };
+  storage: { used_bytes: number; committed_bytes: number; reserved_bytes: number; quota_bytes: number | null };
+  /** One entry per UTC day, oldest first (30 days). */
+  activity_daily: { date: string; count: number }[];
+}
 export interface OrganizationUsage { organization: UsageEntry; workspaces: WorkspaceUsage[]; next_cursor: string | null; }
 export interface AdminOrganization {
   id: Uuid; slug: string; name: string; member_count: number; created_at: string;

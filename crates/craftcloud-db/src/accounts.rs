@@ -396,6 +396,43 @@ async fn change_password_inner(
     Ok(Some(revoked))
 }
 
+/// Sets the display name of an account and records `auth.profile_updated`
+/// (actor and target: the user) in the same transaction. The audit event does
+/// not contain the name. Returns `false` when the account does not exist.
+///
+/// # Errors
+///
+/// Database failures; a failing audit insert leaves the name unchanged.
+pub async fn update_display_name_audited(
+    pool: &PgPool,
+    user_id: Uuid,
+    display_name: &str,
+    audit: &AuditCtx,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query("UPDATE users SET display_name = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(display_name)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if updated != 1 {
+        return Ok(false);
+    }
+    let by = AuditCtx {
+        actor_id: Some(user_id),
+        request_id: audit.request_id.clone(),
+    };
+    record_in(
+        &mut tx,
+        &by,
+        &NewEvent::new("auth.profile_updated").target("user", user_id),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Result of [`set_disabled`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisableOutcome {

@@ -396,7 +396,7 @@ async fn route_resource_visible(
             None => !matches!(role, OrgRole::Guest),
             Some("workspaces" | "shared-with-me") => true,
             Some("members") => !matches!(role, OrgRole::Guest),
-            Some("audit" | "usage" | "invitations") => privileged,
+            Some("audit" | "usage" | "invitations" | "overview") => privileged,
             _ => !matches!(role, OrgRole::Guest),
         });
     }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "react-aria-components";
-import type { AdminDevice, AdminOrganization, AdminUser, AuditEvent, Invitation, Organization, OrganizationGrant, OrganizationLock, OrgMember, Page, Workspace, WorkspaceUsage } from "../api/types.ts";
+import type { AdminDevice, AdminOrganization, AdminUser, AuditEvent, Invitation, Organization, OrganizationGrant, OrganizationLock, OrgMember, Page, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { AppModal, ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
@@ -22,47 +22,6 @@ async function collectPages<T>(load: (cursor?: string) => Promise<Page<T>>, maxP
   const items: T[] = []; let cursor: string | undefined; let pageNo = 0;
   do { const page = await load(cursor); items.push(...page.items); cursor = page.next_cursor ?? undefined; pageNo += 1; } while (cursor !== undefined && pageNo < maxPages);
   return { items, truncated: cursor !== undefined };
-}
-
-export function AdminOverview({ organization, workspaces }: { organization: Organization | null; workspaces: Workspace[] }) {
-  const { t, language } = useI18n(); const { api } = useAuth();
-  const [members, setMembers] = useState<{ count: number; error: unknown; truncated: boolean }>({ count: 0, error: null, truncated: false });
-  const [invitations, setInvitations] = useState<{ count: number; error: unknown }>({ count: 0, error: null });
-  const [usage, setUsage] = useState<{ entries: WorkspaceUsage[]; total: number; quota: number | null; error: unknown; truncated: boolean }>({ entries: [], total: 0, quota: null, error: null, truncated: false });
-  const [locks, setLocks] = useState<{ count: number; error: unknown; truncated: boolean }>({ count: 0, error: null, truncated: false });
-  const [events, setEvents] = useState<AuditEvent[]>([]); const [eventError, setEventError] = useState<unknown>(null);
-  const [coverage, setCoverage] = useState<{ enabled: number; total: number; error: unknown; truncated: boolean } | null>(null);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (organization === null) return;
-    let live = true; setBusy(true);
-    const memberList = collectPages((cursor) => api.listOrgMembers(organization.id, cursor, undefined, { status: "all" }));
-    void Promise.all([
-      memberList.then((r) => { if (live) { const active = r.items.filter((m) => m.status !== "disabled" && m.status !== "invited" && m.account_disabled !== true); setMembers({ count: active.length, error: null, truncated: r.truncated }); } }, (error: unknown) => { if (live) setMembers((v) => ({ ...v, error })); }),
-      collectPages((cursor) => api.listInvitations(organization.id, cursor)).then((r) => { if (live) setInvitations({ count: r.items.filter((i) => i.status === "pending").length, error: null }); }, (error: unknown) => { if (live) setInvitations({ count: 0, error }); }),
-      (async () => { const entries: WorkspaceUsage[] = []; let cursor: string | undefined; let quota: number | null = null; let total = 0; let pageNo = 0; do { const page = await api.getOrganizationUsage(organization.id, cursor); if (pageNo === 0) { quota = page.organization.quota_bytes; total = page.organization.committed_bytes + page.organization.reserved_bytes; } entries.push(...page.workspaces); cursor = page.next_cursor ?? undefined; pageNo += 1; } while (cursor !== undefined && pageNo < 100); if (live) setUsage({ entries, total, quota, error: null, truncated: cursor !== undefined }); })().catch((error: unknown) => { if (live) setUsage((v) => ({ ...v, error })); }),
-      collectPages((cursor) => api.listOrgLocks(organization.id, cursor)).then((r) => { if (live) setLocks({ count: r.items.length, error: null, truncated: r.truncated }); }, (error: unknown) => { if (live) setLocks((v) => ({ ...v, error })); }),
-      api.listAudit({ kind: "organization", orgId: organization.id }, {}, undefined).then((r) => { if (live) setEvents(r.items.slice(0, 10)); }, (error: unknown) => { if (live) setEventError(error); }),
-      api.serverInfo().then((info) => { if (live && info.feature_flags?.two_factor === true) void memberList.then((r) => { const active = r.items.filter((m) => m.status !== "disabled" && m.status !== "invited" && m.account_disabled !== true); if (live) setCoverage({ enabled: active.filter((m) => m.two_factor_enabled === true).length, total: active.length, error: null, truncated: r.truncated }); }, (error: unknown) => { if (live) setCoverage({ enabled: 0, total: 0, error, truncated: false }); }); }, () => undefined),
-    ]).finally(() => { if (live) setBusy(false); });
-    return () => { live = false; };
-  }, [api, organization?.id]);
-  if (organization === null) return <p className="muted">{t("Select an organization first.")}</p>;
-  const workspaceNames = new Map(workspaces.map((x) => [x.id, x.name]));
-  return <div className="stack">
-    {busy && <p role="status" className="muted">{t("Loading overview…")}</p>}
-    <dl className="admin-metrics">
-      <div><dt>{t("Active people")}</dt><dd>{members.error ? "—" : `${members.count}${members.truncated ? "+" : ""}`}</dd></div>
-      <div><dt>{t("Open invitations")}</dt><dd>{invitations.error ? "—" : invitations.count}</dd></div>
-      <div><dt>{t("Storage used")}</dt><dd>{usage.error ? "—" : `${formatBytes(usage.total)} / ${usage.quota === null ? t("Unlimited") : formatBytes(usage.quota)}`}</dd></div>
-      <div><dt>{t("Active locks")}</dt><dd>{locks.error ? "—" : `${locks.count}${locks.truncated ? "+" : ""}`}</dd></div>
-      {coverage !== null && <div><dt>{t("Two-factor coverage")}</dt><dd>{coverage.error ? "—" : coverage.total === 0 ? "—" : `${Math.round(coverage.enabled / coverage.total * 100)}%`}</dd></div>}
-    </dl>
-    {[members.error, invitations.error, usage.error, locks.error, eventError].filter((e) => e !== null).map((error, i) => <ErrorNotice key={i} error={error} />)}
-    {(members.truncated || usage.truncated || locks.truncated || coverage?.truncated) && <p className="muted">{t("Some totals are incomplete because the listing limit was reached.")}</p>}
-    {usage.entries.length > 0 && <section className="section"><h2 className="section__title">{t("Workspace storage")}</h2><div className="table-wrap"><table className="table"><thead><tr><th>{t("Workspace")}</th><th>{t("Used")}</th><th>{t("Quota")}</th></tr></thead><tbody>{usage.entries.map((x) => <tr key={x.workspace_id}><th>{workspaceNames.get(x.workspace_id) ?? x.workspace_id.slice(0, 8)}</th><td data-label={t("Used")}>{formatBytes(x.committed_bytes + x.reserved_bytes)}</td><td data-label={t("Quota")}>{x.effective_limit_bytes === null ? t("Unlimited") : formatBytes(x.effective_limit_bytes)}</td></tr>)}</tbody></table></div></section>}
-    <section className="section"><h2 className="section__title">{t("Recent activity")}</h2>{events.length === 0 && eventError === null ? <p className="muted">{t("No recent activity.")}</p> : <div className="table-wrap"><table className="table"><thead><tr><th>{t("Action")}</th><th>{t("Result")}</th><th>{t("Time")}</th></tr></thead><tbody>{events.map((event) => <tr key={event.id}><th>{event.action}</th><td data-label={t("Result")}>{event.result}</td><td data-label={t("Time")}>{formatDateTime(language, event.created_at)}</td></tr>)}</tbody></table></div>}</section>
-  </div>;
 }
 
 export function AdminPeopleScreen({ organization, onChanged }: { organization: Organization | null; onChanged: () => void }) {

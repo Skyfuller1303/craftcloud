@@ -503,7 +503,6 @@
 	Storage used	Storage used
 	Active locks	Active locks
 	Two-factor coverage	Two-factor coverage
-	Some totals are incomplete because the listing limit was reached.	Some totals are incomplete because the listing limit was reached.
 	Workspace storage	Workspace storage
 	Used	Used
 	Recent activity	Recent activity
@@ -609,3 +608,25 @@
 	Account	Account
 
 # Two-factor authentication (AC-02)
+
+# Profile and organization overview (AC-08b)
+	Profile	Profile
+	Display name	Display name
+	Save display name	Save display name
+	Profile saved.	Profile saved.
+	Shown to other people in members lists, locks and activity.	Shown to other people in members lists, locks and activity.
+	Enter a name of 1 to 100 characters without control characters.	Enter a name of 1 to 100 characters without control characters.
+	Your e-mail address can only be changed by an instance operator for now.	Your e-mail address can only be changed by an instance operator for now.
+	Account security	Account security
+	Active grants	Active grants
+	Activity trend	Activity trend
+	Activity in the last 30 days	Activity in the last 30 days
+	No activity in the last 30 days.	No activity in the last 30 days.
+	{total} events in the last 30 days. Busiest day: {date} with {count}.	{total} events in the last 30 days. Busiest day: {date} with {count}.
+	Peak: {count} per day	Peak: {count} per day
+	Show data as table	Show data as table
+	Date	Date
+	Members by role	Members by role
+	Members by status	Members by status
+	No workspaces yet.	No workspaces yet.
+	Updated {time}	Updated {time}

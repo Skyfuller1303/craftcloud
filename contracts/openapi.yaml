@@ -562,6 +562,39 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/profile:
+    patch:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Change the own display name (AC-08b)
+      description: >-
+        Self-service profile edit. Only `display_name` can be changed: it is trimmed and must have 1 to 100 characters
+        without control or invisible formatting characters, otherwise 422 VALIDATION_ERROR with details.fields
+        ["display_name"]. The e-mail address cannot be changed here; it stays operator-managed until e-mail delivery
+        exists. Records the audit event `auth.profile_updated` (actor and target: the caller) without the name value.
+        Returns the updated account like `GET /auth/session`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateProfileRequest'}
+      responses:
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '200':
+          description: Updated account
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionInfo'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /auth/sessions:
     get:
       tags: [Auth]
@@ -2258,6 +2291,33 @@ paths:
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/overview:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Organizations]
+      summary: Aggregate overview of an organization (organization owner and admin)
+      description: >-
+        Counts only, computed in SQL and scoped to the organization: no names, e-mail addresses or identifiers.
+        `members.by_status` counts all memberships by effective status (a membership of a disabled account counts as
+        `disabled`), `members.by_role` the active members. `two_factor` relates the active members of enabled accounts
+        to those with two-factor authentication enabled. `counts.files` and `counts.projects` exclude the trash,
+        `active_locks` excludes expired locks, `active_grants` revoked grants and `pending_invitations` accepted,
+        revoked, invalidated and expired invitations. `storage.quota_bytes` null means unlimited.
+        `activity_daily` holds one entry per UTC day for the last 30 days (today included), oldest first; days
+        without audit events have count 0. Other members and guests: 403; non-members, other tenants and the
+        instance operator without a role in the organization: 404.
+      responses:
+        '200':
+          description: Overview
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrganizationOverview'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /organizations/{org_id}/audit:
     parameters:
       - {$ref: '#/components/parameters/OrgId'}
@@ -3555,6 +3615,70 @@ components:
               last_seen_at: {type: string, format: date-time}
               expires_at: {type: string, format: date-time, description: Earliest of idle expiry from the last recorded activity and the absolute expiry}
               current: {type: boolean}
+    UpdateProfileRequest:
+      type: object
+      additionalProperties: false
+      required: [display_name]
+      properties:
+        display_name: {type: string, description: 'Trimmed; 1 to 100 characters, no control or invisible formatting characters'}
+    OrganizationOverview:
+      type: object
+      required: [members, two_factor, counts, storage, activity_daily]
+      properties:
+        members:
+          type: object
+          required: [total, by_status, by_role]
+          properties:
+            total: {type: integer, minimum: 0}
+            by_status:
+              type: object
+              required: [active, invited, disabled]
+              properties:
+                active: {type: integer, minimum: 0}
+                invited: {type: integer, minimum: 0}
+                disabled: {type: integer, minimum: 0}
+            by_role:
+              type: object
+              required: [owner, admin, member, guest]
+              properties:
+                owner: {type: integer, minimum: 0}
+                admin: {type: integer, minimum: 0}
+                member: {type: integer, minimum: 0}
+                guest: {type: integer, minimum: 0}
+        two_factor:
+          type: object
+          required: [active_members, enrolled]
+          properties:
+            active_members: {type: integer, minimum: 0}
+            enrolled: {type: integer, minimum: 0}
+        counts:
+          type: object
+          required: [workspaces, projects, files, active_locks, active_grants, pending_invitations]
+          properties:
+            workspaces: {type: integer, minimum: 0}
+            projects: {type: integer, minimum: 0}
+            files: {type: integer, minimum: 0}
+            active_locks: {type: integer, minimum: 0}
+            active_grants: {type: integer, minimum: 0}
+            pending_invitations: {type: integer, minimum: 0}
+        storage:
+          type: object
+          required: [used_bytes, committed_bytes, reserved_bytes, quota_bytes]
+          properties:
+            used_bytes: {type: integer, minimum: 0}
+            committed_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            quota_bytes: {type: [integer, 'null'], minimum: 0}
+        activity_daily:
+          type: array
+          minItems: 30
+          maxItems: 30
+          items:
+            type: object
+            required: [date, count]
+            properties:
+              date: {type: string, format: date}
+              count: {type: integer, minimum: 0}
     ChangePasswordRequest:
       type: object
       additionalProperties: false

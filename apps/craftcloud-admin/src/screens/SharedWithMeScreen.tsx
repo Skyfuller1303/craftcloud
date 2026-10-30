@@ -6,13 +6,17 @@ import { Badge } from "../components/Badge.tsx";
 import { ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
-import { formatDateTime } from "../format.ts";
+import { formatBytes, formatDateTime } from "../format.ts";
 import { useAction, useLeaseRefresh } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
 import { usePagedList } from "../usePagedList.ts";
 import { VersionsDialog } from "./VersionsDialog.tsx";
 
-export function SharedWithMeScreen({ organizationId }: { organizationId: string | null }) {
+/**
+ * `hideWorkspace` is set for guests: they get the items shared with them, not the
+ * name of the workspace around them.
+ */
+export function SharedWithMeScreen({ organizationId, hideWorkspace = false }: { organizationId: string | null; hideWorkspace?: boolean }) {
   const { t } = useI18n();
   const { api } = useAuth();
   const load = useMemo(
@@ -30,7 +34,7 @@ export function SharedWithMeScreen({ organizationId }: { organizationId: string 
   return <>
     <ListStatus list={shares} empty={t("Nothing has been shared with you yet.")} loadingLabel={t("Loading shared items…")} />
     {[...groups.entries()].map(([workspaceId, items]) => <section className="section" key={workspaceId}>
-      <h2 className="section__title">{items[0]?.workspace.name}</h2>
+      {!hideWorkspace && <h2 className="section__title">{items[0]?.workspace.name}</h2>}
       {items.filter((item) => item.target_kind === "project" && item.project !== null).map((item) =>
         item.project === null ? null : <SharedProject key={item.target_id} item={item} />,
       )}
@@ -115,6 +119,11 @@ function SharedFile({ fileId, name, role, record }: {
         {file !== null && <Button className="button button--sm" onPress={() => setVersionsOpen(true)}>{t("Versions")}</Button>}
       </div>
     </div>
+    {file !== null && <p className="muted">{[
+      file.format,
+      t("Size: {size}", { size: formatBytes(language, file.size_bytes) }),
+      t("Updated {time}", { time: formatDateTime(language, file.updated_at) }),
+    ].join(" · ")}</p>}
     {loadError !== null && <ErrorNotice error={loadError} onRetry={loadAgain} onReload={loadAgain} />}
     {lease.error !== null && <ErrorNotice error={lease.error} onRetry={() => void lease.retry()} onReload={() => void lease.retry()} />}
     {lock !== null && <p className="muted">

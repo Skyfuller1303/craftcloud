@@ -15,6 +15,7 @@ function adminRoutes(overrides: Record<string, Handler> = {}): Record<string, Ha
   return loggedInRoutes({
     [`GET /organizations/${ORG_A.id}/members`]: page(MEMBERS),
     [`GET /organizations/${ORG_A.id}/invitations`]: page([]),
+    [`GET /organizations/${ORG_A.id}/overview`]: { body: { members: { total: 0, by_status: { active: 0, invited: 0, disabled: 0 }, by_role: { owner: 0, admin: 0, member: 0, guest: 0 } }, two_factor: { active_members: 0, enrolled: 0 }, counts: { workspaces: 0, projects: 0, files: 0, active_locks: 0, active_grants: 0, pending_invitations: 0 }, storage: { used_bytes: 0, committed_bytes: 0, reserved_bytes: 0, quota_bytes: null }, activity_daily: Array.from({ length: 30 }, (_, i) => ({ date: `2026-10-${String(i + 1).padStart(2, "0")}`, count: 0 })) } },
     [`GET /organizations/${ORG_A.id}/usage`]: { body: { organization: { quota_bytes: null, committed_bytes: 0, reserved_bytes: 0 }, workspaces: [], next_cursor: null } },
     [`GET /organizations/${ORG_A.id}/grants`]: page([]),
     [`GET /organizations/${ORG_A.id}/locks`]: page([]),
@@ -121,7 +122,7 @@ describe.each([["en"], ["de"]] as const)("admin console (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     await screen.findByRole("heading", { level: 1, name: /People|Personen/ });
-    await user.type(screen.getByLabelText(/Email addresses|E-Mail-Adressen/), "new@example.test");
+    await user.type(await screen.findByLabelText(/Email addresses|E-Mail-Adressen/), "new@example.test");
     const send = screen.getByRole("button", { name: language === "en" ? "Send invitations" : "Einladungen senden" });
     await user.click(send);
     await waitFor(() => expect((send as HTMLButtonElement).disabled).toBe(true));

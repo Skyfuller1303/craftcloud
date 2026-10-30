@@ -96,3 +96,15 @@
   .system-grid { grid-template-columns: minmax(0, 1fr); gap: var(--space-4); }
 }
 @media (min-width: 68.75rem) { .system-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+// Activity bar chart of the organization overview: plain SVG, colors only from tokens.
+.chart { margin: 0; max-width: var(--content-max); }
+.chart__title { margin-bottom: var(--space-2); color: var(--muted); font: 500 var(--text-label)/1.3 var(--font-mono); letter-spacing: var(--label-tracking); text-transform: uppercase; }
+.chart__svg { display: block; width: 100%; height: 140px; border: var(--hairline) solid var(--line); background: var(--bg); }
+.chart__bar { fill: var(--progress-fill); }
+.chart__baseline { stroke: var(--line-strong); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.chart__axis { display: flex; justify-content: space-between; gap: var(--space-3); margin-top: var(--space-1); color: var(--muted); font-size: var(--text-small); }
+.chart__data { margin-top: var(--space-3); }
+.chart__data summary { cursor: pointer; color: var(--accent-ink); }
+.overview-people { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: var(--space-5); }
+.facts__row { display: contents; }

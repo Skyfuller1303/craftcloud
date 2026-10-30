@@ -1214,4 +1214,33 @@ mod tests {
         }
         panic!("audit action {action} did not reach count {wanted}");
     }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn device_bearer_changes_only_its_own_display_name() {
+        let env = device_test_env().await;
+        let id = env.user("device-profile").await;
+        let other = env.user("device-profile-other").await;
+        let login = device_for(&env, "device-profile@example.test").await;
+        assert_eq!(login.status, StatusCode::OK, "{}", login.text);
+        let token = login.body["access_token"].as_str().unwrap().to_owned();
+        let response = call(
+            &env.app,
+            Req::new("PATCH", "/api/v1/auth/profile")
+                .header("authorization", &format!("Bearer {token}"))
+                .json(json!({"display_name": "Device Name"})),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        assert_eq!(response.body["display_name"], "Device Name");
+        let names: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, display_name FROM users WHERE id = ANY($1)")
+                .bind(vec![id, other])
+                .fetch_all(&env.pool)
+                .await
+                .unwrap();
+        for (user, name) in names {
+            assert_eq!(name == "Device Name", user == id, "{user}");
+        }
+    }
 }

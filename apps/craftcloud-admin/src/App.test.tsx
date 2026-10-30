@@ -381,8 +381,8 @@ describe("organization and workspace selectors", () => {
     await user.click(await screen.findByRole("button", { name: "Settings" }));
     expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
-    expect(screen.getByRole("heading", { level: 2, name: "Devices" })).toBeTruthy();
-    expect(screen.getByText("There are no registered devices.")).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 2, name: "Devices" })).toBeTruthy();
+    expect(await screen.findByText("There are no registered devices.")).toBeTruthy();
   });
 });
 
