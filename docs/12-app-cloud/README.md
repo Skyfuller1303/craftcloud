@@ -23,8 +23,11 @@ Stand 2026-10-30. Dieser Ordner beschreibt den nächsten Ausbau von CraftCloud a
 | AC-07 | [Launcher-Konto und Dateibrowser](ac-07-launcher-account.md) | craft-launcher (lokal) | AC-01, AC-02, AC-03, AC-04 | Review |
 | AC-08 | [Admin-Konsole](ac-08-admin-console.md) | CraftCloud | AC-01, AC-03, AC-02 | Opus-Review (Sicherheit) |
 | OPS-01 | [Installation auf eigenem Server und Releases](ops-01-install-and-releases.md) | CraftCloud | — | Review (Betrieb, Geheimnisse) |
+| AC-09 | [E-Mail-Versand und Adressverifikation](ac-09-email-delivery.md) | CraftCloud | AC-02 (Serverschlüssel) | Opus-Review (Sicherheit) |
+| AC-10 | [Unternehmens-Anmeldung (OIDC) und Provisionierung (SCIM)](ac-10-sso-and-scim.md) | CraftCloud | AC-01, AC-09 | Opus-Review (Sicherheit) |
+| AC-11 | [Plätze und App-Zuweisung](ac-11-seats-and-app-access.md) | CraftCloud | AC-01, AC-08 | Opus-Review (Sicherheit) |
 
-Empfohlene Reihenfolge: AC-01 und AC-03 parallel (verschiedene Dateien, siehe jeweilige Zuständigkeit), danach AC-02 und AC-04, dann AC-05, AC-06 und AC-07. AC-05 und AC-07 arbeiten in fremden Repositories nur lokal. Stand 2026-10-30: AC-01 und AC-03 sind gemerged (main 73a06bd), AC-02 und AC-04 laufen. OPS-01 kann jederzeit parallel laufen, weil es kaum Dateien der anderen Briefings berührt; AC-08 folgt nach AC-02.
+Empfohlene Reihenfolge: AC-01 und AC-03 parallel (verschiedene Dateien, siehe jeweilige Zuständigkeit), danach AC-02 und AC-04, dann AC-05, AC-06 und AC-07. AC-05 und AC-07 arbeiten in fremden Repositories nur lokal. Stand 2026-10-30: AC-01 und AC-03 sind gemerged (main 73a06bd), AC-02 und AC-04 laufen. OPS-01 kann jederzeit parallel laufen, weil es kaum Dateien der anderen Briefings berührt; AC-08 folgt nach AC-02. Danach AC-09, dann AC-10 (braucht verifizierte Adressen); AC-11 ist davon unabhängig. Die Migrationsnummer vergibt der Koordinator beim Start, weil mehrere Briefings parallel Migrationen anlegen.
 
 ## Feste Entscheidungen
 
