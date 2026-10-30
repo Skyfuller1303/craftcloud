@@ -191,7 +191,7 @@ describe("guest view", () => {
     target_kind: "file",
     target_id: FILE_1.id,
     role,
-    workspace: { id: WS_1.id, name: "Studio" },
+    workspace: { id: WS_1.id, name: null },
     project: { id: PROJECT_1.id, name: PROJECT_1.name },
     file: { id: FILE_1.id, name: FILE_1.name },
   });
@@ -242,5 +242,79 @@ describe("guest view", () => {
       expect(paths).not.toContain(`${ORG}/overview`);
       expect(sibling.name).toBe("secret-sibling.fig");
     });
+  });
+});
+
+describe.each([
+  ["en", "Old password", "New password", "Repeat the new password", "Change password", /Password changed\. Your other browser sessions/, /12 to 128/, /not the same/, /current password is not correct/],
+  ["de", "Altes Passwort", "Neues Passwort", "Neues Passwort wiederholen", "Passwort ändern", /Passwort geändert\. Deine anderen Browser-Sitzungen/, /12 bis 128/, /nicht gleich/, /aktuelle Passwort ist nicht richtig/],
+] as const)("password change (%s)", (language, currentLabel, newLabel, repeatLabel, submitLabel, successText, lengthText, mismatchText, wrongText) => {
+  const form = () => within(document.querySelector(".password-form") as HTMLElement);
+  const openSettings = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(await screen.findByRole("button", { name: /^(Settings|Einstellungen)$/ }));
+    await waitFor(() => expect(document.querySelector(".password-form")).not.toBeNull());
+  };
+  const fill = async (user: ReturnType<typeof userEvent.setup>, current: string, next: string, repeat = next) => {
+    await user.type(form().getByLabelText(currentLabel), current);
+    await user.type(form().getByLabelText(newLabel), next);
+    await user.type(form().getByLabelText(repeatLabel), repeat);
+    await user.click(form().getByRole("button", { name: submitLabel }));
+  };
+
+  it("validates locally, sends the change and explains which sessions ended", async () => {
+    let body: unknown = null;
+    const { fetch } = mockFetch(adminRoutes({
+      "POST /auth/password/change": (call) => { body = call.body; return { status: 204 }; },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch, { language });
+    await openSettings(user);
+    await fill(user, "old-password-1", "short");
+    expect(await screen.findByText(lengthText)).toBeTruthy();
+    expect(body).toBeNull();
+    await user.clear(form().getByLabelText(newLabel));
+    await user.clear(form().getByLabelText(repeatLabel));
+    await user.clear(form().getByLabelText(currentLabel));
+    await user.type(form().getByLabelText(newLabel), "a long enough passphrase");
+    await user.type(form().getByLabelText(repeatLabel), "a different passphrase");
+    await user.click(form().getByRole("button", { name: submitLabel }));
+    expect(await screen.findByText(mismatchText)).toBeTruthy();
+    expect(body).toBeNull();
+    await user.clear(form().getByLabelText(repeatLabel));
+    await user.type(form().getByLabelText(repeatLabel), "a long enough passphrase");
+    await user.type(form().getByLabelText(currentLabel), "old-password-1");
+    await expectNoAxeViolations();
+    await user.click(form().getByRole("button", { name: submitLabel }));
+    await screen.findByText(successText);
+    expect(body).toEqual({ current_password: "old-password-1", new_password: "a long enough passphrase" });
+    // The fields are emptied after the request.
+    expect((form().getByLabelText(currentLabel) as HTMLInputElement).value).toBe("");
+    expect((form().getByLabelText(newLabel) as HTMLInputElement).value).toBe("");
+    await expectNoAxeViolations();
+  });
+
+  it("shows a wrong current password, a refused new password and a rate limit", async () => {
+    const replies = [
+      apiError(403, "INVALID_CURRENT_PASSWORD"),
+      apiError(422, "VALIDATION_ERROR", { details: { fields: ["new_password"] } }),
+      apiError(429, "RATE_LIMITED", { headers: { "Retry-After": "30" } }),
+    ];
+    const { fetch } = mockFetch(adminRoutes({
+      "POST /auth/password/change": () => replies.shift()!,
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch, { language });
+    await openSettings(user);
+    await fill(user, "wrong-password-1", "a long enough passphrase");
+    expect(await screen.findByText(wrongText)).toBeTruthy();
+    expect(document.activeElement).toBe(form().getByLabelText(currentLabel));
+    await expectNoAxeViolations();
+    await fill(user, "right-password-1", "ada-example-password");
+    expect(await screen.findByText(/Choose a longer|Wähle ein/)).toBeTruthy();
+    await expectNoAxeViolations();
+    await fill(user, "right-password-1", "ada-example-password");
+    await screen.findByRole("alert");
+    expect(screen.queryByText(successText)).toBeNull();
+    await expectNoAxeViolations();
   });
 });

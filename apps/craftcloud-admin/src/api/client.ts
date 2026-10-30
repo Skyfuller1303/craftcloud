@@ -71,6 +71,7 @@ export const ENDPOINTS = {
   issuePasswordReset: { method: "POST", path: "/admin/users/{user_id}/password-reset" },
   session: { method: "GET", path: "/auth/session" },
   updateProfile: { method: "PATCH", path: "/auth/profile" },
+  changePassword: { method: "POST", path: "/auth/password/change" },
   orgOverview: { method: "GET", path: "/organizations/{org_id}/overview" },
   listDevices: { method: "GET", path: "/auth/devices" },
   revokeDevice: { method: "DELETE", path: "/auth/devices/{id}" },
@@ -302,6 +303,8 @@ export interface ApiClient {
   session(): Promise<SessionInfo>;
   /** Changes the own display name (AC-08b); answers like `session()`. */
   updateProfile(displayName: string): Promise<SessionInfo>;
+  /** Changes the own password; the server ends all other sessions and devices. */
+  changePassword(body: { current_password: string; new_password: string }): Promise<void>;
   /** Aggregate counts of an organization (owner and admin only). */
   getOrganizationOverview(orgId: string): Promise<OrganizationOverview>;
   /**
@@ -550,6 +553,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       return result;
     },
     updateProfile: (displayName) => call(ENDPOINTS.updateProfile, { body: { display_name: displayName } }),
+    changePassword: (body) => call(ENDPOINTS.changePassword, { body }),
     getOrganizationOverview: (orgId) => call(ENDPOINTS.orgOverview, { params: { org_id: orgId } }),
     async logout() {
       try {

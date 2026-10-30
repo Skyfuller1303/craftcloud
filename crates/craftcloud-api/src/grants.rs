@@ -642,7 +642,29 @@ pub(crate) async fn shared_with_me(
     } else {
         None
     };
-    let items:Vec<_>=rows.iter().map(|x|json!({"target_kind":x.target_kind,"target_id":x.target_id.to_string(),"role":x.role,"workspace":{"id":x.workspace_id.to_string(),"name":x.workspace_name},"project":x.project_id.map(|id|json!({"id":id.to_string(),"name":x.project_name})),"file":x.file_id.map(|id|json!({"id":id.to_string(),"name":x.file_name}))})).collect();
+    // A guest only learns the names of what was shared with them: never the
+    // workspace, and a project only when the grant is on the project itself.
+    let guest = actor
+        .membership
+        .is_some_and(|membership| membership.role == craftcloud_core::policy::OrgRole::Guest);
+    let items: Vec<_> = rows
+        .iter()
+        .map(|x| {
+            let workspace_name = (!guest).then_some(x.workspace_name.as_str());
+            let project = x
+                .project_id
+                .filter(|_| !guest || x.target_kind == "project")
+                .map(|id| json!({"id": id.to_string(), "name": x.project_name}));
+            json!({
+                "target_kind": x.target_kind,
+                "target_id": x.target_id.to_string(),
+                "role": x.role,
+                "workspace": {"id": x.workspace_id.to_string(), "name": workspace_name},
+                "project": project,
+                "file": x.file_id.map(|id| json!({"id": id.to_string(), "name": x.file_name})),
+            })
+        })
+        .collect();
     Json(json!({"items":items,"next_cursor":next})).into_response()
 }
 

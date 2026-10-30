@@ -630,3 +630,9 @@
 	Members by status	Members by status
 	No workspaces yet.	No workspaces yet.
 	Updated {time}	Updated {time}
+	Enter your current password.	Enter your current password.
+	The current password is not correct.	The current password is not correct.
+	Password changed. Your other browser sessions and all registered devices were signed out; this browser stays signed in.	Password changed. Your other browser sessions and all registered devices were signed out; this browser stays signed in.
+	Changing the password signs out your other browser sessions and all registered devices.	Changing the password signs out your other browser sessions and all registered devices.
+	Change password	Change password
+	Old password	Old password

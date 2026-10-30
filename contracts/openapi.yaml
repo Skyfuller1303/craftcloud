@@ -3851,12 +3851,16 @@ components:
         workspace:
           type: object
           required: [id, name]
+          description: The workspace name is null for organization guests.
           properties:
             id: {type: string, format: uuid}
-            name: {type: string}
+            name: {type: [string, 'null']}
         project:
           type: [object, 'null']
           required: [id, name]
+          description: >-
+            For organization guests only present for project grants (null for a file grant); members always
+            get the parent project of a file grant.
           properties:
             id: {type: string, format: uuid}
             name: {type: string}
@@ -3905,7 +3909,7 @@ components:
         can_share: {type: boolean, description: Server-calculated grant-management capability}
         can_force_lock: {type: boolean, description: Server-calculated force-release capability}
         lock: {oneOf: [{$ref: '#/components/schemas/FileLock'}, {type: 'null'}]}
-        project: {type: object, required: [id, name], properties: {id: {type: string, format: uuid}, name: {type: string}}, description: Minimal parent metadata included on authorized file reads}
+        project: {type: object, required: [id, name], properties: {id: {type: string, format: uuid}, name: {type: [string, 'null'], description: Null for an organization guest without a grant on the project}}, description: Minimal parent metadata included on authorized file reads}
     FilePage:
       type: object
       required: [items, next_cursor]

@@ -406,6 +406,27 @@ pub(crate) async fn get_file(
                 Ok(lock) => lock,
                 Err(error) => return db_failure(&error, &headers, "file lock lookup failed"),
             };
+            // A guest with only a file grant does not learn the parent project's name.
+            let project_name_visible = if actor.membership.is_some_and(|membership| {
+                membership.role == craftcloud_core::policy::OrgRole::Guest
+            }) {
+                match craftcloud_db::grants::project_role_for(
+                    &resolved.services.pool,
+                    resolved.org_id,
+                    session.user_id,
+                    resolved.workspace_id,
+                    file.project_id,
+                )
+                .await
+                {
+                    Ok(role) => role.is_some(),
+                    Err(error) => {
+                        return db_failure(&error, &headers, "project grant lookup failed");
+                    }
+                }
+            } else {
+                true
+            };
             let project_name: String = match craftcloud_db::files::project_name(
                 &resolved.services.pool,
                 resolved.org_id,
@@ -424,7 +445,7 @@ pub(crate) async fn get_file(
             };
             object.insert(
                 "project".to_owned(),
-                json!({"id":file.project_id.to_string(),"name":project_name}),
+                json!({"id":file.project_id.to_string(),"name":project_name_visible.then_some(project_name)}),
             );
             object.insert(
                 "can_share".to_owned(),

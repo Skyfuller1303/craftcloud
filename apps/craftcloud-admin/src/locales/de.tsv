@@ -626,3 +626,9 @@
 	Members by status	Mitglieder nach Status
 	No workspaces yet.	Noch keine Workspaces.
 	Updated {time}	Aktualisiert {time}
+	Enter your current password.	Gib dein aktuelles Passwort ein.
+	The current password is not correct.	Das aktuelle Passwort ist nicht richtig.
+	Password changed. Your other browser sessions and all registered devices were signed out; this browser stays signed in.	Passwort geändert. Deine anderen Browser-Sitzungen und alle registrierten Geräte wurden abgemeldet; dieser Browser bleibt angemeldet.
+	Changing the password signs out your other browser sessions and all registered devices.	Beim Ändern des Passworts werden deine anderen Browser-Sitzungen und alle registrierten Geräte abgemeldet.
+	Change password	Passwort ändern
+	Old password	Altes Passwort

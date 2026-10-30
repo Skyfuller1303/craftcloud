@@ -314,7 +314,8 @@ export interface SharedItem {
   target_kind: "project" | "file";
   target_id: Uuid;
   role: "viewer" | "editor";
-  workspace: { id: Uuid; name: string };
+  /** The name is null for organization guests, who only learn what was shared with them. */
+  workspace: { id: Uuid; name: string | null };
   project: { id: Uuid; name: string } | null;
   file: { id: Uuid; name: string } | null;
 }

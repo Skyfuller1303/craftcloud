@@ -532,7 +532,7 @@ export function Shell({
               </section>}
             </>
           ) : section === "shared" ? (
-            <SharedWithMeScreen organizationId={organizationId} hideWorkspace={isGuest} />
+            <SharedWithMeScreen organizationId={organizationId} />
           ) : (
             <EmptyState>{t("This view is not available yet.")}</EmptyState>
           )}

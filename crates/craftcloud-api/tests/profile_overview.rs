@@ -580,4 +580,109 @@ mod tests {
         assert_eq!(second.body["counts"]["active_locks"], 0);
         assert_eq!(second.body["counts"]["pending_invitations"], 0);
     }
+
+    async fn grant(w: &World, kind: &str, id: Uuid, user: Uuid, role: &str) {
+        let response = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/{kind}/{id}/grants"))
+                .session(&w.owner)
+                .json(json!({"user_id": user.to_string(), "role": role})),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::CREATED, "{}", response.text);
+    }
+
+    async fn shared(w: &World, session: &Session) -> Value {
+        let response = call(
+            &w.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/organizations/{}/shared-with-me", w.org),
+            )
+            .session(session),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        response.body
+    }
+
+    async fn file_detail(w: &World, session: &Session) -> Value {
+        let response = call(
+            &w.env.app,
+            Req::new("GET", &format!("/api/v1/files/{}", w.file)).session(session),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        response.body
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn guest_with_a_file_grant_gets_no_workspace_or_project_names() {
+        let w = world().await;
+        let project: Uuid = sqlx::query_scalar("SELECT project_id FROM files WHERE id=$1")
+            .bind(w.file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let (guest_id, guest) = add_member(&w, "red-guest", "member").await;
+        make_guest(&w, guest_id).await;
+        grant(&w, "files", w.file, guest_id, "viewer").await;
+
+        let body = shared(&w, &guest).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["target_kind"], "file");
+        assert_eq!(items[0]["file"]["name"], "One");
+        assert_eq!(items[0]["workspace"]["id"], w.workspace.to_string());
+        assert_eq!(items[0]["workspace"]["name"], Value::Null);
+        assert_eq!(items[0]["project"], Value::Null);
+        let text = serde_json::to_string(&body).unwrap();
+        for name in ["ov-ws", "Project"] {
+            assert!(!text.contains(name), "{name} in {text}");
+        }
+        let detail = file_detail(&w, &guest).await;
+        assert_eq!(detail["project"]["id"], project.to_string());
+        assert_eq!(detail["project"]["name"], Value::Null);
+        assert_eq!(detail["name"], "One");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn guest_with_a_project_grant_sees_the_project_but_not_the_workspace_name() {
+        let w = world().await;
+        let project: Uuid = sqlx::query_scalar("SELECT project_id FROM files WHERE id=$1")
+            .bind(w.file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let (guest_id, guest) = add_member(&w, "red-guest-p", "member").await;
+        make_guest(&w, guest_id).await;
+        grant(&w, "projects", project, guest_id, "editor").await;
+
+        let body = shared(&w, &guest).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["target_kind"], "project");
+        assert_eq!(items[0]["project"]["name"], "Project");
+        assert_eq!(items[0]["workspace"]["name"], Value::Null);
+        assert!(!serde_json::to_string(&body).unwrap().contains("ov-ws"));
+        let detail = file_detail(&w, &guest).await;
+        assert_eq!(detail["project"]["name"], "Project");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn member_keeps_workspace_and_project_names() {
+        let w = world().await;
+        let (member_id, member) = add_member(&w, "red-member", "member").await;
+        grant(&w, "files", w.file, member_id, "viewer").await;
+        let body = shared(&w, &member).await;
+        let item = &body["items"][0];
+        assert_eq!(item["workspace"]["name"], "ov-ws");
+        assert_eq!(item["project"]["name"], "Project");
+        assert_eq!(item["file"]["name"], "One");
+        let detail = file_detail(&w, &member).await;
+        assert_eq!(detail["project"]["name"], "Project");
+    }
 }

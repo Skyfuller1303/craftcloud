@@ -12,11 +12,8 @@ import { useI18n } from "../i18n/index.tsx";
 import { usePagedList } from "../usePagedList.ts";
 import { VersionsDialog } from "./VersionsDialog.tsx";
 
-/**
- * `hideWorkspace` is set for guests: they get the items shared with them, not the
- * name of the workspace around them.
- */
-export function SharedWithMeScreen({ organizationId, hideWorkspace = false }: { organizationId: string | null; hideWorkspace?: boolean }) {
+/** The server sends no workspace name to guests (`name: null`); the group then has no heading. */
+export function SharedWithMeScreen({ organizationId }: { organizationId: string | null }) {
   const { t } = useI18n();
   const { api } = useAuth();
   const load = useMemo(
@@ -34,7 +31,7 @@ export function SharedWithMeScreen({ organizationId, hideWorkspace = false }: { 
   return <>
     <ListStatus list={shares} empty={t("Nothing has been shared with you yet.")} loadingLabel={t("Loading shared items…")} />
     {[...groups.entries()].map(([workspaceId, items]) => <section className="section" key={workspaceId}>
-      {!hideWorkspace && <h2 className="section__title">{items[0]?.workspace.name}</h2>}
+      {items[0]?.workspace.name != null && <h2 className="section__title">{items[0].workspace.name}</h2>}
       {items.filter((item) => item.target_kind === "project" && item.project !== null).map((item) =>
         item.project === null ? null : <SharedProject key={item.target_id} item={item} />,
       )}

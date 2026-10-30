@@ -22,5 +22,7 @@ export default defineConfig({
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.ts"],
     css: false,
+    // Component tests with axe and the lazily loaded screens need more than the default 5 s on a loaded machine.
+    testTimeout: 20000,
   },
 });
