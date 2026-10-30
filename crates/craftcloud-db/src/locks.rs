@@ -108,9 +108,12 @@ impl OrgTx {
         if now >= session.expires_at {
             return Ok(false);
         }
-        // Lock the user row (the same row revocation locks first) and then the
-        // session row, so a concurrent revocation commits either before this
-        // check or after the lease exists and removes it.
+        // Key-share the user row (blocks a concurrent disable or delete) and then
+        // share-lock the session row. Atomicity against revocation comes from the
+        // session row: every revocation updates it, so a concurrent revocation
+        // commits either before this check or after the lease exists and removes
+        // it. A password change only takes NO KEY UPDATE on users and is
+        // serialized through the session rows it revokes.
         let user_enabled: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM users WHERE id=$1 AND disabled_at IS NULL FOR KEY SHARE",
         )
