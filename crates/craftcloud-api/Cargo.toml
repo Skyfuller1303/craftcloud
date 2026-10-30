@@ -31,6 +31,8 @@ time.workspace = true
 [dev-dependencies]
 sha1.workspace = true
 hmac.workspace = true
+# The SDK is exercised against the real router (tests/sdk_second_factor.rs); path-only, not shipped.
+craftcloud-client = { path = "../craftcloud-client" }
 craftcloud-backup.workspace = true
 craftcloud-storage = { workspace = true, features = ["fault-injection"] }
 bytes.workspace = true

@@ -128,6 +128,8 @@ function codeMessage(t: Translate, error: ApiError): string | undefined {
       return t("Somebody else changed this item in the meantime. Reload and try again.");
     case "INVALID_RESET_TOKEN":
       return t("This reset link is not valid any more. Ask for a new one.");
+    case "TWO_FACTOR_SETUP_PENDING":
+      return t("Another session is already setting up two-factor authentication. Finish it there or wait a few minutes.");
     default:
       return undefined;
   }

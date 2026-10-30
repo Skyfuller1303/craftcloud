@@ -15,6 +15,7 @@ pub enum Text {
     Email,
     Password,
     SecondFactor,
+    SecondFactorHint,
     SignIn,
     Account,
     Organization,
@@ -56,6 +57,9 @@ impl Translator for DefaultTranslator {
             (Language::German, Text::Email) => "E-Mail",
             (Language::German, Text::Password) => "Passwort",
             (Language::German, Text::SecondFactor) => "Zweiter Faktor",
+            (Language::German, Text::SecondFactorHint) => {
+                "Sechsstelliger Code der Authenticator-App oder zehnstelliger Wiederherstellungscode"
+            }
             (Language::German, Text::SignIn) => "Anmelden",
             (Language::German, Text::Account) => "Konto",
             (Language::German, Text::Organization) => "Organisation",
@@ -87,6 +91,9 @@ impl Translator for DefaultTranslator {
             (Language::English, Text::Email) => "Email",
             (Language::English, Text::Password) => "Password",
             (Language::English, Text::SecondFactor) => "Second factor",
+            (Language::English, Text::SecondFactorHint) => {
+                "Six-digit authenticator code or ten-character recovery code"
+            }
             (Language::English, Text::SignIn) => "Sign in",
             (Language::English, Text::Account) => "Account",
             (Language::English, Text::Organization) => "Organization",
@@ -113,6 +120,40 @@ impl Translator for DefaultTranslator {
             (Language::English, Text::Connect) => "Connect",
             (Language::English, Text::Close) => "Close",
         }
+    }
+}
+
+/// A second-factor code as typed into the sign-in dialog, normalized for the server.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SecondFactorInput {
+    /// Six digits from an authenticator app.
+    Totp(String),
+    /// Ten-character one-use recovery code, upper case.
+    Recovery(String),
+}
+impl std::fmt::Debug for SecondFactorInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Totp(_) => f.write_str("SecondFactorInput::Totp(***)"),
+            Self::Recovery(_) => f.write_str("SecondFactorInput::Recovery(***)"),
+        }
+    }
+}
+
+/// Classifies typed input: six digits are an authenticator code, ten letters or digits
+/// a recovery code. Spaces and dashes (as people group codes) are ignored. Anything else
+/// is rejected before it is sent, which spares an attempt on the server's limited budget.
+pub fn classify_second_factor(input: &str) -> Option<SecondFactorInput> {
+    let compact: String = input
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    if compact.len() == 6 && compact.bytes().all(|b| b.is_ascii_digit()) {
+        Some(SecondFactorInput::Totp(compact))
+    } else if compact.len() == 10 && compact.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Some(SecondFactorInput::Recovery(compact.to_ascii_uppercase()))
+    } else {
+        None
     }
 }
 
@@ -230,24 +271,50 @@ impl PickerState {
                 ui.label(tr.text(Text::Server));
                 ui.monospace(&self.server_url);
                 ui.label(tr.text(Text::Email));
-                ui.text_edit_singleline(&mut self.email);
-                ui.label(tr.text(Text::Password));
-                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
                 if self.requires_second_factor {
+                    // The password step is done; only the code is asked for now.
+                    ui.monospace(&self.email);
                     ui.label(tr.text(Text::SecondFactor));
-                    ui.text_edit_singleline(&mut self.second_factor);
-                }
-                if ui.button(tr.text(Text::SignIn)).clicked() {
-                    out.push(Action::Login {
-                        server: self.server_url.clone(),
-                        email: self.email.clone(),
-                        password: self.password.clone(),
-                        second_factor: self
-                            .requires_second_factor
-                            .then(|| self.second_factor.clone()),
-                    });
-                    self.password.clear();
-                    self.second_factor.clear();
+                    ui.add(egui::TextEdit::singleline(&mut self.second_factor).password(true));
+                    ui.small(tr.text(Text::SecondFactorHint));
+                    if ui.button(tr.text(Text::SignIn)).clicked() {
+                        match classify_second_factor(&self.second_factor) {
+                            Some(SecondFactorInput::Totp(code))
+                            | Some(SecondFactorInput::Recovery(code)) => {
+                                self.error = None;
+                                out.push(Action::Login {
+                                    server: self.server_url.clone(),
+                                    email: self.email.clone(),
+                                    password: String::new(),
+                                    second_factor: Some(code),
+                                });
+                            }
+                            None => {
+                                self.error = Some(tr.text(Text::SecondFactorHint).to_owned());
+                            }
+                        }
+                        self.second_factor.clear();
+                    }
+                    if ui.button(tr.text(Text::Cancel)).clicked() {
+                        // Back to the password step; the open challenge is abandoned.
+                        self.requires_second_factor = false;
+                        self.second_factor_challenge_id = None;
+                        self.second_factor.clear();
+                        self.error = None;
+                    }
+                } else {
+                    ui.text_edit_singleline(&mut self.email);
+                    ui.label(tr.text(Text::Password));
+                    ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                    if ui.button(tr.text(Text::SignIn)).clicked() {
+                        out.push(Action::Login {
+                            server: self.server_url.clone(),
+                            email: self.email.clone(),
+                            password: self.password.clone(),
+                            second_factor: None,
+                        });
+                        self.password.clear();
+                    }
                 }
             }
             Dialog::Account => {
@@ -429,5 +496,50 @@ mod tests {
             });
             output.drop_without_applying_deltas();
         }
+    }
+
+    #[test]
+    fn second_factor_input_is_classified_and_normalized() {
+        assert_eq!(
+            classify_second_factor(" 123 456 "),
+            Some(SecondFactorInput::Totp("123456".into()))
+        );
+        assert_eq!(
+            classify_second_factor("abcde-fg2h3"),
+            Some(SecondFactorInput::Recovery("ABCDEFG2H3".into()))
+        );
+        for rejected in [
+            "",
+            "12345",
+            "1234567",
+            "abcdef",
+            "abcde-fg2h",
+            "abcde fg2h3x",
+            "12 34 5é",
+        ] {
+            assert_eq!(classify_second_factor(rejected), None, "{rejected:?}");
+        }
+        assert_eq!(
+            format!("{:?}", SecondFactorInput::Totp("123456".into())),
+            "SecondFactorInput::Totp(***)"
+        );
+    }
+
+    #[test]
+    fn second_factor_stage_renders_without_a_gpu() {
+        let ctx = Context::default();
+        let mut state = PickerState {
+            dialog: Some(Dialog::Login),
+            requires_second_factor: true,
+            second_factor_challenge_id: Some("challenge".into()),
+            ..Default::default()
+        };
+        for language in [Language::English, Language::German] {
+            let output = ctx.run_ui(Default::default(), |ui| {
+                state.show(&ui.ctx().clone(), &DefaultTranslator(language));
+            });
+            output.drop_without_applying_deltas();
+        }
+        assert!(state.requires_second_factor);
     }
 }

@@ -43,8 +43,12 @@ pub(crate) async fn discover(State(state): State<ApiState>) -> Json<Discovery> {
         server_version: env!("CARGO_PKG_VERSION"),
         feature_flags: FeatureFlags {
             device_login: true,
-            // AC-01 reserves the challenge; AC-02 enables the implementation.
-            two_factor: false,
+            // True only when the 2FA encryption key is loaded: without it new
+            // setups and second-factor sign-ins answer 503.
+            two_factor: state
+                .services
+                .as_ref()
+                .is_some_and(|services| services.two_factor_available()),
             grants: true,
             locks: true,
             figcraft_live: false,

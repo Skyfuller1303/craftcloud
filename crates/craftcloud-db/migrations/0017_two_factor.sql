@@ -8,11 +8,13 @@ CREATE TABLE user_two_factor (
     secret_ciphertext bytea NOT NULL,
     enabled_at timestamptz NULL,
     last_accepted_step bigint NULL,
+    failed_attempts integer NOT NULL DEFAULT 0,
     pending_session_id uuid NULL,
     pending_session_kind text NULL,
     pending_expires_at timestamptz NULL,
     created_at timestamptz NOT NULL,
     CONSTRAINT user_two_factor_ciphertext_length CHECK (octet_length(secret_ciphertext) BETWEEN 30 AND 256),
+    CONSTRAINT user_two_factor_failed_attempts_nonnegative CHECK (failed_attempts >= 0),
     CONSTRAINT user_two_factor_step_nonnegative CHECK (last_accepted_step IS NULL OR last_accepted_step >= 0),
     CONSTRAINT user_two_factor_pending_shape CHECK (
         (enabled_at IS NOT NULL AND pending_session_id IS NULL AND pending_session_kind IS NULL AND pending_expires_at IS NULL)

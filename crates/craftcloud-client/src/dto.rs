@@ -3,19 +3,27 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+/// Public server discovery. Only `api_version` is required: servers that
+/// predate the additive fields still deserialize, and the caller can then report
+/// an incompatible API major version instead of an invalid response. Missing
+/// fields take their defaults (no feature flags, zero limits, no formats).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Discovery {
+    #[serde(default)]
     pub server_version: String,
     pub api_version: String,
+    #[serde(default)]
     pub feature_flags: FeatureFlags,
+    #[serde(default)]
     pub limits: ServerLimits,
+    #[serde(default)]
     pub formats: Vec<FormatInfo>,
     #[serde(default)]
     pub features: Vec<String>,
     #[serde(default)]
     pub server_mode: Option<String>,
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FeatureFlags {
     pub device_login: bool,
     pub two_factor: bool,
@@ -23,7 +31,7 @@ pub struct FeatureFlags {
     pub locks: bool,
     pub figcraft_live: bool,
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ServerLimits {
     pub max_file_size: u64,
     pub block_size: u64,

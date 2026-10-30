@@ -9,6 +9,10 @@ use crate::audit::{AuditCtx, NewEvent, record_in};
 use crate::device_sessions::NewDeviceSession;
 use crate::sessions::NewSession;
 
+/// Consecutive failed second-factor proofs after which an account is locked
+/// until an operator resets its factor (NIST SP 800-63B, section 5.2.2).
+pub const MAX_FAILED_ATTEMPTS: i32 = 100;
+
 #[derive(Debug, Clone, Copy)]
 pub enum VerifiedFactor {
     TotpStep(i64),
@@ -46,13 +50,13 @@ pub async fn complete_browser_login(
     if live.is_none() {
         return Ok(None);
     }
-    let enabled: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL FOR UPDATE")
-        .bind(user_id).fetch_optional(&mut *tx).await?;
+    let enabled: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
+        .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
     if enabled.as_deref() != Some(secret_ciphertext) {
         return Ok(None);
     }
     let recovery_used = match factor {
-        VerifiedFactor::TotpStep(step) => sqlx::query("UPDATE user_two_factor SET last_accepted_step=$2 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step<$2)")
+        VerifiedFactor::TotpStep(step) => sqlx::query("UPDATE user_two_factor SET last_accepted_step=$2,failed_attempts=0 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step<$2)")
             .bind(user_id).bind(step).execute(&mut *tx).await?.rows_affected() == 1,
         VerifiedFactor::RecoverySalt(salt) => sqlx::query("UPDATE user_two_factor_recovery_codes SET used_at=$3 WHERE user_id=$1 AND salt=$2 AND used_at IS NULL AND EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)")
             .bind(user_id).bind(salt.as_slice()).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1,
@@ -60,6 +64,7 @@ pub async fn complete_browser_login(
     if !recovery_used {
         return Ok(None);
     }
+    reset_failed_attempts(&mut tx, user_id).await?;
     let consumed = sqlx::query("UPDATE two_factor_login_challenges SET used_at=$3 WHERE id_hash=$1 AND user_id=$2 AND used_at IS NULL AND attempts<5 AND expires_at>$3")
         .bind(id_hash.as_slice()).bind(user_id).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1;
     if !consumed {
@@ -122,13 +127,13 @@ pub async fn complete_device_login(
     if live.is_none() {
         return Ok(None);
     }
-    let enabled: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL FOR UPDATE")
-        .bind(user_id).fetch_optional(&mut *tx).await?;
+    let enabled: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
+        .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
     if enabled.as_deref() != Some(secret_ciphertext) {
         return Ok(None);
     }
     let accepted = match factor {
-        VerifiedFactor::TotpStep(step) => sqlx::query("UPDATE user_two_factor SET last_accepted_step=$2 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step<$2)")
+        VerifiedFactor::TotpStep(step) => sqlx::query("UPDATE user_two_factor SET last_accepted_step=$2,failed_attempts=0 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step<$2)")
             .bind(user_id).bind(step).execute(&mut *tx).await?.rows_affected() == 1,
         VerifiedFactor::RecoverySalt(salt) => sqlx::query("UPDATE user_two_factor_recovery_codes SET used_at=$3 WHERE user_id=$1 AND salt=$2 AND used_at IS NULL AND EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)")
             .bind(user_id).bind(salt.as_slice()).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1,
@@ -136,6 +141,7 @@ pub async fn complete_device_login(
     if !accepted {
         return Ok(None);
     }
+    reset_failed_attempts(&mut tx, user_id).await?;
     let consumed = sqlx::query("UPDATE two_factor_login_challenges SET used_at=$3 WHERE id_hash=$1 AND user_id=$2 AND used_at IS NULL AND attempts<5 AND expires_at>$3")
         .bind(id_hash.as_slice()).bind(user_id).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1;
     if !consumed {
@@ -171,6 +177,7 @@ pub async fn complete_device_login(
 pub struct SecretRecord {
     pub secret_ciphertext: Vec<u8>,
     pub last_accepted_step: Option<i64>,
+    pub failed_attempts: i32,
     pub enabled_at: Option<OffsetDateTime>,
     pub pending_session_id: Option<Uuid>,
     pub pending_session_kind: Option<String>,
@@ -210,11 +217,24 @@ pub async fn status(pool: &PgPool, user_id: Uuid) -> Result<(bool, i64), DbError
 /// Loads encrypted secret state for internal verification.
 pub async fn secret(pool: &PgPool, user_id: Uuid) -> Result<Option<SecretRecord>, DbError> {
     Ok(sqlx::query_as::<_, SecretRecord>(
-        "SELECT secret_ciphertext,last_accepted_step,enabled_at,pending_session_id,pending_session_kind,pending_expires_at FROM user_two_factor WHERE user_id=$1",
+        "SELECT secret_ciphertext,last_accepted_step,failed_attempts,enabled_at,pending_session_id,pending_session_kind,pending_expires_at FROM user_two_factor WHERE user_id=$1",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await?)
+}
+
+/// Result of [`begin_setup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupOutcome {
+    /// A fresh pending secret was stored.
+    Started,
+    /// The account already has an enabled factor.
+    AlreadyEnabled,
+    /// Another session holds a live pending setup.
+    Pending,
+    /// The session is gone or the password changed since it was verified.
+    SessionGone,
 }
 
 /// Starts or replaces a pending setup without disturbing an active factor.
@@ -226,7 +246,7 @@ pub async fn begin_setup(
     verified_hash: &str,
     ciphertext: &[u8],
     now: OffsetDateTime,
-) -> Result<bool, DbError> {
+) -> Result<SetupOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let user: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM users WHERE id=$1 AND password_hash=$2 AND disabled_at IS NULL FOR UPDATE",
@@ -236,7 +256,7 @@ pub async fn begin_setup(
     .fetch_optional(&mut *tx)
     .await?;
     if user.is_none() {
-        return Ok(false);
+        return Ok(SetupOutcome::SessionGone);
     }
     let live_session: Option<Uuid> = if session_kind == "device" {
         sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE").bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *tx).await?
@@ -244,7 +264,7 @@ pub async fn begin_setup(
         sqlx::query_scalar("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE").bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *tx).await?
     };
     if live_session.is_none() {
-        return Ok(false);
+        return Ok(SetupOutcome::SessionGone);
     }
     let active: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
@@ -254,10 +274,10 @@ pub async fn begin_setup(
     .await?;
     if active {
         tx.commit().await?;
-        return Ok(false);
+        return Ok(SetupOutcome::AlreadyEnabled);
     }
     let changed = sqlx::query(
-        "INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,last_accepted_step,pending_session_id,pending_session_kind,pending_expires_at,created_at) VALUES($1,$2,NULL,NULL,$3,$4,$5 + interval '10 minutes',$5) ON CONFLICT(user_id) DO UPDATE SET secret_ciphertext=EXCLUDED.secret_ciphertext,last_accepted_step=NULL,pending_session_id=EXCLUDED.pending_session_id,pending_session_kind=EXCLUDED.pending_session_kind,pending_expires_at=EXCLUDED.pending_expires_at,created_at=EXCLUDED.created_at WHERE user_two_factor.enabled_at IS NULL AND (user_two_factor.pending_expires_at<=$5 OR (user_two_factor.pending_session_id=$3 AND user_two_factor.pending_session_kind=$4))",
+        "INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,last_accepted_step,pending_session_id,pending_session_kind,pending_expires_at,created_at) VALUES($1,$2,NULL,NULL,$3,$4,$5 + interval '10 minutes',$5) ON CONFLICT(user_id) DO UPDATE SET secret_ciphertext=EXCLUDED.secret_ciphertext,last_accepted_step=NULL,failed_attempts=0,pending_session_id=EXCLUDED.pending_session_id,pending_session_kind=EXCLUDED.pending_session_kind,pending_expires_at=EXCLUDED.pending_expires_at,created_at=EXCLUDED.created_at WHERE user_two_factor.enabled_at IS NULL AND (user_two_factor.pending_expires_at<=$5 OR (user_two_factor.pending_session_id=$3 AND user_two_factor.pending_session_kind=$4))",
     )
     .bind(user_id)
     .bind(ciphertext)
@@ -269,14 +289,14 @@ pub async fn begin_setup(
     .rows_affected();
     if changed != 1 {
         tx.commit().await?;
-        return Ok(false);
+        return Ok(SetupOutcome::Pending);
     }
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(SetupOutcome::Started)
 }
 
 /// Enables a pending factor, stores the fresh recovery hashes, and retires
@@ -387,43 +407,6 @@ pub async fn confirm_setup(
     Ok(changed)
 }
 
-/// Replaces all recovery codes only while the account's factor remains active.
-pub async fn replace_recovery_codes(
-    pool: &PgPool,
-    user_id: Uuid,
-    hashes: &[RecoveryHash],
-    now: OffsetDateTime,
-) -> Result<bool, DbError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
-    )
-    .bind(user_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if active {
-        sqlx::query("DELETE FROM user_two_factor_recovery_codes WHERE user_id=$1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        for hash in hashes {
-            sqlx::query("INSERT INTO user_two_factor_recovery_codes(user_id,salt,code_hash,created_at) VALUES($1,$2,$3,$4)")
-                .bind(user_id)
-                .bind(&hash.salt)
-                .bind(&hash.code_hash)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-    tx.commit().await?;
-    Ok(active)
-}
-
 /// Replays a TOTP step and rotates recovery hashes as one transaction.
 #[allow(clippy::too_many_arguments)] // Keep proof consumption and replacement in one transaction.
 pub async fn replace_recovery_codes_verified(
@@ -502,61 +485,6 @@ pub async fn recovery_hashes(pool: &PgPool, user_id: Uuid) -> Result<Vec<Recover
     .bind(user_id)
     .fetch_all(pool)
     .await?)
-}
-
-/// Accepts an OTP step exactly once. The row lock serializes simultaneous uses.
-pub async fn accept_step(pool: &PgPool, user_id: Uuid, step: i64) -> Result<bool, DbError> {
-    let changed = sqlx::query(
-        "UPDATE user_two_factor SET last_accepted_step=$2 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step < $2)",
-    )
-    .bind(user_id)
-    .bind(step)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        == 1;
-    Ok(changed)
-}
-
-/// Atomically consumes one recovery code. Returns false when already used.
-pub async fn consume_recovery_hash(
-    pool: &PgPool,
-    user_id: Uuid,
-    salt: &[u8],
-    now: OffsetDateTime,
-) -> Result<bool, DbError> {
-    let changed = sqlx::query(
-        "UPDATE user_two_factor_recovery_codes SET used_at=$3 WHERE user_id=$1 AND salt=$2 AND used_at IS NULL AND EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
-    )
-    .bind(user_id)
-    .bind(salt)
-    .bind(now)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        == 1;
-    Ok(changed)
-}
-
-/// Clears TOTP/recovery state and all outstanding challenges atomically.
-pub async fn reset(pool: &PgPool, user_id: Uuid) -> Result<bool, DbError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let changed = sqlx::query("DELETE FROM user_two_factor WHERE user_id=$1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-        > 0;
-    sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(changed)
 }
 
 /// Disables a user's factor, retires challenges, revokes other sessions and
@@ -803,25 +731,6 @@ pub async fn failed_attempt(
     Ok(())
 }
 
-/// Marks a validated challenge consumed. Caller must recheck TOTP/recovery
-/// replay state in a serialized transaction before creating a session.
-pub async fn consume_challenge(
-    pool: &PgPool,
-    id_hash: &[u8; 32],
-    user_id: Uuid,
-    now: OffsetDateTime,
-) -> Result<bool, DbError> {
-    let changed = sqlx::query("UPDATE two_factor_login_challenges SET used_at=$3 WHERE id_hash=$1 AND user_id=$2 AND used_at IS NULL AND attempts<5 AND expires_at>$3")
-        .bind(id_hash.as_slice())
-        .bind(user_id)
-        .bind(now)
-        .execute(pool)
-        .await?
-        .rows_affected()
-        == 1;
-    Ok(changed)
-}
-
 /// Deletes challenges past their five-minute lifetime.
 pub async fn delete_expired_challenges(pool: &PgPool, now: OffsetDateTime) -> Result<u64, DbError> {
     Ok(sqlx::query(
@@ -831,4 +740,52 @@ pub async fn delete_expired_challenges(pool: &PgPool, now: OffsetDateTime) -> Re
     .execute(pool)
     .await?
     .rows_affected())
+}
+
+async fn reset_failed_attempts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE user_two_factor SET failed_attempts=0 WHERE user_id=$1 AND failed_attempts<>0",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Counts one failed second-factor proof against the account under its row
+/// lock. Returns true when this failure reached [`MAX_FAILED_ATTEMPTS`] and the
+/// account is now locked until an operator resets the factor.
+pub async fn record_failed_proof(
+    pool: &PgPool,
+    user_id: Uuid,
+    audit: &AuditCtx,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let count: Option<i32> = sqlx::query_scalar("UPDATE user_two_factor SET failed_attempts=failed_attempts+1 WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 RETURNING failed_attempts")
+        .bind(user_id)
+        .bind(MAX_FAILED_ATTEMPTS)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let locked = count == Some(MAX_FAILED_ATTEMPTS);
+    if locked {
+        let by = AuditCtx {
+            actor_id: Some(user_id),
+            request_id: audit.request_id.clone(),
+        };
+        record_in(
+            &mut tx,
+            &by,
+            &NewEvent::new("auth.two_factor_locked").target("user", user_id),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(locked)
 }

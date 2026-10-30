@@ -378,58 +378,6 @@ pub async fn revoke_all_for_user(
     Ok(result)
 }
 
-/// Revokes all other browser sessions plus every device session atomically,
-/// preserving the active browser session that performed a security change.
-pub async fn revoke_other_for_user(
-    pool: &PgPool,
-    user_id: Uuid,
-    keep_session: Uuid,
-    now: OffsetDateTime,
-    audit: &AuditCtx,
-    action: &str,
-) -> Result<u64, DbError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let revoked = sqlx::query(
-        "UPDATE sessions SET revoked_at=$3 WHERE user_id=$1 AND id<>$2 AND revoked_at IS NULL",
-    )
-    .bind(user_id)
-    .bind(keep_session)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    locks::delete_for_user_tx(
-        &mut tx,
-        user_id,
-        LockSessionKind::Browser,
-        Some(keep_session),
-    )
-    .await?;
-    let device_audit = AuditCtx {
-        actor_id: Some(user_id),
-        request_id: audit.request_id.clone(),
-    };
-    device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &device_audit).await?;
-    let by = AuditCtx {
-        actor_id: Some(user_id),
-        request_id: audit.request_id.clone(),
-    };
-    record_in(
-        &mut tx,
-        &by,
-        &NewEvent::new(action)
-            .target("user", user_id)
-            .detail("sessions", Detail::Count(count(revoked))),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(revoked)
-}
-
 /// Like [`revoke_all_for_user`], and records the `auth.logout_all` audit event
 /// (actor: the user) in the same transaction.
 ///

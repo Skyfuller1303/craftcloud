@@ -10,7 +10,9 @@ Der native Adapter verwendet ureq 3 mit rustls und Plattform-Zertifikatsprüfung
 
 Die App schreibt zuerst lokal. Eine explizite Verknüpfung in `craftcloud-links.json` steuert nachfolgende Uploads mit der bekannten Basisversion. Fehler erhalten die lokale Datei. Konflikte verlangen eine Entscheidung und vor dem Überschreiben eine erneute Bestätigung. Es gibt keine Hintergrund-Warteschlange. Downloads werden vor Übergabe anhand von `Repr-Digest` geprüft. Nicht-FigCraft-Dateien verwenden die bestehenden fünfminütigen Leases mit einem Herzschlag alle 60 Sekunden.
 
-Discovery ergänzt den bestehenden Endpunkt additiv. Das Formatregister beschreibt Endungen, interpretiert aber keine Inhalte. Der Client erkennt die reservierte `SECOND_FACTOR_REQUIRED`-Challenge, ohne die parallel entwickelte AC-02-Serverimplementierung zu verändern.
+Discovery ergänzt den bestehenden Endpunkt additiv. Das Formatregister beschreibt Endungen, interpretiert aber keine Inhalte. Der Client erkennt die `SECOND_FACTOR_REQUIRED`-Challenge und schließt sie mit `complete_second_factor` über `POST /api/v1/auth/device/login/second-factor` (AC-02) ab; die Demo und der egui-Anmeldedialog nehmen dafür einen Authenticator- oder Wiederherstellungscode entgegen. Die früher dokumentierte Abweichung „AC-02-Endpunkt fehlt“ entfällt; ein datenbankgestützter Test meldet ein Konto mit aktivem 2FA über das SDK an.
+
+Geteilte Erneuerungstokens: Mehrere Clients oder Prozesse mit demselben Schlüsselbund-Eintrag lesen vor jeder Rotation den gespeicherten Wert und rotieren unter einer Sperre (Trait-Methoden `load` und `lock_exclusive`, Sperrdatei im App-Datenordner). Die Demo ersetzt bei jeder Verbindung den alten Client und gibt vorher dessen Leases frei.
 
 ## Abweichung bei der Mindestversion
 

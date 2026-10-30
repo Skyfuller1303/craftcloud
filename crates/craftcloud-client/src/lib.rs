@@ -67,7 +67,14 @@ pub trait CloudTransport: Send + Sync {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum CloudError {
+    /// The outcome of the request is unknown: the connection broke or timed out
+    /// after the request may have reached the server.
     Offline,
+    /// The request provably never reached the server (name resolution failed,
+    /// connection refused or timed out while connecting). Nothing was changed
+    /// on the server, so a rotating request such as a token refresh is safe to
+    /// repeat with the same credentials.
+    Unreachable,
     Cancelled,
     Unauthorized,
     SecondFactorChallenge(String),
@@ -106,7 +113,7 @@ impl fmt::Debug for CloudError {
 impl fmt::Display for CloudError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Offline => f.write_str("CraftCloud is unreachable"),
+            Self::Offline | Self::Unreachable => f.write_str("CraftCloud is unreachable"),
             Self::Cancelled => f.write_str("Operation cancelled"),
             Self::Unauthorized => f.write_str("Sign in again"),
             Self::SecondFactorChallenge(_) => f.write_str("A second-factor code is required"),
@@ -156,10 +163,53 @@ pub struct DeviceTokens {
     pub expires_at: String,
 }
 
+/// Second-factor proof for [`CloudClient::complete_second_factor`]. The code is
+/// held in a [`Secret`], so it is zeroized on drop and never shown by `Debug`.
+pub enum Proof {
+    /// Six-digit authenticator code.
+    Totp(Secret),
+    /// One-use recovery code.
+    Recovery(Secret),
+}
+impl Proof {
+    pub fn totp(code: impl Into<String>) -> Self {
+        Self::Totp(Secret::new(code))
+    }
+    pub fn recovery(code: impl Into<String>) -> Self {
+        Self::Recovery(Secret::new(code))
+    }
+}
+impl fmt::Debug for Proof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Totp(_) => f.write_str("Proof::Totp(***)"),
+            Self::Recovery(_) => f.write_str("Proof::Recovery(***)"),
+        }
+    }
+}
+
 /// Host-owned persistence for refresh tokens only. Implementations must never log tokens.
 /// Failure disables persistence for this session; the client attempts to remove stale data.
+///
+/// Several clients or processes may share one persisted slot (same server, account and
+/// application). Refresh tokens rotate and a reused token revokes the whole session family,
+/// so a store shared that way should implement [`load`](Self::load) and
+/// [`lock_exclusive`](Self::lock_exclusive): the client then re-reads the slot and holds the
+/// lock for the whole read-rotate-store sequence.
 pub trait RefreshTokenStore: Send + Sync {
     fn store(&self, refresh: Option<&Secret>) -> Result<(), CloudError>;
+    /// Reads the currently persisted refresh token. The default reports that reading is
+    /// not supported; the client then refreshes with its in-memory token.
+    fn load(&self) -> Result<Option<Secret>, CloudError> {
+        Err(CloudError::Io(
+            "persisted refresh token cannot be read".into(),
+        ))
+    }
+    /// Blocks until no other client or process using the same slot is refreshing and
+    /// returns a guard that releases the lock when dropped. The default takes no lock.
+    fn lock_exclusive(&self) -> Result<Box<dyn std::any::Any>, CloudError> {
+        Ok(Box::new(()))
+    }
 }
 
 /// Core session and API workflow. Refresh calls serialize within this client.
@@ -272,12 +322,19 @@ impl<T: CloudTransport> CloudClient<T> {
         Ok(user)
     }
     pub fn discover(&self) -> Result<Discovery, CloudError> {
-        let d: Discovery =
-            self.json("GET", "/api/v1/info", None::<&serde_json::Value>, None, &[])?;
-        if d.api_version.split('.').next() != Some(&self.api_major.to_string()) {
-            return Err(CloudError::IncompatibleServer(d.api_version));
+        let response = self.raw("GET", "/api/v1/info", Vec::new(), None, &[])?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|_| CloudError::InvalidResponse)?;
+        // The version decides compatibility before any other field is interpreted, so a
+        // server of another major version is reported as such, not as a malformed answer.
+        let version = value
+            .get("api_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(CloudError::InvalidResponse)?;
+        if version.split('.').next() != Some(&self.api_major.to_string()) {
+            return Err(CloudError::IncompatibleServer(version.to_owned()));
         }
-        Ok(d)
+        serde_json::from_value(value).map_err(|_| CloudError::InvalidResponse)
     }
     pub fn login(
         &self,
@@ -296,6 +353,34 @@ impl<T: CloudTransport> CloudClient<T> {
         }
         self.set_tokens(t.into())
     }
+    /// Completes a login that answered [`CloudError::SecondFactorChallenge`] with the
+    /// challenge id it carried. On success the client holds the session as after `login`.
+    /// A wrong or already used proof answers [`CloudError::Unauthorized`]; the challenge
+    /// allows only a few attempts, then the password step must be repeated.
+    pub fn complete_second_factor(
+        &self,
+        challenge_id: &str,
+        proof: Proof,
+    ) -> Result<(), CloudError> {
+        let (field, code) = match &proof {
+            Proof::Totp(code) => ("code", code.expose()),
+            Proof::Recovery(code) => ("recovery_code", code.expose()),
+        };
+        let mut body = serde_json::Map::new();
+        body.insert("challenge_id".into(), challenge_id.into());
+        body.insert(field.into(), code.into());
+        let t: DeviceLoginResponse = self.json(
+            "POST",
+            "/api/v1/auth/device/login/second-factor",
+            Some(&serde_json::Value::Object(body)),
+            None,
+            &[],
+        )?;
+        if let Ok(mut user) = self.user.lock() {
+            *user = Some(t.user.clone());
+        }
+        self.set_tokens(t.into())
+    }
     pub fn refresh(&self) -> Result<(), CloudError> {
         self.refresh_guarded(None)
     }
@@ -309,7 +394,24 @@ impl<T: CloudTransport> CloudClient<T> {
         {
             return Ok(());
         }
-        let old = g.take().ok_or(CloudError::Unauthorized)?;
+        if g.is_none() {
+            return Err(CloudError::Unauthorized);
+        }
+        let store = self.token_store.lock().ok().and_then(|slot| slot.clone());
+        // Held until the rotated token is stored: no other client or process sharing the
+        // persisted slot can rotate in between.
+        let _exclusive = match store.as_ref() {
+            Some(store) => Some(store.lock_exclusive()?),
+            None => None,
+        };
+        let mut old = g.take().ok_or(CloudError::Unauthorized)?;
+        if let Some(stored) = store.as_ref().and_then(|store| store.load().ok().flatten())
+            && stored.expose() != old.refresh_token.expose()
+        {
+            // Another holder of the shared slot rotated the token. Ours is stale, and
+            // presenting it would make the server revoke the whole session family.
+            old.refresh_token = stored;
+        }
         // Clear before rotation: a crash or lost response must not leave a used token persisted.
         self.persist_refresh(None);
         let body = serde_json::json!({"refresh_token":old.refresh_token.expose()});
@@ -327,6 +429,13 @@ impl<T: CloudTransport> CloudClient<T> {
                 *g = Some(tokens);
                 Ok(())
             }
+            Err(CloudError::Unreachable) => {
+                // The request never reached the server, so the token was not rotated.
+                // Keep the session and restore the persisted copy for a later retry.
+                self.persist_refresh(Some(&old.refresh_token));
+                *g = Some(old);
+                Err(CloudError::Unreachable)
+            }
             Err(e) => {
                 *g = None;
                 if let Ok(mut user) = self.user.lock() {
@@ -336,17 +445,37 @@ impl<T: CloudTransport> CloudClient<T> {
             }
         }
     }
+    /// Ends the server-side device session (and with it the file locks it holds), then
+    /// clears the local session in every case. An expired access token is refreshed once
+    /// and the request repeated. When the server session still could not be ended, the
+    /// local state is cleared nevertheless and the error is returned so that the caller
+    /// can tell the user that only the local sign-out happened.
     pub fn logout(&self) -> Result<(), CloudError> {
         let token = self.access_token()?;
-        let result = self.raw(
+        let mut result = self.raw_logout(&token);
+        if result == Err(CloudError::Unauthorized) {
+            result = match self.refresh_if_current(token.expose()) {
+                Ok(()) => self
+                    .access_token()
+                    .and_then(|fresh| self.raw_logout(&fresh)),
+                // The server no longer accepts the refresh token either: the session is
+                // already gone, which is what a logout wants.
+                Err(CloudError::Unauthorized) => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        self.clear_tokens();
+        result
+    }
+    fn raw_logout(&self, token: &Secret) -> Result<(), CloudError> {
+        self.raw(
             "POST",
             "/api/v1/auth/device/logout",
             Vec::new(),
-            Some(&token),
+            Some(token),
             &[],
-        );
-        self.clear_tokens();
-        result.map(|_| ())
+        )
+        .map(|_| ())
     }
     pub fn get<TOut: DeserializeOwned>(&self, path: &str) -> Result<TOut, CloudError> {
         self.auth_json("GET", path, None::<&serde_json::Value>, None, &[])
@@ -1197,6 +1326,339 @@ mod tests {
             assert!(matches!(handle.join(), Ok(Ok(_))));
         }
         assert_eq!(client.transport().rotations.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Replays canned responses and records every request.
+    struct Recording {
+        responses: Mutex<VecDeque<Result<Response, CloudError>>>,
+        requests: Mutex<Vec<(String, String, String)>>,
+    }
+    impl Recording {
+        fn new(responses: Vec<Result<Response, CloudError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+        fn seen(&self) -> Vec<(String, String, String)> {
+            self.requests.lock().map(|v| v.clone()).unwrap_or_default()
+        }
+    }
+    impl CloudTransport for Recording {
+        fn send(&self, request: Request) -> Result<Response, CloudError> {
+            if let Ok(mut seen) = self.requests.lock() {
+                seen.push((
+                    request.method.clone(),
+                    request.path.clone(),
+                    String::from_utf8_lossy(&request.body).into_owned(),
+                ));
+            }
+            self.responses
+                .lock()
+                .map_err(|_| CloudError::Offline)?
+                .pop_front()
+                .unwrap_or(Err(CloudError::Offline))
+        }
+    }
+
+    const LOGIN: &str = r#"{"access_token":"login-a","access_expires_at":"later","refresh_token":"login-r","refresh_expires_at":"later","device_session_id":"00000000-0000-0000-0000-000000000001","user":{"user_id":"00000000-0000-0000-0000-000000000002","email":"a@example.test","display_name":"A","instance_role":null}}"#;
+
+    #[test]
+    fn second_factor_completion_posts_the_chosen_proof_and_stores_the_session()
+    -> Result<(), CloudError> {
+        for (proof, field) in [
+            (Proof::totp("123456"), "code"),
+            (Proof::recovery("ABCDE-FGHIJ"), "recovery_code"),
+        ] {
+            let client = CloudClient::new(
+                "https://cloud.example",
+                Recording::new(vec![Ok(response(200, LOGIN))]),
+            )?;
+            client.complete_second_factor("challenge-1", proof)?;
+            assert!(client.is_authenticated());
+            assert_eq!(client.refresh_token()?.expose(), "login-r");
+            assert_eq!(
+                client.authenticated_user().map(|user| user.display_name),
+                Some("A".to_owned())
+            );
+            let seen = client.transport().seen();
+            let (method, path, body) = seen.first().ok_or(CloudError::InvalidResponse)?;
+            assert_eq!(method, "POST");
+            assert_eq!(
+                path,
+                "https://cloud.example/api/v1/auth/device/login/second-factor"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(body).map_err(|_| CloudError::InvalidResponse)?;
+            assert_eq!(body["challenge_id"], "challenge-1");
+            assert_eq!(body.as_object().map(|map| map.len()), Some(2));
+            assert!(body.get(field).is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_second_factor_keeps_the_client_signed_out_and_proofs_are_redacted()
+    -> Result<(), CloudError> {
+        let client = CloudClient::new(
+            "https://cloud.example",
+            Recording::new(vec![Ok(response(
+                401,
+                r#"{"error":{"code":"INVALID_CREDENTIALS","message":"no"}}"#,
+            ))]),
+        )?;
+        assert_eq!(
+            client.complete_second_factor("challenge-1", Proof::totp("000000")),
+            Err(CloudError::Unauthorized)
+        );
+        assert!(!client.is_authenticated());
+        let shown = format!(
+            "{:?} {:?}",
+            Proof::totp("424242"),
+            Proof::recovery("SECRET-CODE")
+        );
+        assert!(
+            !shown.contains("424242") && !shown.contains("SECRET-CODE"),
+            "{shown}"
+        );
+        Ok(())
+    }
+
+    /// One persisted slot shared by two clients, standing for two processes
+    /// that use the same keyring entry.
+    struct SharedSlot {
+        value: Mutex<Option<String>>,
+        busy: Arc<AtomicBool>,
+        locks: std::sync::atomic::AtomicUsize,
+    }
+    impl SharedSlot {
+        fn holding(token: &str) -> Arc<Self> {
+            Arc::new(Self {
+                value: Mutex::new(Some(token.into())),
+                busy: Arc::new(AtomicBool::new(false)),
+                locks: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    impl RefreshTokenStore for SharedSlot {
+        fn store(&self, refresh: Option<&Secret>) -> Result<(), CloudError> {
+            *self.value.lock().map_err(|_| CloudError::Offline)? =
+                refresh.map(|token| token.expose().to_owned());
+            Ok(())
+        }
+        fn load(&self) -> Result<Option<Secret>, CloudError> {
+            Ok(self
+                .value
+                .lock()
+                .map_err(|_| CloudError::Offline)?
+                .clone()
+                .map(Secret::new))
+        }
+        fn lock_exclusive(&self) -> Result<Box<dyn std::any::Any>, CloudError> {
+            while self
+                .busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                std::thread::yield_now();
+            }
+            self.locks.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Release(Arc::clone(&self.busy))))
+        }
+    }
+
+    fn rotated(access: &str, refresh: &str) -> Response {
+        response(
+            200,
+            &format!(
+                r#"{{"access_token":"{access}","access_expires_at":"later","refresh_token":"{refresh}","refresh_expires_at":"later","device_session_id":"00000000-0000-0000-0000-000000000001"}}"#
+            ),
+        )
+    }
+
+    #[test]
+    fn a_client_adopts_the_token_another_holder_rotated_before_it_refreshes()
+    -> Result<(), CloudError> {
+        let slot = SharedSlot::holding("old-refresh");
+        let first = authenticated(Recording::new(vec![
+            Ok(response(401, "{}")),
+            Ok(rotated("first-a", "first-r")),
+            Ok(response(200, "{}")),
+        ]))?;
+        let second = authenticated(Recording::new(vec![
+            Ok(response(401, "{}")),
+            Ok(rotated("second-a", "second-r")),
+            Ok(response(200, "{}")),
+        ]))?;
+        first.set_refresh_token_store(slot.clone())?;
+        second.set_refresh_token_store(slot.clone())?;
+
+        first.get::<serde_json::Value>("/api/v1/organizations")?;
+        // The slot now holds "first-r"; the second client still remembers "old-refresh".
+        second.get::<serde_json::Value>("/api/v1/organizations")?;
+
+        let seen = second.transport().seen();
+        let refresh = seen
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/auth/device/refresh"))
+            .ok_or(CloudError::InvalidResponse)?;
+        assert!(refresh.2.contains("first-r"), "{}", refresh.2);
+        assert!(!refresh.2.contains("old-refresh"), "{}", refresh.2);
+        assert_eq!(second.refresh_token()?.expose(), "second-r");
+        assert_eq!(
+            slot.value
+                .lock()
+                .map_err(|_| CloudError::Offline)?
+                .as_deref(),
+            Some("second-r")
+        );
+        assert_eq!(slot.locks.load(Ordering::SeqCst), 2);
+        assert!(!slot.busy.load(Ordering::SeqCst), "lock was not released");
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_attempts_of_two_clients_never_overlap_on_one_slot() -> Result<(), CloudError> {
+        struct Gate {
+            inside: Arc<std::sync::atomic::AtomicUsize>,
+            overlap: Arc<AtomicBool>,
+        }
+        impl CloudTransport for Gate {
+            fn send(&self, request: Request) -> Result<Response, CloudError> {
+                if request.path.ends_with("/refresh") {
+                    if self.inside.fetch_add(1, Ordering::SeqCst) > 0 {
+                        self.overlap.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    self.inside.fetch_sub(1, Ordering::SeqCst);
+                    return Ok(rotated("n-a", "n-r"));
+                }
+                Ok(response(200, "{}"))
+            }
+        }
+        let slot = SharedSlot::holding("old-refresh");
+        let inside = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlap = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let client = authenticated(Gate {
+                inside: Arc::clone(&inside),
+                overlap: Arc::clone(&overlap),
+            })?;
+            client.set_refresh_token_store(slot.clone())?;
+            handles.push(std::thread::spawn(move || client.refresh()));
+        }
+        for handle in handles {
+            assert!(matches!(handle.join(), Ok(Ok(()))));
+        }
+        assert!(!overlap.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[test]
+    fn logout_refreshes_an_expired_access_token_and_retries() -> Result<(), CloudError> {
+        let client = authenticated(Recording::new(vec![
+            Ok(response(401, "{}")),
+            Ok(rotated("new-a", "new-r")),
+            Ok(response(204, "")),
+        ]))?;
+        client.logout()?;
+        assert!(!client.is_authenticated());
+        let seen = client.transport().seen();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.first()
+                .is_some_and(|r| r.1.ends_with("/device/logout"))
+        );
+        assert!(
+            seen.get(1)
+                .is_some_and(|r| r.1.ends_with("/device/refresh"))
+        );
+        assert!(seen.get(2).is_some_and(|r| r.1.ends_with("/device/logout")));
+        Ok(())
+    }
+
+    #[test]
+    fn logout_that_cannot_end_the_server_session_clears_locally_and_reports_it()
+    -> Result<(), CloudError> {
+        // The retry after a successful refresh fails: session state is cleared anyway.
+        let client = authenticated(Recording::new(vec![
+            Ok(response(401, "{}")),
+            Ok(rotated("new-a", "new-r")),
+            Ok(response(503, "{}")),
+        ]))?;
+        assert_eq!(client.logout(), Err(CloudError::StorageUnavailable));
+        assert!(!client.is_authenticated());
+        // The server is unreachable: same contract.
+        let offline = authenticated(Recording::new(vec![Err(CloudError::Unreachable)]))?;
+        assert_eq!(offline.logout(), Err(CloudError::Unreachable));
+        assert!(!offline.is_authenticated());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_that_never_reached_the_server_keeps_the_session() -> Result<(), CloudError> {
+        let client = authenticated(Mock::new(vec![
+            Err(CloudError::Unreachable),
+            Ok(rotated("new-a", "new-r")),
+        ]))?;
+        let store = Arc::new(RecordingStore::default());
+        client.set_refresh_token_store(store.clone())?;
+        assert_eq!(client.refresh(), Err(CloudError::Unreachable));
+        assert!(client.is_authenticated());
+        assert_eq!(client.refresh_token()?.expose(), "old-refresh");
+        // The persisted copy was restored after the temporary clear.
+        assert_eq!(
+            store.0.lock().map_err(|_| CloudError::Offline)?.last(),
+            Some(&Some("old-refresh".to_owned()))
+        );
+        // A later attempt succeeds with the same, never rotated, token.
+        client.refresh()?;
+        assert_eq!(client.refresh_token()?.expose(), "new-r");
+        Ok(())
+    }
+
+    #[test]
+    fn an_uncertain_refresh_outcome_still_clears_the_session() -> Result<(), CloudError> {
+        let client = authenticated(Mock::new(vec![Err(CloudError::Offline)]))?;
+        assert_eq!(client.refresh(), Err(CloudError::Offline));
+        assert!(!client.is_authenticated());
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_reports_other_majors_and_accepts_older_servers() -> Result<(), CloudError> {
+        let other = CloudClient::new(
+            "https://cloud.example",
+            Mock::new(vec![Ok(response(200, r#"{"api_version":"2.0"}"#))]),
+        )?;
+        assert_eq!(
+            other.discover().map(|_| ()),
+            Err(CloudError::IncompatibleServer("2.0".into()))
+        );
+        let minimal = CloudClient::new(
+            "https://cloud.example",
+            Mock::new(vec![Ok(response(200, r#"{"api_version":"1.0"}"#))]),
+        )?;
+        let discovery = minimal.discover()?;
+        assert_eq!(discovery.api_version, "1.0");
+        assert!(!discovery.feature_flags.two_factor);
+        assert!(discovery.formats.is_empty());
+        let broken = CloudClient::new(
+            "https://cloud.example",
+            Mock::new(vec![Ok(response(200, r#"{"server_version":"1"}"#))]),
+        )?;
+        assert_eq!(
+            broken.discover().map(|_| ()),
+            Err(CloudError::InvalidResponse)
+        );
         Ok(())
     }
 }

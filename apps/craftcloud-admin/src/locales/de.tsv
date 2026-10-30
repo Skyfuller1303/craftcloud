@@ -331,6 +331,7 @@
 	Your password was changed. Log in with the new password.	Dein Passwort wurde geändert. Melde dich mit dem neuen Passwort an.
 	Go to log in	Zur Anmeldung
 	This reset link is not valid any more. Ask for a new one.	Dieser Rücksetzlink ist nicht mehr gültig. Bitte um einen neuen.
+	Another session is already setting up two-factor authentication. Finish it there or wait a few minutes.	In einer anderen Sitzung läuft bereits die Einrichtung der Zwei-Faktor-Authentifizierung. Schließe sie dort ab oder warte einige Minuten.
 
 # Activity log (CC-F11)
 	Only organization owners and admins can see the activity log.	Nur Inhaber und Admins der Organisation können das Aktivitätsprotokoll sehen.

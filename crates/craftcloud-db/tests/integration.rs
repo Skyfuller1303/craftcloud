@@ -2124,6 +2124,159 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn second_factor_failures_are_counted_reset_by_success_and_capped_persistently() {
+        use craftcloud_db::two_factor::{self, MAX_FAILED_ATTEMPTS, VerifiedFactor};
+        use sha2::{Digest, Sha256};
+
+        let db = migrated().await;
+        let user_id = user_with_hash(&db.pool, "mfa-cap@example.test", "h1").await;
+        let now = time::OffsetDateTime::now_utc();
+        let ciphertext = vec![7_u8; 32];
+        sqlx::query("INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,last_accepted_step,created_at) VALUES($1,$2,$3,NULL,$3)")
+            .bind(user_id).bind(&ciphertext).bind(now).execute(&db.pool).await.unwrap();
+        let audit = craftcloud_db::audit::AuditCtx {
+            actor_id: Some(user_id),
+            request_id: Some("test-request".into()),
+        };
+        let counter = || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT failed_attempts FROM user_two_factor WHERE user_id=$1",
+            )
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+        };
+        let password_digest: [u8; 32] = Sha256::digest(b"h1").into();
+        let challenge = |marker: u8| {
+            let db = &db;
+            async move {
+                let id = [marker; 32];
+                sqlx::query("INSERT INTO two_factor_login_challenges(id_hash,user_id,password_hash_digest,login_kind,client_address,created_at,expires_at) VALUES($1,$2,$3,'browser','192.0.2.9',$4,$4 + interval '5 minutes')")
+                    .bind(id.as_slice()).bind(user_id).bind(password_digest.as_slice()).bind(now).execute(&db.pool).await.unwrap();
+                id
+            }
+        };
+        let new_session = |marker| NewSession {
+            user_id,
+            token_hash: [marker; 32],
+            now,
+            absolute_expires_at: now + time::Duration::days(1),
+        };
+
+        // Failures accumulate; one success resets the counter.
+        for expected in 1..=3 {
+            assert!(
+                !two_factor::record_failed_proof(&db.pool, user_id, &audit)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(counter().await, expected);
+        }
+        let first = challenge(1).await;
+        let completed = two_factor::complete_browser_login(
+            &db.pool,
+            &first,
+            user_id,
+            "192.0.2.9",
+            "h1",
+            &ciphertext,
+            VerifiedFactor::TotpStep(10),
+            &new_session(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert!(completed.is_some());
+        assert_eq!(counter().await, 0);
+
+        // The failure that reaches the cap reports the lock and audits it once.
+        sqlx::query("UPDATE user_two_factor SET failed_attempts=$2 WHERE user_id=$1")
+            .bind(user_id)
+            .bind(MAX_FAILED_ATTEMPTS - 1)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            two_factor::record_failed_proof(&db.pool, user_id, &audit)
+                .await
+                .unwrap()
+        );
+        assert_eq!(counter().await, MAX_FAILED_ATTEMPTS);
+        assert!(
+            !two_factor::record_failed_proof(&db.pool, user_id, &audit)
+                .await
+                .unwrap()
+        );
+        assert_eq!(counter().await, MAX_FAILED_ATTEMPTS);
+        let locked_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE action='auth.two_factor_locked'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(locked_events, 1);
+
+        // A valid proof (TOTP or recovery) no longer completes a login.
+        let second = challenge(2).await;
+        let refused = two_factor::complete_browser_login(
+            &db.pool,
+            &second,
+            user_id,
+            "192.0.2.9",
+            "h1",
+            &ciphertext,
+            VerifiedFactor::TotpStep(20),
+            &new_session(2),
+            &audit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused, None);
+        assert_eq!(counter().await, MAX_FAILED_ATTEMPTS);
+
+        // A vanished session is reported distinctly from an enabled factor.
+        let outcome = two_factor::begin_setup(
+            &db.pool,
+            user_id,
+            Uuid::new_v4(),
+            "browser",
+            "h1",
+            &ciphertext,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, two_factor::SetupOutcome::SessionGone);
+
+        // An operator reset removes the row, so a new setup starts at zero.
+        assert!(
+            two_factor::reset_for_user(
+                &db.pool,
+                user_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                now,
+                &audit,
+                "auth.two_factor_reset"
+            )
+            .await
+            .unwrap()
+        );
+        let user_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM user_two_factor WHERE user_id=$1")
+                .bind(user_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(user_rows, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn verified_login_insert_waits_for_a_password_change_in_flight_and_then_refuses() {
         let db = migrated().await;
         let id = user_with_hash(&db.pool, "race@example.test", "h1").await;

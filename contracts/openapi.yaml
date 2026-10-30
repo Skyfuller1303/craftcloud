@@ -257,7 +257,11 @@ paths:
         challenge and the TOTP timestep or recovery code before issuing the browser session.
         Origin checks and existing per-account and per-address login limits apply. Failed proofs count
         toward the login limits and the five-attempt challenge budget. Challenges invalidated by credential
-        changes, reset or account disabling cannot create a session. Response is never cacheable.
+        changes, reset or account disabling cannot create a session. Each account also keeps a persistent
+        counter of consecutive failed proofs (TOTP and recovery codes alike, browser and device). After 100
+        failures every further attempt answers 401 INVALID_CREDENTIALS, even with a valid code, until an
+        operator clears the factor (reset link with reset_two_factor or the CLI); a successful proof resets
+        the counter. Response is never cacheable.
       requestBody:
         required: true
         content:
@@ -290,6 +294,7 @@ paths:
         client address. Device name, client kind and client id were validated and captured at the initial
         password step and cannot be replaced here. Browser challenges are rejected. Challenge lifetime,
         one-time proof consumption and login rate limits match the browser second-factor route.
+        The persistent 100-failure account lock described for the browser route applies here as well.
         No cookie is issued; keep the resulting refresh token in the operating system keychain.
       requestBody:
         required: true
@@ -335,7 +340,9 @@ paths:
       description: >-
         Generates a fresh 160-bit secret and stores it encrypted. Enrollment is not active until confirm.
         Render the otpauth URL as a QR code locally; never send it to an external QR service or persist it
-        in browser storage. Missing current encryption key returns 503 TWO_FACTOR_UNAVAILABLE.
+        in browser storage. Missing current encryption key returns 503 TWO_FACTOR_UNAVAILABLE. 409 carries
+        TWO_FACTOR_ALREADY_ENABLED (a factor is active) or TWO_FACTOR_SETUP_PENDING (another session holds a
+        live pending setup); a vanished session or changed password answers 401 INVALID_CREDENTIALS.
       requestBody:
         required: true
         content:

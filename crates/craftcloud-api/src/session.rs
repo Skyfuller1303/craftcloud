@@ -265,13 +265,22 @@ async fn organization_requires_two_factor(
 ) -> Result<bool, AuthRejectionKind> {
     // Axum route captures are percent-decoded. Decode each raw URI segment
     // separately so encoded slashes cannot change the route structure.
-    let decoded: Vec<String> = path
+    // An undecodable segment cannot name an organization; the router or
+    // extractor rejects such a path normally.
+    let Some(decoded) = path
         .split('/')
         .filter(|value| !value.is_empty())
         .map(decode_path_segment)
-        .collect::<Option<_>>()
-        .ok_or(AuthRejectionKind::Internal)?;
+        .collect::<Option<Vec<String>>>()
+    else {
+        return Ok(false);
+    };
     let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
+    // Instance-admin routes carry organization ids but are not organization
+    // scoped; the organization policy must not apply to them.
+    if matches!(segments.as_slice(), ["api", "v1", "admin", ..]) {
+        return Ok(false);
+    }
     let id_after = |name: &str| -> Option<Uuid> {
         let index = segments.iter().position(|segment| *segment == name)?;
         Uuid::parse_str(segments.get(index + 1)?).ok()

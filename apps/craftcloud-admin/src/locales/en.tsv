@@ -333,6 +333,7 @@
 	Your password was changed. Log in with the new password.	Your password was changed. Log in with the new password.
 	Go to log in	Go to log in
 	This reset link is not valid any more. Ask for a new one.	This reset link is not valid any more. Ask for a new one.
+	Another session is already setting up two-factor authentication. Finish it there or wait a few minutes.	Another session is already setting up two-factor authentication. Finish it there or wait a few minutes.
 
 # Activity log (CC-F11)
 	Only organization owners and admins can see the activity log.	Only organization owners and admins can see the activity log.

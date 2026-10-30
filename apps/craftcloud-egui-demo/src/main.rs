@@ -11,12 +11,16 @@ use std::{
 };
 
 use craftcloud_client::dto::{File as CloudFile, Organization, Project, Workspace};
-use craftcloud_client::{CloudClient, CloudError, UploadContent};
+use craftcloud_client::{CloudClient, CloudError, Proof, UploadContent};
 use craftcloud_client_native::{
     CloudLink, FileLeaseHeartbeat, KeychainTokenStore, LinksStore, NewFile, SaveOutcome,
-    UreqTransport, VersionCache, save_local_first_with_cancel, save_new_local_first_with_cancel,
+    UreqTransport, VersionCache, cache_extension, overwrite_local_first_with_cancel,
+    save_local_first_with_cancel, save_new_local_first_with_cancel,
 };
-use craftcloud_egui::{Action, DefaultTranslator, Dialog, Language, PickerState};
+use craftcloud_egui::{
+    Action, DefaultTranslator, Dialog, Language, PickerState, SecondFactorInput,
+    classify_second_factor,
+};
 use eframe::egui;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -29,13 +33,17 @@ enum Request {
         email: String,
         password: String,
     },
+    SecondFactor {
+        email: String,
+        challenge_id: String,
+        proof: Proof,
+    },
     List {
         context: ListContext,
         cursor: Option<String>,
     },
     Open {
         file_id: String,
-        file_name: String,
         read_only: bool,
     },
     SaveNew {
@@ -63,6 +71,7 @@ enum Event {
         email: String,
     },
     SecondFactor(String),
+    SecondFactorRejected(String),
     Listing {
         context: ListContext,
         items: ListItems,
@@ -90,8 +99,21 @@ enum Event {
     Conflict(String),
     Locked(String),
     LoggedOut,
+    /// The local session ended but the server could not be told.
+    LoggedOutLocally(String),
     Failed(String),
     Cancelled,
+}
+
+/// Results that describe something that already happened on the server. A cancel request
+/// that arrives after the commit or the file creation must not replace them with
+/// "cancelled": the UI would otherwise forget the new file or version and, for example,
+/// create a second remote file on the next save.
+fn survives_cancel(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Saved(_) | Event::Retryable { .. } | Event::Conflict(_)
+    )
 }
 
 struct Job {
@@ -330,7 +352,8 @@ impl DemoApp {
             } else {
                 None
             };
-            let event = if cancelled.load(Ordering::Acquire) {
+            let cancel_requested = cancelled.load(Ordering::Acquire);
+            let event = if cancel_requested && !survives_cancel(&message.event) {
                 Event::Cancelled
             } else {
                 message.event
@@ -355,6 +378,8 @@ impl DemoApp {
                     self.picker.dialog = Some(Dialog::Account);
                     self.picker.email = email;
                     self.picker.account_name = display_name;
+                    self.picker.requires_second_factor = false;
+                    self.picker.second_factor_challenge_id = None;
                     self.status = "Signed in".into();
                     self.start_list(ListContext::Organizations);
                 }
@@ -363,6 +388,11 @@ impl DemoApp {
                     self.picker.second_factor_challenge_id = Some(challenge);
                     self.picker.dialog = Some(Dialog::Login);
                     self.status = "Enter second factor".into();
+                }
+                Event::SecondFactorRejected(message) => {
+                    self.picker.dialog = Some(Dialog::Login);
+                    self.picker.error = Some(message.clone());
+                    self.status = message;
                 }
                 Event::Listing {
                     context,
@@ -407,7 +437,12 @@ impl DemoApp {
                 }
                 Event::Saved(file_id) => {
                     self.picker.selected_file = Some(file_id);
-                    self.status = "Cloud save complete; local file retained".into();
+                    self.status = if cancel_requested {
+                        "Cloud save completed before the cancel request took effect; local file retained"
+                    } else {
+                        "Cloud save complete; local file retained"
+                    }
+                    .into();
                     self.picker.dialog = Some(Dialog::Save);
                 }
                 Event::Retryable { file_id, message } => {
@@ -437,13 +472,22 @@ impl DemoApp {
                     self.picker.locked_by = Some(owner);
                     self.picker.dialog = Some(Dialog::Lock);
                 }
-                Event::LoggedOut => {
+                Event::LoggedOut | Event::LoggedOutLocally(_) => {
                     self.clear_server_context();
                     self.picker.email.clear();
                     self.picker.account_name.clear();
                     self.picker.organization_name.clear();
+                    self.picker.requires_second_factor = false;
+                    self.picker.second_factor_challenge_id = None;
                     self.picker.dialog = Some(Dialog::Login);
                     self.status = "Signed out".into();
+                    if let Event::LoggedOutLocally(error) = event {
+                        let message = format!(
+                            "Signed out locally; the server session could not be ended ({error})"
+                        );
+                        self.picker.error = Some(message.clone());
+                        self.status = message;
+                    }
                 }
                 Event::Failed(error) => {
                     self.picker.error = Some(error.clone());
@@ -484,13 +528,29 @@ impl DemoApp {
                 password,
                 second_factor,
                 ..
-            } => {
-                if self.picker.second_factor_challenge_id.is_some() && second_factor.is_some() {
-                    self.status = "This server build does not provide the AC-02 second-factor completion route".into();
-                } else {
-                    self.send(Request::Login { email, password });
+            } => match (
+                self.picker.second_factor_challenge_id.clone(),
+                second_factor,
+            ) {
+                (Some(challenge_id), Some(code)) => {
+                    let proof = match classify_second_factor(&code) {
+                        Some(SecondFactorInput::Totp(code)) => Some(Proof::totp(code)),
+                        Some(SecondFactorInput::Recovery(code)) => Some(Proof::recovery(code)),
+                        None => None,
+                    };
+                    if let Some(proof) = proof {
+                        self.send(Request::SecondFactor {
+                            email,
+                            challenge_id,
+                            proof,
+                        });
+                    } else {
+                        self.status =
+                            "Enter a six-digit code or a ten-character recovery code".into();
+                    }
                 }
-            }
+                _ => self.send(Request::Login { email, password }),
+            },
             Action::Logout => {
                 self.clear_server_context();
                 self.picker.account_name.clear();
@@ -540,7 +600,6 @@ impl DemoApp {
                 }
                 self.send(Request::Open {
                     file_id,
-                    file_name: self.file_name.clone(),
                     read_only: false,
                 });
             }
@@ -614,7 +673,6 @@ impl DemoApp {
                     self.selected_read_only = true;
                     self.send(Request::Open {
                         file_id,
-                        file_name: self.file_name.clone(),
                         read_only: true,
                     });
                 }
@@ -742,17 +800,25 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
                 Request::Discover(base) => {
                     let canonical = canonical_server(&base);
                     if server != canonical {
+                        // Release the leases first: they hold the old client and need
+                        // its session to unlock the files.
+                        leases.clear();
                         if let Some(previous) = client.take()
                             && previous.is_authenticated()
                         {
                             let _ = previous.logout();
                         }
-                        leases.clear();
                         server.clear();
                     }
                     match CloudClient::new(canonical.clone(), UreqTransport::default()) {
                         Ok(candidate) => match candidate.discover() {
                             Ok(_) => {
+                                // A reconnect replaces the client. The old one must not
+                                // stay behind holding leases or a stale copy of the
+                                // refresh token that the new client shares through the
+                                // keychain.
+                                leases.clear();
+                                drop(client.take());
                                 server = canonical;
                                 client = Some(std::sync::Arc::new(candidate));
                                 Ok(Event::Discovered)
@@ -770,11 +836,7 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
                         {
                             let _ = active.logout();
                         }
-                        let bound = keychain.bound(
-                            server.clone(),
-                            account_key(&email),
-                            "craftcloud-egui-demo",
-                        );
+                        let bound = bind_store(&keychain, &data_dir, &server, &email);
                         let stored = bound.load().ok().flatten();
                         match active.set_refresh_token_store(Arc::new(bound)) {
                             Err(error) => Err(error.to_string()),
@@ -813,6 +875,30 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
                         Err("Add and discover a server first".into())
                     }
                 }
+                Request::SecondFactor {
+                    email,
+                    challenge_id,
+                    proof,
+                } => {
+                    if let Some(active) = client.as_ref() {
+                        let bound = bind_store(&keychain, &data_dir, &server, &email);
+                        match active.set_refresh_token_store(Arc::new(bound)) {
+                            Err(error) => Err(error.to_string()),
+                            Ok(()) => Ok(match active.complete_second_factor(&challenge_id, proof) {
+                                Ok(()) => login_event(active, &email),
+                                Err(CloudError::SecondFactorChallenge(id)) => {
+                                    Event::SecondFactor(id)
+                                }
+                                Err(CloudError::Unauthorized) => Event::SecondFactorRejected(
+                                    "The code was not accepted or the sign-in expired. Check the code or cancel and sign in again".into(),
+                                ),
+                                Err(error) => Event::SecondFactorRejected(error.to_string()),
+                            }),
+                        }
+                    } else {
+                        Err("Add and discover a server first".into())
+                    }
+                }
                 Request::List { context, cursor } => client
                     .as_ref()
                     .ok_or_else(|| "Sign in first".to_string())
@@ -825,11 +911,7 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
                             }
                         })
                     }),
-                Request::Open {
-                    file_id,
-                    file_name,
-                    read_only,
-                } => {
+                Request::Open { file_id, read_only } => {
                     leases.clear();
                     open_file(
                         OpenResources {
@@ -841,7 +923,6 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
                             events: &events,
                         },
                         &file_id,
-                        &file_name,
                         read_only,
                         &job.cancelled,
                     )
@@ -907,10 +988,14 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
                 .map_err(|e| e.to_string()),
                 Request::Logout => {
                     leases.clear();
-                    if let Some(active) = client.as_ref() {
-                        let _ = active.logout();
+                    match client.as_ref().map(|active| active.logout()) {
+                        None | Some(Ok(())) | Some(Err(CloudError::Unauthorized)) => {
+                            Ok(Event::LoggedOut)
+                        }
+                        // The local session is gone either way; tell the user that the
+                        // server may still hold it until it expires.
+                        Some(Err(error)) => Ok(Event::LoggedOutLocally(error.to_string())),
                     }
-                    Ok(Event::LoggedOut)
                 }
                 Request::CloseFile(id) => match Uuid::parse_str(&id) {
                     Ok(uuid) => {
@@ -926,10 +1011,16 @@ fn worker(requests: Receiver<Job>, events: Sender<WorkerEvent>) {
             }
         };
         let event = if job.cancelled.load(Ordering::Acquire) {
-            if let Some(file_id) = requested_open_file {
-                leases.remove(&file_id);
+            match result {
+                // The server already acted; report that instead of "cancelled".
+                Ok(event) if survives_cancel(&event) => event,
+                _ => {
+                    if let Some(file_id) = requested_open_file {
+                        leases.remove(&file_id);
+                    }
+                    Event::Cancelled
+                }
             }
-            Event::Cancelled
         } else {
             result.unwrap_or_else(Event::Failed)
         };
@@ -960,6 +1051,23 @@ fn login_event(client: &CloudClient<UreqTransport>, fallback_email: &str) -> Eve
         display_name,
         email,
     }
+}
+
+/// The refresh-token slot of one account on one server, with a lock file in the app data
+/// directory so that several processes sharing the slot never rotate the token at once.
+fn bind_store(
+    keychain: &KeychainTokenStore,
+    data_dir: &Path,
+    server: &str,
+    email: &str,
+) -> craftcloud_client_native::BoundKeychainTokenStore {
+    keychain
+        .bound(
+            server.to_owned(),
+            account_key(email),
+            "craftcloud-egui-demo",
+        )
+        .with_lock_dir(data_dir)
 }
 
 fn canonical_server(server: &str) -> String {
@@ -1130,7 +1238,6 @@ struct OpenResources<'a> {
 fn open_file(
     resources: OpenResources<'_>,
     id: &str,
-    name: &str,
     read_only: bool,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Event, String> {
@@ -1198,9 +1305,11 @@ fn open_file(
     {
         return Err("Downloaded file checksum does not match the committed version".into());
     }
-    let extension = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("bin");
+    // The registered format names the extension; a display name such as
+    // "Logo v2.1 final" has no usable one.
+    let extension = cache_extension(&file.format);
     let path = cache
-        .store(server, id, &version_id.to_string(), extension, &bytes)
+        .store(server, id, &version_id.to_string(), &extension, &bytes)
         .map_err(|error| error.to_string())?;
     if !read_only {
         links
@@ -1378,18 +1487,24 @@ fn overwrite(
     let file: CloudFile = active
         .get(&format!("/api/v1/files/{id}"))
         .map_err(|error| error.to_string())?;
-    let mut rebased_link = link;
-    rebased_link.base_version = file.head_version_id.map(|version| version.to_string());
-    links
-        .upsert(rebased_link)
-        .map_err(|error| error.to_string())?;
     let upload = UploadContent {
         file_id: id,
         base_version: None,
         idempotency_key: Uuid::new_v4().to_string(),
         bytes,
     };
-    match save_local_first_with_cancel(active, links, path, server, upload, Arc::clone(cancelled)) {
+    // The current head is the base for this upload only. The link keeps its old base
+    // until the commit succeeded, so a failed or cancelled overwrite cannot let a later
+    // plain save pass the conflict check.
+    match overwrite_local_first_with_cancel(
+        active,
+        links,
+        path,
+        server,
+        upload,
+        file.head_version_id,
+        Arc::clone(cancelled),
+    ) {
         Ok(SaveOutcome::Uploaded(_)) => Ok(Event::Saved(id.to_string())),
         Ok(SaveOutcome::LocalOnly) => Ok(Event::Failed(
             "Local file is not linked to CraftCloud".into(),
@@ -1803,6 +1918,167 @@ mod tests {
                 .err()
                 .map(|error| error.kind()),
             Some(io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_cancel_after_the_save_finished_keeps_the_saved_file() {
+        let (mut app, _requests, event_sender) = test_app();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        app.current_job = Some((31, cancelled));
+        app.busy = true;
+        event_sender
+            .send(WorkerEvent {
+                id: Some(31),
+                event: Event::Saved("created-file".into()),
+            })
+            .ok();
+        app.process_events(&egui::Context::default());
+        assert_eq!(app.picker.selected_file.as_deref(), Some("created-file"));
+        assert!(
+            app.status.contains("completed before the cancel"),
+            "{}",
+            app.status
+        );
+
+        // A file that was created but not yet uploaded stays selected for the retry.
+        app.current_job = Some((32, Arc::new(AtomicBool::new(true))));
+        app.busy = true;
+        app.picker.selected_file = None;
+        event_sender
+            .send(WorkerEvent {
+                id: Some(32),
+                event: Event::Retryable {
+                    file_id: "created-file".into(),
+                    message: "Operation cancelled".into(),
+                },
+            })
+            .ok();
+        app.process_events(&egui::Context::default());
+        assert_eq!(app.picker.selected_file.as_deref(), Some("created-file"));
+
+        // Other results are still replaced by the cancellation.
+        app.current_job = Some((33, Arc::new(AtomicBool::new(true))));
+        app.busy = true;
+        event_sender
+            .send(WorkerEvent {
+                id: Some(33),
+                event: Event::Failed("late failure".into()),
+            })
+            .ok();
+        app.process_events(&egui::Context::default());
+        assert_eq!(app.status, "Cloud action cancelled");
+    }
+
+    #[test]
+    fn second_factor_codes_are_sent_as_the_matching_proof() {
+        let (mut app, requests, _events) = test_app();
+        app.picker.second_factor_challenge_id = Some("challenge-1".into());
+        app.handle(Action::Login {
+            server: "https://cloud.example".into(),
+            email: "a@example.test".into(),
+            password: String::new(),
+            second_factor: Some("123456".into()),
+        });
+        assert!(matches!(
+            requests.try_recv().map(|job| job.request),
+            Ok(Request::SecondFactor { challenge_id, proof: Proof::Totp(_), .. })
+                if challenge_id == "challenge-1"
+        ));
+        app.busy = false;
+        app.current_job = None;
+        app.handle(Action::Login {
+            server: "https://cloud.example".into(),
+            email: "a@example.test".into(),
+            password: String::new(),
+            second_factor: Some("abcde-fg2h3".into()),
+        });
+        assert!(matches!(
+            requests.try_recv().map(|job| job.request),
+            Ok(Request::SecondFactor {
+                proof: Proof::Recovery(_),
+                ..
+            })
+        ));
+        // Garbage is not sent at all.
+        app.busy = false;
+        app.current_job = None;
+        app.handle(Action::Login {
+            server: "https://cloud.example".into(),
+            email: "a@example.test".into(),
+            password: String::new(),
+            second_factor: Some("12".into()),
+        });
+        assert!(requests.try_recv().is_err());
+        // Without an open challenge the password login is used.
+        app.picker.second_factor_challenge_id = None;
+        app.handle(Action::Login {
+            server: "https://cloud.example".into(),
+            email: "a@example.test".into(),
+            password: "pw".into(),
+            second_factor: None,
+        });
+        assert!(matches!(
+            requests.try_recv().map(|job| job.request),
+            Ok(Request::Login { .. })
+        ));
+    }
+
+    #[test]
+    fn rejected_second_factor_keeps_the_code_dialog_and_signing_in_clears_it() {
+        let (mut app, _requests, event_sender) = test_app();
+        app.picker.requires_second_factor = true;
+        app.picker.second_factor_challenge_id = Some("challenge-1".into());
+        app.current_job = Some((40, Arc::new(AtomicBool::new(false))));
+        app.busy = true;
+        event_sender
+            .send(WorkerEvent {
+                id: Some(40),
+                event: Event::SecondFactorRejected("rejected".into()),
+            })
+            .ok();
+        app.process_events(&egui::Context::default());
+        assert_eq!(app.picker.dialog, Some(Dialog::Login));
+        assert!(app.picker.requires_second_factor);
+        assert_eq!(app.picker.error.as_deref(), Some("rejected"));
+
+        app.current_job = Some((41, Arc::new(AtomicBool::new(false))));
+        app.busy = true;
+        event_sender
+            .send(WorkerEvent {
+                id: Some(41),
+                event: Event::LoggedIn {
+                    display_name: "A".into(),
+                    email: "a@example.test".into(),
+                },
+            })
+            .ok();
+        app.process_events(&egui::Context::default());
+        assert!(!app.picker.requires_second_factor);
+        assert_eq!(app.picker.second_factor_challenge_id, None);
+    }
+
+    #[test]
+    fn a_logout_the_server_did_not_confirm_is_shown_to_the_user() {
+        let (mut app, _requests, event_sender) = test_app();
+        app.current_job = Some((50, Arc::new(AtomicBool::new(false))));
+        app.busy = true;
+        event_sender
+            .send(WorkerEvent {
+                id: Some(50),
+                event: Event::LoggedOutLocally("CraftCloud is unreachable".into()),
+            })
+            .ok();
+        app.process_events(&egui::Context::default());
+        assert_eq!(app.picker.dialog, Some(Dialog::Login));
+        assert!(
+            app.picker
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("Signed out locally")
+                    && text.contains("could not be ended")),
+            "{:?}",
+            app.picker.error
         );
     }
 }

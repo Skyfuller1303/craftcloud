@@ -926,7 +926,10 @@ mod tests {
             let probe = store.probe();
             let _ = tokio::time::timeout(std::time::Duration::ZERO, probe).await;
         }
-        for _ in 0..200 {
+        // Generous deadline: under a loaded CI run the 50 blocking jobs can
+        // queue behind other tests, and on Windows a scanner may briefly hold
+        // a file open before its removal succeeds.
+        for _ in 0..1000 {
             if tmp_files() == 0 {
                 break;
             }

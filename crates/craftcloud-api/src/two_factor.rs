@@ -228,22 +228,63 @@ pub(crate) async fn setup(
     )
     .await
     {
-        Ok(true) => {
+        Ok(two_factor::SetupOutcome::Started) => {
             let encoded = base32_encode(&secret);
-            let uri = format!(
-                "otpauth://totp/CraftCloud?secret={}&issuer=CraftCloud&algorithm=SHA1&digits=6&period=30",
-                encoded
+            let uri = otpauth_uri(
+                &encoded,
+                services.settings.public_url.as_deref(),
+                &account.normalized_email,
             );
             Json(json!({"secret": encoded, "otpauth_url": uri})).into_response()
         }
-        Ok(false) => error_response(
+        Ok(two_factor::SetupOutcome::AlreadyEnabled) => error_response(
             StatusCode::CONFLICT,
             "TWO_FACTOR_ALREADY_ENABLED",
             "Two-factor authentication is already enabled.",
             &headers,
         ),
+        Ok(two_factor::SetupOutcome::Pending) => error_response(
+            StatusCode::CONFLICT,
+            "TWO_FACTOR_SETUP_PENDING",
+            "Another session is already setting up two-factor authentication. Finish it there or wait a few minutes.",
+            &headers,
+        ),
+        Ok(two_factor::SetupOutcome::SessionGone) => invalid(&headers),
         Err(error) => failed(&error, &headers),
     }
+}
+
+/// Percent-encodes everything except RFC 3986 unreserved characters.
+fn uri_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Builds the Key URI Format provisioning URI. The label identifies the
+/// issuer, the server host and the account so authenticator entries from
+/// several CraftCloud servers stay distinguishable.
+pub(crate) fn otpauth_uri(secret: &str, public_url: Option<&str>, email: &str) -> String {
+    let host = public_url
+        .map(|url| url.split_once("://").map_or(url, |(_, rest)| rest))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .filter(|host| !host.is_empty());
+    let issuer = match host {
+        Some(host) => format!("CraftCloud ({host})"),
+        None => "CraftCloud".to_owned(),
+    };
+    let issuer = uri_encode(&issuer);
+    // The issuer parameter repeats the label prefix, as the Key URI Format asks.
+    format!(
+        "otpauth://totp/{issuer}:{}?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30",
+        uri_encode(email),
+    )
 }
 
 pub(crate) async fn confirm(
@@ -635,6 +676,11 @@ async fn validate_challenge(
         Ok(_) => return Err(Box::new(invalid(headers))),
         Err(error) => return Err(Box::new(failed(&error, headers))),
     };
+    if factor.failed_attempts >= two_factor::MAX_FAILED_ATTEMPTS {
+        // Locked until an operator resets the factor; same shape as a wrong code.
+        reservation.record_failure(services.now_secs());
+        return Err(Box::new(invalid(headers)));
+    }
     let Some(secret) = decrypt_for_keys(services, challenge.user_id, &factor.secret_ciphertext)
     else {
         return Err(Box::new(unavailable(headers, "TWO_FACTOR_UNAVAILABLE")));
@@ -678,6 +724,15 @@ async fn validate_challenge(
         crate::auth::record_two_factor_failure(services, headers, challenge.user_id);
         if let Err(error) =
             two_factor::failed_attempt(&services.pool, &id_hash, services.clock.now()).await
+        {
+            return Err(Box::new(failed(&error, headers)));
+        }
+        if let Err(error) = two_factor::record_failed_proof(
+            &services.pool,
+            challenge.user_id,
+            &crate::audit::ctx(headers, Some(challenge.user_id)),
+        )
+        .await
         {
             return Err(Box::new(failed(&error, headers)));
         }
@@ -850,6 +905,15 @@ pub(crate) async fn device_login(
         crate::auth::record_two_factor_failure(&services, &headers, challenge.user_id);
         return invalid(&headers);
     };
+    // The contract answers with the same `DeviceLoginResponse` as the password-only
+    // route, including the signed-in user. Read it before the session is created so a
+    // lookup failure cannot leave a session the client never learns about.
+    let public = match accounts::get(&services.pool, challenge.user_id).await {
+        Ok(Some(public)) => public,
+        Ok(None) => return invalid(&headers),
+        Err(error) => return failed(&error, &headers),
+    };
+    let user = json!({"user_id":public.id.to_string(),"email":public.normalized_email,"display_name":public.display_name,"instance_role":public.instance_role});
     let Ok(access) = DeviceToken::generate(DeviceTokenKind::Access) else {
         return internal(&headers);
     };
@@ -899,5 +963,40 @@ pub(crate) async fn device_login(
         Err(error) => return failed(&error, &headers),
     };
     crate::auth::cleanup(&services).await;
-    crate::device::token_reply(id, &access, &refresh, access_expiry, idle_expiry, None)
+    crate::device::token_reply(
+        id,
+        &access,
+        &refresh,
+        access_expiry,
+        idle_expiry,
+        Some(user),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{otpauth_uri, uri_encode};
+
+    #[test]
+    fn labels_are_percent_encoded_per_the_key_uri_format() {
+        assert_eq!(uri_encode("a b(c)@d.e"), "a%20b%28c%29%40d.e");
+        assert_eq!(
+            otpauth_uri(
+                "ABC",
+                Some("https://cloud.example:8443/app"),
+                "ann+x@example.test"
+            ),
+            "otpauth://totp/CraftCloud%20%28cloud.example%3A8443%29:ann%2Bx%40example.test?secret=ABC&issuer=CraftCloud%20%28cloud.example%3A8443%29&algorithm=SHA1&digits=6&period=30"
+        );
+        assert_eq!(
+            otpauth_uri("ABC", None, "a@b.test"),
+            "otpauth://totp/CraftCloud:a%40b.test?secret=ABC&issuer=CraftCloud&algorithm=SHA1&digits=6&period=30"
+        );
+        // Hostile characters in the account name cannot add URI parameters.
+        let uri = otpauth_uri("ABC", Some("https://h.test"), "x&secret=EVIL#y");
+        assert!(
+            !uri.contains("EVIL#") && uri.matches("secret=").count() == 1,
+            "{uri}"
+        );
+    }
 }
