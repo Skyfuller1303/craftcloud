@@ -49,3 +49,6 @@ None of these are implemented by this blueprint. Update this list in the same PR
   - Der Webtest `activity.test.tsx` („is reachable and operable by keyboard“) schlug einmal unter Last fehl und lief bei Wiederholung durch; möglicher Flake.
   - Ein hängender Download hält seinen Lesethread bis zum Socket-Timeout von ureq; der Aufrufer bricht nach seinem Budget ab, der Thread endet später.
   - Bleibt die Refresh-Sperrdatei länger als 10 s belegt, erneuert der Client nur unter der Prozesssperre; eine Token-Wiederverwendung zwischen Prozessen ist dann möglich, dafür blockiert die Anmeldung nie.
+  - MSRV 1.90 von `craftcloud-client` und `craftcloud-client-native` ist deklariert, aber mangels 1.90-Toolchain nicht gebaut.
+  - Der exakte ureq-Pin des SDK (`=3.5.0`) muss mit den Apps zusammen angehoben werden, sonst löst eine App mit anderer ureq-Version nicht auf.
+  - Die Einbindung per Pfad-Abhängigkeit in PhotoCraft, FigCraft und Launcher ist noch nicht gebaut; `keyring` 3.6 kommt dort neu in den Abhängigkeitsbaum.
