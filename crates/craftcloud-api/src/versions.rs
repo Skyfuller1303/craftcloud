@@ -1,4 +1,4 @@
-﻿//! File versions, compare-and-set commits, restores and downloads (CC-F08).
+//! File versions, compare-and-set commits, restores and downloads (CC-F08).
 //!
 //! Two ETags exist on a file: the metadata ETag `"file-v<n>"` (name changes,
 //! `PATCH /files/{id}`) and the content ETag `"version:<uuid>"` (the head

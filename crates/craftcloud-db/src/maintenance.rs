@@ -1,4 +1,4 @@
-﻿//! Database side of the maintenance job (CC-F10, CC-P02-06, CC-P02-07):
+//! Database side of the maintenance job (CC-F10, CC-P02-06, CC-P02-07):
 //! retention purge, version retention, blob garbage collection with a claim
 //! phase, integrity bookkeeping, usage drift correction and the run log.
 //!

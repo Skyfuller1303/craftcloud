@@ -1,4 +1,4 @@
-﻿-- 0016: object grants, guests and edit leases (AC-03).
+-- 0016: object grants, guests and edit leases (AC-03).
 -- Grants and leases are scoped to the organization and workspace. Leases are
 -- deliberately ephemeral and are excluded from backups.
 ALTER TABLE files ADD CONSTRAINT files_org_workspace_id_unique UNIQUE (org_id, workspace_id, id);

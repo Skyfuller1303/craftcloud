@@ -1,4 +1,4 @@
-﻿# ADR-0020: Grants und Bearbeitungssperren
+# ADR-0020: Grants und Bearbeitungssperren
 
 - Status: angenommen für AC-03
 - Datum: 2026-10-30
