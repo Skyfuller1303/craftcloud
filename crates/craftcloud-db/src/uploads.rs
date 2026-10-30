@@ -357,7 +357,7 @@ impl OrgTx {
 
     /// Where a file lives and whether it or its project is in the trash:
     /// `(workspace_id, project_id, file_deleted, project_deleted)`.
-    async fn file_state(
+    pub(crate) async fn file_state(
         &mut self,
         file_id: Uuid,
     ) -> Result<Option<(Uuid, Uuid, bool, bool)>, DbError> {
@@ -736,7 +736,7 @@ impl OrgTx {
             return Ok(false);
         }
         let live: Option<Uuid> = if device {
-            sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND access_expires_at>$3 AND idle_expires_at>$3 AND absolute_expires_at>$3 FOR SHARE")
+            sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE")
                 .bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *self.tx).await?
         } else {
             sqlx::query_scalar("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE")

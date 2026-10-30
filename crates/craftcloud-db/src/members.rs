@@ -386,13 +386,16 @@ impl OrgTx {
         if self.stored_role_of(user_id).await?.is_none() {
             return Ok(RemoveOutcome::NotMember);
         }
-        if self.would_orphan(user_id).await? {
-            return Ok(RemoveOutcome::LastOwner);
-        }
+        // Lock order: organization row, then the user row. `would_orphan` share-locks
+        // the user row, so taking the exclusive lock first avoids a lock upgrade
+        // deadlock when two organizations remove the same user concurrently.
         sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
             .bind(user_id)
             .fetch_optional(&mut *self.tx)
             .await?;
+        if self.would_orphan(user_id).await? {
+            return Ok(RemoveOutcome::LastOwner);
+        }
         sqlx::query("UPDATE grants SET revoked_at = CURRENT_TIMESTAMP, version = version + 1 WHERE org_id = $1 AND grantee_user_id = $2 AND revoked_at IS NULL")
             .bind(self.org_id)
             .bind(user_id)
