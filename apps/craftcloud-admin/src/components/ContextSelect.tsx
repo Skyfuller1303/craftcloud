@@ -69,11 +69,13 @@ export function NativeSelect({
   value,
   options,
   onChange,
+  isDisabled = false,
 }: {
   label: string;
   value: string;
   options: Choice[];
   onChange: (value: string) => void;
+  isDisabled?: boolean;
 }) {
   return (
     <label className="select">
@@ -82,6 +84,7 @@ export function NativeSelect({
         <select
           className="select__native"
           value={value}
+          disabled={isDisabled}
           onChange={(event) => onChange(event.target.value)}
         >
           {options.map((option) => (

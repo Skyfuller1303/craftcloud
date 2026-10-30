@@ -958,6 +958,28 @@ impl Maintenance {
                 break;
             }
         }
+        if ctx.dry {
+            let due = craftcloud_db::locks::count_expired(&self.pool).await?;
+            report.add("would_expire_file_locks", u64::try_from(due).unwrap_or(0));
+        } else {
+            let orgs = craftcloud_db::locks::orgs_with_expired(&self.pool, 1000).await?;
+            for org_id in orgs {
+                if !ctx.go() {
+                    break;
+                }
+                match craftcloud_db::locks::expire_for_org(&self.pool, org_id, 1000).await {
+                    Ok(expired) => report.add("expired_file_locks", expired),
+                    Err(error) => self.fail_item(
+                        ctx,
+                        "expire_uploads",
+                        report,
+                        "expiring file locks",
+                        org_id,
+                        &error,
+                    ),
+                }
+            }
+        }
         Ok(())
     }
 

@@ -86,7 +86,7 @@ describe("members", () => {
     expect(bob.getByRole("button", { name: "Remove Bob" })).toBeTruthy();
     await user.click(bob.getByRole("button", { name: "Change role: Bob" }));
     const options = within(await screen.findByRole("combobox", { name: "Role" })).getAllByRole("option");
-    expect(options.map((o) => o.textContent)).toEqual(["Admin", "Member"]);
+    expect(options.map((o) => o.textContent)).toEqual(["Admin", "Member", "Guest"]);
   });
 
   it("lets a plain member only leave and shows no workspace management", async () => {
@@ -290,7 +290,8 @@ describe("invitations", () => {
     renderApp(fetch);
     await openSection(user, "Invitations");
     await user.type(await screen.findByLabelText("E-mail address"), "new@example.test");
-    expect(screen.queryByRole("combobox", { name: "Organization role" })).toBeNull();
+    expect(screen.getByRole("combobox", { name: "Organization role" })).toBeTruthy();
+    expect(within(screen.getByRole("combobox", { name: "Organization role" })).getAllByRole("option").map((option) => option.textContent)).toEqual(["Member", "Guest"]);
     const roles = within(screen.getByRole("combobox", { name: "Workspace role" })).getAllByRole("option");
     expect(roles.map((o) => o.textContent)).toEqual(["Editor", "Viewer"]);
     await user.click(screen.getByRole("button", { name: "Create invitation" }));
@@ -303,6 +304,28 @@ describe("invitations", () => {
     });
     // Workspace admins cannot list invitations; the UI does not even ask.
     expect(calls.some((c) => c.method === "GET" && c.path.endsWith("/invitations"))).toBe(false);
+  });
+
+  it("lets an eligible workspace admin issue a guest invitation scoped to their workspace", async () => {
+    const { fetch, calls } = mockFetch(viewRoutes({
+      "GET /organizations": {
+        body: { items: [{ ...ORG_A, role: "member", workspace_admin_invites_enabled: true }], next_cursor: null },
+      },
+      ...asWorkspaceRole("admin"),
+      [`POST /organizations/${ORG_A.id}/invitations`]: { status: 201, body: CREATED },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await openSection(user, "Invitations");
+    await user.type(await screen.findByLabelText("E-mail address"), "guest@example.test");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Organization role" }), "guest");
+    await user.click(screen.getByRole("button", { name: "Create invitation" }));
+    await screen.findByLabelText("Link");
+    expect(calls.find((call) => call.method === "POST")?.body).toEqual({
+      email: "guest@example.test",
+      org_role: "guest",
+      workspace_id: WS_1.id,
+    });
   });
 
   it("hides the form when the organization setting forbids workspace admin invitations", async () => {

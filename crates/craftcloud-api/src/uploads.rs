@@ -206,7 +206,7 @@ async fn resolve_upload(
     state: &ApiState,
     headers: &HeaderMap,
     raw: &str,
-) -> Result<(Resolved, Uuid), Box<Response>> {
+) -> Result<(Resolved, Uuid, Uuid), Box<Response>> {
     let services = services_of(state, headers).await?;
     let Some(id) = parse_id(raw) else {
         return Err(Box::new(not_found(headers)));
@@ -220,6 +220,7 @@ async fn resolve_upload(
                 id,
             },
             location.creator,
+            location.file_id,
         )),
         Ok(None) => Err(Box::new(not_found(headers))),
         Err(error) => Err(Box::new(db_failure(
@@ -238,6 +239,7 @@ async fn upload_read_gate(
     action: Action,
     name: &str,
     creator: Uuid,
+    file_id: Uuid,
 ) -> Result<OrgScope, Box<Response>> {
     let actor = read_actor(
         &resolved.services.pool,
@@ -247,15 +249,18 @@ async fn upload_read_gate(
     )
     .await
     .map_err(|error| Box::new(db_failure(&error, headers, "actor lookup failed")))?;
-    let decision = can(
-        &actor,
-        action,
-        &Resource::Upload {
-            org_id: resolved.org_id,
-            workspace_id: resolved.workspace_id,
-            creator,
-        },
-    );
+    let object = crate::projects::policy_resource(
+        &resolved.services.pool,
+        session.user_id,
+        resolved.org_id,
+        resolved.workspace_id,
+        file_id,
+        Action::FileRead,
+    )
+    .await
+    .map_err(|error| Box::new(db_failure(&error, headers, "file grant lookup failed")))?;
+    let resource = upload_object_resource(object, resolved.org_id, resolved.workspace_id, creator);
+    let decision = can(&actor, action, &resource);
     match gate(
         decision,
         headers,
@@ -271,6 +276,27 @@ async fn upload_read_gate(
     }
 }
 
+fn upload_object_resource(
+    resource: Resource,
+    org_id: Uuid,
+    workspace_id: Uuid,
+    creator: Uuid,
+) -> Resource {
+    match resource {
+        Resource::Object { target, .. } => Resource::UploadObject {
+            org_id,
+            workspace_id,
+            creator,
+            target,
+        },
+        _ => Resource::Upload {
+            org_id,
+            workspace_id,
+            creator,
+        },
+    }
+}
+
 /// Locks the organization, loads fresh roles and decides for an upload session.
 pub(crate) async fn upload_write_gate(
     resolved: &Resolved,
@@ -279,8 +305,9 @@ pub(crate) async fn upload_write_gate(
     action: Action,
     name: &str,
     creator: Uuid,
+    file_id: Uuid,
 ) -> Result<(OrgTx, OrgScope), Box<Response>> {
-    let Locked { tx, actor } = lock(
+    let Locked { mut tx, actor } = lock(
         &resolved.services.pool,
         session.user_id,
         resolved.org_id,
@@ -288,15 +315,43 @@ pub(crate) async fn upload_write_gate(
         headers,
     )
     .await?;
-    let decision = can(
-        &actor,
-        action,
-        &Resource::Upload {
+    let resource = if matches!(action, Action::UploadWrite | Action::VersionCommit) {
+        tx.policy_resource(session.user_id, resolved.workspace_id, file_id, action)
+            .await
+            .map_err(|error| Box::new(db_failure(&error, headers, "file grant lookup failed")))?
+    } else if action == Action::UploadAbort && creator == session.user_id {
+        let object = tx
+            .policy_resource(
+                session.user_id,
+                resolved.workspace_id,
+                file_id,
+                Action::FileRead,
+            )
+            .await
+            .map_err(|error| Box::new(db_failure(&error, headers, "file grant lookup failed")))?;
+        upload_object_resource(object, resolved.org_id, resolved.workspace_id, creator)
+    } else {
+        Resource::Upload {
             org_id: resolved.org_id,
             workspace_id: resolved.workspace_id,
             creator,
-        },
-    );
+        }
+    };
+    let decision = if matches!(action, Action::UploadWrite | Action::VersionCommit)
+        && creator != session.user_id
+    {
+        can(
+            &actor,
+            action,
+            &Resource::Upload {
+                org_id: resolved.org_id,
+                workspace_id: resolved.workspace_id,
+                creator,
+            },
+        )
+    } else {
+        can(&actor, action, &resource)
+    };
     match gate(
         decision,
         headers,
@@ -305,9 +360,31 @@ pub(crate) async fn upload_write_gate(
         Some(resolved.org_id),
         Some(resolved.id),
     ) {
-        Gate::Open(permit) => OrgScope::from_permit(&permit)
-            .map(|scope| (tx, scope))
-            .ok_or_else(|| Box::new(internal(headers))),
+        Gate::Open(permit) => {
+            if action == Action::VersionCommit {
+                match tx.file_lock(file_id).await {
+                    Ok(Some(lock)) if lock.holder_session_id != session.session_id => {
+                        return Err(Box::new(crate::projects::locked_response(
+                            &lock,
+                            session.session_id,
+                            session.user_id,
+                            headers,
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Err(Box::new(db_failure(
+                            &error,
+                            headers,
+                            "file lock lookup failed",
+                        )));
+                    }
+                }
+            }
+            OrgScope::from_permit(&permit)
+                .map(|scope| (tx, scope))
+                .ok_or_else(|| Box::new(internal(headers)))
+        }
         Gate::Closed(response) => Err(Box::new(response)),
     }
 }
@@ -474,7 +551,7 @@ pub(crate) async fn get_upload(
     session: AuthenticatedSession,
     Path(raw): Path<String>,
 ) -> Response {
-    let (resolved, creator) = match resolve_upload(&state, &headers, &raw).await {
+    let (resolved, creator, file_id) = match resolve_upload(&state, &headers, &raw).await {
         Ok(found) => found,
         Err(response) => return *response,
     };
@@ -485,6 +562,7 @@ pub(crate) async fn get_upload(
         Action::UploadRead,
         "upload.read",
         creator,
+        file_id,
     )
     .await
     {
@@ -521,7 +599,7 @@ pub(crate) async fn abort_upload(
     session: AuthenticatedSession,
     Path(raw): Path<String>,
 ) -> Response {
-    let (resolved, creator) = match resolve_upload(&state, &headers, &raw).await {
+    let (resolved, creator, file_id) = match resolve_upload(&state, &headers, &raw).await {
         Ok(found) => found,
         Err(response) => return *response,
     };
@@ -532,6 +610,7 @@ pub(crate) async fn abort_upload(
         Action::UploadAbort,
         "upload.abort",
         creator,
+        file_id,
     )
     .await
     {
@@ -653,6 +732,7 @@ struct Finish {
     org_id: Uuid,
     workspace_id: Uuid,
     upload_id: Uuid,
+    file_id: Uuid,
     creator: Uuid,
     headers: HeaderMap,
 }
@@ -675,6 +755,7 @@ async fn finish_upload(finish: Finish) -> Response {
         org_id,
         workspace_id,
         upload_id,
+        file_id,
         creator,
         headers,
     } = finish;
@@ -753,15 +834,27 @@ async fn finish_upload(finish: Finish) -> Response {
             return db_failure(&error, &headers, "session check failed");
         }
     }
-    let decision = can(
-        &actor,
-        Action::UploadWrite,
-        &Resource::Upload {
+    let write_resource = if creator == user_id {
+        match tx
+            .policy_resource(user_id, workspace_id, file_id, Action::UploadWrite)
+            .await
+        {
+            Ok(resource) => resource,
+            Err(error) => {
+                fail_in_tx(tx, &services, org_id, upload_id, now).await;
+                guard.key = None;
+                delete_object(&services, &key).await;
+                return db_failure(&error, &headers, "file grant lookup failed");
+            }
+        }
+    } else {
+        Resource::Upload {
             org_id,
             workspace_id,
             creator,
-        },
-    );
+        }
+    };
+    let decision = can(&actor, Action::UploadWrite, &write_resource);
     let scope = match gate(
         decision,
         &headers,
@@ -856,7 +949,7 @@ pub(crate) async fn put_content(
     Path(raw): Path<String>,
     body: Body,
 ) -> Response {
-    let (resolved, creator) = match resolve_upload(&state, &headers, &raw).await {
+    let (resolved, creator, file_id) = match resolve_upload(&state, &headers, &raw).await {
         Ok(found) => found,
         Err(response) => return *response,
     };
@@ -872,6 +965,7 @@ pub(crate) async fn put_content(
         Action::UploadWrite,
         "upload.content",
         creator,
+        file_id,
     )
     .await
     {
@@ -1025,6 +1119,7 @@ pub(crate) async fn put_content(
         org_id,
         workspace_id: resolved.workspace_id,
         upload_id,
+        file_id,
         creator,
         headers: headers.clone(),
     };

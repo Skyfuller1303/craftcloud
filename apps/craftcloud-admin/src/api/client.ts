@@ -11,6 +11,7 @@ import type {
   DeviceSession,
   ErrorBody,
   FileRecord,
+  FileLock,
   FileVersion,
   Invitation,
   LoginRequest,
@@ -22,6 +23,9 @@ import type {
   Project,
   ResetPasswordRequest,
   SessionInfo,
+  ServerInfo,
+  ShareGrant,
+  SharedItem,
   SetupCompleteRequest,
   SetupCompleteResponse,
   SetupStatus,
@@ -42,6 +46,7 @@ export interface Endpoint {
 /** Every operation the UI calls. `endpoints.test.ts` checks these against contracts/openapi.yaml. */
 export const ENDPOINTS = {
   setupStatus: { method: "GET", path: "/setup/status" },
+  serverInfo: { method: "GET", path: "/info" },
   setupComplete: { method: "POST", path: "/setup/complete" },
   login: { method: "POST", path: "/auth/login" },
   session: { method: "GET", path: "/auth/session" },
@@ -53,6 +58,7 @@ export const ENDPOINTS = {
   acceptInvitation: { method: "POST", path: "/invitations/accept" },
   resetPassword: { method: "POST", path: "/auth/password-reset" },
   listOrgMembers: { method: "GET", path: "/organizations/{org_id}/members" },
+  listSharedWithMe: { method: "GET", path: "/organizations/{org_id}/shared-with-me" },
   changeOrgMemberRole: { method: "PATCH", path: "/organizations/{org_id}/members/{user_id}" },
   removeOrgMember: { method: "DELETE", path: "/organizations/{org_id}/members/{user_id}" },
   listWorkspaceMembers: { method: "GET", path: "/workspaces/{workspace_id}/members" },
@@ -76,13 +82,20 @@ export const ENDPOINTS = {
   listProjects: { method: "GET", path: "/workspaces/{workspace_id}/projects" },
   createProject: { method: "POST", path: "/workspaces/{workspace_id}/projects" },
   getProject: { method: "GET", path: "/projects/{project_id}" },
+  getFile: { method: "GET", path: "/files/{file_id}" },
   renameProject: { method: "PATCH", path: "/projects/{project_id}" },
   trashProject: { method: "DELETE", path: "/projects/{project_id}" },
   restoreProject: { method: "POST", path: "/projects/{project_id}/restore" },
+  listProjectGrants: { method: "GET", path: "/projects/{project_id}/grants" },
+  createProjectGrant: { method: "POST", path: "/projects/{project_id}/grants" },
   listFiles: { method: "GET", path: "/projects/{project_id}/files" },
   createFile: { method: "POST", path: "/projects/{project_id}/files" },
   trashFile: { method: "DELETE", path: "/files/{file_id}" },
   restoreFile: { method: "POST", path: "/files/{file_id}/restore" },
+  listFileGrants: { method: "GET", path: "/files/{file_id}/grants" },
+  createFileGrant: { method: "POST", path: "/files/{file_id}/grants" },
+  changeGrant: { method: "PATCH", path: "/grants/{grant_id}" },
+  revokeGrant: { method: "DELETE", path: "/grants/{grant_id}" },
   createUpload: { method: "POST", path: "/files/{file_id}/uploads" },
   uploadContent: { method: "PUT", path: "/uploads/{upload_id}/content" },
   abortUpload: { method: "DELETE", path: "/uploads/{upload_id}" },
@@ -91,6 +104,8 @@ export const ENDPOINTS = {
   restoreVersion: { method: "POST", path: "/files/{file_id}/versions/{version_id}/restore" },
   downloadHead: { method: "GET", path: "/files/{file_id}/content" },
   downloadVersion: { method: "GET", path: "/files/{file_id}/versions/{version_id}/content" },
+  acquireFileLock: { method: "POST", path: "/files/{file_id}/lock" },
+  releaseFileLock: { method: "DELETE", path: "/files/{file_id}/lock" },
 } as const satisfies Record<string, Endpoint>;
 
 export const API_BASE = "/api/v1";
@@ -238,6 +253,7 @@ export interface ApiClient {
   setCsrfToken(token: string | null): void;
   hasCsrfToken(): boolean;
   setupStatus(): Promise<SetupStatus>;
+  serverInfo(): Promise<ServerInfo>;
   setupComplete(body: SetupCompleteRequest): Promise<SetupCompleteResponse>;
   login(body: LoginRequest): Promise<LoginResponse>;
   session(): Promise<SessionInfo>;
@@ -254,7 +270,8 @@ export interface ApiClient {
   acceptInvitation(body: AcceptInvitationRequest): Promise<AcceptedInvitation>;
   resetPassword(body: ResetPasswordRequest): Promise<void>;
 
-  listOrgMembers(orgId: string, cursor?: string): Promise<Page<OrgMember>>;
+  listOrgMembers(orgId: string, cursor?: string, query?: string): Promise<Page<OrgMember>>;
+  listSharedWithMe(orgId: string, cursor?: string): Promise<Page<SharedItem>>;
   changeOrgMemberRole(orgId: string, userId: string, role: OrgRole): Promise<OrgMember>;
   removeOrgMember(orgId: string, userId: string): Promise<void>;
   listWorkspaceMembers(workspaceId: string, cursor?: string): Promise<Page<WorkspaceMember>>;
@@ -282,15 +299,22 @@ export interface ApiClient {
 
   listProjects(workspaceId: string, deleted: boolean, cursor?: string): Promise<Page<Project>>;
   getProject(projectId: string): Promise<Project>;
+  getFile(fileId: string): Promise<FileRecord>;
   createProject(workspaceId: string, name: string): Promise<Project>;
   renameProject(project: Pick<Project, "id" | "version">, name: string): Promise<Project>;
   trashProject(projectId: string): Promise<void>;
   restoreProject(projectId: string): Promise<Project>;
+  listProjectGrants(projectId: string, cursor?: string): Promise<Page<ShareGrant>>;
+  createProjectGrant(projectId: string, userId: string, role: "viewer" | "editor"): Promise<ShareGrant>;
 
   listFiles(projectId: string, deleted: boolean, cursor?: string): Promise<Page<FileRecord>>;
   createFile(projectId: string, body: CreateFileRequest): Promise<FileRecord>;
   trashFile(fileId: string): Promise<void>;
   restoreFile(fileId: string): Promise<FileRecord>;
+  listFileGrants(fileId: string, cursor?: string): Promise<Page<ShareGrant>>;
+  createFileGrant(fileId: string, userId: string, role: "viewer" | "editor"): Promise<ShareGrant>;
+  changeGrant(grantId: string, version: number, role: "viewer" | "editor"): Promise<ShareGrant>;
+  revokeGrant(grantId: string): Promise<void>;
 
   /** `idempotencyKey` makes a repeated request return the same session. */
   createUpload(
@@ -319,6 +343,8 @@ export interface ApiClient {
   ): Promise<FileVersion>;
   /** URL for a plain link or `<a download>`; the browser streams the body, the page never holds it. */
   downloadUrl(fileId: string, versionId?: string): string;
+  acquireFileLock(fileId: string, clientId: string, takeover?: boolean): Promise<FileLock>;
+  releaseFileLock(fileId: string, force?: boolean): Promise<void>;
 }
 
 interface CallConfig {
@@ -334,6 +360,7 @@ interface CallConfig {
 /** Strong entity tags the server derives from the `version` field of a row or a version id. */
 export const etag = {
   project: (version: number) => `"prj-v${version}"`,
+  grant: (version: number) => `"grant-v${version}"`,
   content: (versionId: string) => `"version:${versionId}"`,
 };
 
@@ -434,6 +461,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     },
     hasCsrfToken: () => csrfToken !== null,
     setupStatus: () => call(ENDPOINTS.setupStatus, { anonymous: true }),
+    serverInfo: () => call(ENDPOINTS.serverInfo, { anonymous: true }),
     setupComplete: (body) => call(ENDPOINTS.setupComplete, { body, anonymous: true }),
     async login(body) {
       const result = await call<LoginResponse>(ENDPOINTS.login, { body, anonymous: true });
@@ -482,8 +510,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     },
     resetPassword: (body) => call(ENDPOINTS.resetPassword, { body, anonymous: true }),
 
-    listOrgMembers: (orgId, cursor) =>
-      call(ENDPOINTS.listOrgMembers, { params: { org_id: orgId }, query: { limit: "50", cursor } }),
+    listOrgMembers: (orgId, cursor, query) =>
+      call(ENDPOINTS.listOrgMembers, { params: { org_id: orgId }, query: { limit: "50", cursor, query } }),
+    listSharedWithMe: (orgId, cursor) =>
+      call(ENDPOINTS.listSharedWithMe, { params: { org_id: orgId }, query: { limit: "50", cursor } }),
     changeOrgMemberRole: (orgId, userId, role) =>
       call(ENDPOINTS.changeOrgMemberRole, {
         params: { org_id: orgId, user_id: userId },
@@ -547,6 +577,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         query: { limit: "50", deleted: deleted ? "true" : undefined, cursor },
       }),
     getProject: (projectId) => call(ENDPOINTS.getProject, { params: { project_id: projectId } }),
+    getFile: (fileId) => call(ENDPOINTS.getFile, { params: { file_id: fileId } }),
     createProject: (workspaceId, name) =>
       call(ENDPOINTS.createProject, { params: { workspace_id: workspaceId }, body: { name } }),
     renameProject: (project, name) =>
@@ -559,6 +590,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       call(ENDPOINTS.trashProject, { params: { project_id: projectId } }),
     restoreProject: (projectId) =>
       call(ENDPOINTS.restoreProject, { params: { project_id: projectId } }),
+    listProjectGrants: (projectId, cursor) =>
+      call(ENDPOINTS.listProjectGrants, { params: { project_id: projectId }, query: { limit: "50", cursor } }),
+    createProjectGrant: (projectId, userId, role) =>
+      call(ENDPOINTS.createProjectGrant, { params: { project_id: projectId }, body: { user_id: userId, role } }),
 
     listFiles: (projectId, deleted, cursor) =>
       call(ENDPOINTS.listFiles, {
@@ -569,6 +604,13 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       call(ENDPOINTS.createFile, { params: { project_id: projectId }, body }),
     trashFile: (fileId) => call(ENDPOINTS.trashFile, { params: { file_id: fileId } }),
     restoreFile: (fileId) => call(ENDPOINTS.restoreFile, { params: { file_id: fileId } }),
+    listFileGrants: (fileId, cursor) =>
+      call(ENDPOINTS.listFileGrants, { params: { file_id: fileId }, query: { limit: "50", cursor } }),
+    createFileGrant: (fileId, userId, role) =>
+      call(ENDPOINTS.createFileGrant, { params: { file_id: fileId }, body: { user_id: userId, role } }),
+    changeGrant: (grantId, version, role) =>
+      call(ENDPOINTS.changeGrant, { params: { grant_id: grantId }, body: { role }, headers: { "If-Match": etag.grant(version) } }),
+    revokeGrant: (grantId) => call(ENDPOINTS.revokeGrant, { params: { grant_id: grantId } }),
 
     createUpload: (fileId, body, idempotencyKey) =>
       call(ENDPOINTS.createUpload, {
@@ -677,5 +719,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         ? API_BASE + expandPath(ENDPOINTS.downloadHead.path, { file_id: fileId })
         : API_BASE +
           expandPath(ENDPOINTS.downloadVersion.path, { file_id: fileId, version_id: versionId }),
+    acquireFileLock: (fileId, clientId, takeover) =>
+      call(ENDPOINTS.acquireFileLock, {
+        params: { file_id: fileId },
+        body: { client_id: clientId, ...(takeover === true ? { takeover: true } : {}) },
+      }),
+    releaseFileLock: (fileId, force) =>
+      call(ENDPOINTS.releaseFileLock, {
+        params: { file_id: fileId },
+        ...(force === true ? { query: { force: "true" } } : {}),
+      }),
   };
 }

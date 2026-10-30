@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use craftcloud_core::policy::Action;
+use craftcloud_core::policy::{Action, can};
 use craftcloud_core::{FileApp, FileFormat, FileName};
 use craftcloud_db::files::{
     self, File, FileCreateOutcome, FileDeleteOutcome, FileRenameOutcome, FileRestoreOutcome,
@@ -28,7 +28,7 @@ use crate::projects::{
     Resolved, expected_version, opt_time, read_gate, resolve_project, retention_expired,
     trash_query, version_conflict, with_etag, write_gate,
 };
-use crate::responses::{rejection_response, unavailable, validation_failed};
+use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::session::AuthenticatedSession;
 
 const ETAG: &str = "file";
@@ -59,6 +59,9 @@ fn file_json(f: &File) -> Value {
         "updated_by": f.updated_by_user_id.to_string(),
         "updated_at": rfc3339(f.updated_at),
         "deleted_at": opt_time(f.deleted_at),
+        "can_share": false,
+        "can_force_lock": false,
+        "lock": null,
     })
 }
 
@@ -266,7 +269,66 @@ pub(crate) async fn list_files(
     } else {
         None
     };
-    let items: Vec<_> = rows.iter().map(file_json).collect();
+    let actor = match crate::workspaces::read_actor(
+        &resolved.services.pool,
+        session.user_id,
+        resolved.org_id,
+        resolved.workspace_id,
+    )
+    .await
+    {
+        Ok(actor) => actor,
+        Err(error) => return db_failure(&error, &headers, "actor lookup failed"),
+    };
+    let mut items: Vec<_> = rows.iter().map(file_json).collect();
+    for (item, file) in items.iter_mut().zip(&rows) {
+        let share = match crate::projects::policy_resource(
+            &resolved.services.pool,
+            session.user_id,
+            resolved.org_id,
+            resolved.workspace_id,
+            file.id,
+            Action::GrantCreate,
+        )
+        .await
+        {
+            Ok(resource) => can(&actor, Action::GrantCreate, &resource)
+                .permit()
+                .is_some(),
+            Err(error) => return db_failure(&error, &headers, "grant lookup failed"),
+        };
+        let force = match crate::projects::policy_resource(
+            &resolved.services.pool,
+            session.user_id,
+            resolved.org_id,
+            resolved.workspace_id,
+            file.id,
+            Action::FileLockForce,
+        )
+        .await
+        {
+            Ok(resource) => can(&actor, Action::FileLockForce, &resource)
+                .permit()
+                .is_some(),
+            Err(error) => return db_failure(&error, &headers, "grant lookup failed"),
+        };
+        let held = match craftcloud_db::locks::get(
+            &resolved.services.pool,
+            resolved.org_id,
+            file.id,
+        )
+        .await
+        {
+            Ok(lock) => lock,
+            Err(error) => return db_failure(&error, &headers, "file lock lookup failed"),
+        };
+        let Some(item) = item.as_object_mut() else {
+            return internal(&headers);
+        };
+        item.insert("can_share".to_owned(), json!(share));
+        item.insert("can_force_lock".to_owned(), json!(force));
+        item.insert("lock".to_owned(), held.as_ref().map(|lock| json!({"holder_display_name":lock.display_name,"since":rfc3339(lock.acquired_at),"expires_at":rfc3339(lock.expires_at),"mine":lock.holder_user_id==session.user_id,"held_by_current_session":lock.holder_user_id==session.user_id && lock.holder_session_id==session.session_id})).unwrap_or(serde_json::Value::Null));
+    }
     Json(json!({ "items": items, "next_cursor": next })).into_response()
 }
 
@@ -296,7 +358,103 @@ pub(crate) async fn get_file(
         Err(response) => return *response,
     };
     match files::get(&resolved.services.pool, &scope, resolved.id).await {
-        Ok(Some(file)) => file_response(StatusCode::OK, &file),
+        Ok(Some(file)) => {
+            let actor = match crate::workspaces::read_actor(
+                &resolved.services.pool,
+                session.user_id,
+                resolved.org_id,
+                resolved.workspace_id,
+            )
+            .await
+            {
+                Ok(actor) => actor,
+                Err(error) => return db_failure(&error, &headers, "actor lookup failed"),
+            };
+            let share_resource = match crate::projects::policy_resource(
+                &resolved.services.pool,
+                session.user_id,
+                resolved.org_id,
+                resolved.workspace_id,
+                resolved.id,
+                Action::GrantCreate,
+            )
+            .await
+            {
+                Ok(resource) => resource,
+                Err(error) => return db_failure(&error, &headers, "file grant lookup failed"),
+            };
+            let force_resource = match crate::projects::policy_resource(
+                &resolved.services.pool,
+                session.user_id,
+                resolved.org_id,
+                resolved.workspace_id,
+                resolved.id,
+                Action::FileLockForce,
+            )
+            .await
+            {
+                Ok(resource) => resource,
+                Err(error) => return db_failure(&error, &headers, "file grant lookup failed"),
+            };
+            let active_lock = match craftcloud_db::locks::get(
+                &resolved.services.pool,
+                resolved.org_id,
+                resolved.id,
+            )
+            .await
+            {
+                Ok(lock) => lock,
+                Err(error) => return db_failure(&error, &headers, "file lock lookup failed"),
+            };
+            let project_name: String = match craftcloud_db::files::project_name(
+                &resolved.services.pool,
+                resolved.org_id,
+                resolved.workspace_id,
+                file.project_id,
+            )
+            .await
+            {
+                Ok(Some(name)) => name,
+                Ok(None) => return not_found(&headers),
+                Err(error) => return db_failure(&error, &headers, "parent project lookup failed"),
+            };
+            let mut value = file_json(&file);
+            let Some(object) = value.as_object_mut() else {
+                return internal(&headers);
+            };
+            object.insert(
+                "project".to_owned(),
+                json!({"id":file.project_id.to_string(),"name":project_name}),
+            );
+            object.insert(
+                "can_share".to_owned(),
+                json!(
+                    can(&actor, Action::GrantCreate, &share_resource)
+                        .permit()
+                        .is_some()
+                ),
+            );
+            object.insert(
+                "can_force_lock".to_owned(),
+                json!(
+                    can(&actor, Action::FileLockForce, &force_resource)
+                        .permit()
+                        .is_some()
+                ),
+            );
+            object.insert("lock".to_owned(), active_lock.as_ref().map(|lock| json!({
+                "holder_display_name": lock.display_name,
+                "since": rfc3339(lock.acquired_at),
+                "expires_at": rfc3339(lock.expires_at),
+                "mine": lock.holder_user_id == session.user_id,
+                "held_by_current_session": lock.holder_user_id == session.user_id && lock.holder_session_id == session.session_id
+            })).unwrap_or(serde_json::Value::Null));
+            with_etag(
+                (StatusCode::OK, Json(value)).into_response(),
+                ETAG,
+                file.version,
+            )
+        }
         Ok(None) => not_found(&headers),
         Err(error) => db_failure(&error, &headers, "file read failed"),
     }

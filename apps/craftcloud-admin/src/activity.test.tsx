@@ -223,7 +223,7 @@ describe.each(languages)("axe: activity log (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-      await user.click(within(nav).getByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
+      await user.click(await within(nav).findByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
     await screen.findByRole("table");
     await expectNoAxeViolations();
     // Validation errors are exposed to assistive technology too.
@@ -241,7 +241,7 @@ describe.each(languages)("axe: activity log (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-      await user.click(within(nav).getByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
+      await user.click(await within(nav).findByRole("button", { name: /^(Activity|Aktivit\u00e4t)$/ }));
     await screen.findByRole("alert");
     await expectNoAxeViolations();
   });

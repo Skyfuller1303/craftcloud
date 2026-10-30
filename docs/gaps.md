@@ -4,6 +4,10 @@
 
 AC-01 (2026-10-30) ergänzt lokal Desktop-Geräte-Sitzungen, Bearer-Authentifizierung und eine Geräteliste in den Web-Einstellungen; die historischen Lücken zur Desktop-Anmeldung und Geräteliste sind damit teilweise geschlossen. Offen bleiben AC-02 (TOTP), AC-04 (Schlüsselbund und Client-SDK), fremde Geräte durch Administratoren, Browser-Device-Flow und OIDC. Refresh verwendet bewusst keine optionale Gnadenfrist: Ein wiederholter Versuch nach einer verlorenen Antwort widerruft die Familie und erfordert eine erneute Anmeldung. Die zusätzlichen Sicherheitstests verwenden synthetische Daten; reale Clients, Proxy-Deployments und assistive Technologien benötigen weiterhin eigene Abnahme.
 
+### AC-03 work in progress
+
+Backend work adds tenant-bound project/file grants, guest invitations without workspace-role creation, scoped `shared-with-me`, constrained grant-recipient search, five-minute session-bound file leases, and server-calculated sharing/force-lock capabilities. OpenAPI and migration 0016 are being updated with the implementation. Remaining acceptance gates: finish all grants and member-search API tests, run DB integration tests (Docker is unavailable in the current OS context), and complete the coordinated Rust/API validation. Grants are backed up; ephemeral file locks are excluded from backup and restore. See [AC-03 brief](12-app-cloud/ac-03-shares-and-edit-locks.md) and [ADR-0020](09-decisions/adr-0020-grants-and-edit-locks.md).
+
 1. `craftrules` inaccessible via public GitHub; confirm shared standards.
 2. Official repository/name and licensing consent absent.
 3. Identity provider strategy and role matrix not reviewed.

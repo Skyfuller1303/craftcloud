@@ -58,6 +58,94 @@ async function chooseAndSubmit(user: User, file = picked()) {
 }
 
 describe("file list and downloads", () => {
+  it("rechecks an expired lock with the server and re-enables new versions when released", async () => {
+    const lock = {
+      holder_display_name: "Ada",
+      since: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 1800).toISOString(),
+      mine: true,
+      held_by_current_session: false,
+    };
+    const lockedFile = { ...FILE_1, app: "photocraft", lock };
+    const { fetch, calls } = mockFetch(viewRoutes({
+      [`GET /projects/${PROJECT_1.id}/files`]: { body: { items: [lockedFile], next_cursor: null } },
+      [`GET /files/${lockedFile.id}`]: { body: { ...lockedFile, lock: null } },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await openFiles(user);
+    const row = screen.getByRole("row", { name: /logo\.fig/ });
+    expect(within(row).getByRole("button", { name: /Upload a new version of logo\.fig/ }).hasAttribute("disabled")).toBe(true);
+    await waitFor(() => expect(within(screen.getByRole("row", { name: /logo\.fig/ })).getByRole("button", { name: /Upload a new version of logo\.fig/ }).hasAttribute("disabled")).toBe(false), { timeout: 3000 });
+    expect(calls.some((call) => call.path === `/files/${lockedFile.id}` && call.method === "GET")).toBe(true);
+  });
+
+  it("rechecks expired locks on loaded later pages by file id", async () => {
+    const lock = {
+      holder_display_name: "Ada",
+      since: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 1800).toISOString(),
+      mine: false,
+      held_by_current_session: false,
+    };
+    const laterFile = {
+      ...FILE_1,
+      id: "00000000-0000-4000-8000-0000000000d7",
+      name: "later.png",
+      app: "photocraft",
+      lock,
+    };
+    const { fetch, calls } = mockFetch(viewRoutes({
+      [`GET /projects/${PROJECT_1.id}/files`]: (call) => call.query.has("cursor")
+        ? { body: { items: [laterFile], next_cursor: null } }
+        : { body: { items: [FILE_1], next_cursor: "page-2" } },
+      [`GET /files/${laterFile.id}`]: { body: { ...laterFile, lock: null } },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await openFiles(user);
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    const row = await screen.findByRole("row", { name: /later\.png/ });
+    expect(within(row).getByRole("button", { name: /Upload a new version of later\.png/ }).hasAttribute("disabled")).toBe(true);
+    await waitFor(() => {
+      const refreshed = screen.getByRole("row", { name: /later\.png/ });
+      expect(within(refreshed).getByRole("button", { name: /Upload a new version of later\.png/ }).hasAttribute("disabled")).toBe(false);
+    }, { timeout: 4000 });
+    expect(calls.some((call) => call.path === `/files/${laterFile.id}` && call.method === "GET")).toBe(true);
+  });
+
+  it("expired lock override yields to a later list refresh with a new foreign lock", async () => {
+    const expiredLock = {
+      holder_display_name: "Ada",
+      since: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 1800).toISOString(),
+      mine: false,
+      held_by_current_session: false,
+    };
+    const renewedLock = { ...expiredLock, holder_display_name: "Bob", expires_at: new Date(Date.now() + 60_000).toISOString() };
+    const lockedFile = { ...FILE_1, app: "photocraft", lock: expiredLock };
+    let lists = 0;
+    const { fetch } = mockFetch(viewRoutes({
+      [`GET /projects/${PROJECT_1.id}/files`]: () => {
+        lists += 1;
+        return { body: { items: lists === 1 ? [lockedFile, FILE_EMPTY] : [{ ...lockedFile, lock: renewedLock }], next_cursor: null } };
+      },
+      [`GET /files/${lockedFile.id}`]: { body: { ...lockedFile, lock: null } },
+      [`DELETE /files/${FILE_EMPTY.id}`]: { status: 204 },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await openFiles(user);
+    const versionButton = () => within(screen.getByRole("row", { name: /logo\.fig/ })).getByRole("button", { name: /Upload a new version of logo\.fig/ });
+    await waitFor(() => expect(versionButton().hasAttribute("disabled")).toBe(false), { timeout: 4000 });
+    await user.click(within(screen.getByRole("row", { name: /draft\.fig/ })).getByRole("button", { name: /Move to trash: draft\.fig/ }));
+    const confirmation = await screen.findByRole("dialog", { name: /Move file to the trash/ });
+    await user.click(within(confirmation).getByRole("button", { name: "Move to trash" }));
+    await waitFor(() => expect(lists).toBeGreaterThan(1));
+    await waitFor(() => expect(versionButton().hasAttribute("disabled")).toBe(true));
+    expect(screen.getByText(/In progress by Bob/)).toBeTruthy();
+  });
+
   it("links downloads to the API (no blob in memory) and marks files without content", async () => {
     const { fetch, calls } = mockFetch(viewRoutes());
     const user = userEvent.setup();

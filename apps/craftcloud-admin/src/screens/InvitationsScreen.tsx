@@ -201,16 +201,17 @@ function InviteForm({
   const { api } = useAuth();
   const names = useRoleNames();
   const manager = isOrgManager(scope.organization);
+  const canInviteGuest = manager || (scope.workspace?.workspace_role === "admin" && scope.organization?.workspace_admin_invites_enabled === true);
   const fixedWorkspace = !manager ? scope.workspace : null;
   const [email, setEmail] = useState("");
-  const [orgRole, setOrgRole] = useState<"admin" | "member">("member");
+  const [orgRole, setOrgRole] = useState<"admin" | "member" | "guest">("member");
   const [workspaceId, setWorkspaceId] = useState(NO_WORKSPACE);
   const [workspaceRole, setWorkspaceRole] = useState<WorkspaceRole>("viewer");
   const [errors, setErrors] = useState<{ email?: string }>({});
   const action = useAction();
   const form = useRef<HTMLFormElement>(null);
 
-  // Workspace admins: own workspace only, role member, editor at most (ADR-0013 item 7).
+  // Workspace admins may invite guests to the own workspace as context, without membership.
   const effectiveWorkspace = fixedWorkspace !== null ? fixedWorkspace.id : workspaceId;
   const roleChoices: WorkspaceRole[] = manager ? ["admin", "editor", "viewer"] : ["editor", "viewer"];
   const effectiveRole = roleChoices.includes(workspaceRole) ? workspaceRole : (roleChoices[0] ?? "viewer");
@@ -230,9 +231,11 @@ function InviteForm({
       try {
         return await api.createInvitation(orgId, {
           email: trimmed,
-          org_role: manager ? orgRole : "member",
+          org_role: canInviteGuest ? orgRole : manager ? orgRole : "member",
           ...(effectiveWorkspace !== NO_WORKSPACE
-            ? { workspace_id: effectiveWorkspace, workspace_role: effectiveRole }
+            ? orgRole === "guest"
+              ? { workspace_id: effectiveWorkspace }
+              : { workspace_id: effectiveWorkspace, workspace_role: effectiveRole }
             : {}),
         });
       } catch (failure) {
@@ -259,15 +262,16 @@ function InviteForm({
         onChange={setEmail}
         error={errors.email}
       />
-      {manager && (
+      {canInviteGuest && (
         <NativeSelect
           label={t("Organization role")}
           value={orgRole}
           options={[
             { id: "member", label: names.orgRole("member") },
-            { id: "admin", label: names.orgRole("admin") },
+            ...(manager ? [{ id: "admin", label: names.orgRole("admin") }] : []),
+            { id: "guest", label: names.orgRole("guest") },
           ]}
-          onChange={(value) => setOrgRole(value === "admin" ? "admin" : "member")}
+          onChange={(value) => setOrgRole(value === "guest" || (manager && value === "admin") ? value : "member")}
         />
       )}
       {manager ? (
@@ -285,7 +289,7 @@ function InviteForm({
           {t("Workspace")}: {fixedWorkspace?.name ?? ""}
         </p>
       )}
-      {effectiveWorkspace !== NO_WORKSPACE && (
+      {effectiveWorkspace !== NO_WORKSPACE && orgRole !== "guest" && (
         <NativeSelect
           label={t("Workspace role")}
           value={effectiveRole}

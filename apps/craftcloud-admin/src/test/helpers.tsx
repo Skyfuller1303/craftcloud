@@ -14,7 +14,7 @@ export interface RecordedCall {
 }
 
 export type Reply = { status?: number; body?: unknown; headers?: Record<string, string> };
-export type Handler = Reply | ((call: RecordedCall) => Reply);
+export type Handler = Reply | ((call: RecordedCall) => Reply | Promise<Reply>);
 
 /**
  * A fetch double. Handlers are keyed by `"METHOD /path"` (path without query).
@@ -40,7 +40,7 @@ export function mockFetch(routes: Record<string, Handler>) {
     if (handler === undefined) {
       return new Response(`{"unexpected":"${call.method} ${call.path}"}`, { status: 599 });
     }
-    const reply = typeof handler === "function" ? handler(call) : handler;
+    const reply = await (typeof handler === "function" ? handler(call) : handler);
     const status = reply.status ?? 200;
     const text = status === 204 || reply.body === undefined ? null : JSON.stringify(reply.body);
     return new Response(text, {

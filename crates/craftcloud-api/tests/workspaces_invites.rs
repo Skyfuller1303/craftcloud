@@ -1221,6 +1221,92 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn guest_invitation_workspace_is_context_only_even_for_legacy_roles() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let invitation=w.invite(&c.owner.1,c.org,json!({"email":"legacy-guest@example.test","org_role":"guest","workspace_id":c.ws.to_string()})).await;
+        assert_eq!(
+            invitation.status,
+            StatusCode::CREATED,
+            "{}",
+            invitation.text
+        );
+        let invitation_id = Uuid::parse_str(invitation.body["id"].as_str().unwrap()).unwrap();
+        sqlx::query("UPDATE invitations SET workspace_role='editor' WHERE id=$1")
+            .bind(invitation_id)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let accepted=w.accept(None,json!({"token":token_of(&invitation),"display_name":"Legacy Guest","password":"legacy-guest-password-1"})).await;
+        assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.text);
+        assert_eq!(accepted.body["workspace_id"], c.ws.to_string());
+        assert_eq!(accepted.body["workspace_role_applied"], false);
+        let guest_id = Uuid::parse_str(accepted.body["user_id"].as_str().unwrap()).unwrap();
+        let guest_session = session_from(&accepted);
+        let role: String = sqlx::query_scalar(
+            "SELECT role FROM organization_members WHERE org_id=$1 AND user_id=$2",
+        )
+        .bind(c.org)
+        .bind(guest_id)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(role, "guest");
+        let ws_role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM workspace_members WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",
+        )
+        .bind(c.org)
+        .bind(c.ws)
+        .bind(guest_id)
+        .fetch_optional(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(ws_role, None);
+
+        // Even a legacy database row cannot grant a guest workspace visibility.
+        sqlx::query("INSERT INTO workspace_members(org_id,workspace_id,user_id,role) VALUES($1,$2,$3,'editor')").bind(c.org).bind(c.ws).bind(guest_id).execute(&w.env.pool).await.unwrap();
+        hidden(
+            &w.get(&guest_session, &format!("/api/v1/workspaces/{}", c.ws))
+                .await,
+        );
+        hidden(&w.ws_role(&guest_session, c.ws, c.plain.0, "viewer").await);
+        assert_eq!(
+            w.ws_add(&guest_session, c.ws, c.plain.0, "viewer")
+                .await
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        sqlx::query(
+            "DELETE FROM workspace_members WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",
+        )
+        .bind(c.org)
+        .bind(c.ws)
+        .bind(guest_id)
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+
+        // A normal member invitation accepted by an existing guest never installs its workspace role.
+        let regular=w.invite(&c.owner.1,c.org,json!({"email":"legacy-guest@example.test","org_role":"member","workspace_id":c.ws.to_string(),"workspace_role":"editor"})).await;
+        assert_eq!(regular.status, StatusCode::CREATED, "{}", regular.text);
+        let outcome = w
+            .accept(Some(&guest_session), json!({"token":token_of(&regular)}))
+            .await;
+        assert_eq!(outcome.status, StatusCode::CONFLICT, "{}", outcome.text);
+        let ws_role: Option<String> = sqlx::query_scalar(
+            "SELECT role FROM workspace_members WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",
+        )
+        .bind(c.org)
+        .bind(c.ws)
+        .bind(guest_id)
+        .fetch_optional(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(ws_role, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn stale_invitations_of_demoted_or_disabled_inviters_and_changed_settings_are_refused() {
         let w = W::new().await;
         let c = cast(&w).await;

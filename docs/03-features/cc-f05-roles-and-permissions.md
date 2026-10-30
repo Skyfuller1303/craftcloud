@@ -4,6 +4,7 @@
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 > **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-03 Freigaben an Personen, Gastrolle und Bearbeitungssperre).
+> **AC-03 Backend-Erweiterung:** Workspace-Rollen werden mit tenantgebundenen Projekt-/Datei-Grants kombiniert. `guest` erhält durch Einladung keine Workspace-Mitgliedschaft. Grant-Management und Mitgliedersuche sind Workspace-Editoren und höher vorbehalten; Rechte bleiben serverseitig in `can()` und werden nicht aus UI-Daten hergeleitet. Details und Scope-Matrix siehe [ADR-0020](../09-decisions/adr-0020-grants-and-edit-locks.md) und [Berechtigungsmatrix](../05-security/permission-matrix.md). Implementierung und Sicherheitsintegrationstests laufen im AC-03 Worktree.
 
 ## Problem und Nutzen
 

@@ -96,6 +96,36 @@ pub async fn locate(pool: &PgPool, file_id: Uuid) -> Result<Option<Location>, Db
     }))
 }
 
+pub async fn app_for(
+    pool: &PgPool,
+    org_id: Uuid,
+    file_id: Uuid,
+) -> Result<Option<String>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT app FROM files WHERE org_id=$1 AND id=$2")
+            .bind(org_id)
+            .bind(file_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn project_name(
+    pool: &PgPool,
+    org_id: Uuid,
+    workspace_id: Uuid,
+    project_id: Uuid,
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT name FROM projects WHERE org_id=$1 AND workspace_id=$2 AND id=$3",
+    )
+    .bind(org_id)
+    .bind(workspace_id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// Fetches one file of the scoped organization (also a trashed one).
 ///
 /// # Errors

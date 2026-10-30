@@ -149,7 +149,13 @@ impl Capabilities {
     pub fn development_defaults() -> Self {
         Self {
             api_version: API_VERSION.to_owned(),
-            features: Vec::new(),
+            features: [
+                FeatureId::new("sharing.grants"),
+                FeatureId::new("sharing.edit-locks"),
+            ]
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect(),
             server_mode: ServerMode::DevelopmentPrototype,
         }
     }
@@ -230,7 +236,13 @@ mod tests {
     fn defaults_are_explicitly_development() {
         let caps = Capabilities::development_defaults();
         assert_eq!(caps.api_version, "1.0");
-        assert!(caps.features.is_empty());
+        assert_eq!(
+            caps.features
+                .iter()
+                .map(FeatureId::as_str)
+                .collect::<Vec<_>>(),
+            ["sharing.grants", "sharing.edit-locks"]
+        );
         assert_eq!(caps.server_mode, ServerMode::DevelopmentPrototype);
     }
 
@@ -241,7 +253,7 @@ mod tests {
             value.ok(),
             Some(serde_json::json!({
                 "api_version": "1.0",
-                "features": [],
+                "features": ["sharing.grants", "sharing.edit-locks"],
                 "server_mode": "development-prototype"
             }))
         );
@@ -273,7 +285,7 @@ mod tests {
 
     #[test]
     fn unknown_server_mode_falls_back_to_unknown() {
-        let json = r#"{"api_version":"1.0","features":[],"server_mode":"quantum-cloud"}"#;
+        let json = r#"{"api_version":"1.0","features":["sharing.grants","sharing.edit-locks"],"server_mode":"quantum-cloud"}"#;
         let caps: Capabilities = serde_json::from_str(json).unwrap();
         assert_eq!(caps.server_mode, ServerMode::Unknown);
     }

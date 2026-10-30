@@ -24,8 +24,8 @@ const MAX_CURSOR_CHARS: usize = 512;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PageQuery {
-    limit: Option<String>,
-    cursor: Option<String>,
+    pub(crate) limit: Option<String>,
+    pub(crate) cursor: Option<String>,
 }
 
 /// Query parameters of the operator's account listing.

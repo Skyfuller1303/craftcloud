@@ -82,12 +82,12 @@ describe("content permissions (matrix PR-008)", () => {
 
 describe("organization member actions (matrix PR-006)", () => {
   it("owners assign everything and remove anybody", () => {
-    expect(assignableOrgRoles("owner", member("owner"))).toEqual(["owner", "admin", "member"]);
+    expect(assignableOrgRoles("owner", member("owner"))).toEqual(["owner", "admin", "member", "guest"]);
     expect(canRemoveOrgMember("owner", "me", member("owner"))).toBe(true);
   });
   it("admins never touch owners and never promote to owner", () => {
     expect(assignableOrgRoles("admin", member("owner"))).toEqual([]);
-    expect(assignableOrgRoles("admin", member("member"))).toEqual(["admin", "member"]);
+    expect(assignableOrgRoles("admin", member("member"))).toEqual(["admin", "member", "guest"]);
     expect(canRemoveOrgMember("admin", "me", member("owner"))).toBe(false);
     expect(canRemoveOrgMember("admin", "me", member("admin"))).toBe(true);
   });

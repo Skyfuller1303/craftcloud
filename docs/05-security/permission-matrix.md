@@ -91,6 +91,28 @@ Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (`project_and_file_act
 
 Abweichung vom Vorschlag in der ersten Tabelle: Der Org-Admin liest das Protokoll der Organisation vollständig (nicht „begrenzt“), WorkspaceAdmins ohne Org-Rolle lesen es nicht, und der Operator hat **keinen** impliziten Zugriff auf das Protokoll einer Organisation (nur auf Instanz-Ereignisse). Verweigerte Anfragen (403) werden aggregiert aufgezeichnet, 404-Antworten nicht. Zugehörige Tests: `crates/craftcloud-core/src/policy.rs` (`project_and_file_actions_follow_workspace_roles` mit der Zeile `AuditRead`, `instance_actions_are_operator_only`) und `crates/craftcloud-api/tests/audit.rs` (`only_owners_and_admins_read_the_audit_log_of_their_organization`).
 
+## AC-03: Objektfreigaben und Bearbeitungsleases
+
+Die verbindliche Entscheidung steht in [ADR-0020](../09-decisions/adr-0020-grants-and-edit-locks.md). `guest` ist eine Organisationsrolle ohne automatische Workspace-Mitgliedschaft. Eine Workspace-ID bei einer Gast-Einladung ist nur Einladungskontext. Gäste werden weder über die Annahme noch über Member-Add zu Workspace-Mitgliedern.
+
+Objektberechtigungen sind das Maximum aus ursprünglicher Workspace-Rolle und aktiven Datei-/Projekt-Grants. `viewer` liest das freigegebene Ziel; `editor` darf zulässige Dateiaktionen ausführen. Projekt-Grants erlauben Projektansicht, Dateiaktionen und Dateianlage innerhalb dieses Projekts, aber keine Projektanlage oder Projektumbenennung, Papierkorb-/Restore-Verwaltung, Workspace- oder Mitgliederverwaltung. Datei-Grants erlauben nur die jeweilige Datei; Geschwisterdateien und Projektlisten bleiben verborgen. Der autorisierte Datei-DTO darf die minimale Parent-ID und den Namen enthalten. Freigaben verwalten ausschließlich Workspace-Editoren und höhere Rollen. Grants verleihen keine Freigabe- oder Member-Suchrechte.
+
+| Aktion | Org-Owner/Admin | WS-Admin | WS-Editor | WS-Viewer | Grant-Editor | Grant-Viewer | Org-Gast ohne Grant | Org-Gast mit Grant |
+|---|---|---|---|---|---|---|---|---|
+| Freigaben sehen/anlegen/ändern/widerrufen | ja | eigener Workspace | eigener Workspace | 403 | 403 | 403 | 404 | 403 |
+| Mitglieder auflisten | ja | ja | ja | ja | ja | ja | 403 | 403 |
+| Mitglieder für Freigabe suchen | ja | ja | ja | 403 | 403 | 403 | 403 | 403 |
+| Projekt-Grant: Projekt sehen/Dateien listen | ja | ja | ja | ja | Ziel und Dateien im Projekt | Ziel und Dateien im Projekt | 404 | nur mit Grant |
+| Datei-Grant: Datei lesen/herunterladen | ja | ja | ja | ja | nur Ziel-Datei | nur Ziel-Datei | 404 | nur mit Grant |
+| Datei-Grant: Datei ändern/Upload abschließen | ja | ja | ja | 403 | nur Ziel-Datei | 403 | 404 | nur mit Editor-Grant |
+| Lock fremd erzwingen (`DELETE ?force=true`) | ja | ja | 403 | 403 | 403 | 403 | 404 | 403 |
+
+Lease gehört einer aktiven Browser-Sitzung und läuft nach fünf Minuten ab; Heartbeat verlängert sie. Dieselbe Person in einer anderen Sitzung darf nur mit `takeover=true` übernehmen. Fremde aktive Leases blockieren Datei-Metadatenänderung, Upload-Anlage/-Abschluss, Versionsabschluss/-Restore, Datei-Papierkorb/-Restore sowie Projekt-Papierkorb/-Restore mit 423 `FILE_LOCKED`. Lesen und Download bleiben möglich. FigCraft-Dateien antworten für Lock-Operationen mit 409 `LOCK_NOT_SUPPORTED`.
+
+## Abnahmebelege
+
+Die vollständige Grant-Aktionsmatrix liegt in `craftcloud-core/src/policy.rs::object_grant_matrix_is_scoped_and_never_grants_management`; Gäste-MemberList in `member_list`. HTTP-Abdeckung: `craftcloud-api/tests/shares_locks.rs::file_grant_does_not_reveal_project_or_sibling_and_shared_item_is_minimal`, `project_editor_grant_covers_files_but_not_project_management`, `leases_guard_writes_project_restore_and_audit_only_state_changes`. Upload-Zulassung und Entzug während des Streams: `craftcloud-api/tests/uploads.rs::file_grant_editor_can_upload_and_revocation_during_stream_is_rechecked`. Datei-Bindung beim Commit: `craftcloud-api/tests/versions.rs::an_upload_is_bound_to_its_file_even_with_a_foreign_target_lease`. DB-Rennen, Projekt-Lease-Suche und Grant-Demotion/Revoke-Cleanup: `craftcloud-db/tests/integration.rs::migration_0016_grant_shape_keys_and_shared_projection_are_valid`.
+
 ## Negativtests
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.

@@ -141,7 +141,7 @@ pub async fn roles(
                 (SELECT wm.role FROM workspace_members wm \
                  WHERE wm.workspace_id = $2 AND wm.org_id = $1 AND wm.user_id = $3) \
          FROM organization_members m \
-         WHERE m.org_id = $1 AND m.user_id = $3 AND m.status = 'active'",
+         WHERE m.org_id = $1 AND m.user_id = $3 AND m.status = 'active' AND m.role <> 'guest'",
     )
     .bind(org_id)
     .bind(workspace_id)
@@ -149,10 +149,15 @@ pub async fn roles(
     .fetch_optional(pool)
     .await?;
     Ok(match row {
-        Some((org_role, ws_role)) => (
-            OrgRole::parse(&org_role),
-            ws_role.as_deref().and_then(WorkspaceRole::parse),
-        ),
+        Some((org_role, ws_role)) => {
+            let org_role = OrgRole::parse(&org_role);
+            let workspace_role = if org_role == Some(OrgRole::Guest) {
+                None
+            } else {
+                ws_role.as_deref().and_then(WorkspaceRole::parse)
+            };
+            (org_role, workspace_role)
+        }
         None => (None, None),
     })
 }
@@ -213,7 +218,7 @@ pub async fn list_visible(
            AND ($2::uuid IS NULL OR EXISTS ( \
                  SELECT 1 FROM workspace_members wm \
                  JOIN organization_members m ON m.org_id = wm.org_id AND m.user_id = wm.user_id \
-                 WHERE wm.workspace_id = w.id AND wm.user_id = $2 AND m.status = 'active')) \
+                 WHERE wm.workspace_id = w.id AND wm.user_id = $2 AND m.status = 'active' AND m.role <> 'guest')) \
            AND ($3::timestamptz IS NULL OR (w.created_at, w.id) > ($3::timestamptz, $4::uuid)) \
          ORDER BY w.created_at, w.id LIMIT $5",
     )
@@ -243,7 +248,7 @@ pub async fn list_members(
     Ok(sqlx::query_as::<_, WorkspaceMember>(&format!(
         "{MEMBER_SELECT} \
          JOIN organization_members m ON m.org_id = wm.org_id AND m.user_id = wm.user_id \
-         WHERE wm.org_id = $1 AND wm.workspace_id = $2 AND m.status = 'active' \
+         WHERE wm.org_id = $1 AND wm.workspace_id = $2 AND m.status = 'active' AND m.role <> 'guest' \
            AND ($3::timestamptz IS NULL OR (wm.created_at, wm.user_id) > ($3::timestamptz, $4::uuid)) \
          ORDER BY wm.created_at, wm.user_id LIMIT $5"
     ))
@@ -359,7 +364,7 @@ impl OrgTx {
             "SELECT wm.role FROM workspace_members wm \
              JOIN organization_members m ON m.org_id = wm.org_id AND m.user_id = wm.user_id \
              WHERE wm.org_id = $1 AND wm.workspace_id = $2 AND wm.user_id = $3 \
-               AND m.status = 'active'",
+               AND m.status = 'active' AND m.role <> 'guest'",
         )
         .bind(self.org_id)
         .bind(workspace_id)
@@ -465,7 +470,7 @@ impl OrgTx {
         }
         let eligible: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM organization_members m JOIN users u ON u.id = m.user_id \
-             WHERE m.org_id = $1 AND m.user_id = $2 AND m.status = 'active' \
+             WHERE m.org_id = $1 AND m.user_id = $2 AND m.status = 'active' AND m.role <> 'guest' \
                AND u.disabled_at IS NULL)",
         )
         .bind(self.org_id)
@@ -514,6 +519,12 @@ impl OrgTx {
         if current.workspace_role() == Some(role) {
             return Ok(WorkspaceRoleOutcome::Unchanged(current));
         }
+        sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2 AND file_id IN (SELECT f.id FROM files f WHERE f.workspace_id = $3)")
+            .bind(self.org_id)
+            .bind(user_id)
+            .bind(workspace_id)
+            .execute(&mut *self.tx)
+            .await?;
         sqlx::query(
             "UPDATE workspace_members SET role = $4 \
              WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3",
@@ -542,6 +553,12 @@ impl OrgTx {
         user_id: Uuid,
     ) -> Result<bool, DbError> {
         self.check(scope, Action::WorkspaceMemberRemove)?;
+        sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2 AND file_id IN (SELECT f.id FROM files f WHERE f.workspace_id = $3)")
+            .bind(self.org_id)
+            .bind(user_id)
+            .bind(workspace_id)
+            .execute(&mut *self.tx)
+            .await?;
         let removed = sqlx::query(
             "DELETE FROM workspace_members WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3",
         )

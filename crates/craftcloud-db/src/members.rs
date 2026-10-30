@@ -88,6 +88,31 @@ pub async fn list(
     .await?)
 }
 
+/// Searches active organization members by display name or normalized e-mail.
+pub async fn search(
+    pool: &PgPool,
+    scope: &OrgScope,
+    query: &str,
+    limit: u32,
+    after: Option<AfterKey>,
+) -> Result<Vec<Member>, DbError> {
+    Ok(sqlx::query_as::<_, Member>(&format!(
+        "{MEMBER_SELECT} WHERE m.org_id=$1 AND m.status='active' AND (u.disabled_at IS NULL) \
+         AND (position($2 in lower(u.display_name))>0 OR position($2 in u.normalized_email)>0) \
+         AND ($3::timestamptz IS NULL OR (m.created_at,m.user_id)>($3,$4)) ORDER BY m.created_at,m.user_id LIMIT $5"
+    ))
+    .bind(scope.org_id()).bind(query).bind(after.map(|x|x.0)).bind(after.map(|x|x.1)).bind(clamp_page(limit)).fetch_all(pool).await?)
+}
+
+pub async fn can_manage_grants(
+    pool: &PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM organization_members m WHERE m.org_id=$1 AND m.user_id=$2 AND m.status='active' AND m.role IN ('owner','admin')) OR EXISTS(SELECT 1 FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id AND w.org_id=wm.org_id JOIN organization_members m ON m.org_id=wm.org_id AND m.user_id=wm.user_id AND m.status='active' AND m.role <> 'guest' WHERE wm.org_id=$1 AND wm.user_id=$2 AND wm.role IN ('admin','editor'))")
+        .bind(org_id).bind(user_id).fetch_one(pool).await?)
+}
+
 /// Result of [`OrgTx::add`].
 #[derive(Debug, Clone)]
 pub enum AddOutcome {
@@ -304,6 +329,18 @@ impl OrgTx {
         if current_role == Some(OrgRole::Owner) && self.would_orphan(user_id).await? {
             return Ok(RoleOutcome::LastOwner);
         }
+        sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2")
+            .bind(self.org_id)
+            .bind(user_id)
+            .execute(&mut *self.tx)
+            .await?;
+        if new_role == OrgRole::Guest {
+            sqlx::query("DELETE FROM workspace_members WHERE org_id = $1 AND user_id = $2")
+                .bind(self.org_id)
+                .bind(user_id)
+                .execute(&mut *self.tx)
+                .await?;
+        }
         sqlx::query(
             "UPDATE organization_members SET role = $3 \
              WHERE org_id = $1 AND user_id = $2 AND status = 'active'",
@@ -355,6 +392,16 @@ impl OrgTx {
         sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
             .bind(user_id)
             .fetch_optional(&mut *self.tx)
+            .await?;
+        sqlx::query("UPDATE grants SET revoked_at = CURRENT_TIMESTAMP, version = version + 1 WHERE org_id = $1 AND grantee_user_id = $2 AND revoked_at IS NULL")
+            .bind(self.org_id)
+            .bind(user_id)
+            .execute(&mut *self.tx)
+            .await?;
+        sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2")
+            .bind(self.org_id)
+            .bind(user_id)
+            .execute(&mut *self.tx)
             .await?;
         sqlx::query("DELETE FROM workspace_members WHERE org_id = $1 AND user_id = $2")
             .bind(self.org_id)
