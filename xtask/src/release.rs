@@ -52,7 +52,7 @@ fn create_release(root: &Path, version: &str) -> Result<(), String> {
     run_status(archive_command, "git archive")?;
 
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/release_archive.py");
-    let status = Command::new("python")
+    let status = python_command()?
         .args([
             "-I",
             helper.to_string_lossy().as_ref(),
@@ -71,6 +71,50 @@ fn create_release(root: &Path, version: &str) -> Result<(), String> {
     }
     println!("created {}", archive.display());
     Ok(())
+}
+
+/// Interpreter candidates in order of preference: `python3`, `python`, and the
+/// Windows launcher `py -3`.
+const PYTHON_CANDIDATES: [(&str, &[&str]); 3] =
+    [("python3", &[]), ("python", &[]), ("py", &["-3"])];
+
+/// Exit status the version probe uses for "Python is too old".
+const PYTHON_TOO_OLD: i32 = 3;
+
+/// Finds a Python 3.11 or newer interpreter (the release helper needs `tomllib`).
+/// A candidate that cannot run at all, such as the Microsoft Store stub, is skipped.
+fn python_command() -> Result<Command, String> {
+    let mut too_old = Vec::new();
+    for (program, prefix) in PYTHON_CANDIDATES {
+        let probe = Command::new(program)
+            .args(prefix)
+            .args([
+                "-I",
+                "-c",
+                "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 3)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match probe {
+            Ok(status) if status.success() => {
+                let mut command = Command::new(program);
+                command.args(prefix);
+                return Ok(command);
+            }
+            Ok(status) if status.code() == Some(PYTHON_TOO_OLD) => too_old.push(program),
+            _ => {}
+        }
+    }
+    if too_old.is_empty() {
+        Err("no Python interpreter found (tried python3, python, py -3); install Python 3.11 or newer".to_owned())
+    } else {
+        Err(format!(
+            "Python 3.11 or newer is required for the release archive; found only an older {}",
+            too_old.join(", ")
+        ))
+    }
 }
 
 struct ReleaseLock {
@@ -337,7 +381,8 @@ mod tests {
             return;
         };
         let test_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/test_release_archive.py");
-        let status = Command::new("python")
+        let status = python_command()
+            .expect("Python 3.11 or newer is required")
             .args(["-I", test_script.to_string_lossy().as_ref()])
             .current_dir(root)
             .status();

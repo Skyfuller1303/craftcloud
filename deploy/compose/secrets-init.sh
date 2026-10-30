@@ -13,7 +13,7 @@ case $- in *x*) set +x ;; esac
 #   db        root   superuser password (PostgreSQL entrypoint)
 #   db-init   999    the three passwords
 #   migrate   65532  owner and runtime database URL
-#   server    65532  runtime database URL; bootstrap and metrics token only when
+#   server    65532  runtime database URL and two-factor key; bootstrap and metrics token only when
 #                    the compose.setup.yaml / compose.metrics.yaml override asks
 #
 # It never prints a secret. The two database URLs are built here from the two
@@ -108,7 +108,17 @@ printf 'postgres://%s:%s@db:5432/%s' "$RUNTIME_ROLE" "$runtime_password" "$DATAB
 prune migrate db_owner_url db_runtime_url
 
 printf 'postgres://%s:%s@db:5432/%s' "$RUNTIME_ROLE" "$runtime_password" "$DATABASE" | put 65532 server db_runtime_url
-server_files="db_runtime_url"
+# The two-factor encryption key is Base64 of 32 random bytes. It is checked for shape
+# only; the value is never printed.
+two_factor_key=$(cat "$SRC/two_factor_key")
+case "$two_factor_key" in
+    "" | *[!A-Za-z0-9+/=]*)
+        echo "secrets-init: CC_SECRET_TWO_FACTOR_KEY is empty or not Base64; run \`cargo xtask compose-secrets\` or add a Base64 value of 32 random bytes" >&2
+        exit 1
+        ;;
+esac
+copy 65532 server two_factor_key
+server_files="db_runtime_url two_factor_key"
 if [ "${COPY_BOOTSTRAP_TOKEN:-0}" = 1 ]; then
     copy 65532 server bootstrap_token
     server_files="$server_files bootstrap_token"

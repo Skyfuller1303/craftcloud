@@ -10,6 +10,7 @@ cat >"$TMP/bin/docker" <<'DOCKER'
 #!/bin/sh
 printf '%s\n' "$*" >>"${DOCKER_LOG:-/dev/null}"
 case "$*" in
+    *"${DOCKER_FAIL:-@@never@@}"*) exit 1 ;;
     'compose version --short') echo 2.24.0 ;;
     'version --format {{.Server.Version}}') echo 25.0.0 ;;
     *'exec -T caddy wget -qO- http://server:8080/api/v1/setup/status'*) echo '{"setup_required":false}' ;;
@@ -49,6 +50,11 @@ sh -x "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost \
 [ -f "$TMP/etc/craftcloud/caddy/tls-custom.caddy" ]
 [ "$(sed -n 's/^CRAFTCLOUD_PUBLIC_URL=//p' "$TMP/etc/craftcloud/craftcloud.env")" = 'https://localhost:28543' ]
 [ -L "$TMP/opt/craftcloud/current" ]
+# The 2FA encryption key is generated once: Base64 of 32 bytes, kept on rerun.
+two_factor_key=$(sed -n 's/^CC_SECRET_TWO_FACTOR_KEY=//p' "$TMP/etc/craftcloud/craftcloud.env")
+[ "${#two_factor_key}" -eq 44 ]
+[ "$(printf '%s' "$two_factor_key" | base64 -d | wc -c)" -eq 32 ]
+[ -f "$TMP/etc/craftcloud/caddy/.shipped-sha256" ]
 cp "$TMP/etc/craftcloud/bootstrap-token" "$TMP/bootstrap-before"
 PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_IMAGE_PREFIX=craftcloud-server:ops01- CRAFTCLOUD_INSTALL_ROOT="$TMP/opt/craftcloud" \
 CRAFTCLOUD_CONFIG_DIR="$TMP/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/data" \
@@ -57,6 +63,89 @@ sh -x "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost \
   --acme-email test@example.invalid --http-port 28180 --https-port 28543 \
   --data-dir "$TMP/data" "$TMP/output/craftcloud-0.1.0.tar.gz" >"$TMP/reinstall.log" 2>&1
 cmp "$TMP/bootstrap-before" "$TMP/etc/craftcloud/bootstrap-token"
+[ "$(sed -n 's/^CC_SECRET_TWO_FACTOR_KEY=//p' "$TMP/etc/craftcloud/craftcloud.env")" = "$two_factor_key" ]
+[ "$(grep -c '^CC_SECRET_TWO_FACTOR_KEY=' "$TMP/etc/craftcloud/craftcloud.env")" -eq 1 ]
+
+# Invalid ACME addresses are rejected (the character class once allowed a range
+# that included , / : ; < = > ?). A normal address passes a dry run.
+for bad_email in 'a,b@example.org' 'a/b@example.org' 'a:b@example.org' 'a?b@example.org' 'a<b@example.org'; do
+    if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/email/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/email/etc" \
+       CRAFTCLOUD_DATA_DIR="$TMP/email/data" sh "$ROOT/deploy/install/install.sh" --dry-run --domain localhost \
+       --acme-email "$bad_email" --data-dir "$TMP/email/data" "$TMP/output/craftcloud-0.1.0.tar.gz" >"$TMP/bad-email.log" 2>&1; then
+        echo "installer accepted ACME email $bad_email" >&2
+        exit 1
+    fi
+    grep -F 'invalid ACME email' "$TMP/bad-email.log" >/dev/null
+done
+PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/email/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/email/etc" \
+CRAFTCLOUD_DATA_DIR="$TMP/email/data" sh "$ROOT/deploy/install/install.sh" --dry-run --domain localhost \
+  --acme-email 'first.last+tag@example-host.org' --data-dir "$TMP/email/data" "$TMP/output/craftcloud-0.1.0.tar.gz" >/dev/null 2>&1
+
+# Helper for the retry tests below: build a release archive from a source tree.
+# usage: make_release <version> <commit> [no-metadata]
+make_release() {
+    mkdir -p "$TMP/source/craftcloud-$1/deploy/compose/caddy"
+    printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-$1/deploy/compose/compose.yaml"
+    printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-$1/deploy/compose/compose.install.yaml"
+    printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy }' >"$TMP/source/craftcloud-$1/deploy/compose/caddy/Caddyfile"
+    printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key' >"$TMP/source/craftcloud-$1/deploy/compose/caddy/tls-custom.caddy"
+    if [ "${3:-}" != no-metadata ]; then
+        printf '{"version":"%s","commit":"%s"}\n' "$1" "$2" >"$TMP/source/craftcloud-$1/CRAFTCLOUD-RELEASE.json"
+    fi
+    (cd "$TMP/source" && tar -czf "$TMP/output/craftcloud-$1.tar.gz" "craftcloud-$1")
+    (cd "$TMP/output" && sha256sum "craftcloud-$1.tar.gz" >SHA256SUMS)
+}
+
+# A failed first install (here: the migration fails) leaves no active release; a
+# rerun must succeed and reuse the complete release directory.
+retry_env() {
+    PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_IMAGE_PREFIX=craftcloud-server:retry- CRAFTCLOUD_INSTALL_ROOT="$TMP/retry/opt" \
+    CRAFTCLOUD_CONFIG_DIR="$TMP/retry/etc" CRAFTCLOUD_DATA_DIR="$TMP/retry/data" CRAFTCLOUD_PROJECT_NAME=craftcloud-retry \
+    DOCKER_LOG="$TMP/docker.log" "$@"
+}
+make_release 0.2.0 0200000
+if retry_env DOCKER_FAIL='run --rm migrate' sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost \
+   --http-port 28190 --https-port 28553 --data-dir "$TMP/retry/data" "$TMP/output/craftcloud-0.2.0.tar.gz" >"$TMP/retry-first.log" 2>&1; then
+    echo 'install with failing migration unexpectedly succeeded' >&2
+    exit 1
+fi
+[ -d "$TMP/retry/opt/releases/0.2.0" ] && [ ! -e "$TMP/retry/opt/current" ]
+retry_env sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost \
+  --http-port 28190 --https-port 28553 --data-dir "$TMP/retry/data" "$TMP/output/craftcloud-0.2.0.tar.gz" >"$TMP/retry-second.log" 2>&1
+[ -L "$TMP/retry/opt/current" ]
+# An incomplete leftover directory of an interrupted older run is replaced.
+rm -f "$TMP/retry/opt/current"
+rm -rf "$TMP/retry/opt/releases/0.2.0"
+mkdir "$TMP/retry/opt/releases/0.2.0"
+retry_env sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost \
+  --http-port 28190 --https-port 28553 --data-dir "$TMP/retry/data" "$TMP/output/craftcloud-0.2.0.tar.gz" >"$TMP/retry-third.log" 2>&1
+[ -f "$TMP/retry/opt/releases/0.2.0/CRAFTCLOUD-RELEASE.json" ]
+
+# An archive without metadata is rejected without leaving a release or staging directory.
+make_release 0.2.1 0210000 no-metadata
+if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/bad/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/bad/etc" \
+   CRAFTCLOUD_DATA_DIR="$TMP/bad/data" CRAFTCLOUD_PROJECT_NAME=craftcloud-bad DOCKER_LOG="$TMP/docker.log" \
+   sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost --http-port 28191 --https-port 28554 \
+   --data-dir "$TMP/bad/data" "$TMP/output/craftcloud-0.2.1.tar.gz" >"$TMP/bad-archive.log" 2>&1; then
+    echo 'installer accepted an archive without metadata' >&2
+    exit 1
+fi
+[ -z "$(ls -A "$TMP/bad/opt/releases")" ]
+
+# An over-long Docker tag fails before any environment file or secret is written.
+long_version=0.3.0-$(printf 'a%.0s' $(seq 1 130))
+make_release "$long_version" 0300000
+if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/long/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/long/etc" \
+   CRAFTCLOUD_DATA_DIR="$TMP/long/data" CRAFTCLOUD_PROJECT_NAME=craftcloud-long DOCKER_LOG="$TMP/docker.log" \
+   sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost --http-port 28192 --https-port 28555 \
+   --data-dir "$TMP/long/data" "$TMP/output/craftcloud-$long_version.tar.gz" >"$TMP/long-version.log" 2>&1; then
+    echo 'installer accepted an over-long image tag' >&2
+    exit 1
+fi
+grep -F 'too long for a Docker image tag' "$TMP/long-version.log" >/dev/null
+[ ! -e "$TMP/long/etc/craftcloud.env" ]
+# Restore the checksum file of the main archive for the tests that follow.
+(cd "$TMP/output" && sha256sum craftcloud-0.1.0.tar.gz >SHA256SUMS)
 mkdir -p "$TMP/preexisting-data"
 printf '%s\n' 'user data remains' >"$TMP/preexisting-data/user.txt"
 if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/untrusted/opt/craftcloud" \
@@ -104,14 +193,46 @@ sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost --http
 mkdir -p "$TMP/source/craftcloud-1.2.4/deploy/compose/caddy"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.4/deploy/compose/compose.yaml"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.4/deploy/compose/compose.install.yaml"
-printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy }' >"$TMP/source/craftcloud-1.2.4/deploy/compose/caddy/Caddyfile"
-printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key' >"$TMP/source/craftcloud-1.2.4/deploy/compose/caddy/tls-custom.caddy"
+printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy } # v2' >"$TMP/source/craftcloud-1.2.4/deploy/compose/caddy/Caddyfile"
+printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key # v2' >"$TMP/source/craftcloud-1.2.4/deploy/compose/caddy/tls-custom.caddy"
 printf '{"version":"1.2.4","commit":"1234567"}\n' >"$TMP/source/craftcloud-1.2.4/CRAFTCLOUD-RELEASE.json"
 (cd "$TMP/source" && tar -czf "$TMP/output/craftcloud-1.2.4.tar.gz" craftcloud-1.2.4)
 (cd "$TMP/output" && sha256sum craftcloud-1.2.4.tar.gz >SHA256SUMS)
 PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
 CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
+# An older configuration without the 2FA key gets one on upgrade; an operator edit
+# of a shipped Caddy file is kept (new version beside it as .new), unmodified shipped
+# files are refreshed, and operator-owned certificate files are never touched.
+sed -i '/^CC_SECRET_TWO_FACTOR_KEY=/d' "$TMP/plus/etc/craftcloud/craftcloud.env"
+printf '%s\n' '# local edit' >>"$TMP/plus/etc/craftcloud/caddy/Caddyfile"
+printf '%s' 'operator certificate' >"$TMP/plus/etc/craftcloud/caddy/fullchain.pem"
+# Release 1.2.5 has no metadata: the upgrade must fail and leave no release or staging directory.
+make_release 1.2.5 1250000 no-metadata
+if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
+   CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
+   sh "$ROOT/deploy/install/craftcloud-ctl" upgrade "$TMP/output/craftcloud-1.2.5.tar.gz" >"$TMP/plus-bad-upgrade.log" 2>&1; then
+    echo 'upgrade accepted an archive without metadata' >&2
+    exit 1
+fi
+[ ! -e "$TMP/plus/opt/craftcloud/releases/1.2.5" ]
+[ -z "$(find "$TMP/plus/opt/craftcloud/releases" -maxdepth 1 -name '.tmp-*')" ]
+# An incomplete directory left by an older interrupted run does not block the upgrade.
+mkdir "$TMP/plus/opt/craftcloud/releases/1.2.4"
+(cd "$TMP/output" && sha256sum craftcloud-1.2.4.tar.gz >SHA256SUMS)
+PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
+CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
 sh "$ROOT/deploy/install/craftcloud-ctl" upgrade "$TMP/output/craftcloud-1.2.4.tar.gz" >"$TMP/plus-upgrade.log" 2>&1
+plus_key=$(sed -n 's/^CC_SECRET_TWO_FACTOR_KEY=//p' "$TMP/plus/etc/craftcloud/craftcloud.env")
+[ "${#plus_key}" -eq 44 ]
+grep -F 'v2' "$TMP/plus/etc/craftcloud/caddy/tls-custom.caddy" >/dev/null
+if grep -F 'v2' "$TMP/plus/etc/craftcloud/caddy/Caddyfile" >/dev/null; then
+    echo 'upgrade overwrote an operator-edited Caddy file' >&2
+    exit 1
+fi
+grep -F '# local edit' "$TMP/plus/etc/craftcloud/caddy/Caddyfile" >/dev/null
+grep -F 'v2' "$TMP/plus/etc/craftcloud/caddy/Caddyfile.new" >/dev/null
+grep -F 'Caddyfile was changed locally' "$TMP/plus-upgrade.log" >/dev/null
+[ "$(cat "$TMP/plus/etc/craftcloud/caddy/fullchain.pem")" = 'operator certificate' ]
 PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/plus/opt/craftcloud" \
 CRAFTCLOUD_CONFIG_DIR="$TMP/plus/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/plus/data" \
 sh "$ROOT/deploy/install/craftcloud-ctl" rollback >"$TMP/plus-rollback.log" 2>&1
@@ -144,6 +265,44 @@ if grep -E 'CC_SECRET_|bootstrap-token=' "$TMP/setup-complete.log" >/dev/null; t
     exit 1
 fi
 
+# status reports the key file without printing it; backup names where the key lives.
+main_ctl() {
+    PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_IMAGE_PREFIX=craftcloud-server:ops01- CRAFTCLOUD_INSTALL_ROOT="$TMP/opt/craftcloud" \
+    CRAFTCLOUD_CONFIG_DIR="$TMP/etc/craftcloud" CRAFTCLOUD_DATA_DIR="$TMP/data" DOCKER_LOG="$TMP/docker.log" \
+    sh "$ROOT/deploy/install/craftcloud-ctl" "$@"
+}
+main_ctl status >"$TMP/status.log" 2>&1
+grep -F 'Two-factor key: present' "$TMP/status.log" >/dev/null
+main_ctl backup >"$TMP/backup.log" 2>&1
+grep -F 'does not contain the two-factor encryption key' "$TMP/backup.log" >/dev/null
+grep -F "$TMP/etc/craftcloud/craftcloud.env" "$TMP/backup.log" >/dev/null
+
+# Backup, upgrade and rollback exclude each other.
+if command -v flock >/dev/null 2>&1; then
+    flock "$TMP/etc/craftcloud/.ctl.lock" sleep 4 &
+    lock_holder=$!
+    sleep 1
+    if main_ctl backup >"$TMP/locked-backup.log" 2>&1; then
+        echo 'backup ran while the ctl lock was held' >&2
+        exit 1
+    fi
+    grep -F 'another craftcloud-ctl' "$TMP/locked-backup.log" >/dev/null
+    wait "$lock_holder"
+    main_ctl backup >"$TMP/unlocked-backup.log" 2>&1
+else
+    echo 'install-safety: flock missing, lock test skipped' >&2
+fi
+
+# Secret scan: no log of this run contains any generated secret value.
+for secret in $(sed -n 's/^CC_SECRET_[A-Z_]*=//p' "$TMP/etc/craftcloud/craftcloud.env"); do
+    for scanned in "$TMP"/*.log; do
+        if grep -F -- "$secret" "$scanned" >/dev/null; then
+            echo "a log exposed a generated secret: $scanned" >&2
+            exit 1
+        fi
+    done
+done
+
 cp "$TMP/output/SHA256SUMS" "$TMP/output/SHA256SUMS.good"
 printf '%064d  other-file.tar.gz\n' 0 >"$TMP/output/SHA256SUMS"
 if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_IMAGE_PREFIX=craftcloud-server:ops01- CRAFTCLOUD_INSTALL_ROOT="$TMP/opt/craftcloud" \
@@ -168,5 +327,54 @@ CRAFTCLOUD_SYSTEMD_DIR="$TMP/systemd" CRAFTCLOUD_PROJECT_NAME=craftcloud-ops01 D
 sh "$ROOT/deploy/install/craftcloud-ctl" uninstall --purge --confirm-purge >"$TMP/purge-confirmed.log" 2>&1
 grep -F 'down --volumes' "$TMP/docker.log" >/dev/null
 [ ! -e "$TMP/data" ] && [ ! -e "$TMP/etc/craftcloud" ] && [ ! -e "$TMP/opt/craftcloud" ]
+
+# Uninstall must work when the systemd units were never installed (the install stopped
+# before the unit step) and must disable only units that exist.
+cat >"$TMP/bin/systemctl" <<'SYSTEMCTL'
+#!/bin/sh
+printf '%s\n' "$*" >>"${SYSTEMCTL_LOG:-/dev/null}"
+case "$1" in disable|enable) exit 1 ;; esac
+exit 0
+SYSTEMCTL
+chmod +x "$TMP/bin/systemctl"
+make_release 0.2.2 0220000
+(cd "$TMP/output" && sha256sum craftcloud-0.2.2.tar.gz >SHA256SUMS)
+for instance in none partial; do
+    port=28200
+    [ "$instance" = none ] || port=28210
+    PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/units/$instance/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/units/$instance/etc" \
+    CRAFTCLOUD_DATA_DIR="$TMP/units/$instance/data" CRAFTCLOUD_PROJECT_NAME="craftcloud-units-$instance" DOCKER_LOG="$TMP/docker.log" \
+    sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost --http-port "$port" --https-port "$((port + 1))" \
+      --data-dir "$TMP/units/$instance/data" "$TMP/output/craftcloud-0.2.2.tar.gz" >"$TMP/units-$instance-install.log" 2>&1
+done
+created_systemd_dir=0
+if [ ! -d /run/systemd/system ] && mkdir -p /run/systemd/system 2>/dev/null; then created_systemd_dir=1; fi
+if [ -d /run/systemd/system ]; then
+    mkdir -p "$TMP/units/partial/systemd"
+    : >"$TMP/units/partial/systemd/craftcloud.service"
+    for instance in none partial; do
+        PATH="$TMP/bin:$PATH" CRAFTCLOUD_INSTALL_ROOT="$TMP/units/$instance/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/units/$instance/etc" \
+        CRAFTCLOUD_DATA_DIR="$TMP/units/$instance/data" CRAFTCLOUD_PROJECT_NAME="craftcloud-units-$instance" \
+        CRAFTCLOUD_SYSTEMD_DIR="$TMP/units/$instance/systemd" DOCKER_LOG="$TMP/docker.log" SYSTEMCTL_LOG="$TMP/systemctl-$instance.log" \
+        sh "$ROOT/deploy/install/craftcloud-ctl" uninstall >"$TMP/units-$instance-uninstall.log" 2>&1 || {
+            [ "$created_systemd_dir" -eq 0 ] || rmdir /run/systemd/system 2>/dev/null || true
+            echo "uninstall failed without installed systemd units ($instance)" >&2
+            exit 1
+        }
+        [ ! -e "$TMP/units/$instance/opt" ]
+    done
+    [ "$created_systemd_dir" -eq 0 ] || rmdir /run/systemd/system 2>/dev/null || true
+    if grep -F 'disable' "$TMP/systemctl-none.log" >/dev/null 2>&1; then
+        echo 'uninstall disabled units that were never installed' >&2
+        exit 1
+    fi
+    grep -F 'disable --now craftcloud.service' "$TMP/systemctl-partial.log" >/dev/null
+    if grep -F 'craftcloud-backup' "$TMP/systemctl-partial.log" >/dev/null; then
+        echo 'uninstall disabled a unit that does not exist' >&2
+        exit 1
+    fi
+else
+    echo 'install-safety: cannot create /run/systemd/system, systemd-unit uninstall test skipped' >&2
+fi
 
 echo 'install-safety: passed'
