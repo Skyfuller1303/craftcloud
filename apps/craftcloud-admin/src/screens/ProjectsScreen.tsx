@@ -16,6 +16,8 @@ import { useI18n } from "../i18n/index.tsx";
 import { canTrashProjects, canWriteContent } from "../permissions.ts";
 import type { Scope } from "../permissions.ts";
 import { usePagedList } from "../usePagedList.ts";
+import { SharingDialog } from "./SharingDialog.tsx";
+import type { ShareTarget } from "./SharingDialog.tsx";
 
 const MAX_NAME = 100;
 
@@ -37,6 +39,7 @@ export function ProjectsScreen({
   const [showTrash, setShowTrash] = useState(false);
   const [renaming, setRenaming] = useState<Project | null>(null);
   const [trashing, setTrashing] = useState<Project | null>(null);
+  const [sharing, setSharing] = useState<ShareTarget | null>(null);
   const trashAction = useAction();
   const restoreAction = useAction();
 
@@ -111,6 +114,11 @@ export function ProjectsScreen({
                           onPress={() => onOpenProject(project)}
                         >
                           {t("Files")}
+                        </Button>
+                      )}
+                      {!showTrash && project.can_share === true && (
+                        <Button className="button button--sm" aria-label={t("Share {name}", { name: project.name })} onPress={() => setSharing({ kind: "project", id: project.id, name: project.name })}>
+                          {t("Share")}
                         </Button>
                       )}
                       {!showTrash && mayWrite && (
@@ -211,6 +219,9 @@ export function ProjectsScreen({
               });
           }}
         />
+      )}
+      {sharing !== null && scope.organization !== null && (
+        <SharingDialog target={sharing} organizationId={scope.organization.id} onClose={() => setSharing(null)} />
       )}
     </>
   );

@@ -397,9 +397,10 @@ mod tests {
 
     #[test]
     fn embedded_migrations_are_ordered_and_complete() {
+        // Migration 15 is reserved for AC-01; AC-03 adds migration 16 independently.
         assert_eq!(
             embedded_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16]
         );
     }
 
@@ -407,6 +408,8 @@ mod tests {
     fn migrator_up_to_filters() {
         assert_eq!(migrator_up_to(1).iter().count(), 1);
         assert_eq!(migrator_up_to(0).iter().count(), 0);
-        assert_eq!(migrator_up_to(99).iter().count(), 14);
+        assert_eq!(migrator_up_to(15).iter().count(), 14);
+        assert_eq!(migrator_up_to(16).iter().count(), 15);
+        assert_eq!(migrator_up_to(99).iter().count(), 15);
     }
 }

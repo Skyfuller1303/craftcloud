@@ -1,13 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "react-aria-components";
 import type { FileRecord, FileVersion } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
 import { AppModal } from "../components/Dialog.tsx";
+import { Badge } from "../components/Badge.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatBytes, formatDateTime } from "../format.ts";
-import { useAction } from "../hooks.ts";
+import { useAction, useLeaseRefresh } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
 import { usePagedList } from "../usePagedList.ts";
 
@@ -33,6 +34,12 @@ export function VersionsDialog({
   const announce = useAnnounce();
   const action = useAction();
   const [changed, setChanged] = useState(false);
+  const [lock, setLock] = useState(file.lock ?? null);
+  useEffect(() => setLock(file.lock ?? null), [file.lock]);
+  const lease = useLeaseRefresh(lock?.expires_at, async () => {
+    const updated = await api.getFile(file.id);
+    setLock(updated.lock ?? null);
+  });
 
   const load = useMemo(() => (cursor?: string) => api.listVersions(file.id, cursor), [api, file.id]);
   const versions = usePagedList<FileVersion>(load);
@@ -46,6 +53,9 @@ export function VersionsDialog({
 
   return (
     <AppModal title={t("Versions of {name}", { name: file.name })} onClose={close} busy={action.pending} size="lg">
+      {lock != null && <p className="muted"><Badge tone="warn">{t("In progress")}</Badge>{" "}{t("In progress by {name}, since {time}.", { name: lock.holder_display_name, time: formatDateTime(language, lock.since) })}</p>}
+      {lock != null && !lock.held_by_current_session && canRestore && <p className="muted">{t("A new version is unavailable until this edit lock is released.")}</p>}
+      {lease.error !== null && <ErrorNotice error={lease.error} onRetry={() => void lease.retry()} onReload={() => void lease.retry()} />}
       <ListStatus
         list={versions}
         empty={t("This file has no versions yet.")}
@@ -98,7 +108,7 @@ export function VersionsDialog({
                       >
                         {t("Download")}
                       </a>
-                      {canRestore && version.id !== head && head !== null && (
+                      {canRestore && !(lock != null && !lock.held_by_current_session) && version.id !== head && head !== null && (
                         <Button
                           className="button button--sm"
                           isDisabled={action.pending}

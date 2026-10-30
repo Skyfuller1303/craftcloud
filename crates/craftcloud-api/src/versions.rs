@@ -1,4 +1,4 @@
-//! File versions, compare-and-set commits, restores and downloads (CC-F08).
+﻿//! File versions, compare-and-set commits, restores and downloads (CC-F08).
 //!
 //! Two ETags exist on a file: the metadata ETag `"file-v<n>"` (name changes,
 //! `PATCH /files/{id}`) and the content ETag `"version:<uuid>"` (the head
@@ -207,16 +207,19 @@ pub(crate) async fn commit_version(
     let services = Arc::clone(&resolved.services);
     // The upload must live in the same workspace as the file; anything else
     // looks like an unknown upload.
-    let creator = match uploads::locate(&services.pool, upload_id).await {
+    let (creator, upload_file_id) = match uploads::locate(&services.pool, upload_id).await {
         Ok(Some(location))
             if location.org_id == resolved.org_id
                 && location.workspace_id == resolved.workspace_id =>
         {
-            location.creator
+            (location.creator, location.file_id)
         }
         Ok(_) => return not_found(&headers),
         Err(error) => return db_failure(&error, &headers, "upload lookup failed"),
     };
+    if upload_file_id != resolved.id {
+        return not_found(&headers);
+    }
     let upload_resolved = Resolved {
         services: Arc::clone(&services),
         org_id: resolved.org_id,
@@ -230,6 +233,7 @@ pub(crate) async fn commit_version(
         Action::VersionCommit,
         "version.commit",
         creator,
+        upload_file_id,
     )
     .await
     {
@@ -242,7 +246,7 @@ pub(crate) async fn commit_version(
     };
     // An Idempotency-Key, if sent, must be the one the upload was created with.
     if let Some(sent) = headers.get("idempotency-key") {
-        match uploads::get(&services.pool, &scope, upload_id).await {
+        match tx.upload_get(&scope, upload_id).await {
             Ok(Some(upload)) => {
                 if sent.to_str().ok() != upload.idempotency_key.as_deref() {
                     return conflict(

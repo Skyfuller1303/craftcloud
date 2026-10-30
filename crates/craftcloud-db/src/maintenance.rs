@@ -1,4 +1,4 @@
-//! Database side of the maintenance job (CC-F10, CC-P02-06, CC-P02-07):
+﻿//! Database side of the maintenance job (CC-F10, CC-P02-06, CC-P02-07):
 //! retention purge, version retention, blob garbage collection with a claim
 //! phase, integrity bookkeeping, usage drift correction and the run log.
 //!
@@ -258,6 +258,16 @@ impl OrgTx {
         file_id: Uuid,
         now: OffsetDateTime,
     ) -> Result<PurgeCounts, DbError> {
+        sqlx::query("DELETE FROM file_locks WHERE file_id = $1 AND org_id = $2")
+            .bind(file_id)
+            .bind(self.org_id)
+            .execute(&mut *self.tx)
+            .await?;
+        sqlx::query("DELETE FROM grants WHERE org_id = $1 AND file_id = $2")
+            .bind(self.org_id)
+            .bind(file_id)
+            .execute(&mut *self.tx)
+            .await?;
         let open = sqlx::query_as::<_, UploadSession>(&format!(
             "SELECT {SESSION_COLUMNS} FROM upload_sessions \
              WHERE file_id = $1 AND org_id = $2 AND state IN {HOLDING} FOR UPDATE"
@@ -411,6 +421,11 @@ impl OrgTx {
                 .fetch_one(&mut *self.tx)
                 .await?;
         if remaining == 0 {
+            sqlx::query("DELETE FROM grants WHERE org_id = $1 AND project_id = $2")
+                .bind(self.org_id)
+                .bind(project_id)
+                .execute(&mut *self.tx)
+                .await?;
             counts.projects = sqlx::query("DELETE FROM projects WHERE id = $1 AND org_id = $2")
                 .bind(project_id)
                 .bind(self.org_id)

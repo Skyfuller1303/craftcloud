@@ -36,6 +36,8 @@ use uuid::Uuid;
 /// Role inside an organization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum OrgRole {
+    /// Guest: no implicit workspace access; only explicit grants apply.
+    Guest,
     /// Highest role; may assign every role.
     Owner,
     /// Manages members and settings but never touches owners.
@@ -46,7 +48,12 @@ pub enum OrgRole {
 
 impl OrgRole {
     /// All roles.
-    pub const ALL: [OrgRole; 3] = [OrgRole::Owner, OrgRole::Admin, OrgRole::Member];
+    pub const ALL: [OrgRole; 4] = [
+        OrgRole::Owner,
+        OrgRole::Admin,
+        OrgRole::Member,
+        OrgRole::Guest,
+    ];
 
     /// The stored / wire representation.
     #[must_use]
@@ -55,6 +62,7 @@ impl OrgRole {
             Self::Owner => "owner",
             Self::Admin => "admin",
             Self::Member => "member",
+            Self::Guest => "guest",
         }
     }
 
@@ -65,6 +73,7 @@ impl OrgRole {
             "owner" => Some(Self::Owner),
             "admin" => Some(Self::Admin),
             "member" => Some(Self::Member),
+            "guest" => Some(Self::Guest),
             _ => None,
         }
     }
@@ -246,6 +255,22 @@ pub enum Action {
     AuditRead,
     /// Read and export the instance-level audit log (operator).
     InstanceAuditRead,
+    /// Manage grants for an object.
+    GrantList,
+    /// Create a grant.
+    GrantCreate,
+    /// Change a grant role or revoke a grant.
+    GrantChange,
+    /// List objects shared with the actor.
+    SharedWithMe,
+    /// Search active organization members.
+    MemberSearch,
+    /// Acquire or renew a file editing lease.
+    FileLockAcquire,
+    /// Release the actor's own lease.
+    FileLockRelease,
+    /// Force-release a lease as a workspace administrator.
+    FileLockForce,
 }
 
 impl Action {
@@ -275,7 +300,10 @@ impl Action {
             | Self::UsageRead
             | Self::VersionList
             | Self::VersionRead
-            | Self::FileDownload => false,
+            | Self::FileDownload
+            | Self::GrantList
+            | Self::SharedWithMe
+            | Self::MemberSearch => false,
             Self::OrganizationUpdate
             | Self::OrganizationCreate
             | Self::MemberAdd
@@ -306,12 +334,17 @@ impl Action {
             | Self::OrganizationQuotaSet
             | Self::WorkspaceQuotaSet
             | Self::VersionCommit
-            | Self::VersionRestore => true,
+            | Self::VersionRestore
+            | Self::GrantCreate
+            | Self::GrantChange
+            | Self::FileLockAcquire
+            | Self::FileLockRelease
+            | Self::FileLockForce => true,
         }
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 53] = [
+    pub const ALL: [Action; 61] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -365,6 +398,14 @@ impl Action {
         Action::HealthRead,
         Action::AuditRead,
         Action::InstanceAuditRead,
+        Action::GrantList,
+        Action::GrantCreate,
+        Action::GrantChange,
+        Action::SharedWithMe,
+        Action::MemberSearch,
+        Action::FileLockAcquire,
+        Action::FileLockRelease,
+        Action::FileLockForce,
     ];
 }
 
@@ -386,6 +427,22 @@ pub struct WorkspaceMemberTarget {
     pub role: WorkspaceRole,
 }
 
+/// Grant role, bounded by workspace role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantRole {
+    Viewer,
+    Editor,
+}
+
+/// Project or file for object permission decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectTarget {
+    /// Project metadata and its file list.
+    Project { grant_role: Option<GrantRole> },
+    /// File and version actions.
+    File { grant_role: Option<GrantRole> },
+}
+
 /// What an invitation grants (and who created it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvitationSpec {
@@ -393,6 +450,8 @@ pub struct InvitationSpec {
     pub org_role: OrgRole,
     /// Workspace and workspace role granted, if any.
     pub workspace: Option<(Uuid, WorkspaceRole)>,
+    /// Workspace context for a guest invitation, without workspace membership.
+    pub guest_workspace: Option<Uuid>,
     /// The organization setting that lets workspace admins invite.
     pub workspace_admin_invites_enabled: bool,
     /// Who created the invitation (relevant for revoking).
@@ -419,12 +478,28 @@ pub enum Resource {
         /// The role being assigned (add, change role).
         role: Option<OrgRole>,
     },
+    /// Organization member discovery for grant managers.
+    MemberSearch {
+        /// The organization.
+        org_id: Uuid,
+        /// Whether the actor can manage grants in at least one workspace.
+        grant_manager: bool,
+    },
     /// A workspace of an organization.
     Workspace {
         /// The organization.
         org_id: Uuid,
         /// The workspace.
         workspace_id: Uuid,
+    },
+    /// A project or file and the actor's effective object grant.
+    Object {
+        /// Owning organization.
+        org_id: Uuid,
+        /// Owning workspace.
+        workspace_id: Uuid,
+        /// Object kind and loaded grant role.
+        target: ObjectTarget,
     },
     /// Membership data of a workspace.
     WorkspaceMember {
@@ -446,6 +521,17 @@ pub enum Resource {
         workspace_id: Uuid,
         /// Who created the session.
         creator: Uuid,
+    },
+    /// An upload session bound to its source file and effective grant.
+    UploadObject {
+        /// Owning organization.
+        org_id: Uuid,
+        /// Owning workspace.
+        workspace_id: Uuid,
+        /// Who created the session.
+        creator: Uuid,
+        /// Grant on the source file, if any.
+        target: ObjectTarget,
     },
     /// Invitations of an organization. `spec` is `None` for listing.
     Invitation {
@@ -522,6 +608,12 @@ fn role_in(actor: &Actor, org_id: Uuid) -> Option<OrgRole> {
 /// Role of the actor in the given workspace, only if the loaded workspace
 /// membership is for that workspace.
 fn workspace_role_in(actor: &Actor, workspace_id: Uuid) -> Option<WorkspaceRole> {
+    if actor
+        .membership
+        .is_some_and(|membership| membership.role == OrgRole::Guest)
+    {
+        return None;
+    }
     actor
         .workspace
         .filter(|w| w.workspace_id == workspace_id)
@@ -572,26 +664,45 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
 
         // ---- organization ----
         (A::OrganizationRead, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
+            Some(OrgRole::Owner | OrgRole::Admin | OrgRole::Member) => allow(action, Some(*org_id)),
+            Some(OrgRole::Guest) | None => Decision::Hidden,
+        },
+        (A::SharedWithMe, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
             Some(_) => allow(action, Some(*org_id)),
             None => Decision::Hidden,
         },
         (A::OrganizationUpdate, Resource::Organization { org_id }) => {
             match role_in(actor, *org_id) {
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-                Some(OrgRole::Member) => Decision::Forbidden,
+                Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
                 None => Decision::Hidden,
             }
         }
 
         // ---- members ----
         (A::MemberList, Resource::Member { org_id, .. }) => match role_in(actor, *org_id) {
-            Some(_) => allow(action, Some(*org_id)),
+            Some(OrgRole::Owner | OrgRole::Admin | OrgRole::Member) => allow(action, Some(*org_id)),
+            Some(OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
+        },
+        (
+            A::MemberSearch,
+            Resource::MemberSearch {
+                org_id,
+                grant_manager,
+            },
+        ) => match role_in(actor, *org_id) {
+            None => Decision::Hidden,
+            Some(OrgRole::Guest) => Decision::Forbidden,
+            Some(_) if *grant_manager => allow(action, Some(*org_id)),
+            Some(_) => Decision::Forbidden,
         },
         (A::MemberAdd, Resource::Member { org_id, role, .. }) => {
             match (role_in(actor, *org_id), role) {
                 (None, _) => Decision::Hidden,
-                (Some(OrgRole::Owner), Some(_)) => allow(action, Some(*org_id)),
+                (Some(OrgRole::Owner), Some(OrgRole::Owner | OrgRole::Admin | OrgRole::Member)) => {
+                    allow(action, Some(*org_id))
+                }
                 // An admin never creates an owner.
                 (Some(OrgRole::Admin), Some(OrgRole::Admin | OrgRole::Member)) => {
                     allow(action, Some(*org_id))
@@ -609,7 +720,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
         ) => {
             match (role_in(actor, *org_id), target, role) {
                 (None, _, _) => Decision::Hidden,
-                (Some(OrgRole::Member), _, _) => Decision::Forbidden,
+                (Some(OrgRole::Member | OrgRole::Guest), _, _) => Decision::Forbidden,
                 // Whether the target is a member is only revealed to managers.
                 (Some(_), None, _) => Decision::Hidden,
                 (Some(_), Some(_), None) => Decision::Forbidden,
@@ -628,8 +739,8 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
         (A::MemberRemove, Resource::Member { org_id, target, .. }) => {
             match (role_in(actor, *org_id), target) {
                 (None, _) => Decision::Hidden,
-                (Some(OrgRole::Member), None) => Decision::Forbidden,
-                (Some(OrgRole::Member), Some(target)) => {
+                (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Forbidden,
+                (Some(OrgRole::Member | OrgRole::Guest), Some(target)) => {
                     // Leaving is allowed for everybody.
                     if target.user_id == actor.user_id {
                         allow(action, Some(*org_id))
@@ -657,17 +768,13 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                 workspace_id,
             },
         ) => {
-            let ws_role = actor
-                .workspace
-                .filter(|w| w.workspace_id == *workspace_id)
-                .map(|w| w.role);
+            let ws_role = workspace_role_in(actor, *workspace_id);
             match (role_in(actor, *org_id), ws_role) {
                 (None, _) => Decision::Hidden,
-                (Some(OrgRole::Owner | OrgRole::Admin), _) | (Some(OrgRole::Member), Some(_)) => {
-                    allow(action, Some(*org_id))
-                }
+                (Some(OrgRole::Owner | OrgRole::Admin), _)
+                | (Some(OrgRole::Member | OrgRole::Guest), Some(_)) => allow(action, Some(*org_id)),
                 // A plain member must not learn about workspaces they are not in.
-                (Some(OrgRole::Member), None) => Decision::Hidden,
+                (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             }
         }
         (
@@ -677,20 +784,18 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                 workspace_id,
             },
         ) => {
-            let ws_role = actor
-                .workspace
-                .filter(|w| w.workspace_id == *workspace_id)
-                .map(|w| w.role);
+            let ws_role = workspace_role_in(actor, *workspace_id);
             match (role_in(actor, *org_id), ws_role) {
                 (None, _) => Decision::Hidden,
                 (Some(OrgRole::Owner | OrgRole::Admin), _)
-                | (Some(OrgRole::Member), Some(WorkspaceRole::Admin)) => {
+                | (Some(OrgRole::Member | OrgRole::Guest), Some(WorkspaceRole::Admin)) => {
                     allow(action, Some(*org_id))
                 }
-                (Some(OrgRole::Member), Some(WorkspaceRole::Editor | WorkspaceRole::Viewer)) => {
-                    Decision::Forbidden
-                }
-                (Some(OrgRole::Member), None) => Decision::Hidden,
+                (
+                    Some(OrgRole::Member | OrgRole::Guest),
+                    Some(WorkspaceRole::Editor | WorkspaceRole::Viewer),
+                ) => Decision::Forbidden,
+                (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             }
         }
 
@@ -701,7 +806,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
         },
         (A::WorkspaceCreate, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-            Some(OrgRole::Member) => Decision::Forbidden,
+            Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
         },
 
@@ -722,10 +827,14 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             let org_role = role_in(actor, *org_id);
             // Visibility first: whoever cannot see the workspace gets 404.
             let manager = match (org_role, ws_role) {
-                (None, _) | (Some(OrgRole::Member), None) => return Decision::Hidden,
+                (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => {
+                    return Decision::Hidden;
+                }
                 (Some(OrgRole::Owner | OrgRole::Admin), _) => Manager::Org,
-                (Some(OrgRole::Member), Some(WorkspaceRole::Admin)) => Manager::Workspace,
-                (Some(OrgRole::Member), Some(_)) => Manager::None,
+                (Some(OrgRole::Member | OrgRole::Guest), Some(WorkspaceRole::Admin)) => {
+                    Manager::Workspace
+                }
+                (Some(OrgRole::Member | OrgRole::Guest), Some(_)) => Manager::None,
             };
             match action {
                 A::WorkspaceMemberList => allow(action, Some(*org_id)),
@@ -794,7 +903,7 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             role_in(actor, *org_id),
             workspace_role_in(actor, *workspace_id),
         ) {
-            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             _ => allow(action, Some(*org_id)),
         },
         (
@@ -813,12 +922,15 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             role_in(actor, *org_id),
             workspace_role_in(actor, *workspace_id),
         ) {
-            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             (Some(OrgRole::Owner | OrgRole::Admin), _)
-            | (Some(OrgRole::Member), Some(WorkspaceRole::Admin | WorkspaceRole::Editor)) => {
-                allow(action, Some(*org_id))
+            | (
+                Some(OrgRole::Member | OrgRole::Guest),
+                Some(WorkspaceRole::Admin | WorkspaceRole::Editor),
+            ) => allow(action, Some(*org_id)),
+            (Some(OrgRole::Member | OrgRole::Guest), Some(WorkspaceRole::Viewer)) => {
+                Decision::Forbidden
             }
-            (Some(OrgRole::Member), Some(WorkspaceRole::Viewer)) => Decision::Forbidden,
         },
         (
             A::ProjectDelete | A::ProjectRestore,
@@ -830,14 +942,91 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             role_in(actor, *org_id),
             workspace_role_in(actor, *workspace_id),
         ) {
-            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             (Some(OrgRole::Owner | OrgRole::Admin), _)
-            | (Some(OrgRole::Member), Some(WorkspaceRole::Admin)) => allow(action, Some(*org_id)),
-            (Some(OrgRole::Member), Some(WorkspaceRole::Editor | WorkspaceRole::Viewer)) => {
-                Decision::Forbidden
+            | (Some(OrgRole::Member | OrgRole::Guest), Some(WorkspaceRole::Admin)) => {
+                allow(action, Some(*org_id))
             }
+            (
+                Some(OrgRole::Member | OrgRole::Guest),
+                Some(WorkspaceRole::Editor | WorkspaceRole::Viewer),
+            ) => Decision::Forbidden,
         },
 
+        // ---- object grants: object visibility never implies workspace visibility ----
+        (
+            action,
+            Resource::Object {
+                org_id,
+                workspace_id,
+                target,
+            },
+        ) => {
+            let org_role = role_in(actor, *org_id);
+            let ws_role = workspace_role_in(actor, *workspace_id);
+            if org_role.is_none() {
+                return Decision::Hidden;
+            }
+            let workspace_read =
+                matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin)) || ws_role.is_some();
+            let workspace_write = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                || matches!(ws_role, Some(WorkspaceRole::Admin | WorkspaceRole::Editor));
+            let workspace_admin = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                || ws_role == Some(WorkspaceRole::Admin);
+            let grant_read = match target {
+                ObjectTarget::Project { grant_role } | ObjectTarget::File { grant_role } => {
+                    grant_role.is_some()
+                }
+            };
+            let grant_write = match target {
+                ObjectTarget::Project { grant_role } | ObjectTarget::File { grant_role } => {
+                    *grant_role == Some(GrantRole::Editor)
+                }
+            };
+            let allowed = match (target, action) {
+                (ObjectTarget::Project { grant_role }, A::ProjectRead | A::FileList) => {
+                    workspace_read || grant_role.is_some()
+                }
+                (ObjectTarget::Project { .. }, A::ProjectRename | A::ProjectCreate) => {
+                    workspace_write
+                }
+                (ObjectTarget::Project { grant_role }, A::FileCreate) => {
+                    workspace_write || *grant_role == Some(GrantRole::Editor)
+                }
+                (ObjectTarget::Project { .. }, A::ProjectDelete | A::ProjectRestore) => {
+                    workspace_admin
+                }
+                (
+                    ObjectTarget::File { .. },
+                    A::FileRead | A::VersionList | A::VersionRead | A::FileDownload,
+                ) => workspace_read || grant_read,
+                (
+                    ObjectTarget::File { .. },
+                    A::FileRename
+                    | A::FileDelete
+                    | A::FileRestore
+                    | A::UploadCreate
+                    | A::UploadWrite
+                    | A::VersionCommit
+                    | A::VersionRestore
+                    | A::FileLockAcquire
+                    | A::FileLockRelease,
+                ) => workspace_write || grant_write,
+                (
+                    ObjectTarget::Project { .. } | ObjectTarget::File { .. },
+                    A::GrantList | A::GrantCreate | A::GrantChange,
+                ) => workspace_write,
+                (ObjectTarget::File { .. }, A::FileLockForce) => workspace_admin,
+                _ => return Decision::Forbidden,
+            };
+            if allowed {
+                allow(action, Some(*org_id))
+            } else if !workspace_read && !grant_read {
+                Decision::Hidden
+            } else {
+                Decision::Forbidden
+            }
+        }
         // ---- uploads and quota ----
         (
             A::UploadCreate,
@@ -849,12 +1038,15 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             role_in(actor, *org_id),
             workspace_role_in(actor, *workspace_id),
         ) {
-            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             (Some(OrgRole::Owner | OrgRole::Admin), _)
-            | (Some(OrgRole::Member), Some(WorkspaceRole::Admin | WorkspaceRole::Editor)) => {
-                allow(action, Some(*org_id))
+            | (
+                Some(OrgRole::Member | OrgRole::Guest),
+                Some(WorkspaceRole::Admin | WorkspaceRole::Editor),
+            ) => allow(action, Some(*org_id)),
+            (Some(OrgRole::Member | OrgRole::Guest), Some(WorkspaceRole::Viewer)) => {
+                Decision::Forbidden
             }
-            (Some(OrgRole::Member), Some(WorkspaceRole::Viewer)) => Decision::Forbidden,
         },
         (
             A::UploadRead | A::UploadAbort | A::UploadWrite | A::VersionCommit,
@@ -869,15 +1061,21 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             let manager = matches!(
                 (org_role, ws_role),
                 (Some(OrgRole::Owner | OrgRole::Admin), _)
-                    | (Some(OrgRole::Member), Some(WorkspaceRole::Admin))
+                    | (
+                        Some(OrgRole::Member | OrgRole::Guest),
+                        Some(WorkspaceRole::Admin)
+                    )
             );
             let can_write = manager
                 || matches!(
                     (org_role, ws_role),
-                    (Some(OrgRole::Member), Some(WorkspaceRole::Editor))
+                    (
+                        Some(OrgRole::Member | OrgRole::Guest),
+                        Some(WorkspaceRole::Editor)
+                    )
                 );
             match (org_role, ws_role) {
-                (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+                (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
                 _ => {
                     let own = *creator == actor.user_id;
                     let ok = match action {
@@ -897,6 +1095,46 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             }
         }
         (
+            A::UploadRead | A::UploadAbort | A::UploadWrite | A::VersionCommit,
+            Resource::UploadObject {
+                org_id,
+                workspace_id,
+                creator,
+                target,
+            },
+        ) => {
+            let org_role = role_in(actor, *org_id);
+            let ws_role = workspace_role_in(actor, *workspace_id);
+            let grant_role = match target {
+                ObjectTarget::File { grant_role } => *grant_role,
+                ObjectTarget::Project { .. } => None,
+            };
+            let manager = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                || ws_role == Some(WorkspaceRole::Admin);
+            let workspace_read =
+                matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin)) || ws_role.is_some();
+            let workspace_write = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                || matches!(ws_role, Some(WorkspaceRole::Admin | WorkspaceRole::Editor));
+            let grant_read = grant_role.is_some();
+            let own = *creator == actor.user_id;
+            let visible = workspace_read || (own && grant_read);
+            if org_role.is_none() || !visible {
+                return Decision::Hidden;
+            }
+            let allowed = match action {
+                A::UploadRead | A::UploadAbort => own || manager,
+                A::UploadWrite | A::VersionCommit => {
+                    own && (workspace_write || grant_role == Some(GrantRole::Editor))
+                }
+                _ => false,
+            };
+            if allowed {
+                allow(action, Some(*org_id))
+            } else {
+                Decision::Forbidden
+            }
+        }
+        (
             A::WorkspaceQuotaSet,
             Resource::Workspace {
                 org_id,
@@ -906,49 +1144,53 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             role_in(actor, *org_id),
             workspace_role_in(actor, *workspace_id),
         ) {
-            (None, _) | (Some(OrgRole::Member), None) => Decision::Hidden,
+            (None, _) | (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Hidden,
             (Some(OrgRole::Owner | OrgRole::Admin), _) => allow(action, Some(*org_id)),
-            (Some(OrgRole::Member), Some(_)) => Decision::Forbidden,
+            (Some(OrgRole::Member | OrgRole::Guest), Some(_)) => Decision::Forbidden,
         },
         (A::UsageRead, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-            Some(OrgRole::Member) => Decision::Forbidden,
+            Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
         },
 
         // ---- audit log ----
         (A::AuditRead, Resource::Organization { org_id }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-            Some(OrgRole::Member) => Decision::Forbidden,
+            Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
         },
 
         // ---- invitations ----
         (A::InvitationList, Resource::Invitation { org_id, .. }) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-            Some(OrgRole::Member) => Decision::Forbidden,
+            Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
         },
         (A::InvitationCreate, Resource::Invitation { org_id, spec }) => {
             let Some(spec) = spec else {
                 return Decision::Forbidden;
             };
-            let org_role = role_in(actor, *org_id);
-            match org_role {
+            match role_in(actor, *org_id) {
                 None => Decision::Hidden,
-                // Nobody invites an owner.
                 Some(_) if spec.org_role == OrgRole::Owner => Decision::Forbidden,
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
-                Some(OrgRole::Member) => {
-                    // A workspace admin of exactly the invited workspace, if the
-                    // organization allows it, inviting plain members up to editor.
-                    let allowed = spec.workspace_admin_invites_enabled
-                        && spec.org_role == OrgRole::Member
-                        && spec.workspace.is_some_and(|(ws, ws_role)| {
+                Some(OrgRole::Member | OrgRole::Guest) => {
+                    let invited_workspace =
+                        match (spec.org_role, spec.workspace, spec.guest_workspace) {
+                            (
+                                OrgRole::Member,
+                                Some((ws, WorkspaceRole::Editor | WorkspaceRole::Viewer)),
+                                None,
+                            ) => Some(ws),
+                            (OrgRole::Guest, None, Some(ws)) => Some(ws),
+                            _ => None,
+                        };
+                    if spec.workspace_admin_invites_enabled
+                        && invited_workspace.is_some_and(|ws| {
                             workspace_role_in(actor, ws) == Some(WorkspaceRole::Admin)
-                                && matches!(ws_role, WorkspaceRole::Editor | WorkspaceRole::Viewer)
-                        });
-                    if allowed {
+                        })
+                    {
                         allow(action, Some(*org_id))
                     } else {
                         Decision::Forbidden
@@ -960,12 +1202,12 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             match (role_in(actor, *org_id), spec) {
                 (None, _) => Decision::Hidden,
                 (Some(OrgRole::Owner | OrgRole::Admin), Some(_)) => allow(action, Some(*org_id)),
-                // Unknown invitation: managers learn that (404), others get 403.
                 (Some(OrgRole::Owner | OrgRole::Admin), None) => Decision::Hidden,
-                // A workspace admin revokes only invitations they created for their workspace.
-                (Some(OrgRole::Member), Some(spec)) => {
+                (Some(OrgRole::Member | OrgRole::Guest), Some(spec)) => {
                     let own = spec.created_by == Some(actor.user_id);
-                    let ws_admin = spec.workspace.is_some_and(|(ws, _)| {
+                    let invited_workspace =
+                        spec.workspace.map(|(ws, _)| ws).or(spec.guest_workspace);
+                    let ws_admin = invited_workspace.is_some_and(|ws| {
                         workspace_role_in(actor, ws) == Some(WorkspaceRole::Admin)
                     });
                     if own && ws_admin {
@@ -974,10 +1216,9 @@ pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                         Decision::Forbidden
                     }
                 }
-                (Some(OrgRole::Member), None) => Decision::Forbidden,
+                (Some(OrgRole::Member | OrgRole::Guest), None) => Decision::Forbidden,
             }
         }
-
         // Anything else (action applied to the wrong kind of resource) is denied.
         _ => Decision::Forbidden,
     }
@@ -1069,6 +1310,14 @@ mod tests {
     #[test]
     fn member_list() {
         check(Action::MemberList, member(None, None), [H, Y, Y, Y]);
+        assert_eq!(
+            can(
+                &actor(Some(OrgRole::Guest), false),
+                Action::MemberList,
+                &member(None, None)
+            ),
+            Decision::Forbidden
+        );
     }
 
     #[test]
@@ -1428,6 +1677,14 @@ mod tests {
             Action::HealthRead,
             Action::AuditRead,
             Action::InstanceAuditRead,
+            Action::GrantList,
+            Action::GrantCreate,
+            Action::GrantChange,
+            Action::SharedWithMe,
+            Action::MemberSearch,
+            Action::FileLockAcquire,
+            Action::FileLockRelease,
+            Action::FileLockForce,
         ]
         .into_iter()
         .collect();
@@ -1486,7 +1743,15 @@ mod tests {
                 | Action::MaintenanceRead
                 | Action::HealthRead
                 | Action::AuditRead
-                | Action::InstanceAuditRead => {}
+                | Action::InstanceAuditRead
+                | Action::GrantList
+                | Action::GrantCreate
+                | Action::GrantChange
+                | Action::SharedWithMe
+                | Action::MemberSearch
+                | Action::FileLockAcquire
+                | Action::FileLockRelease
+                | Action::FileLockForce => {}
             }
             assert!(
                 covered.contains(&action),
@@ -1523,7 +1788,10 @@ mod tests {
                 Action::MaintenanceRead,
                 Action::HealthRead,
                 Action::AuditRead,
-                Action::InstanceAuditRead
+                Action::InstanceAuditRead,
+                Action::GrantList,
+                Action::SharedWithMe,
+                Action::MemberSearch,
             ]
         );
     }
@@ -1593,6 +1861,411 @@ mod tests {
                 &foreign
             ),
             Decision::Hidden
+        );
+    }
+
+    #[test]
+    fn object_grant_matrix_is_scoped_and_never_grants_management() {
+        let member = actor(Some(OrgRole::Member), false);
+        let project_viewer = Resource::Object {
+            org_id: ORG,
+            workspace_id: WS,
+            target: ObjectTarget::Project {
+                grant_role: Some(GrantRole::Viewer),
+            },
+        };
+        let project_editor = Resource::Object {
+            org_id: ORG,
+            workspace_id: WS,
+            target: ObjectTarget::Project {
+                grant_role: Some(GrantRole::Editor),
+            },
+        };
+        let file_viewer = Resource::Object {
+            org_id: ORG,
+            workspace_id: WS,
+            target: ObjectTarget::File {
+                grant_role: Some(GrantRole::Viewer),
+            },
+        };
+        let file_editor = Resource::Object {
+            org_id: ORG,
+            workspace_id: WS,
+            target: ObjectTarget::File {
+                grant_role: Some(GrantRole::Editor),
+            },
+        };
+
+        for action in Action::ALL {
+            let project_view_allowed = matches!(action, Action::ProjectRead | Action::FileList);
+            let project_editor_allowed = project_view_allowed || action == Action::FileCreate;
+            let file_view_allowed = matches!(
+                action,
+                Action::FileRead | Action::VersionList | Action::VersionRead | Action::FileDownload
+            );
+            let file_edit_allowed = file_view_allowed
+                || matches!(
+                    action,
+                    Action::FileRename
+                        | Action::FileDelete
+                        | Action::FileRestore
+                        | Action::UploadCreate
+                        | Action::UploadWrite
+                        | Action::VersionCommit
+                        | Action::VersionRestore
+                        | Action::FileLockAcquire
+                        | Action::FileLockRelease
+                );
+            assert_eq!(
+                can(&member, action, &project_viewer).is_allow(),
+                project_view_allowed,
+                "project viewer {action:?}"
+            );
+            assert_eq!(
+                can(&member, action, &project_editor).is_allow(),
+                project_editor_allowed,
+                "project editor {action:?}"
+            );
+            assert_eq!(
+                can(&member, action, &file_viewer).is_allow(),
+                file_view_allowed,
+                "file viewer {action:?}"
+            );
+            assert_eq!(
+                can(&member, action, &file_editor).is_allow(),
+                file_edit_allowed,
+                "file editor {action:?}"
+            );
+        }
+
+        assert_eq!(
+            outcome(can(&member, Action::FileCreate, &project_viewer)),
+            F,
+            "project viewer cannot add files"
+        );
+        assert_eq!(
+            outcome(can(&member, Action::FileCreate, &project_editor)),
+            Y,
+            "project editor can add files"
+        );
+        for (action, expected) in [
+            (Action::ProjectRead, Y),
+            (Action::FileList, Y),
+            (Action::ProjectRename, F),
+            (Action::ProjectDelete, F),
+            (Action::ProjectRestore, F),
+            (Action::ProjectCreate, F),
+            (Action::GrantList, F),
+            (Action::GrantCreate, F),
+            (Action::GrantChange, F),
+        ] {
+            assert_eq!(
+                outcome(can(&member, action, &project_viewer)),
+                expected,
+                "project viewer {action:?}"
+            );
+            assert_eq!(
+                outcome(can(&member, action, &project_editor)),
+                expected,
+                "project editor {action:?}"
+            );
+        }
+        for (action, expected) in [
+            (Action::FileRead, Y),
+            (Action::VersionList, Y),
+            (Action::VersionRead, Y),
+            (Action::FileDownload, Y),
+            (Action::FileList, F),
+            (Action::FileCreate, F),
+            (Action::FileRename, F),
+            (Action::FileDelete, F),
+            (Action::FileRestore, F),
+            (Action::UploadCreate, F),
+            (Action::UploadWrite, F),
+            (Action::VersionCommit, F),
+            (Action::VersionRestore, F),
+            (Action::FileLockAcquire, F),
+            (Action::FileLockRelease, F),
+            (Action::FileLockForce, F),
+            (Action::GrantList, F),
+            (Action::GrantCreate, F),
+            (Action::GrantChange, F),
+        ] {
+            assert_eq!(
+                outcome(can(&member, action, &file_viewer)),
+                expected,
+                "file viewer {action:?}"
+            );
+        }
+        for action in [
+            Action::FileRename,
+            Action::FileDelete,
+            Action::FileRestore,
+            Action::UploadCreate,
+            Action::UploadWrite,
+            Action::VersionCommit,
+            Action::VersionRestore,
+            Action::FileLockAcquire,
+            Action::FileLockRelease,
+        ] {
+            assert_eq!(
+                outcome(can(&member, action, &file_editor)),
+                Y,
+                "file editor {action:?}"
+            );
+        }
+        for action in [
+            Action::GrantList,
+            Action::GrantCreate,
+            Action::GrantChange,
+            Action::FileLockForce,
+            Action::FileCreate,
+        ] {
+            assert_eq!(
+                outcome(can(&member, action, &file_editor)),
+                F,
+                "file editor must not manage {action:?}"
+            );
+        }
+
+        let guest = actor(Some(OrgRole::Guest), false);
+        assert_eq!(
+            can(
+                &guest,
+                Action::WorkspaceRead,
+                &Resource::Workspace {
+                    org_id: ORG,
+                    workspace_id: WS
+                }
+            ),
+            Decision::Hidden
+        );
+        assert_eq!(outcome(can(&guest, Action::FileRead, &file_viewer)), Y);
+    }
+
+    #[test]
+    fn object_policy_covers_every_action_and_role_combination() {
+        let org_roles = [
+            None,
+            Some(OrgRole::Guest),
+            Some(OrgRole::Member),
+            Some(OrgRole::Admin),
+            Some(OrgRole::Owner),
+        ];
+        let workspace_roles = [
+            None,
+            Some(WorkspaceRole::Viewer),
+            Some(WorkspaceRole::Editor),
+            Some(WorkspaceRole::Admin),
+        ];
+        let grant_roles = [None, Some(GrantRole::Viewer), Some(GrantRole::Editor)];
+        for org_role in org_roles {
+            for workspace_role in workspace_roles {
+                for grant_role in grant_roles {
+                    let mut current = actor(org_role, false);
+                    current.workspace = workspace_role.map(|role| WorkspaceMembership {
+                        workspace_id: WS,
+                        role,
+                    });
+                    let effective_ws_role = if org_role == Some(OrgRole::Guest) {
+                        None
+                    } else {
+                        workspace_role
+                    };
+                    let org_read = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                        || effective_ws_role.is_some();
+                    let org_write = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                        || matches!(
+                            effective_ws_role,
+                            Some(WorkspaceRole::Admin | WorkspaceRole::Editor)
+                        );
+                    let org_admin = matches!(org_role, Some(OrgRole::Owner | OrgRole::Admin))
+                        || effective_ws_role == Some(WorkspaceRole::Admin);
+                    for target_kind in [
+                        ObjectTarget::Project { grant_role },
+                        ObjectTarget::File { grant_role },
+                    ] {
+                        let resource = Resource::Object {
+                            org_id: ORG,
+                            workspace_id: WS,
+                            target: target_kind,
+                        };
+                        for action in Action::ALL {
+                            let grant_read = grant_role.is_some();
+                            let grant_write = grant_role == Some(GrantRole::Editor);
+                            let recognized = match target_kind {
+                                ObjectTarget::Project { .. } => matches!(
+                                    action,
+                                    Action::ProjectRead
+                                        | Action::FileList
+                                        | Action::ProjectRename
+                                        | Action::ProjectCreate
+                                        | Action::FileCreate
+                                        | Action::ProjectDelete
+                                        | Action::ProjectRestore
+                                        | Action::GrantList
+                                        | Action::GrantCreate
+                                        | Action::GrantChange
+                                ),
+                                ObjectTarget::File { .. } => matches!(
+                                    action,
+                                    Action::FileRead
+                                        | Action::VersionList
+                                        | Action::VersionRead
+                                        | Action::FileDownload
+                                        | Action::FileRename
+                                        | Action::FileDelete
+                                        | Action::FileRestore
+                                        | Action::UploadCreate
+                                        | Action::UploadWrite
+                                        | Action::VersionCommit
+                                        | Action::VersionRestore
+                                        | Action::FileLockAcquire
+                                        | Action::FileLockRelease
+                                        | Action::FileLockForce
+                                        | Action::GrantList
+                                        | Action::GrantCreate
+                                        | Action::GrantChange
+                                ),
+                            };
+                            let allowed = if !recognized || org_role.is_none() {
+                                false
+                            } else {
+                                match (target_kind, action) {
+                                    (
+                                        ObjectTarget::Project { .. },
+                                        Action::ProjectRead | Action::FileList,
+                                    ) => org_read || grant_read,
+                                    (
+                                        ObjectTarget::Project { .. },
+                                        Action::ProjectRename | Action::ProjectCreate,
+                                    ) => org_write,
+                                    (ObjectTarget::Project { .. }, Action::FileCreate) => {
+                                        org_write || grant_write
+                                    }
+                                    (
+                                        ObjectTarget::Project { .. },
+                                        Action::ProjectDelete | Action::ProjectRestore,
+                                    ) => org_admin,
+                                    (
+                                        ObjectTarget::Project { .. },
+                                        Action::GrantList
+                                        | Action::GrantCreate
+                                        | Action::GrantChange,
+                                    ) => org_write,
+                                    (
+                                        ObjectTarget::File { .. },
+                                        Action::FileRead
+                                        | Action::VersionList
+                                        | Action::VersionRead
+                                        | Action::FileDownload,
+                                    ) => org_read || grant_read,
+                                    (
+                                        ObjectTarget::File { .. },
+                                        Action::FileRename
+                                        | Action::FileDelete
+                                        | Action::FileRestore
+                                        | Action::UploadCreate
+                                        | Action::UploadWrite
+                                        | Action::VersionCommit
+                                        | Action::VersionRestore
+                                        | Action::FileLockAcquire
+                                        | Action::FileLockRelease,
+                                    ) => org_write || grant_write,
+                                    (ObjectTarget::File { .. }, Action::FileLockForce) => org_admin,
+                                    (
+                                        ObjectTarget::File { .. },
+                                        Action::GrantList
+                                        | Action::GrantCreate
+                                        | Action::GrantChange,
+                                    ) => org_write,
+                                    _ => false,
+                                }
+                            };
+                            let expected = if allowed {
+                                Want::Allow
+                            } else if org_role.is_none() || (recognized && !org_read && !grant_read)
+                            {
+                                Want::Hidden
+                            } else {
+                                Want::Forbidden
+                            };
+                            assert_eq!(
+                                outcome(can(&current, action, &resource)),
+                                expected,
+                                "org={org_role:?} workspace={workspace_role:?} grant={grant_role:?} target={target_kind:?} action={action:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guest_cannot_use_stale_workspace_admin_membership() {
+        let mut guest = actor(Some(OrgRole::Guest), false);
+        guest.workspace = Some(WorkspaceMembership {
+            workspace_id: WS,
+            role: WorkspaceRole::Admin,
+        });
+        let workspace = Resource::Workspace {
+            org_id: ORG,
+            workspace_id: WS,
+        };
+        assert_eq!(
+            can(&guest, Action::WorkspaceRead, &workspace),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(&guest, Action::WorkspaceManage, &workspace),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(
+                &guest,
+                Action::WorkspaceCreate,
+                &Resource::Organization { org_id: ORG }
+            ),
+            Decision::Forbidden
+        );
+        let members = Resource::WorkspaceMember {
+            org_id: ORG,
+            workspace_id: WS,
+            target: None,
+            role: Some(WorkspaceRole::Editor),
+        };
+        for action in [
+            Action::WorkspaceMemberList,
+            Action::WorkspaceMemberAdd,
+            Action::WorkspaceMemberChangeRole,
+            Action::WorkspaceMemberRemove,
+        ] {
+            assert_eq!(
+                can(&guest, action, &members),
+                Decision::Hidden,
+                "{action:?}"
+            );
+        }
+        assert_eq!(
+            can(
+                &guest,
+                Action::MemberSearch,
+                &Resource::MemberSearch {
+                    org_id: ORG,
+                    grant_manager: true
+                }
+            ),
+            Decision::Forbidden,
+        );
+        let invite = guest_inv(Some(WS), true, Some(ME));
+        assert_eq!(
+            can(&guest, Action::InvitationCreate, &invite),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(&guest, Action::InvitationRevoke, &invite),
+            Decision::Forbidden
         );
     }
 
@@ -1698,6 +2371,58 @@ mod tests {
             )
             .is_allow()
         );
+    }
+
+    #[test]
+    fn grant_only_creator_can_read_abort_and_write_own_upload_by_file_role() {
+        let plain = actor(Some(OrgRole::Member), false);
+        let upload = |grant_role| Resource::UploadObject {
+            org_id: ORG,
+            workspace_id: WS,
+            creator: ME,
+            target: ObjectTarget::File { grant_role },
+        };
+        let viewer = upload(Some(GrantRole::Viewer));
+        let editor = upload(Some(GrantRole::Editor));
+        let none = upload(None);
+        for action in [Action::UploadRead, Action::UploadAbort] {
+            assert_eq!(
+                can(&plain, action, &viewer),
+                Decision::Allow(Permit {
+                    org_id: Some(ORG),
+                    action
+                })
+            );
+            assert_eq!(
+                can(&plain, action, &editor),
+                Decision::Allow(Permit {
+                    org_id: Some(ORG),
+                    action
+                })
+            );
+            assert_eq!(can(&plain, action, &none), Decision::Hidden);
+        }
+        for action in [Action::UploadWrite, Action::VersionCommit] {
+            assert_eq!(can(&plain, action, &viewer), Decision::Forbidden);
+            assert_eq!(
+                can(&plain, action, &editor),
+                Decision::Allow(Permit {
+                    org_id: Some(ORG),
+                    action
+                })
+            );
+            assert_eq!(can(&plain, action, &none), Decision::Hidden);
+        }
+        let foreign = Resource::UploadObject {
+            org_id: ORG,
+            workspace_id: WS,
+            creator: OTHER,
+            target: ObjectTarget::File {
+                grant_role: Some(GrantRole::Editor),
+            },
+        };
+        assert_eq!(can(&plain, Action::UploadRead, &foreign), Decision::Hidden);
+        assert_eq!(can(&plain, Action::UploadAbort, &foreign), Decision::Hidden);
     }
 
     #[test]
@@ -1899,8 +2624,22 @@ mod tests {
             spec: Some(InvitationSpec {
                 org_role,
                 workspace: workspace.map(|r| (WS, r)),
+                guest_workspace: None,
                 workspace_admin_invites_enabled: enabled,
                 created_by: Some(ME),
+            }),
+        }
+    }
+
+    fn guest_inv(workspace: Option<Uuid>, enabled: bool, created_by: Option<Uuid>) -> Resource {
+        Resource::Invitation {
+            org_id: ORG,
+            spec: Some(InvitationSpec {
+                org_role: OrgRole::Guest,
+                workspace: None,
+                guest_workspace: workspace,
+                workspace_admin_invites_enabled: enabled,
+                created_by,
             }),
         }
     }
@@ -1969,6 +2708,7 @@ mod tests {
             spec: Some(InvitationSpec {
                 org_role: OrgRole::Member,
                 workspace: Some((Uuid::from_u128(77), Editor)),
+                guest_workspace: None,
                 workspace_admin_invites_enabled: true,
                 created_by: Some(ME),
             }),
@@ -2055,6 +2795,84 @@ mod tests {
         assert_eq!(
             can(&outsider, Action::InvitationRevoke, &own),
             Decision::Hidden
+        );
+        for a in [&owner, &admin] {
+            assert!(
+                can(
+                    a,
+                    Action::InvitationCreate,
+                    &guest_inv(None, false, Some(ME))
+                )
+                .is_allow()
+            );
+            assert!(
+                can(
+                    a,
+                    Action::InvitationCreate,
+                    &guest_inv(Some(WS), false, Some(ME))
+                )
+                .is_allow()
+            );
+        }
+        assert!(
+            can(
+                &ws_admin,
+                Action::InvitationCreate,
+                &guest_inv(Some(WS), true, Some(ME))
+            )
+            .is_allow()
+        );
+        assert_eq!(
+            can(
+                &ws_admin,
+                Action::InvitationCreate,
+                &guest_inv(Some(WS), false, Some(ME))
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &ws_admin,
+                Action::InvitationCreate,
+                &guest_inv(None, true, Some(ME))
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &editor,
+                Action::InvitationCreate,
+                &guest_inv(Some(WS), true, Some(ME))
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &outsider,
+                Action::InvitationCreate,
+                &guest_inv(None, true, Some(ME))
+            ),
+            Decision::Hidden
+        );
+        assert_eq!(
+            can(
+                &owner,
+                Action::MemberAdd,
+                &Resource::Member {
+                    org_id: ORG,
+                    target: None,
+                    role: Some(OrgRole::Guest)
+                }
+            ),
+            Decision::Forbidden
+        );
+        assert!(
+            can(
+                &ws_admin,
+                Action::InvitationRevoke,
+                &guest_inv(Some(WS), true, Some(ME))
+            )
+            .is_allow()
         );
     }
 

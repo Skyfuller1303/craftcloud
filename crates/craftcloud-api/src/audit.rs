@@ -103,6 +103,7 @@ pub(crate) fn target_type(action: &str) -> Option<&'static str> {
             "project" => "project",
             "file" => "file",
             "version" => "file_version",
+            "file_lock" => "file",
             "upload" => "upload",
             "organization" => "organization",
             _ => return None,

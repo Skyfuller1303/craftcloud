@@ -408,3 +408,26 @@
 	Last backup	Letztes Backup
 	No successful backup recorded yet.	Noch kein erfolgreiches Backup erfasst.
 	System	System
+	Guest	Gast
+	Share	Teilen
+	Share {name}	{name} teilen
+	People with access	Personen mit Zugriff
+	No one else has access yet.	Noch hat niemand Zugriff.
+	Loading shares…	Freigaben werden geladen …
+	Add a person	Person hinzufügen
+	Search organization members	Organisationsmitglieder suchen
+	Searching…	Suche läuft …
+	No members found.	Keine Mitglieder gefunden.
+	Role for {name}	Rolle für {name}
+	Remove access	Zugriff entfernen
+	{name} will lose access to {target}.	{name} verliert den Zugriff auf {target}.
+	Shared with me	Für mich freigegeben
+	Nothing has been shared with you yet.	Es wurde noch nichts für dich freigegeben.
+	Loading shared items…	Freigegebene Inhalte werden geladen …
+	In progress	In Bearbeitung
+	In progress by {name}, since {time}.	In Bearbeitung von {name}, seit {time}.
+	A new version is unavailable until this edit lock is released.	Eine neue Version ist erst verfügbar, wenn diese Bearbeitungssperre aufgehoben ist.
+	Release lock	Sperre aufheben
+	Release lock for {name}	Sperre aufheben für {name}
+	Release edit lock	Bearbeitungssperre aufheben
+	Release the edit lock held by {name}?	Die Bearbeitungssperre von {name} aufheben?

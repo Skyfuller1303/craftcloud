@@ -17,7 +17,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::StatusCode;
     use bytes::Bytes;
-    use craftcloud_api::Clock;
+    use craftcloud_api::{ApiConfig, Clock, Services, router_with_shared};
+    use craftcloud_core::Capabilities;
     use craftcloud_storage::FaultKind;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -1009,6 +1010,223 @@ mod tests {
         // Authorization still comes first.
         forbidden(&w.create(&c.viewer.1, c.file, b"x").await);
         hidden(&w.create(&c.outsider.1, c.file, b"x").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn file_grant_editor_can_upload_and_revocation_during_stream_is_rechecked() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let grant = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/grants", c.file),
+                &c.owner.1,
+                json!({"user_id": c.plain.0.to_string(), "role": "editor"}),
+            )
+            .await;
+        assert_eq!(grant.status, StatusCode::CREATED, "{}", grant.text);
+        let grant_id = Uuid::parse_str(grant.body["id"].as_str().unwrap()).unwrap();
+
+        let data = pattern(100_000, 37);
+        let completed = w.upload_id(&c.plain.1, c.file, &data).await;
+        assert_eq!(
+            w.put(&c.plain.1, completed, data.clone()).await.status,
+            StatusCode::OK
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id=$1")
+            .bind(completed)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "stored",
+            "an editor grant authorizes content finalization"
+        );
+
+        let raced = w.upload_id(&c.plain.1, c.file, &data).await;
+        let (tx, put) = start_put(&w, &c.plain.1, raced);
+        tx.send(Bytes::from(data[..50_000].to_vec())).await.unwrap();
+        w.wait_for(raced, "receiving").await;
+        assert_eq!(
+            w.delete(&c.owner.1, &format!("/api/v1/grants/{grant_id}"))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        tx.send(Bytes::from(data[50_000..].to_vec())).await.unwrap();
+        drop(tx);
+        let rejected = put.await.unwrap();
+        hidden(&rejected);
+        w.wait_for(raced, "failed").await;
+        w.settled_no_temp().await;
+        assert_eq!(
+            w.stored_objects(),
+            1,
+            "only the upload completed before revoke remains stored"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn file_grantee_can_read_and_abort_own_upload_until_grant_is_revoked() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let grant = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/grants", c.file),
+                &c.owner.1,
+                json!({"user_id": c.plain.0.to_string(), "role": "editor"}),
+            )
+            .await;
+        assert_eq!(grant.status, StatusCode::CREATED, "{}", grant.text);
+        let grant_id = id_of(&grant);
+
+        let bytes = pattern(32, 13);
+        let first = w.upload_id(&c.plain.1, c.file, &bytes).await;
+        let seen = w.get(&c.plain.1, &format!("/api/v1/uploads/{first}")).await;
+        assert_eq!(seen.status, StatusCode::OK, "{}", seen.text);
+        assert_eq!(seen.body["upload_id"], first.to_string());
+        assert_eq!(
+            w.delete(&c.plain.1, &format!("/api/v1/uploads/{first}"))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            w.reserved().await,
+            (0, 0),
+            "abort releases both quota reservations"
+        );
+
+        let second = w.upload_id(&c.plain.1, c.file, &bytes).await;
+        let demoted = w
+            .send(
+                Req::new("PATCH", &format!("/api/v1/grants/{grant_id}"))
+                    .session(&c.owner.1)
+                    .if_match("\"grant-v1\"")
+                    .json(json!({"role":"viewer"})),
+            )
+            .await;
+        assert_eq!(demoted.status, StatusCode::OK, "{}", demoted.text);
+        assert_eq!(
+            w.get(&c.plain.1, &format!("/api/v1/uploads/{second}"))
+                .await
+                .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            w.delete(&c.plain.1, &format!("/api/v1/uploads/{second}"))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+
+        let promoted = w
+            .send(
+                Req::new("PATCH", &format!("/api/v1/grants/{grant_id}"))
+                    .session(&c.owner.1)
+                    .if_match("\"grant-v2\"")
+                    .json(json!({"role":"editor"})),
+            )
+            .await;
+        assert_eq!(promoted.status, StatusCode::OK, "{}", promoted.text);
+        let third = w.upload_id(&c.plain.1, c.file, &bytes).await;
+        assert_eq!(
+            w.delete(&c.owner.1, &format!("/api/v1/grants/{grant_id}"))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        hidden(&w.get(&c.plain.1, &format!("/api/v1/uploads/{third}")).await);
+        hidden(
+            &w.delete(&c.plain.1, &format!("/api/v1/uploads/{third}"))
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn organization_write_routes_reuse_the_transaction_connection() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        sqlx::query("UPDATE files SET app='photocraft',format='native' WHERE id=$1")
+            .bind(c.file)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let pool = w
+            .env
+            .pool_with_max_connections(1, Duration::from_secs(2))
+            .await;
+        let config = ApiConfig::default();
+        let store = craftcloud_storage::LocalStore::open(&w.env.storage_dir)
+            .await
+            .unwrap();
+        let services = Services::new(pool, None, settings())
+            .with_storage(store)
+            .with_clock(w.env.clock.clone())
+            .with_metrics(config.metrics.clone());
+        let app = router_with_shared(
+            Capabilities::development_defaults(),
+            &config,
+            Some(std::sync::Arc::new(services)),
+        );
+
+        let created = call(
+            &app,
+            Req::new("POST", &format!("/api/v1/files/{}/grants", c.file))
+                .session(&c.owner.1)
+                .json(json!({"user_id":c.plain.0.to_string(),"role":"editor"})),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let listed = call(
+            &app,
+            Req::new("GET", &format!("/api/v1/files/{}/grants", c.file)).cookie_only(&c.owner.1),
+        )
+        .await;
+        assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+        assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+
+        let upload = w.upload_id(&c.plain.1, c.file, b"single-pool upload").await;
+        let completed = call(
+            &app,
+            Req::new("PUT", &format!("/api/v1/uploads/{upload}/content"))
+                .session(&c.plain.1)
+                .body(Body::from(b"single-pool upload".to_vec())),
+        )
+        .await;
+        assert_eq!(completed.status, StatusCode::OK, "{}", completed.text);
+
+        let lock = call(
+            &app,
+            Req::new("POST", &format!("/api/v1/files/{}/lock", c.file))
+                .session(&c.owner.1)
+                .json(json!({"client_id":"single-pool"})),
+        )
+        .await;
+        assert_eq!(lock.status, StatusCode::OK, "{}", lock.text);
+
+        let renamed = call(
+            &app,
+            Req::new("PATCH", &format!("/api/v1/files/{}", c.file))
+                .session(&c.owner.1)
+                .if_match("\"file-v1\"")
+                .json(json!({"name":"single-pool.fig"})),
+        )
+        .await;
+        assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.text);
+        assert_eq!(
+            call(
+                &app,
+                Req::new("DELETE", &format!("/api/v1/files/{}/lock", c.file)).session(&c.owner.1),
+            )
+            .await
+            .status,
+            StatusCode::NO_CONTENT
+        );
     }
 
     // ---- concurrency and races ---------------------------------------------------------------------------------

@@ -18,17 +18,23 @@ POST /api/v1/auth/password/change auth=cookie+csrf req=ChangePasswordRequest ok=
 GET /api/v1/auth/session auth=cookie req=- ok=SessionInfo codes=200,401,500,503
 GET /api/v1/auth/sessions auth=cookie req=- ok=SessionList codes=200,401,500,503
 DELETE /api/v1/auth/sessions/{session_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
-DELETE /api/v1/files/{file_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
+DELETE /api/v1/files/{file_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,423,500,503
 GET /api/v1/files/{file_id} auth=cookie req=- ok=File codes=200,401,404,500,503
-PATCH /api/v1/files/{file_id} auth=cookie+csrf req=UpdateFileRequest ok=File codes=200,401,403,404,409,412,413,415,422,428,500,503
+PATCH /api/v1/files/{file_id} auth=cookie+csrf req=UpdateFileRequest ok=File codes=200,401,403,404,409,412,413,415,422,423,428,500,503
 GET /api/v1/files/{file_id}/content auth=cookie req=- ok=- codes=200,206,401,404,409,416,500,503
-POST /api/v1/files/{file_id}/restore auth=cookie+csrf req=- ok=File codes=200,401,403,404,409,410,500,503
-POST /api/v1/files/{file_id}/uploads auth=cookie+csrf req=CreateUploadRequest ok=Upload codes=200,201,401,403,404,409,413,415,422,500,503
+GET /api/v1/files/{file_id}/grants auth=cookie req=- ok=- codes=200,401,403,404,500,503
+POST /api/v1/files/{file_id}/grants auth=cookie req=GrantCreateRequest ok=Grant codes=201,401,403,404,409,422,500,503
+DELETE /api/v1/files/{file_id}/lock auth=cookie req=- ok=- codes=204,401,403,404,409,500,503
+POST /api/v1/files/{file_id}/lock auth=cookie req=LockAcquireRequest ok=FileLock codes=200,401,403,404,409,422,423,500,503
+POST /api/v1/files/{file_id}/restore auth=cookie+csrf req=- ok=File codes=200,401,403,404,409,410,423,500,503
+POST /api/v1/files/{file_id}/uploads auth=cookie+csrf req=CreateUploadRequest ok=Upload codes=200,201,401,403,404,409,413,415,422,423,500,503
 GET /api/v1/files/{file_id}/versions auth=cookie req=- ok=VersionPage codes=200,400,401,404,422,500,503
-POST /api/v1/files/{file_id}/versions auth=cookie+csrf req=CommitVersionRequest ok=Version codes=200,201,401,403,404,409,410,412,413,415,422,428,500,503
+POST /api/v1/files/{file_id}/versions auth=cookie+csrf req=CommitVersionRequest ok=Version codes=200,201,401,403,404,409,410,412,413,415,422,423,428,500,503
 GET /api/v1/files/{file_id}/versions/{version_id} auth=cookie req=- ok=Version codes=200,401,404,500,503
 GET /api/v1/files/{file_id}/versions/{version_id}/content auth=cookie req=- ok=- codes=200,206,401,404,409,416,500,503
-POST /api/v1/files/{file_id}/versions/{version_id}/restore auth=cookie+csrf req=- ok=Version codes=201,401,403,404,409,412,422,428,500,503
+POST /api/v1/files/{file_id}/versions/{version_id}/restore auth=cookie+csrf req=- ok=Version codes=201,401,403,404,409,412,422,423,428,500,503
+DELETE /api/v1/grants/{grant_id} auth=cookie req=- ok=- codes=204,401,403,404,500,503
+PATCH /api/v1/grants/{grant_id} auth=cookie req=GrantChangeRequest ok=Grant codes=200,401,403,404,412,422,428,500,503
 GET /api/v1/info auth=none req=- ok=- codes=200,503
 POST /api/v1/invitations/accept auth=none req=AcceptInvitationRequest ok=AcceptedInvitation codes=200,400,401,403,409,413,415,422,429,500,503
 GET /api/v1/organizations auth=cookie req=- ok=MyOrganizationPage codes=200,400,401,422,500,503
@@ -40,19 +46,22 @@ GET /api/v1/organizations/{org_id}/audit/export auth=cookie req=- ok=- codes=200
 GET /api/v1/organizations/{org_id}/invitations auth=cookie req=- ok=InvitationPage codes=200,400,401,403,404,422,500,503
 POST /api/v1/organizations/{org_id}/invitations auth=cookie+csrf req=CreateInvitationRequest ok=CreatedInvitation codes=201,401,403,404,409,413,415,422,429,500,503
 DELETE /api/v1/organizations/{org_id}/invitations/{invitation_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
-GET /api/v1/organizations/{org_id}/members auth=cookie req=- ok=MemberPage codes=200,400,401,404,422,500,503
+GET /api/v1/organizations/{org_id}/members auth=cookie req=- ok=MemberPage codes=200,400,401,403,404,422,500,503
 POST /api/v1/organizations/{org_id}/members auth=cookie+csrf req=AddMemberRequest ok=Member codes=201,401,403,404,409,413,415,422,500,503
 DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
 PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf req=ChangeRoleRequest ok=Member codes=200,401,403,404,409,413,415,422,500,503
+GET /api/v1/organizations/{org_id}/shared-with-me auth=cookie req=- ok=SharedWithMeResponse codes=200,400,401,404,422,500,503
 GET /api/v1/organizations/{org_id}/usage auth=cookie req=- ok=UsagePage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/workspaces auth=cookie req=- ok=WorkspacePage codes=200,400,401,404,422,500,503
 POST /api/v1/organizations/{org_id}/workspaces auth=cookie+csrf req=CreateWorkspaceRequest ok=Workspace codes=201,401,403,404,413,415,422,500,503
-DELETE /api/v1/projects/{project_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,500,503
+DELETE /api/v1/projects/{project_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,423,500,503
 GET /api/v1/projects/{project_id} auth=cookie req=- ok=Project codes=200,401,404,500,503
 PATCH /api/v1/projects/{project_id} auth=cookie+csrf req=UpdateProjectRequest ok=Project codes=200,401,403,404,409,412,413,415,422,428,500,503
 GET /api/v1/projects/{project_id}/files auth=cookie req=- ok=FilePage codes=200,400,401,404,422,500,503
 POST /api/v1/projects/{project_id}/files auth=cookie+csrf req=CreateFileRequest ok=File codes=201,401,403,404,409,413,415,422,500,503
-POST /api/v1/projects/{project_id}/restore auth=cookie+csrf req=- ok=Project codes=200,401,403,404,409,410,500,503
+GET /api/v1/projects/{project_id}/grants auth=cookie req=- ok=- codes=200,401,403,404,500,503
+POST /api/v1/projects/{project_id}/grants auth=cookie req=GrantCreateRequest ok=Grant codes=201,401,403,404,409,422,500,503
+POST /api/v1/projects/{project_id}/restore auth=cookie+csrf req=- ok=Project codes=200,401,403,404,409,410,423,500,503
 POST /api/v1/setup/complete auth=none req=SetupCompleteRequest ok=- codes=201,403,409,413,415,422,500,503
 GET /api/v1/setup/status auth=none req=- ok=- codes=200,500,503
 DELETE /api/v1/uploads/{upload_id} auth=cookie+csrf req=- ok=- codes=204,401,403,404,409,500,503
@@ -93,10 +102,15 @@ CreatedInvitation
 CreatedOrganization
 Error
 File
+FileLock
 FilePage
+Grant
+GrantChangeRequest
+GrantCreateRequest
 HealthLevel
 Invitation
 InvitationPage
+LockAcquireRequest
 LoginRequest
 LoginResponse
 MaintenanceRun
@@ -116,6 +130,8 @@ ResetPasswordRequest
 SessionInfo
 SessionList
 SetupCompleteRequest
+SharedTarget
+SharedWithMeResponse
 UpdateFileRequest
 UpdateOrganizationRequest
 UpdateProjectRequest

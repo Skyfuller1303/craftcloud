@@ -100,13 +100,23 @@ pub(crate) async fn create_invitation(
     // Structural validation (no state involved).
     let email = NormalizedEmail::parse(&request.email);
     let org_role = OrgRole::parse(&request.org_role);
-    let workspace = match (&request.workspace_id, &request.workspace_role) {
-        (None, None) => Ok(None),
-        (Some(id), Some(role)) => match (parse_id(id), WorkspaceRole::parse(role)) {
-            (Some(id), Some(role)) => Ok(Some((id, role))),
+    let (workspace, guest_workspace) = if org_role == Some(OrgRole::Guest) {
+        let guest_workspace = match (&request.workspace_id, &request.workspace_role) {
+            (None, None) => Ok(None),
+            (Some(id), None) => parse_id(id).map(Some).ok_or(()),
             _ => Err(()),
-        },
-        _ => Err(()),
+        };
+        (Ok(None), guest_workspace)
+    } else {
+        let workspace = match (&request.workspace_id, &request.workspace_role) {
+            (None, None) => Ok(None),
+            (Some(id), Some(role)) => match (parse_id(id), WorkspaceRole::parse(role)) {
+                (Some(id), Some(role)) => Ok(Some((id, role))),
+                _ => Err(()),
+            },
+            _ => Err(()),
+        };
+        (workspace, Ok(None))
     };
     let mut invalid = Vec::new();
     if email.is_err() {
@@ -115,11 +125,13 @@ pub(crate) async fn create_invitation(
     if org_role.is_none() {
         invalid.push("org_role");
     }
-    if workspace.is_err() {
+    if workspace.is_err() || guest_workspace.is_err() {
         invalid.push("workspace_id");
         invalid.push("workspace_role");
     }
-    let (Ok(email), Some(org_role), Ok(workspace)) = (email, org_role, workspace) else {
+    let (Ok(email), Some(org_role), Ok(workspace), Ok(guest_workspace)) =
+        (email, org_role, workspace, guest_workspace)
+    else {
         return validation_failed(&invalid, &headers);
     };
     let Some(public_url) = services.settings.public_url.clone() else {
@@ -140,10 +152,11 @@ pub(crate) async fn create_invitation(
         Ok(None) => return not_found(&headers),
         Err(error) => return db_failure(&error, &headers, "invitation transaction failed"),
     };
+    let invited_workspace = workspace.map(|(id, _)| id).or(guest_workspace);
     let loaded = async {
         let role = tx.role_of(session.user_id).await?;
-        let ws_role = match workspace {
-            Some((workspace_id, _)) => tx.workspace_role_of(workspace_id, session.user_id).await?,
+        let ws_role = match invited_workspace {
+            Some(workspace_id) => tx.workspace_role_of(workspace_id, session.user_id).await?,
             None => None,
         };
         let enabled = tx.workspace_admin_invites_enabled().await?;
@@ -158,13 +171,14 @@ pub(crate) async fn create_invitation(
         user_id: session.user_id,
         instance_operator: false,
         membership: role.map(|role| OrgMembership { org_id, role }),
-        workspace: workspace
+        workspace: invited_workspace
             .zip(ws_role)
-            .map(|((workspace_id, _), role)| WorkspaceMembership { workspace_id, role }),
+            .map(|(workspace_id, role)| WorkspaceMembership { workspace_id, role }),
     };
     let spec = InvitationSpec {
         org_role,
         workspace,
+        guest_workspace,
         workspace_admin_invites_enabled: enabled,
         created_by: Some(session.user_id),
     };
@@ -203,6 +217,7 @@ pub(crate) async fn create_invitation(
                 email: email.as_str().to_owned(),
                 org_role,
                 workspace,
+                guest_workspace,
                 token_hash: token.hash(),
                 created_by: session.user_id,
                 now,
@@ -363,8 +378,11 @@ pub(crate) async fn revoke_invitation(
             Some(invitation) => tx.invitation_spec(invitation).await?,
             None => None,
         };
-        let ws_role = match spec.and_then(|s| s.workspace) {
-            Some((workspace_id, _)) => tx.workspace_role_of(workspace_id, session.user_id).await?,
+        let invited_workspace = spec
+            .as_ref()
+            .and_then(|s| s.workspace.map(|(id, _)| id).or(s.guest_workspace));
+        let ws_role = match invited_workspace {
+            Some(workspace_id) => tx.workspace_role_of(workspace_id, session.user_id).await?,
             None => None,
         };
         Ok::<_, DbError>((role, spec, ws_role))
@@ -379,9 +397,9 @@ pub(crate) async fn revoke_invitation(
         instance_operator: false,
         membership: role.map(|role| OrgMembership { org_id, role }),
         workspace: spec
-            .and_then(|s| s.workspace)
+            .and_then(|s| s.workspace.map(|(id, _)| id).or(s.guest_workspace))
             .zip(ws_role)
-            .map(|((workspace_id, _), role)| WorkspaceMembership { workspace_id, role }),
+            .map(|(workspace_id, role)| WorkspaceMembership { workspace_id, role }),
     };
     let decision = can(
         &actor,

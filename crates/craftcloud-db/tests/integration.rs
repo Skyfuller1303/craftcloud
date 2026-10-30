@@ -198,6 +198,7 @@ mod tests {
                 org_id,
                 workspace_id: Uuid::new_v4(),
             },
+            craftcloud_core::policy::Action::WorkspaceCreate => Resource::Organization { org_id },
             _ => Resource::Organization { org_id },
         };
         let permit = can(&actor, action, &resource).permit().unwrap();
@@ -278,9 +279,323 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         migrate::verify(&db.pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn migration_0016_grant_shape_keys_and_shared_projection_are_valid() {
+        let db = migrated().await;
+        let (base_scope, owner) = org(&db.pool, "ac03-shared").await;
+        let workspace = workspaces::create(
+            &db.pool,
+            &sc(
+                &base_scope,
+                craftcloud_core::policy::Action::WorkspaceCreate,
+            ),
+            &NewWorkspace {
+                slug: "shared".to_owned(),
+                name: "Shared workspace".to_owned(),
+                quota_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+        let grantee = user(&db.pool, "ac03-grantee@example.test").await;
+        organizations::add_member(
+            &db.pool,
+            &sc(&base_scope, craftcloud_core::policy::Action::MemberAdd),
+            grantee.id,
+            OrgRole::Member,
+            MemberStatus::Active,
+        )
+        .await
+        .unwrap();
+        let project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,org_id,workspace_id,name,name_key,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,'Project','project',$4,CURRENT_TIMESTAMP,$4,CURRENT_TIMESTAMP)")
+            .bind(project_id).bind(base_scope.org_id()).bind(workspace.id).bind(owner.id).execute(&db.pool).await.unwrap();
+        let file_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO files(id,org_id,workspace_id,project_id,name,name_key,app,format,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,$4,'File','file','figcraft','figcraft',$5,CURRENT_TIMESTAMP,$5,CURRENT_TIMESTAMP)")
+            .bind(file_id).bind(base_scope.org_id()).bind(workspace.id).bind(project_id).bind(owner.id).execute(&db.pool).await.unwrap();
+
+        let invalid = sqlx::query("INSERT INTO grants(id,org_id,workspace_id,target_kind,target_id,grantee_user_id,role,created_by_user_id,created_at) VALUES($1,$2,$3,'file',$4,$5,'viewer',$6,CURRENT_TIMESTAMP)")
+            .bind(Uuid::new_v4()).bind(base_scope.org_id()).bind(workspace.id).bind(file_id).bind(grantee.id).bind(owner.id).execute(&db.pool).await;
+        assert!(
+            matches!(invalid, Err(sqlx::Error::Database(error)) if error.constraint() == Some("grants_target_shape"))
+        );
+
+        let grant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO grants(id,org_id,workspace_id,target_kind,target_id,file_id,grantee_user_id,role,created_by_user_id,created_at) VALUES($1,$2,$3,'file',$4,$4,$5,'editor',$6,CURRENT_TIMESTAMP)")
+            .bind(grant_id).bind(base_scope.org_id()).bind(workspace.id).bind(file_id).bind(grantee.id).bind(owner.id).execute(&db.pool).await.unwrap();
+        let rows = craftcloud_db::grants::shared_with_me_items(
+            &db.pool,
+            base_scope.org_id(),
+            grantee.id,
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workspace_name, "Shared workspace");
+        assert_eq!(rows[0].project_id, Some(project_id));
+        assert_eq!(rows[0].project_name.as_deref(), Some("Project"));
+        assert_eq!(rows[0].file_id, Some(file_id));
+        assert_eq!(rows[0].file_name.as_deref(), Some("File"));
+
+        let session_owner = Uuid::new_v4();
+        let session_grantee = Uuid::new_v4();
+        let now = time::OffsetDateTime::now_utc();
+        for (session_id, user_id, token_hash) in [
+            (session_owner, owner.id, [1_u8; 32]),
+            (session_grantee, grantee.id, [2_u8; 32]),
+        ] {
+            sqlx::query("INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at) VALUES($1,$2,$3,$4,$4,$5)")
+                .bind(session_id).bind(user_id).bind(token_hash.as_slice()).bind(now).bind(now + time::Duration::hours(1)).execute(&db.pool).await.unwrap();
+        }
+        let pool = db.pool.clone();
+        let org_id = base_scope.org_id();
+        let concurrent_acquire = |user_id, session_id| {
+            let pool = pool.clone();
+            async move {
+                let mut tx = craftcloud_db::members::OrgTx::begin(&pool, org_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let outcome = tx
+                    .lock_acquire(
+                        file_id,
+                        craftcloud_db::locks::LockSessionContext {
+                            user_id,
+                            session_id,
+                            expires_at: now + time::Duration::hours(1),
+                            idle_timeout_secs: 3600,
+                            kind: craftcloud_db::locks::LockSessionKind::Browser,
+                        },
+                        "test-client",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                outcome
+            }
+        };
+        let (a, b) = tokio::join!(
+            concurrent_acquire(owner.id, session_owner),
+            concurrent_acquire(grantee.id, session_grantee)
+        );
+        assert_eq!(
+            (matches!(&a, craftcloud_db::locks::AcquireOutcome::Acquired { .. }) as usize)
+                + (matches!(&b, craftcloud_db::locks::AcquireOutcome::Acquired { .. }) as usize),
+            1
+        );
+        assert_eq!(
+            (matches!(&a, craftcloud_db::locks::AcquireOutcome::Locked { .. }) as usize)
+                + (matches!(&b, craftcloud_db::locks::AcquireOutcome::Locked { .. }) as usize),
+            1
+        );
+
+        // A project operation must find a foreign lease even if the current session's file sorts first.
+        let second_file_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO files(id,org_id,workspace_id,project_id,name,name_key,app,format,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,$4,'Second file','second-file','photocraft','native',$5,CURRENT_TIMESTAMP,$5,CURRENT_TIMESTAMP)")
+            .bind(second_file_id).bind(base_scope.org_id()).bind(workspace.id).bind(project_id).bind(owner.id).execute(&db.pool).await.unwrap();
+        sqlx::query("DELETE FROM file_locks WHERE org_id=$1 AND file_id IN ($2,$3)")
+            .bind(base_scope.org_id())
+            .bind(file_id)
+            .bind(second_file_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for (target_file, user_id, session_id) in [
+            (file_id, owner.id, session_owner),
+            (second_file_id, grantee.id, session_grantee),
+        ] {
+            let mut tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                tx.lock_acquire(
+                    target_file,
+                    craftcloud_db::locks::LockSessionContext {
+                        user_id,
+                        session_id,
+                        expires_at: now + time::Duration::hours(1),
+                        idle_timeout_secs: 3600,
+                        kind: craftcloud_db::locks::LockSessionKind::Browser,
+                    },
+                    "project-order",
+                    false,
+                )
+                .await
+                .unwrap(),
+                craftcloud_db::locks::AcquireOutcome::Acquired { .. }
+            ));
+            tx.commit().await.unwrap();
+        }
+        let mut tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let foreign = tx
+            .active_project_lock(project_id, session_owner)
+            .await
+            .unwrap();
+        assert_eq!(foreign.map(|lock| lock.file_id), Some(second_file_id));
+        tx.commit().await.unwrap();
+
+        // Grant demotion and revoke clear a grantee's active lease in their own transaction.
+        sqlx::query("DELETE FROM file_locks WHERE org_id=$1 AND file_id=$2")
+            .bind(base_scope.org_id())
+            .bind(file_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mut lease_tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lease_tx
+                .lock_acquire(
+                    file_id,
+                    craftcloud_db::locks::LockSessionContext {
+                        user_id: grantee.id,
+                        session_id: session_grantee,
+                        expires_at: now + time::Duration::hours(1),
+                        idle_timeout_secs: 3600,
+                        kind: craftcloud_db::locks::LockSessionKind::Browser,
+                    },
+                    "demotion-test",
+                    false,
+                )
+                .await
+                .unwrap(),
+            craftcloud_db::locks::AcquireOutcome::Acquired { .. }
+        ));
+        lease_tx.commit().await.unwrap();
+        let mut demotion_tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = demotion_tx
+            .grant_change(
+                &sc(&base_scope, craftcloud_core::policy::Action::GrantChange),
+                grant_id,
+                craftcloud_db::grants::GrantRole::Viewer,
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            craftcloud_db::grants::ChangeOutcome::Changed(_)
+        ));
+        demotion_tx.commit().await.unwrap();
+        let still_locked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM file_locks WHERE org_id=$1 AND file_id=$2 AND holder_user_id=$3)")
+            .bind(base_scope.org_id()).bind(file_id).bind(grantee.id).fetch_one(&db.pool).await.unwrap();
+        assert!(
+            !still_locked,
+            "editor-to-viewer demotion clears the grant lease atomically"
+        );
+
+        let mut lease_tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lease_tx
+                .lock_acquire(
+                    file_id,
+                    craftcloud_db::locks::LockSessionContext {
+                        user_id: grantee.id,
+                        session_id: session_grantee,
+                        expires_at: now + time::Duration::hours(1),
+                        idle_timeout_secs: 3600,
+                        kind: craftcloud_db::locks::LockSessionKind::Browser,
+                    },
+                    "revoke-test",
+                    false,
+                )
+                .await
+                .unwrap(),
+            craftcloud_db::locks::AcquireOutcome::Acquired { .. }
+        ));
+        lease_tx.commit().await.unwrap();
+        let mut revoke_tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            revoke_tx
+                .grant_revoke(
+                    &sc(&base_scope, craftcloud_core::policy::Action::GrantChange),
+                    grant_id,
+                    now
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        revoke_tx.commit().await.unwrap();
+        let still_locked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM file_locks WHERE org_id=$1 AND file_id=$2 AND holder_user_id=$3)")
+            .bind(base_scope.org_id()).bind(file_id).bind(grantee.id).fetch_one(&db.pool).await.unwrap();
+        assert!(
+            !still_locked,
+            "grant revocation clears the grant lease atomically"
+        );
+
+        let project_grant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO grants(id,org_id,workspace_id,target_kind,target_id,project_id,grantee_user_id,role,created_by_user_id,created_at) VALUES($1,$2,$3,'project',$4,$4,$5,'editor',$6,CURRENT_TIMESTAMP)")
+            .bind(project_grant_id).bind(base_scope.org_id()).bind(workspace.id).bind(project_id).bind(grantee.id).bind(owner.id).execute(&db.pool).await.unwrap();
+        let mut lease_tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lease_tx
+                .lock_acquire(
+                    file_id,
+                    craftcloud_db::locks::LockSessionContext {
+                        user_id: grantee.id,
+                        session_id: session_grantee,
+                        expires_at: now + time::Duration::hours(1),
+                        idle_timeout_secs: 3600,
+                        kind: craftcloud_db::locks::LockSessionKind::Browser,
+                    },
+                    "project-demotion",
+                    false,
+                )
+                .await
+                .unwrap(),
+            craftcloud_db::locks::AcquireOutcome::Acquired { .. }
+        ));
+        lease_tx.commit().await.unwrap();
+        let mut demotion_tx = craftcloud_db::members::OrgTx::begin(&db.pool, base_scope.org_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            demotion_tx
+                .grant_change(
+                    &sc(&base_scope, craftcloud_core::policy::Action::GrantChange),
+                    project_grant_id,
+                    craftcloud_db::grants::GrantRole::Viewer,
+                    1
+                )
+                .await
+                .unwrap(),
+            craftcloud_db::grants::ChangeOutcome::Changed(_)
+        ));
+        demotion_tx.commit().await.unwrap();
+        let still_locked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM file_locks WHERE org_id=$1 AND file_id=$2 AND holder_user_id=$3)").bind(base_scope.org_id()).bind(file_id).bind(grantee.id).fetch_one(&db.pool).await.unwrap();
+        assert!(
+            !still_locked,
+            "project grant demotion clears descendant leases"
+        );
     }
 
     #[tokio::test]
@@ -301,14 +616,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            14,
+            16,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 14);
+        assert_eq!(count, 16);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -323,7 +638,7 @@ mod tests {
         assert_eq!(
             migrate::verify(&db.pool).await,
             Err(DbError::Schema(SchemaProblem::Pending(vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
             ])))
         );
 
@@ -332,7 +647,7 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         migrate::verify(&db.pool).await.unwrap();
 

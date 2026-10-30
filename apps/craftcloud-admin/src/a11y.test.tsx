@@ -19,7 +19,7 @@ const NAV = {
 
 async function go(user: User, section: keyof typeof NAV) {
   const nav = await screen.findByRole("navigation");
-  await user.click(within(nav).getByRole("button", { name: NAV[section] }));
+  await user.click(await within(nav).findByRole("button", { name: NAV[section] }));
   await screen.findByRole("heading", { level: 1 });
 }
 

@@ -426,7 +426,10 @@ impl OrgTx {
             return Ok(CommitOutcome::Gone);
         };
         // Defense in depth: the upload must live in the workspace of the locked file.
-        if session.workspace_id != workspace_id {
+        if session.workspace_id != workspace_id
+            || session.file_id != file_id
+            || session.created_by_user_id != user_id
+        {
             return Ok(CommitOutcome::Gone);
         }
         // A retry of a finished commit returns the version, whatever the

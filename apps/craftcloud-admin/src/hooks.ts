@@ -83,3 +83,42 @@ export function useCountdown(seconds: number | undefined, key: unknown): number 
   }, [seconds, key]);
   return left;
 }
+
+/** Rechecks an edit lease at its server-provided expiry, then periodically if it remains. */
+export function useLeaseRefresh(expiresAt: string | null | undefined, refresh: () => Promise<unknown>) {
+  const [error, setError] = useState<unknown>(null);
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    setError(null);
+    if (expiresAt == null) return;
+    const expiry = Date.parse(expiresAt);
+    if (!Number.isFinite(expiry)) return;
+    let timer = 0;
+    let active = true;
+    const check = async () => {
+      try {
+        await refreshRef.current();
+        if (active) setError(null);
+      } catch (failure) {
+        if (active) setError(failure);
+      }
+      if (active) timer = window.setTimeout(() => void check(), 30_000);
+    };
+    timer = window.setTimeout(() => void check(), Math.max(0, expiry - Date.now()));
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [expiresAt, attempt]);
+  return {
+    error,
+    retry: async () => {
+      setError(null);
+      try {
+        await refreshRef.current();
+      } catch (failure) {
+        setError(failure);
+      }
+      setAttempt((value) => value + 1);
+    },
+  };
+}

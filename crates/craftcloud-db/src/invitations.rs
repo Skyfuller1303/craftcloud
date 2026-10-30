@@ -79,13 +79,22 @@ impl Invitation {
 
     fn spec(&self, workspace_admin_invites_enabled: bool) -> Option<InvitationSpec> {
         let org_role = OrgRole::parse(&self.org_role)?;
-        let workspace = match (self.workspace_id, self.workspace_role.as_deref()) {
-            (Some(id), Some(role)) => Some((id, WorkspaceRole::parse(role)?)),
-            _ => None,
+        let workspace = if org_role == OrgRole::Guest {
+            None
+        } else {
+            match (self.workspace_id, self.workspace_role.as_deref()) {
+                (Some(id), Some(role)) => Some((id, WorkspaceRole::parse(role)?)),
+                _ => None,
+            }
         };
         Some(InvitationSpec {
             org_role,
             workspace,
+            guest_workspace: if org_role == OrgRole::Guest {
+                self.workspace_id
+            } else {
+                None
+            },
             workspace_admin_invites_enabled,
             created_by: Some(self.created_by),
         })
@@ -104,6 +113,8 @@ pub struct NewInvitation {
     pub org_role: OrgRole,
     /// Workspace and role granted, if any.
     pub workspace: Option<(Uuid, WorkspaceRole)>,
+    /// Guest invitation context, without a workspace role.
+    pub guest_workspace: Option<Uuid>,
     /// SHA-256 of the secret token.
     pub token_hash: [u8; 32],
     /// The inviter.
@@ -171,7 +182,7 @@ impl OrgTx {
         new: &NewInvitation,
     ) -> Result<CreateInvitationOutcome, DbError> {
         self.check(scope, Action::InvitationCreate)?;
-        if let Some((workspace_id, _)) = new.workspace
+        if let Some(workspace_id) = new.workspace.map(|(id, _)| id).or(new.guest_workspace)
             && !self.workspace_exists(workspace_id).await?
         {
             return Ok(CreateInvitationOutcome::WorkspaceMissing);
@@ -217,7 +228,7 @@ impl OrgTx {
         .bind(self.org_id)
         .bind(&new.email)
         .bind(new.org_role.as_str())
-        .bind(new.workspace.map(|(id, _)| id))
+        .bind(new.workspace.map(|(id, _)| id).or(new.guest_workspace))
         .bind(new.workspace.map(|(_, role)| role.as_str()))
         .bind(new.token_hash.as_slice())
         .bind(new.created_by)
@@ -503,15 +514,20 @@ async fn accept_inner(
     }
 
     // 6. Effects.
-    let workspace = match (
-        invitation.workspace_id,
-        invitation.workspace_role.as_deref(),
-    ) {
-        (Some(id), Some(role)) => WorkspaceRole::parse(role).map(|r| (id, r)),
-        _ => None,
-    };
     let Some(org_role) = OrgRole::parse(&invitation.org_role) else {
         return Ok(AcceptOutcome::Invalid);
+    };
+    let invitation_workspace_id = invitation.workspace_id;
+    let workspace = if org_role == OrgRole::Guest {
+        None
+    } else {
+        match (
+            invitation.workspace_id,
+            invitation.workspace_role.as_deref(),
+        ) {
+            (Some(id), Some(role)) => WorkspaceRole::parse(role).map(|r| (id, r)),
+            _ => None,
+        }
     };
     if created {
         let AcceptBy::NewAccount {
@@ -558,7 +574,13 @@ async fn accept_inner(
         .fetch_optional(&mut *otx.tx)
         .await?;
         match existing {
-            Some((_, status)) if status == "active" => {
+            Some((existing_role, status)) if status == "active" => {
+                if existing_role == "guest" {
+                    // An older invitation may carry a workspace role. Existing guests never gain it.
+                    if workspace.is_some() {
+                        return Ok(AcceptOutcome::AlreadyMember);
+                    }
+                }
                 if workspace.is_none() {
                     // Nothing to grant: keep the invitation pending and revocable.
                     return Ok(AcceptOutcome::AlreadyMember);
@@ -637,7 +659,7 @@ async fn accept_inner(
     Ok(AcceptOutcome::Accepted {
         user_id: account,
         org_id,
-        workspace_id: workspace.map(|(id, _)| id),
+        workspace_id: invitation_workspace_id,
         account_created: created,
         invitation_id,
         inviter_id,

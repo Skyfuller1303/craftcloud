@@ -133,29 +133,36 @@ pub struct SessionLocation {
     pub org_id: Uuid,
     /// Workspace.
     pub workspace_id: Uuid,
+    /// Project.
+    pub project_id: Uuid,
+    /// File.
+    pub file_id: Uuid,
     /// Who created it.
     pub creator: Uuid,
 }
 
-/// Resolves organization, workspace and creator of an upload id.
+/// Resolves organization, workspace, project, file and creator of an upload id.
 ///
 /// # Errors
 ///
 /// Database failures only.
 pub async fn locate(pool: &PgPool, id: Uuid) -> Result<Option<SessionLocation>, DbError> {
-    let row: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
-        "SELECT org_id, workspace_id, created_by_user_id FROM upload_sessions WHERE id = $1",
+    let row: Option<(Uuid, Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT org_id, workspace_id, project_id, file_id, created_by_user_id FROM upload_sessions WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(org_id, workspace_id, creator)| SessionLocation {
-        org_id,
-        workspace_id,
-        creator,
-    }))
+    Ok(row.map(
+        |(org_id, workspace_id, project_id, file_id, creator)| SessionLocation {
+            org_id,
+            workspace_id,
+            project_id,
+            file_id,
+            creator,
+        },
+    ))
 }
-
 /// Reads one session of the scoped organization.
 ///
 /// # Errors
@@ -333,6 +340,21 @@ fn fingerprint(file_id: Uuid, size: i64, sha256: &[u8; 32]) -> String {
 }
 
 impl OrgTx {
+    pub async fn upload_get(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+    ) -> Result<Option<UploadSession>, DbError> {
+        self.check(scope, craftcloud_core::policy::Action::VersionCommit)?;
+        Ok(sqlx::query_as::<_, UploadSession>(&format!(
+            "SELECT {SESSION_COLUMNS} FROM upload_sessions WHERE org_id=$1 AND id=$2"
+        ))
+        .bind(self.org_id)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await?)
+    }
+
     /// Where a file lives and whether it or its project is in the trash:
     /// `(workspace_id, project_id, file_deleted, project_deleted)`.
     async fn file_state(

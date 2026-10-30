@@ -51,7 +51,7 @@ export interface SessionInfo {
   expires_at: string;
 }
 
-export type OrgRole = "owner" | "admin" | "member";
+export type OrgRole = "owner" | "admin" | "member" | "guest";
 
 export interface Organization {
   id: Uuid;
@@ -150,7 +150,7 @@ export type AuditSource = { kind: "organization"; orgId: string } | { kind: "ins
 export interface Invitation {
   id: Uuid;
   email: string;
-  org_role: "admin" | "member";
+  org_role: "admin" | "member" | "guest";
   workspace_id: Uuid | null;
   workspace_role: WorkspaceRole | null;
   status: "pending" | "accepted" | "revoked" | "expired" | "invalid";
@@ -161,7 +161,7 @@ export interface Invitation {
 
 export interface CreateInvitationRequest {
   email: string;
-  org_role: "admin" | "member";
+  org_role: "admin" | "member" | "guest";
   workspace_id?: Uuid;
   workspace_role?: WorkspaceRole;
 }
@@ -184,6 +184,7 @@ export interface Project {
   updated_by: Uuid;
   updated_at: string;
   deleted_at: string | null;
+  can_share?: boolean;
 }
 
 /** File metadata (named `FileRecord` so it does not shadow the DOM `File`). */
@@ -204,6 +205,41 @@ export interface FileRecord {
   updated_by: Uuid;
   updated_at: string;
   deleted_at: string | null;
+  can_share?: boolean;
+  can_force_lock?: boolean;
+  lock?: FileLock | null;
+}
+
+export interface FileLock {
+  holder_display_name: string;
+  since: string;
+  expires_at: string;
+  mine: boolean;
+  held_by_current_session: boolean;
+}
+
+export interface ShareGrant {
+  id: Uuid;
+  target_kind: "project" | "file";
+  target_id: Uuid;
+  grantee: { user_id: Uuid; display_name: string; email: string };
+  role: "viewer" | "editor";
+  created_by: Uuid;
+  created_at: string;
+  version: number;
+}
+
+export interface SharedItem {
+  target_kind: "project" | "file";
+  target_id: Uuid;
+  role: "viewer" | "editor";
+  workspace: { id: Uuid; name: string };
+  project: { id: Uuid; name: string } | null;
+  file: { id: Uuid; name: string } | null;
+}
+
+export interface ServerInfo {
+  features: string[];
 }
 
 export interface CreateFileRequest {

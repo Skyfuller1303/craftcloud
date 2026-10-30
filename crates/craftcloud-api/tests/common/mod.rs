@@ -390,6 +390,19 @@ impl TestEnv {
         sqlx::query_scalar(sql).fetch_one(&self.pool).await.unwrap()
     }
 
+    pub async fn pool_with_max_connections(
+        &self,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect_with(self.admin.clone().database(&self.name))
+            .await
+            .unwrap()
+    }
+
     /// Creates an enabled account `<name>@example.test` with the shared password.
     pub async fn user(&self, name: &str) -> Uuid {
         let id = Uuid::new_v4();

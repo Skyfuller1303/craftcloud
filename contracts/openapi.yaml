@@ -534,10 +534,13 @@ paths:
       summary: List the members of an organization (any member)
       description: >-
         Ordered by join time and user id (stable, keyset paginated); cursors contain only a timestamp and ids, never
-        names or e-mail addresses. Only active members are listed. Non-members and unknown organizations answer 404.
+        names or e-mail addresses. Only active members are listed. The optional `query` searches names and e-mail
+        addresses and requires grant-management rights in at least one workspace (403 otherwise). Non-members and
+        unknown organizations answer 404.
       parameters:
         - {$ref: '#/components/parameters/Limit'}
         - {$ref: '#/components/parameters/Cursor'}
+        - {in: query, name: query, required: false, schema: {type: string, minLength: 2, maxLength: 100}}
       responses:
         '200':
           description: One page
@@ -546,6 +549,7 @@ paths:
               schema: {$ref: '#/components/schemas/MemberPage'}
         '400': {$ref: '#/components/responses/InvalidCursor'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -1269,6 +1273,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /projects/{project_id}/restore:
@@ -1294,6 +1299,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: PROJECT_NAME_TAKEN
           content:
@@ -1423,6 +1429,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: FILE_NAME_TAKEN, FILE_DELETED or PROJECT_DELETED
           content:
@@ -1457,6 +1464,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: PROJECT_DELETED
           content:
@@ -1488,6 +1496,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: FILE_NAME_TAKEN or PROJECT_DELETED
           content:
@@ -1542,6 +1551,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: UPLOAD_LIMIT, IDEMPOTENCY_KEY_REUSED, FILE_DELETED or PROJECT_DELETED
           content:
@@ -1561,10 +1571,10 @@ paths:
       - {$ref: '#/components/parameters/UploadId'}
     get:
       tags: [Uploads]
-      summary: Read an upload session (creator, workspace admin, organization owner/admin)
+      summary: Read own upload session when the source file is visible (creator, active file grantee, workspace admin, organization owner/admin)
       description: >-
         An open session past its expiry is closed first (state `expired`). Unknown ids, ids of other tenants and
-        sessions in workspaces the caller cannot see are indistinguishable: 404. Other members of the workspace: 403.
+        sessions in workspaces the caller cannot see are indistinguishable: 404. A file grant permits reading only the caller's own upload sessions for that file; other members of the workspace: 403.
       responses:
         '200':
           description: The session
@@ -1581,7 +1591,7 @@ paths:
       security:
         - cookieAuth: []
           csrfToken: []
-      summary: Abort an upload session (creator, workspace admin, organization owner/admin)
+      summary: Abort own upload session when the source file is visible (creator, active file grantee, workspace admin, organization owner/admin)
       description: >-
         Releases the reservation; a stored but uncommitted blob becomes orphaned (removed later by the cleanup job).
         Idempotent for closed sessions. While content is being received: 409 UPLOAD_IN_PROGRESS; after a commit:
@@ -1907,6 +1917,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: UPLOAD_INCOMPLETE, UPLOAD_CLOSED, FILE_DELETED, PROJECT_DELETED or IDEMPOTENCY_KEY_REUSED
           content:
@@ -1984,6 +1995,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '409':
           description: FILE_DELETED or PROJECT_DELETED
           content:
@@ -2228,6 +2240,149 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /projects/{project_id}/grants:
+    get:
+      tags: [Projects]
+      summary: List active grants (workspace editor and higher)
+      parameters: [{$ref: '#/components/parameters/ProjectId'}]
+      responses:
+        '200': {description: Active grants, content: {application/json: {schema: {type: object, required: [items, next_cursor], properties: {items: {type: array, items: {$ref: '#/components/schemas/Grant'}}, next_cursor: {type: [string, 'null']}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Projects]
+      summary: Grant project access to an organization member
+      parameters: [{$ref: '#/components/parameters/ProjectId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GrantCreateRequest'}
+      responses:
+        '201': {description: Grant created, content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/grants:
+    get:
+      tags: [Files]
+      summary: List active grants (workspace editor and higher)
+      parameters: [{$ref: '#/components/parameters/FileId'}]
+      responses:
+        '200': {description: Active grants, content: {application/json: {schema: {type: object, required: [items, next_cursor], properties: {items: {type: array, items: {$ref: '#/components/schemas/Grant'}}, next_cursor: {type: [string, 'null']}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Files]
+      summary: Grant file access to an organization member
+      parameters: [{$ref: '#/components/parameters/FileId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GrantCreateRequest'}
+      responses:
+        '201': {description: Grant created, content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /grants/{grant_id}:
+    patch:
+      tags: [Projects]
+      summary: Change a grant role with an ETag precondition
+      parameters:
+        - {in: path, name: grant_id, required: true, schema: {type: string, format: uuid}}
+        - {in: header, name: If-Match, required: true, schema: {type: string, pattern: '^"grant-v[0-9]+"$'}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GrantChangeRequest'}
+      responses:
+        '200': {description: Updated grant, content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '412': {description: VERSION_CONFLICT, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '428': {description: PRECONDITION_REQUIRED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Projects]
+      summary: Revoke a grant
+      parameters: [{$ref: '#/components/parameters/GrantId'}]
+      responses:
+        '204': {description: Grant revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/lock:
+    post:
+      tags: [Files]
+      summary: Acquire or renew the current browser session's edit lease
+      parameters: [{$ref: '#/components/parameters/FileId'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LockAcquireRequest'}
+      responses:
+        '200': {description: Lease acquired or renewed, content: {application/json: {schema: {$ref: '#/components/schemas/FileLock'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: LOCK_NOT_SUPPORTED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Files]
+      summary: Release the current session's edit lease; admins may force release
+      parameters:
+        - {$ref: '#/components/parameters/FileId'}
+        - {in: query, name: force, required: false, schema: {type: boolean}}
+      responses:
+        '204': {description: Lease released}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: LOCK_NOT_SUPPORTED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/shared-with-me:
+    get:
+      tags: [Files]
+      summary: List active grants held by the current user in an organization
+      parameters:
+        - {$ref: '#/components/parameters/OrgId'}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200': {description: Shared targets with minimal workspace and parent identity, content: {application/json: {schema: {$ref: '#/components/schemas/SharedWithMeResponse'}}}}
+        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /invitations/accept:
     post:
       tags: [Invitations]
@@ -2297,6 +2452,11 @@ components:
     FileId:
       in: path
       name: file_id
+      required: true
+      schema: {type: string, format: uuid}
+    GrantId:
+      in: path
+      name: grant_id
       required: true
       schema: {type: string, format: uuid}
     VersionId:
@@ -2507,7 +2667,7 @@ components:
         id: {type: string, format: uuid}
         slug: {type: string}
         name: {type: string}
-        role: {type: string, enum: [owner, admin, member], description: The caller's role}
+        role: {type: string, enum: [owner, admin, member, guest], description: The caller's role}
         version: {type: integer, minimum: 1}
         workspace_admin_invites_enabled: {type: boolean, description: Whether workspace admins may invite into their own workspace}
         created_at: {type: string, format: date-time}
@@ -2554,7 +2714,7 @@ components:
         user_id: {type: string, format: uuid}
         display_name: {type: string}
         email: {type: string}
-        role: {type: string, enum: [owner, admin, member]}
+        role: {type: string, enum: [owner, admin, member, guest]}
         joined_at: {type: string, format: date-time}
     MemberPage:
       type: object
@@ -2586,13 +2746,13 @@ components:
       required: [user_id, role]
       properties:
         user_id: {type: string, format: uuid}
-        role: {type: string, enum: [owner, admin, member]}
+        role: {type: string, enum: [owner, admin, member, guest]}
     ChangeRoleRequest:
       type: object
       additionalProperties: false
       required: [role]
       properties:
-        role: {type: string, enum: [owner, admin, member]}
+        role: {type: string, enum: [owner, admin, member, guest]}
     SessionList:
       type: object
       required: [sessions]
@@ -2707,6 +2867,7 @@ components:
         updated_by: {type: string, format: uuid}
         updated_at: {type: string, format: date-time}
         deleted_at: {type: [string, 'null'], format: date-time}
+        can_share: {type: boolean, description: Server-calculated grant-management capability}
     ProjectPage:
       type: object
       required: [items, next_cursor]
@@ -2728,6 +2889,89 @@ components:
       required: [name]
       properties:
         name: {type: string, minLength: 1, maxLength: 100}
+    GrantCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, role]
+      properties:
+        user_id: {type: string, format: uuid}
+        role: {type: string, enum: [viewer, editor]}
+    GrantChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: {type: string, enum: [viewer, editor]}
+    Grant:
+      type: object
+      required: [id, organization_id, workspace_id, target_kind, target_id, grantee, role, created_by, created_at, version]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        workspace_id: {type: string, format: uuid}
+        target_kind: {type: string, enum: [project, file]}
+        target_id: {type: string, format: uuid}
+        grantee:
+          type: object
+          required: [user_id, display_name, email]
+          properties:
+            user_id: {type: string, format: uuid}
+            display_name: {type: string}
+            email: {type: string}
+        role: {type: string, enum: [viewer, editor]}
+        created_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        version: {type: integer, minimum: 1}
+    SharedWithMeResponse:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/SharedTarget'}
+        next_cursor: {type: [string, 'null']}
+    SharedTarget:
+      type: object
+      required: [target_kind, target_id, role, workspace, project, file]
+      properties:
+        target_kind: {type: string, enum: [project, file]}
+        target_id: {type: string, format: uuid}
+        role: {type: string, enum: [viewer, editor]}
+        workspace:
+          type: object
+          required: [id, name]
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+        project:
+          type: [object, 'null']
+          required: [id, name]
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+        file:
+          type: [object, 'null']
+          required: [id, name]
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+    LockAcquireRequest:
+      type: object
+      additionalProperties: false
+      required: [client_id]
+      properties:
+        client_id: {type: string, pattern: '^[a-z0-9-]{1,32}$'}
+        takeover: {type: boolean, default: false}
+    FileLock:
+      type: object
+      required: [holder_display_name, since, expires_at, mine, held_by_current_session]
+      properties:
+        holder_display_name: {type: string}
+        since: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        mine: {type: boolean}
+        held_by_current_session: {type: boolean}
     File:
       type: object
       required: [id, organization_id, workspace_id, project_id, name, app, format, size_bytes, sha256, head_version_id, version, created_by, created_at, updated_by, updated_at, deleted_at]
@@ -2748,6 +2992,10 @@ components:
         updated_by: {type: string, format: uuid}
         updated_at: {type: string, format: date-time}
         deleted_at: {type: [string, 'null'], format: date-time}
+        can_share: {type: boolean, description: Server-calculated grant-management capability}
+        can_force_lock: {type: boolean, description: Server-calculated force-release capability}
+        lock: {oneOf: [{$ref: '#/components/schemas/FileLock'}, {type: 'null'}]}
+        project: {type: object, required: [id, name], properties: {id: {type: string, format: uuid}, name: {type: string}}, description: Minimal parent metadata included on authorized file reads}
     FilePage:
       type: object
       required: [items, next_cursor]
@@ -3017,9 +3265,9 @@ components:
       required: [email, org_role]
       properties:
         email: {type: string, maxLength: 320}
-        org_role: {type: string, enum: [admin, member]}
-        workspace_id: {type: string, format: uuid, description: Requires workspace_role}
-        workspace_role: {type: string, enum: [admin, editor, viewer], description: Requires workspace_id}
+        org_role: {type: string, enum: [admin, member, guest]}
+        workspace_id: {type: [string, 'null'], format: uuid, description: Guest invitation context only without workspace_role; otherwise required together with workspace_role}
+        workspace_role: {type: [string, 'null'], enum: [admin, editor, viewer, null], description: Forbidden for guest invitations; required with workspace_id for other roles}
     CreatedInvitation:
       type: object
       required: [invitation_id, invite_url, expires_at]
@@ -3035,7 +3283,7 @@ components:
       properties:
         id: {type: string, format: uuid}
         email: {type: string}
-        org_role: {type: string, enum: [admin, member]}
+        org_role: {type: string, enum: [admin, member, guest]}
         workspace_id: {type: [string, 'null'], format: uuid}
         workspace_role: {type: [string, 'null'], enum: [admin, editor, viewer, null]}
         status: {type: string, enum: [pending, accepted, revoked, expired, invalid]}

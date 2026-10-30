@@ -47,10 +47,10 @@ export function canTrashProjects(scope: Scope): boolean {
 /** Roles the viewer may give `target` in the organization (empty: no control). */
 export function assignableOrgRoles(actor: OrgRole | undefined, target: OrgMember): OrgRole[] {
   if (actor === "owner") {
-    return ["owner", "admin", "member"];
+    return ["owner", "admin", "member", "guest"];
   }
   if (actor === "admin" && target.role !== "owner") {
-    return ["admin", "member"];
+    return ["admin", "member", "guest"];
   }
   return [];
 }

@@ -15,8 +15,10 @@ mod auth;
 mod client_ip;
 mod clock;
 mod files;
+mod grants;
 mod health;
 mod invitations;
+mod locks;
 pub mod maintenance;
 mod observe;
 mod orgs;
@@ -139,6 +141,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/projects/{project_id}/files", &["GET", "POST"]),
     ("/api/v1/files/{file_id}", &["GET", "PATCH", "DELETE"]),
     ("/api/v1/files/{file_id}/restore", &["POST"]),
+    ("/api/v1/files/{file_id}/lock", &["POST", "DELETE"]),
+    ("/api/v1/projects/{project_id}/grants", &["GET", "POST"]),
+    ("/api/v1/files/{file_id}/grants", &["GET", "POST"]),
+    ("/api/v1/grants/{grant_id}", &["PATCH", "DELETE"]),
+    ("/api/v1/organizations/{org_id}/shared-with-me", &["GET"]),
     ("/api/v1/files/{file_id}/uploads", &["POST"]),
     ("/api/v1/files/{file_id}/versions", &["GET", "POST"]),
     ("/api/v1/files/{file_id}/versions/{version_id}", &["GET"]),
@@ -294,6 +301,26 @@ pub fn router_with_shared(
                 .delete(files::delete_file),
         )
         .route("/api/v1/files/{file_id}/restore", post(files::restore_file))
+        .route(
+            "/api/v1/files/{file_id}/lock",
+            post(locks::acquire).delete(locks::release),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/grants",
+            get(grants::list_project).post(grants::create_project),
+        )
+        .route(
+            "/api/v1/files/{file_id}/grants",
+            get(grants::list_file).post(grants::create_file),
+        )
+        .route(
+            "/api/v1/grants/{grant_id}",
+            patch(grants::change).delete(grants::revoke),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/shared-with-me",
+            get(grants::shared_with_me),
+        )
         .route(
             "/api/v1/files/{file_id}/uploads",
             post(uploads::create_upload),

@@ -17,13 +17,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use craftcloud_core::ProjectName;
-use craftcloud_core::policy::{Action, Resource, can};
+use craftcloud_core::policy::{Action, ObjectTarget, Resource, can};
 use craftcloud_db::members::OrgTx;
 use craftcloud_db::projects::{
     self, Project, ProjectCreateOutcome, ProjectDeleteOutcome, ProjectRenameOutcome,
     ProjectRestoreOutcome,
 };
-use craftcloud_db::{OrgScope, workspaces};
+use craftcloud_db::{DbError, OrgScope, grants, workspaces};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -34,7 +34,7 @@ use crate::pagination::{PageQuery, TrashListQuery, decode_time_cursor, encode_ti
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::session::AuthenticatedSession;
 use crate::workspaces::{Locked, lock, read_actor};
-use crate::{ApiState, Services, error_response};
+use crate::{ApiState, Services, error_response, error_response_with_details};
 
 // ---- shared helpers ------------------------------------------------------------
 
@@ -166,6 +166,149 @@ pub(crate) async fn resolve_project(
     }
 }
 
+pub(crate) async fn policy_resource(
+    pool: &craftcloud_db::PgPool,
+    user_id: Uuid,
+    org_id: Uuid,
+    workspace_id: Uuid,
+    id: Uuid,
+    action: Action,
+) -> Result<Resource, DbError> {
+    use Action as A;
+    let grant_action = matches!(action, A::GrantList | A::GrantCreate | A::GrantChange);
+    if grant_action {
+        if let Some(location) = craftcloud_db::projects::locate(pool, id).await? {
+            if location.org_id != org_id || location.workspace_id != workspace_id {
+                return Err(DbError::Internal);
+            }
+            let grant_role = grants::project_role_for(pool, org_id, user_id, workspace_id, id)
+                .await?
+                .map(|role| match role {
+                    craftcloud_db::grants::GrantRole::Viewer => {
+                        craftcloud_core::policy::GrantRole::Viewer
+                    }
+                    craftcloud_db::grants::GrantRole::Editor => {
+                        craftcloud_core::policy::GrantRole::Editor
+                    }
+                });
+            return Ok(Resource::Object {
+                org_id,
+                workspace_id,
+                target: ObjectTarget::Project { grant_role },
+            });
+        }
+        let location = craftcloud_db::files::locate(pool, id)
+            .await?
+            .ok_or(DbError::Internal)?;
+        if location.org_id != org_id || location.workspace_id != workspace_id {
+            return Err(DbError::Internal);
+        }
+        let grant_role =
+            grants::role_for(pool, org_id, user_id, workspace_id, id, location.project_id)
+                .await?
+                .map(|role| match role {
+                    craftcloud_db::grants::GrantRole::Viewer => {
+                        craftcloud_core::policy::GrantRole::Viewer
+                    }
+                    craftcloud_db::grants::GrantRole::Editor => {
+                        craftcloud_core::policy::GrantRole::Editor
+                    }
+                });
+        return Ok(Resource::Object {
+            org_id,
+            workspace_id,
+            target: ObjectTarget::File { grant_role },
+        });
+    }
+    let project_action = matches!(
+        action,
+        A::ProjectRead
+            | A::FileList
+            | A::FileCreate
+            | A::ProjectRename
+            | A::ProjectDelete
+            | A::ProjectRestore
+    );
+    let file_action = matches!(
+        action,
+        A::FileRead
+            | A::FileRename
+            | A::FileDelete
+            | A::FileRestore
+            | A::UploadCreate
+            | A::UploadWrite
+            | A::VersionList
+            | A::VersionRead
+            | A::FileDownload
+            | A::VersionCommit
+            | A::VersionRestore
+            | A::FileLockAcquire
+            | A::FileLockRelease
+            | A::FileLockForce
+    );
+    if project_action {
+        let grant_role = grants::project_role_for(pool, org_id, user_id, workspace_id, id)
+            .await?
+            .map(|role| match role {
+                craftcloud_db::grants::GrantRole::Viewer => {
+                    craftcloud_core::policy::GrantRole::Viewer
+                }
+                craftcloud_db::grants::GrantRole::Editor => {
+                    craftcloud_core::policy::GrantRole::Editor
+                }
+            });
+        Ok(Resource::Object {
+            org_id,
+            workspace_id,
+            target: ObjectTarget::Project { grant_role },
+        })
+    } else if file_action {
+        let location = craftcloud_db::files::locate(pool, id)
+            .await?
+            .ok_or(DbError::Internal)?;
+        let grant_role =
+            grants::role_for(pool, org_id, user_id, workspace_id, id, location.project_id)
+                .await?
+                .map(|role| match role {
+                    craftcloud_db::grants::GrantRole::Viewer => {
+                        craftcloud_core::policy::GrantRole::Viewer
+                    }
+                    craftcloud_db::grants::GrantRole::Editor => {
+                        craftcloud_core::policy::GrantRole::Editor
+                    }
+                });
+        Ok(Resource::Object {
+            org_id,
+            workspace_id,
+            target: ObjectTarget::File { grant_role },
+        })
+    } else {
+        Ok(Resource::Workspace {
+            org_id,
+            workspace_id,
+        })
+    }
+}
+pub(crate) fn locked_response(
+    lock: &craftcloud_db::locks::FileLock,
+    session_id: Uuid,
+    user_id: Uuid,
+    headers: &HeaderMap,
+) -> Response {
+    error_response_with_details(
+        StatusCode::LOCKED,
+        "FILE_LOCKED",
+        "Another session holds the editing lease.",
+        headers,
+        Some(json!({
+            "holder": { "display_name": lock.display_name },
+            "since": rfc3339(lock.acquired_at),
+            "expires_at": rfc3339(lock.expires_at),
+            "mine": lock.holder_user_id == user_id,
+            "held_by_current_session": lock.holder_session_id == session_id && lock.holder_user_id == user_id
+        })),
+    )
+}
 /// Policy decision for a read of the resolved workspace; the scope of the
 /// permitted action.
 pub(crate) async fn read_gate(
@@ -184,14 +327,17 @@ pub(crate) async fn read_gate(
     )
     .await
     .map_err(|error| Box::new(db_failure(&error, headers, "actor lookup failed")))?;
-    let decision = can(
-        &actor,
+    let resource = policy_resource(
+        &resolved.services.pool,
+        session.user_id,
+        resolved.org_id,
+        resolved.workspace_id,
+        resolved.id,
         action,
-        &Resource::Workspace {
-            org_id: resolved.org_id,
-            workspace_id: resolved.workspace_id,
-        },
-    );
+    )
+    .await
+    .map_err(|error| Box::new(db_failure(&error, headers, "object grant lookup failed")))?;
+    let decision = can(&actor, action, &resource);
     match gate(
         decision,
         headers,
@@ -217,7 +363,7 @@ pub(crate) async fn write_gate(
     name: &str,
     target: Uuid,
 ) -> Result<(OrgTx, OrgScope), Box<Response>> {
-    let Locked { tx, actor } = lock(
+    let Locked { mut tx, actor } = lock(
         &resolved.services.pool,
         session.user_id,
         resolved.org_id,
@@ -225,14 +371,11 @@ pub(crate) async fn write_gate(
         headers,
     )
     .await?;
-    let decision = can(
-        &actor,
-        action,
-        &Resource::Workspace {
-            org_id: resolved.org_id,
-            workspace_id: resolved.workspace_id,
-        },
-    );
+    let resource = tx
+        .policy_resource(session.user_id, resolved.workspace_id, resolved.id, action)
+        .await
+        .map_err(|error| Box::new(db_failure(&error, headers, "object grant lookup failed")))?;
+    let decision = can(&actor, action, &resource);
     match gate(
         decision,
         headers,
@@ -241,9 +384,61 @@ pub(crate) async fn write_gate(
         Some(resolved.org_id),
         Some(target),
     ) {
-        Gate::Open(permit) => OrgScope::from_permit(&permit)
-            .map(|scope| (tx, scope))
-            .ok_or_else(|| Box::new(internal(headers))),
+        Gate::Open(permit) => {
+            if matches!(action, Action::ProjectDelete | Action::ProjectRestore) {
+                match tx
+                    .active_project_lock(resolved.id, session.session_id)
+                    .await
+                {
+                    Ok(Some(lock)) if lock.holder_session_id != session.session_id => {
+                        return Err(Box::new(locked_response(
+                            &lock,
+                            session.session_id,
+                            session.user_id,
+                            headers,
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Err(Box::new(db_failure(
+                            &error,
+                            headers,
+                            "project lock lookup failed",
+                        )));
+                    }
+                }
+            }
+            if matches!(
+                action,
+                Action::FileRename
+                    | Action::FileDelete
+                    | Action::FileRestore
+                    | Action::UploadCreate
+                    | Action::VersionRestore
+            ) {
+                match tx.file_lock(resolved.id).await {
+                    Ok(Some(lock)) if lock.holder_session_id != session.session_id => {
+                        return Err(Box::new(locked_response(
+                            &lock,
+                            session.session_id,
+                            session.user_id,
+                            headers,
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Err(Box::new(db_failure(
+                            &error,
+                            headers,
+                            "file lock lookup failed",
+                        )));
+                    }
+                }
+            }
+            OrgScope::from_permit(&permit)
+                .map(|scope| (tx, scope))
+                .ok_or_else(|| Box::new(internal(headers)))
+        }
         Gate::Closed(response) => Err(Box::new(response)),
     }
 }
@@ -275,6 +470,7 @@ fn project_json(p: &Project) -> Value {
         "updated_by": p.updated_by_user_id.to_string(),
         "updated_at": rfc3339(p.updated_at),
         "deleted_at": opt_time(p.deleted_at),
+        "can_share": false,
     })
 }
 
@@ -424,7 +620,44 @@ pub(crate) async fn list_projects(
     } else {
         None
     };
-    let items: Vec<_> = rows.iter().map(project_json).collect();
+    let actor = match crate::workspaces::read_actor(
+        &resolved.services.pool,
+        session.user_id,
+        resolved.org_id,
+        resolved.workspace_id,
+    )
+    .await
+    {
+        Ok(actor) => actor,
+        Err(error) => return db_failure(&error, &headers, "actor lookup failed"),
+    };
+    let mut items: Vec<_> = rows.iter().map(project_json).collect();
+    for (item, project) in items.iter_mut().zip(&rows) {
+        let resource = match policy_resource(
+            &resolved.services.pool,
+            session.user_id,
+            resolved.org_id,
+            resolved.workspace_id,
+            project.id,
+            Action::GrantCreate,
+        )
+        .await
+        {
+            Ok(resource) => resource,
+            Err(error) => return db_failure(&error, &headers, "grant lookup failed"),
+        };
+        let Some(item) = item.as_object_mut() else {
+            return internal(&headers);
+        };
+        item.insert(
+            "can_share".to_owned(),
+            json!(
+                can(&actor, Action::GrantCreate, &resource)
+                    .permit()
+                    .is_some()
+            ),
+        );
+    }
     Json(json!({ "items": items, "next_cursor": next })).into_response()
 }
 
@@ -454,7 +687,49 @@ pub(crate) async fn get_project(
         Err(response) => return *response,
     };
     match projects::get(&resolved.services.pool, &scope, resolved.id).await {
-        Ok(Some(project)) => project_response(StatusCode::OK, &project),
+        Ok(Some(project)) => {
+            let actor = match crate::workspaces::read_actor(
+                &resolved.services.pool,
+                session.user_id,
+                resolved.org_id,
+                resolved.workspace_id,
+            )
+            .await
+            {
+                Ok(actor) => actor,
+                Err(error) => return db_failure(&error, &headers, "actor lookup failed"),
+            };
+            let resource = match policy_resource(
+                &resolved.services.pool,
+                session.user_id,
+                resolved.org_id,
+                resolved.workspace_id,
+                resolved.id,
+                Action::GrantCreate,
+            )
+            .await
+            {
+                Ok(resource) => resource,
+                Err(error) => return db_failure(&error, &headers, "grant lookup failed"),
+            };
+            let mut value = project_json(&project);
+            let Some(object) = value.as_object_mut() else {
+                return internal(&headers);
+            };
+            object.insert(
+                "can_share".to_owned(),
+                json!(
+                    can(&actor, Action::GrantCreate, &resource)
+                        .permit()
+                        .is_some()
+                ),
+            );
+            with_etag(
+                (StatusCode::OK, Json(value)).into_response(),
+                ETAG,
+                project.version,
+            )
+        }
         Ok(None) => not_found(&headers),
         Err(error) => db_failure(&error, &headers, "project read failed"),
     }

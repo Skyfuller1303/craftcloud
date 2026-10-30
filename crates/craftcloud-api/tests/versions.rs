@@ -455,7 +455,9 @@ mod tests {
         assert_eq!(state, "stored");
         // ... and becomes a new file in the same workspace without uploading again.
         let copy = w.file(&c.editor2.1, c.project, "design (copy).fig").await;
-        let saved = w.first_commit(&c.editor2.1, copy, up_d).await;
+        hidden(&w.first_commit(&c.editor2.1, copy, up_d).await);
+        let copy_upload = w.stored_upload(&c.editor2.1, copy, &pattern(700, 24)).await;
+        let saved = w.first_commit(&c.editor2.1, copy, copy_upload).await;
         assert_eq!(saved.status, StatusCode::CREATED, "{}", saved.text);
         assert_eq!(saved.body["file_id"], copy.to_string());
         assert_eq!(saved.body["size_bytes"], 700);
@@ -466,6 +468,148 @@ mod tests {
         let rebased = w.next_commit(&c.editor2.1, c.file, up_b, v2_id).await;
         assert_eq!(rebased.status, StatusCode::CREATED, "{}", rebased.text);
         assert_eq!(rebased.body["number"], 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn lease_blocks_version_commit_and_restore_but_allows_reads() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let v1 = w.push(&c.editor.1, c.file, &pattern(128, 1)).await;
+        let v2 = w.push(&c.editor.1, c.file, &pattern(256, 2)).await;
+        let upload = w.stored_upload(&c.editor.1, c.file, &pattern(512, 3)).await;
+        let lease = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{}/lock", c.file))
+                    .session(&c.editor2.1)
+                    .json(json!({"client_id":"version-owner"})),
+            )
+            .await;
+        assert_eq!(lease.status, StatusCode::OK, "{}", lease.text);
+        let commit = w.next_commit(&c.editor.1, c.file, upload, v2).await;
+        assert_status(&commit, StatusCode::LOCKED, "FILE_LOCKED");
+        let restore = w
+            .send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{v1}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(v2)),
+            )
+            .await;
+        assert_status(&restore, StatusCode::LOCKED, "FILE_LOCKED");
+        assert_eq!(
+            w.get(&c.editor.1, &format!("/api/v1/files/{}/versions", c.file))
+                .await
+                .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            w.download(
+                &c.editor.1,
+                &format!("/api/v1/files/{}/content", c.file),
+                None
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            w.delete(&c.editor2.1, &format!("/api/v1/files/{}/lock", c.file))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        let restored = w
+            .send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{v1}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(v2)),
+            )
+            .await;
+        assert_eq!(restored.status, StatusCode::CREATED, "{}", restored.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn file_editor_grant_can_commit_but_revocation_before_commit_is_rechecked() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let grant = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/grants", c.file),
+                &c.owner.1,
+                json!({"user_id":c.plain.0.to_string(),"role":"editor"}),
+            )
+            .await;
+        assert_eq!(grant.status, StatusCode::CREATED, "{}", grant.text);
+        let data = pattern(256, 73);
+        let upload = w.stored_upload(&c.plain.1, c.file, &data).await;
+        let committed = w.first_commit(&c.plain.1, c.file, upload).await;
+        assert_eq!(committed.status, StatusCode::CREATED, "{}", committed.text);
+
+        let pending = w.stored_upload(&c.plain.1, c.file, &data).await;
+        let grant_id = id_of(&grant);
+        assert_eq!(
+            w.delete(&c.owner.1, &format!("/api/v1/grants/{grant_id}"))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        hidden(&w.first_commit(&c.plain.1, c.file, pending).await);
+        let state: String = sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id=$1")
+            .bind(pending)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "stored",
+            "revoked grant leaves upload recoverable but commits no version"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn an_upload_is_bound_to_its_file_even_with_a_foreign_target_lease() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let other_file = w.file(&c.editor.1, c.project, "other.fig").await;
+        let upload = w
+            .stored_upload(&c.editor.1, c.file, &pattern(128, 42))
+            .await;
+        let lease = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{other_file}/lock"))
+                    .session(&c.editor2.1)
+                    .json(json!({"client_id":"editor-two"})),
+            )
+            .await;
+        assert_eq!(lease.status, StatusCode::OK, "{}", lease.text);
+        forbidden(&w.first_commit(&c.editor2.1, c.file, upload).await);
+        let untouched: String = sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id=$1")
+            .bind(upload)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            untouched, "stored",
+            "another editor cannot commit the creator's upload"
+        );
+        hidden(&w.first_commit(&c.editor.1, other_file, upload).await);
+        let state: String = sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id=$1")
+            .bind(upload)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "stored", "cross-file attempt changes nothing");
+        let committed = w.first_commit(&c.editor.1, c.file, upload).await;
+        assert_eq!(committed.status, StatusCode::CREATED, "{}", committed.text);
+        assert_eq!(committed.body["file_id"], c.file.to_string());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

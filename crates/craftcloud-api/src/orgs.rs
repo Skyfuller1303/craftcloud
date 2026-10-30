@@ -485,12 +485,20 @@ pub(crate) async fn update_org(
 
 // ---- GET /organizations/{org_id}/members -----------------------------------
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MemberPageQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+    query: Option<String>,
+}
+
 pub(crate) async fn list_members(
     State(state): State<ApiState>,
     headers: HeaderMap,
     session: AuthenticatedSession,
     Path(org_raw): Path<String>,
-    query: Result<Query<PageQuery>, QueryRejection>,
+    query: Result<Query<MemberPageQuery>, QueryRejection>,
 ) -> Response {
     let Some(services) = state.services.clone() else {
         return unavailable(&headers, "AUTH_UNAVAILABLE");
@@ -525,31 +533,87 @@ pub(crate) async fn list_members(
     let Some(scope) = OrgScope::from_permit(&permit) else {
         return internal(&headers);
     };
-    let Ok(Query(page)) = query else {
+    let Ok(Query(member_page)) = query else {
         return validation_failed(&["query"], &headers);
+    };
+    let search = member_page
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_lowercase);
+    let page = PageQuery {
+        limit: member_page.limit,
+        cursor: member_page.cursor,
     };
     let limit = match page.limit() {
         Ok(limit) => limit,
         Err(error) => return page_error(error, &headers),
     };
-    let scope_text = org_id.to_string();
+    let scope_text = search
+        .as_ref()
+        .map_or_else(|| org_id.to_string(), |term| format!("{org_id}:{term}"));
+    let cursor_kind = if search.is_some() {
+        "member-search"
+    } else {
+        "members"
+    };
     let after = match page
         .cursor()
-        .map(|c| decode_time_cursor(c, "members", &scope_text))
+        .map(|c| decode_time_cursor(c, cursor_kind, &scope_text))
     {
         Some(Ok(key)) => Some(key),
         Some(Err(error)) => return page_error(error, &headers),
         None => None,
     };
-    let mut rows =
-        match craftcloud_db::members::list(&services.pool, &scope, limit + 1, after).await {
-            Ok(rows) => rows,
-            Err(error) => return db_failure(&error, &headers, "member list failed"),
+    if let Some(term) = &search {
+        if term.chars().count() < 2 || term.chars().count() > 100 {
+            return validation_failed(&["query"], &headers);
+        }
+        let grant_manager: bool = match craftcloud_db::members::can_manage_grants(
+            &services.pool,
+            org_id,
+            session.user_id,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(error) => {
+                return db_failure(&error, &headers, "member search authorization failed");
+            }
         };
+        let decision = craftcloud_core::policy::can(
+            &actor,
+            Action::MemberSearch,
+            &Resource::MemberSearch {
+                org_id,
+                grant_manager,
+            },
+        );
+        match gate(
+            decision,
+            &headers,
+            session.user_id,
+            "member.search",
+            Some(org_id),
+            None,
+        ) {
+            Gate::Open(_) => {}
+            Gate::Closed(response) => return response,
+        }
+    }
+    let mut rows = match if let Some(term) = &search {
+        craftcloud_db::members::search(&services.pool, &scope, term, limit + 1, after).await
+    } else {
+        craftcloud_db::members::list(&services.pool, &scope, limit + 1, after).await
+    } {
+        Ok(rows) => rows,
+        Err(error) => return db_failure(&error, &headers, "member list failed"),
+    };
     let next = if rows.len() > limit as usize {
         rows.truncate(limit as usize);
         rows.last()
-            .map(|last| encode_time_cursor("members", &scope_text, last.joined_at, last.user_id))
+            .map(|last| encode_time_cursor(cursor_kind, &scope_text, last.joined_at, last.user_id))
     } else {
         None
     };

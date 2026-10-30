@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "react-aria-components";
-import type { Organization, Project, SessionInfo, Workspace } from "../api/types.ts";
+import type { Organization, Project, ServerInfo, SessionInfo, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { ContextSelect } from "../components/ContextSelect.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
@@ -18,6 +18,7 @@ import { InvitationsScreen } from "./InvitationsScreen.tsx";
 import { MembersScreen } from "./MembersScreen.tsx";
 import { ProjectsScreen } from "./ProjectsScreen.tsx";
 import { SystemScreen } from "./SystemScreen.tsx";
+import { SharedWithMeScreen } from "./SharedWithMeScreen.tsx";
 
 /**
  * Dashboard sections. Settings follows with a later ticket and stays a
@@ -30,6 +31,7 @@ const CONTENT_SECTIONS = [
   "members",
   "invitations",
   "activity",
+  "shared",
 ] as const;
 const ADMIN_SECTIONS = ["settings", "system"] as const;
 type Section = (typeof CONTENT_SECTIONS)[number] | (typeof ADMIN_SECTIONS)[number];
@@ -55,6 +57,7 @@ export function Shell({
   const [projectId, setProjectId] = useState<string | null>(null);
   const names = useRoleNames();
   const [logoutError, setLogoutError] = useState<unknown>(null);
+  const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
   const attemptLogout = useCallback(() => {
     setLogoutError(null);
     logout().catch((error: unknown) => setLogoutError(error));
@@ -62,6 +65,15 @@ export function Shell({
 
   const loadOrganizations = useCallback((cursor?: string) => api.listOrganizations(cursor), [api]);
   const organizations = usePagedList<Organization>(loadOrganizations);
+
+  useEffect(() => {
+    let current = true;
+    api.serverInfo().then(
+      (info) => { if (current) setServerInfo(info); },
+      () => { if (current) setServerInfo({ features: [] }); },
+    );
+    return () => { current = false; };
+  }, [api]);
 
   useEffect(() => {
     if (organizations.status !== "ready" || organizations.items.length === 0) {
@@ -109,10 +121,23 @@ export function Shell({
     invitations: t("Invitations"),
     settings: t("Settings"),
     activity: t("Activity"),
+    shared: t("Shared with me"),
     system: t("System"),
   };
   const isOperator = session.instance_role === "operator";
-  const visibleAdminSections = ADMIN_SECTIONS.filter((key) => key !== "system" || isOperator);
+  const isGuest = organization?.role === "guest";
+  const limitedNavigation = isGuest || organization === null;
+  useEffect(() => {
+    if (isGuest && !(section === "system" && isOperator) && !["overview", "shared"].includes(section)) {
+      setSection("shared");
+    }
+  }, [isGuest, isOperator, section]);
+  const visibleContentSections = CONTENT_SECTIONS.filter((key) =>
+    key === "shared"
+      ? serverInfo?.features.includes("sharing.grants") === true
+      : !limitedNavigation || key === "overview",
+  );
+  const visibleAdminSections = ADMIN_SECTIONS.filter((key) => key === "system" ? isOperator : !limitedNavigation);
 
   return (
     <div className="shell">
@@ -163,7 +188,7 @@ export function Shell({
       <div className="shell__body">
         <nav className="shell__nav" aria-label={t("Main navigation")}>
           <ul>
-            {CONTENT_SECTIONS.map((key) => (
+            {visibleContentSections.map((key) => (
               <li key={key}>
                 <button
                   type="button"
@@ -239,7 +264,9 @@ export function Shell({
             </Button>
           )}
 
-          {section === "overview" ? (
+          {limitedNavigation && section !== "overview" && section !== "shared" && !(section === "system" && isOperator) ? (
+            <EmptyState>{t("This view is not available yet.")}</EmptyState>
+          ) : section === "overview" ? (
             <dl className="facts">
               <dt>{t("Signed in as")}</dt>
               <dd>
@@ -288,6 +315,8 @@ export function Shell({
             />
           ) : section === "system" ? (
             <SystemScreen isOperator={isOperator} />
+          ) : section === "shared" ? (
+            <SharedWithMeScreen organizationId={organizationId} />
           ) : (
             <EmptyState>{t("This view is not available yet.")}</EmptyState>
           )}

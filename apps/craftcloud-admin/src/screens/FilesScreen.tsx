@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Checkbox } from "react-aria-components";
-import type { FileRecord, Project } from "../api/types.ts";
+import type { FileLock, FileRecord, Project } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
 import { Badge } from "../components/Badge.tsx";
@@ -10,7 +10,7 @@ import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Icon } from "../components/Icon.tsx";
 import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
 import { formatBytes, formatDateTime } from "../format.ts";
-import { useAction } from "../hooks.ts";
+import { useAction, useLeaseRefresh } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
 import { canWriteContent } from "../permissions.ts";
 import type { Scope } from "../permissions.ts";
@@ -18,6 +18,8 @@ import { usePagedList } from "../usePagedList.ts";
 import { UploadDialog } from "./UploadDialog.tsx";
 import type { UploadTarget } from "./UploadDialog.tsx";
 import { VersionsDialog } from "./VersionsDialog.tsx";
+import { SharingDialog } from "./SharingDialog.tsx";
+import type { ShareTarget } from "./SharingDialog.tsx";
 
 export function FilesScreen({
   scope,
@@ -35,8 +37,11 @@ export function FilesScreen({
   const [uploading, setUploading] = useState<UploadTarget | null>(null);
   const [versionsOf, setVersionsOf] = useState<FileRecord | null>(null);
   const [trashing, setTrashing] = useState<FileRecord | null>(null);
+  const [unlocking, setUnlocking] = useState<FileRecord | null>(null);
+  const [sharing, setSharing] = useState<ShareTarget | null>(null);
   const trashAction = useAction();
   const restoreAction = useAction();
+  const unlockAction = useAction();
 
   const workspaceId = scope.workspace?.id ?? null;
   const loadProjects = useMemo(
@@ -76,6 +81,47 @@ export function FilesScreen({
     [api, selectedId, showTrash],
   );
   const files = usePagedList<FileRecord>(loadFiles);
+  const [lockOverrides, setLockOverrides] = useState<Record<string, { source: FileRecord; lock: FileLock | null }>>({});
+  const currentFileScope = useRef("");
+  currentFileScope.current = `${selectedId ?? ""}:${showTrash}`;
+  useEffect(() => {
+    setLockOverrides((current) => {
+      const stillCurrent = Object.entries(current).filter(([id, override]) =>
+        files.items.some((file) => file.id === id && file === override.source),
+      );
+      return stillCurrent.length === Object.keys(current).length ? current : Object.fromEntries(stillCurrent);
+    });
+  }, [files.items]);
+  const lockForFile = (file: FileRecord): FileLock | null =>
+    lockOverrides[file.id]?.source === file
+      ? lockOverrides[file.id]?.lock ?? null
+      : file.lock ?? null;
+  const lockExpiry = files.items.reduce<string | null>((soonest, file) => {
+    const expiry = lockForFile(file)?.expires_at;
+    if (expiry == null) return soonest;
+    return soonest === null || Date.parse(expiry) < Date.parse(soonest) ? expiry : soonest;
+  }, null);
+  const lease = useLeaseRefresh(lockExpiry, async () => {
+    const scope = currentFileScope.current;
+    const expired = files.items.filter((file) => {
+      const lock = lockForFile(file);
+      return lock !== null && Date.parse(lock.expires_at) <= Date.now();
+    });
+    const refreshed = await Promise.all(expired.map(async (file) => {
+      const updated = await api.getFile(file.id);
+      return [file.id, updated.lock ?? null] as const;
+    }));
+    if (currentFileScope.current === scope) {
+      const sourceById = new Map(files.items.map((file) => [file.id, file]));
+      setLockOverrides((current) => ({
+        ...current,
+        ...Object.fromEntries(refreshed.flatMap(([id, lock]) => {
+          const source = sourceById.get(id);
+          return source === undefined ? [] : [[id, { source, lock }]];
+        })),
+      }));
+    }
+  });
   const mayWrite = canWriteContent(scope);
 
   if (scope.workspace === null || workspaceId === null) {
@@ -105,6 +151,7 @@ export function FilesScreen({
       {projects.status === "error" && (
         <ErrorNotice error={projects.error} onRetry={projects.reload} onReload={projects.reload} />
       )}
+      {lease.error !== null && <ErrorNotice error={lease.error} onRetry={() => void lease.retry()} onReload={() => void lease.retry()} />}
       {projects.status === "ready" && projects.items.length === 0 && (
         <p className="muted">{t("This workspace has no projects yet.")}</p>
       )}
@@ -151,9 +198,14 @@ export function FilesScreen({
                   </tr>
                 </thead>
                 <tbody>
-                  {files.items.map((file) => (
+                  {files.items.map((file) => {
+                    const fileLock = lockForFile(file);
+                    return (
                     <tr key={file.id}>
-                      <th scope="row">{file.name}</th>
+                      <th scope="row">
+                        {file.name}
+                        {fileLock !== null && <span className="cell__sub"><Badge tone="warn">{t("In progress")}</Badge> {t("In progress by {name}, since {time}.", { name: fileLock.holder_display_name, time: formatDateTime(language, fileLock.since) })}</span>}
+                      </th>
                       <td className="hash col--optional" data-label={t("Format")}>
                         {file.app} · {file.format}
                       </td>
@@ -179,18 +231,33 @@ export function FilesScreen({
                             <Button
                               className="button button--sm"
                               aria-label={t("Versions of {name}", { name: file.name })}
-                              onPress={() => setVersionsOf(file)}
+                              onPress={() => setVersionsOf({ ...file, lock: fileLock })}
                             >
                               {t("Versions")}
+                            </Button>
+                          )}
+                          {!showTrash && file.can_share === true && (
+                            <Button className="button button--sm" aria-label={t("Share {name}", { name: file.name })} onPress={() => setSharing({ kind: "file", id: file.id, name: file.name })}>
+                              {t("Share")}
                             </Button>
                           )}
                           {!showTrash && mayWrite && (
                             <Button
                               className="button button--sm"
                               aria-label={t("Upload a new version of {name}", { name: file.name })}
-                              onPress={() => setUploading({ kind: "new-version", file })}
+                              isDisabled={fileLock !== null && !fileLock.held_by_current_session}
+                              {...(fileLock !== null && !fileLock.held_by_current_session ? { "aria-describedby": `file-lock-note-${file.id}` } : {})}
+                              onPress={() => setUploading({ kind: "new-version", file: { ...file, lock: fileLock } })}
                             >
                               {t("New version")}
+                            </Button>
+                          )}
+                          {!showTrash && mayWrite && fileLock !== null && !fileLock.held_by_current_session && (
+                            <span id={`file-lock-note-${file.id}`} className="cell__sub">{t("A new version is unavailable until this edit lock is released.")}</span>
+                          )}
+                          {!showTrash && file.can_force_lock === true && fileLock !== null && (
+                            <Button className="button button--danger-quiet button--sm" aria-label={t("Release lock for {name}", { name: file.name })} onPress={() => setUnlocking({ ...file, lock: fileLock })}>
+                              {t("Release lock")}
                             </Button>
                           )}
                           {!showTrash && mayWrite && (
@@ -223,7 +290,8 @@ export function FilesScreen({
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -277,6 +345,39 @@ export function FilesScreen({
               });
           }}
         />
+      )}
+
+      {unlocking !== null && unlocking.lock != null && (
+        <ConfirmDialog
+          title={t("Release edit lock")}
+          message={t("Release the edit lock held by {name}?", { name: unlocking.lock.holder_display_name })}
+          confirmLabel={t("Release lock")}
+          danger
+          busy={unlockAction.pending}
+          error={unlockAction.failed ? unlockAction.error : null}
+          onClose={() => { setUnlocking(null); unlockAction.clear(); }}
+          onReload={() => { files.refresh(); setUnlocking(null); unlockAction.clear(); }}
+          onConfirm={() => {
+            const target = unlocking;
+            void unlockAction.run(async () => {
+              await api.releaseFileLock(target.id, true);
+              return true;
+            }).then((done) => {
+              if (done === true) {
+                const source = files.items.find((item) => item.id === target.id);
+                if (source !== undefined) {
+                  setLockOverrides((current) => ({ ...current, [target.id]: { source, lock: null } }));
+                }
+                files.refresh();
+                setUnlocking(null);
+              }
+            });
+          }}
+        />
+      )}
+
+      {sharing !== null && scope.organization !== null && (
+        <SharingDialog target={sharing} organizationId={scope.organization.id} onClose={() => setSharing(null)} />
       )}
     </>
   );

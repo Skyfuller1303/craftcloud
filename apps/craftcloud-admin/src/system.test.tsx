@@ -2,6 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import {
+  ORG_A,
   SESSION,
   apiError,
   expectNoAxeViolations,
@@ -159,6 +160,31 @@ describe("system view", () => {
     await waitFor(() => expect(within(nav).getAllByRole("button").length).toBeGreaterThan(5));
     expect(within(nav).queryByRole("button", { name: "System" })).toBeNull();
     expect(calls.some((call) => call.path === "/admin/health")).toBe(false);
+  });
+
+  it("keeps system access for an operator without an organization", async () => {
+    const { fetch, calls } = mockFetch(viewRoutes({
+      "GET /organizations": { body: { items: [], next_cursor: null } },
+      "GET /admin/health": { body: HEALTH },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await user.click(await screen.findByRole("button", { name: "System" }));
+    await screen.findByText("1.2.3");
+    expect(calls.some((call) => call.path === "/admin/health")).toBe(true);
+  });
+
+  it("keeps operator system access while a guest organization is selected", async () => {
+    const { fetch, calls } = mockFetch(viewRoutes({
+      "GET /organizations": { body: { items: [{ ...ORG_A, role: "guest" }], next_cursor: null } },
+      [`GET /organizations/${ORG_A.id}/workspaces`]: { body: { items: [], next_cursor: null } },
+      "GET /admin/health": { body: HEALTH },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await user.click(await screen.findByRole("button", { name: "System" }));
+    await screen.findByText("1.2.3");
+    expect(calls.some((call) => call.path === "/admin/health")).toBe(true);
   });
 
   it("is shown in German", async () => {

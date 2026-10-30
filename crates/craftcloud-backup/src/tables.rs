@@ -60,6 +60,7 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("blobs", 8),
     table("upload_sessions", 8),
     table("file_versions", 9),
+    table("grants", 16),
     table("audit_events", 11),
 ];
 
@@ -76,6 +77,7 @@ pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("password_reset_tokens", 4),
     ("storage_binding", 10),
     ("maintenance_runs", 10),
+    ("file_locks", 16),
 ];
 
 /// The names of [`EXCLUDED_WITH_VERSION`].
@@ -84,6 +86,7 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "password_reset_tokens",
     "storage_binding",
     "maintenance_runs",
+    "file_locks",
 ];
 
 /// The migration bookkeeping table: recreated by running the migrations.
@@ -161,12 +164,26 @@ mod tests {
     #[test]
     fn the_table_set_follows_the_migration_version() {
         // Every current table exists from the first supported version on.
+        // AC-03 extends that original table set with grants at migration 16.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len()
+            BACKUP_TABLES.len() - 1
         );
-        assert_eq!(backup_tables_for(14).unwrap().len(), BACKUP_TABLES.len());
-        assert_eq!(excluded_tables_for(14), EXCLUDED_TABLES);
+        assert!(
+            !backup_tables_for(15)
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "grants")
+        );
+        assert!(
+            backup_tables_for(16)
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "grants")
+        );
+        assert!(!excluded_tables_for(15).contains(&"file_locks"));
+        assert_eq!(backup_tables_for(16).unwrap().len(), BACKUP_TABLES.len());
+        assert_eq!(excluded_tables_for(16), EXCLUDED_TABLES);
         // Older schemas are refused with a clear reason.
         let error = backup_tables_for(MIN_BACKUP_MIGRATION - 1).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Format);

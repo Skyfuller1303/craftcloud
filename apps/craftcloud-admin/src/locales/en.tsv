@@ -410,3 +410,26 @@
 	Last backup	Last backup
 	No successful backup recorded yet.	No successful backup recorded yet.
 	System	System
+	Guest	Guest
+	Share	Share
+	Share {name}	Share {name}
+	People with access	People with access
+	No one else has access yet.	No one else has access yet.
+	Loading shares…	Loading shares…
+	Add a person	Add a person
+	Search organization members	Search organization members
+	Searching…	Searching…
+	No members found.	No members found.
+	Role for {name}	Role for {name}
+	Remove access	Remove access
+	{name} will lose access to {target}.	{name} will lose access to {target}.
+	Shared with me	Shared with me
+	Nothing has been shared with you yet.	Nothing has been shared with you yet.
+	Loading shared items…	Loading shared items…
+	In progress	In progress
+	In progress by {name}, since {time}.	In progress by {name}, since {time}.
+	A new version is unavailable until this edit lock is released.	A new version is unavailable until this edit lock is released.
+	Release lock	Release lock
+	Release lock for {name}	Release lock for {name}
+	Release edit lock	Release edit lock
+	Release the edit lock held by {name}?	Release the edit lock held by {name}?

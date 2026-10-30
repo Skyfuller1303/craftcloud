@@ -2,6 +2,10 @@
 
 ## Blocking decisions
 
+### AC-03 work in progress
+
+Backend work adds tenant-bound project/file grants, guest invitations without workspace-role creation, scoped `shared-with-me`, constrained grant-recipient search, five-minute session-bound file leases, and server-calculated sharing/force-lock capabilities. OpenAPI and migration 0016 are being updated with the implementation. Remaining acceptance gates: finish all grants and member-search API tests, run DB integration tests (Docker is unavailable in the current OS context), and complete the coordinated Rust/API validation. Grants are backed up; ephemeral file locks are excluded from backup and restore. See [AC-03 brief](12-app-cloud/ac-03-shares-and-edit-locks.md) and [ADR-0020](09-decisions/adr-0020-grants-and-edit-locks.md).
+
 1. `craftrules` inaccessible via public GitHub; confirm shared standards.
 2. Official repository/name and licensing consent absent.
 3. Identity provider strategy and role matrix not reviewed.

@@ -8,7 +8,7 @@ export function useRoleNames(): {
 } {
   const { t } = useI18n();
   return {
-    orgRole: (role) => ({ owner: t("Owner"), admin: t("Admin"), member: t("Member") })[role],
+    orgRole: (role) => ({ owner: t("Owner"), admin: t("Admin"), member: t("Member"), guest: t("Guest") })[role],
     workspaceRole: (role) =>
       role === null
         ? t("No workspace role")
