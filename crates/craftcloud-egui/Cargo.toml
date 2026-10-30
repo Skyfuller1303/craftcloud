@@ -1,0 +1,12 @@
+[package]
+name = "craftcloud-egui"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+egui = "0.36.2"
+
+[lints]
+workspace = true

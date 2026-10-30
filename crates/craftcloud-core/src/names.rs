@@ -265,6 +265,13 @@ impl FileApp {
 pub struct FileFormat(String);
 
 impl FileFormat {
+    /// Suggests the registry application for this validated format identifier.
+    /// Unknown formats retain support through the generic application.
+    #[must_use]
+    pub fn registered_app(&self) -> &'static str {
+        crate::formats::app_for_extension(self.as_str())
+    }
+
     /// Parses `raw`.
     ///
     /// # Errors

@@ -2,6 +2,10 @@
 resolver = "3"
 members = [
     "apps/craftcloud-server",
+    "apps/craftcloud-egui-demo",
+    "crates/craftcloud-client",
+    "crates/craftcloud-client-native",
+    "crates/craftcloud-egui",
     "crates/craftcloud-core",
     "crates/craftcloud-api",
     "crates/craftcloud-backup",

@@ -1,0 +1,21 @@
+[package]
+name = "craftcloud-client"
+version.workspace = true
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid = { version = "1", features = ["serde"] }
+url.workspace = true
+zeroize = "1"
+
+[dev-dependencies]
+serde_yaml_ng = "0.10"
+
+[lints]
+workspace = true

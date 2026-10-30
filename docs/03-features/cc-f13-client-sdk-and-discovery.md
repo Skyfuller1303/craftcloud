@@ -1,6 +1,6 @@
 # CC-F13 — Gemeinsames Client SDK und Server-Discovery
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P4 (Client SDK / first app). **Priorität:** später / nur nach Gate.  
+> **Status:** AC-04 implementiert die drei SDK-/Widget-Crates, Discovery und eine lokale Demo; die Abnahmebelege und verbleibenden Einschränkungen stehen im AC-04-Bericht. App-Integration folgt in AC-05. **Zielphase:** P4 (Client SDK / first app). **Priorität:** nach API-Gate.
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 > **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-04, AC-05).
@@ -11,7 +11,7 @@ Craft-Apps erhalten einen kleinen Rust-Client mit Discovery, authentifizierten R
 
 ## Detaillierter Funktionsumfang und technische Umsetzung
 
-`craftcloud-client` mit traitbasiertem Transport; `core` bleibt so weit sinnvoll WASM-tauglich, native HTTP/TLS in anderem Modul; Server `GET /api/v1/info` publiziert versions/feature flags/limits. Device login via browser after separate flow approval. Kein globaler API-Key mit Adminrechten in Desktop-App-Konfiguration; Token OS keychain nur nach SDK-Abstimmung.
+`craftcloud-client` verwendet einen transportbasierten, I/O-freien Ablauf; `craftcloud-client-native` übernimmt HTTP/TLS, Schlüsselbund, lokale Verknüpfungen und Cache; `craftcloud-egui` liefert übersetzbare Widgets mit den Visuals der Gast-App. `GET /api/v1/info` publiziert Versionen, Funktionsschalter, Grenzen und Formatregister. Desktop-Geräte-Sitzungen verwenden den genehmigten AC-01-Login; die reservierte 2FA-Challenge wird erkannt, ihre serverseitige Fortsetzung hängt von AC-02 ab. Kein globaler API-Key wird gespeichert. Siehe [SDK-Vertrag](../04-integrations/sdk-contract.md) und [ADR-0021](../09-decisions/adr-0021-client-sdk.md).
 
 ## User Journey und gewünschtes Verhalten
 

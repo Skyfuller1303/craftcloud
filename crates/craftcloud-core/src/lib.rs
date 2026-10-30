@@ -4,6 +4,7 @@
 //! dependencies; it only uses `serde` for the wire representation.
 
 mod capabilities;
+pub mod formats;
 mod identity;
 mod names;
 pub mod policy;

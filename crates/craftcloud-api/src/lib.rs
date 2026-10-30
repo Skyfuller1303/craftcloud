@@ -18,6 +18,7 @@ mod device;
 mod files;
 mod grants;
 mod health;
+mod info;
 mod invitations;
 mod locks;
 pub mod maintenance;
@@ -244,7 +245,7 @@ pub fn router_with_shared(
     let routes = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health::health_ready))
-        .route("/api/v1/info", get(info))
+        .route("/api/v1/info", get(info::discover))
         .route("/api/v1/setup/status", get(setup::status))
         .route("/api/v1/setup/complete", post(setup::complete))
         .route(
@@ -617,10 +618,6 @@ async fn discard_untrusted_request_id(mut request: Request, next: Next) -> Respo
 
 async fn health_live() -> Json<serde_json::Value> {
     Json(json!({ "status": "live" }))
-}
-
-async fn info(State(state): State<ApiState>) -> Json<Capabilities> {
-    Json(state.capabilities)
 }
 
 async fn not_found(headers: HeaderMap) -> Response {

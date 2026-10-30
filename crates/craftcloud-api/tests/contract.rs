@@ -569,10 +569,18 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        let documented: BTreeSet<_> = ["api_version", "features", "server_mode"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let documented: BTreeSet<_> = [
+            "api_version",
+            "features",
+            "server_mode",
+            "server_version",
+            "feature_flags",
+            "limits",
+            "formats",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         assert_eq!(keys, documented);
         let doc = openapi();
         let required = doc["paths"]["/info"]["get"]["responses"]["200"]["content"]["application/json"]
@@ -584,6 +592,18 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(required, documented);
         assert_eq!(info.body["server_mode"], "development-prototype");
+        assert_eq!(info.body["feature_flags"]["device_login"], true);
+        assert_eq!(info.body["feature_flags"]["two_factor"], false);
+        assert_eq!(info.body["feature_flags"]["figcraft_live"], false);
+        assert_eq!(
+            info.body["limits"]["block_size"],
+            craftcloud_storage::CHUNK_BYTES
+        );
+        assert!(
+            info.body["formats"]
+                .as_array()
+                .is_some_and(|formats| formats.len() == 4)
+        );
 
         // Without a database the server is not ready; the answer is the common
         // error shape and names nothing.
