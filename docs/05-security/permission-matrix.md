@@ -107,7 +107,7 @@ Objektberechtigungen sind das Maximum aus ursprünglicher Workspace-Rolle und ak
 | Datei-Grant: Datei ändern/Upload abschließen | ja | ja | ja | 403 | nur Ziel-Datei | 403 | 404 | nur mit Editor-Grant |
 | Lock fremd erzwingen (`DELETE ?force=true`) | ja | ja | 403 | 403 | 403 | 403 | 404 | 403 |
 
-Lease gehört einer aktiven Browser-Sitzung und läuft nach fünf Minuten ab; Heartbeat verlängert sie. Dieselbe Person in einer anderen Sitzung darf nur mit `takeover=true` übernehmen. Fremde aktive Leases blockieren Datei-Metadatenänderung, Upload-Anlage/-Abschluss, Versionsabschluss/-Restore, Datei-Papierkorb/-Restore sowie Projekt-Papierkorb/-Restore mit 423 `FILE_LOCKED`. Lesen und Download bleiben möglich. FigCraft-Dateien antworten für Lock-Operationen mit 409 `LOCK_NOT_SUPPORTED`.
+Lease gehört einer aktiven Browser- oder Geräte-Sitzung (AC-01) und läuft nach fünf Minuten ab; sie endet außerdem mit dem Widerruf dieser Sitzung; Heartbeat verlängert sie. Dieselbe Person in einer anderen Sitzung darf nur mit `takeover=true` übernehmen. Fremde aktive Leases blockieren Datei-Metadatenänderung, Upload-Anlage/-Abschluss, Versionsabschluss/-Restore, Datei-Papierkorb/-Restore sowie Projekt-Papierkorb/-Restore mit 423 `FILE_LOCKED`. Lesen und Download bleiben möglich. FigCraft-Dateien antworten für Lock-Operationen mit 409 `LOCK_NOT_SUPPORTED`. Sichtbare, aber nicht erlaubte Lock-Aktionen antworten 403, nicht sichtbare 404; Dateien und Projekte im Papierkorb lehnen Lock und Grant mit 409 `FILE_DELETED`/`PROJECT_DELETED` ab. Die Mitgliedersuche ist je Benutzer ratenbegrenzt (429).
 
 ## Abnahmebelege
 

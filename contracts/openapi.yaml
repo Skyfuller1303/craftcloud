@@ -676,7 +676,7 @@ paths:
       description: >-
         Ordered by join time and user id (stable, keyset paginated); cursors contain only a timestamp and ids, never
         names or e-mail addresses. Only active members are listed. The optional `query` searches names and e-mail
-        addresses and requires grant-management rights in at least one workspace (403 otherwise). Non-members and
+        addresses and requires grant-management rights in at least one workspace (403 otherwise); searches are rate limited per user (429). Non-members and
         unknown organizations answer 404.
       parameters:
         - {$ref: '#/components/parameters/Limit'}
@@ -688,11 +688,12 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MemberPage'}
-        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '400': {description: 'INVALID_CURSOR or AMBIGUOUS_CREDENTIALS', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
     post:
@@ -1853,6 +1854,11 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: FILE_LOCKED (another session holds the edit lease when the stored object would be recorded; the object is deleted and the upload fails)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '413':
           description: PAYLOAD_TOO_LARGE (more bytes than declared)
           content:
@@ -2450,6 +2456,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/ProjectId'}]
       responses:
         '200': {description: Active grants, content: {application/json: {schema: {type: object, required: [items, next_cursor], properties: {items: {type: array, items: {$ref: '#/components/schemas/Grant'}}, next_cursor: {type: [string, 'null']}}}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2457,7 +2464,11 @@ paths:
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
     post:
       tags: [Projects]
-      summary: Grant project access to an organization member
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Grant project access to an organization member (409 PROJECT_DELETED for a trashed project)
       parameters: [{$ref: '#/components/parameters/ProjectId'}]
       requestBody:
         required: true
@@ -2466,6 +2477,7 @@ paths:
             schema: {$ref: '#/components/schemas/GrantCreateRequest'}
       responses:
         '201': {description: Grant created, content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2480,6 +2492,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/FileId'}]
       responses:
         '200': {description: Active grants, content: {application/json: {schema: {type: object, required: [items, next_cursor], properties: {items: {type: array, items: {$ref: '#/components/schemas/Grant'}}, next_cursor: {type: [string, 'null']}}}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2487,7 +2500,11 @@ paths:
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
     post:
       tags: [Files]
-      summary: Grant file access to an organization member
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Grant file access to an organization member (409 FILE_DELETED or PROJECT_DELETED for a trashed target)
       parameters: [{$ref: '#/components/parameters/FileId'}]
       requestBody:
         required: true
@@ -2496,6 +2513,7 @@ paths:
             schema: {$ref: '#/components/schemas/GrantCreateRequest'}
       responses:
         '201': {description: Grant created, content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2506,6 +2524,10 @@ paths:
   /grants/{grant_id}:
     patch:
       tags: [Projects]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
       summary: Change a grant role with an ETag precondition
       parameters:
         - {in: path, name: grant_id, required: true, schema: {type: string, format: uuid}}
@@ -2517,6 +2539,7 @@ paths:
             schema: {$ref: '#/components/schemas/GrantChangeRequest'}
       responses:
         '200': {description: Updated grant, content: {application/json: {schema: {$ref: '#/components/schemas/Grant'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2527,10 +2550,15 @@ paths:
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
     delete:
       tags: [Projects]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
       summary: Revoke a grant
       parameters: [{$ref: '#/components/parameters/GrantId'}]
       responses:
         '204': {description: Grant revoked}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2539,7 +2567,11 @@ paths:
   /files/{file_id}/lock:
     post:
       tags: [Files]
-      summary: Acquire or renew the current browser session's edit lease
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Acquire or renew the current session's (browser or device) edit lease
       parameters: [{$ref: '#/components/parameters/FileId'}]
       requestBody:
         required: true
@@ -2548,22 +2580,28 @@ paths:
             schema: {$ref: '#/components/schemas/LockAcquireRequest'}
       responses:
         '200': {description: Lease acquired or renewed, content: {application/json: {schema: {$ref: '#/components/schemas/FileLock'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {description: LOCK_NOT_SUPPORTED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '409': {description: 'LOCK_NOT_SUPPORTED, FILE_DELETED or PROJECT_DELETED (target in the trash)', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '423': {description: FILE_LOCKED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
     delete:
       tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
       summary: Release the current session's edit lease; admins may force release
       parameters:
         - {$ref: '#/components/parameters/FileId'}
         - {in: query, name: force, required: false, schema: {type: boolean}}
       responses:
         '204': {description: Lease released}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2580,7 +2618,7 @@ paths:
         - {$ref: '#/components/parameters/Cursor'}
       responses:
         '200': {description: Shared targets with minimal workspace and parent identity, content: {application/json: {schema: {$ref: '#/components/schemas/SharedWithMeResponse'}}}}
-        '400': {$ref: '#/components/responses/InvalidCursor'}
+        '400': {description: 'INVALID_CURSOR or AMBIGUOUS_CREDENTIALS', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/BodyInvalid'}

@@ -25,7 +25,10 @@ Workspace-Rollen allein gewähren zu breite Freigaben. Gleichzeitig benötigen C
 
 - Migration 0016 ergänzt `guest`, Grants, Sperren und nötige Indizes/Constraints. Bestehende Einladungen bleiben kompatibel.
 - Jede Objekt- und Schreibroute muss Grants beziehungsweise Leases berücksichtigen; Integrationstests decken Scope, parallele Lease-Anlage, Entzug während Upload und alle Schreibwege ab.
-- Geräte-Sitzungen werden erst integriert, wenn AC-01 ihr persistentes Sitzungsmodell bereitstellt. AC-03 darf Browser-Sitzungen real binden, aber keine Geräteidentität aus Clientdaten vortäuschen.
+- Leases binden an die authentifizierte Sitzung: Browser-Sitzungen (`holder_session_kind='browser'`, Tabelle `sessions`) und Geräte-Sitzungen aus AC-01 (`'device'`, Tabelle `device_sessions`, ADR-0018). Die Art folgt aus der Anmeldeart der Anfrage, nie aus Clientdaten. Ob eine Sitzung aktiv ist, prüft `lock_acquire` je Art (nicht widerrufen, absoluter und Leerlauf-Ablauf, Konto aktiviert) und sperrt Benutzer- und Sitzungszeile, damit ein gleichzeitiger Widerruf entweder davor wirkt oder die neue Lease mit entfernt. Jeder Widerruf (Abmeldung, Refresh-Wiederverwendung, Widerruf über die Geräteliste, Passwortänderung und -Reset, Konto deaktivieren, „überall abmelden“) löscht die Leases der betroffenen Sitzungen in derselben Transaktion. Eine Lease einer Geräte-Sitzung ist für eine Browser-Sitzung derselben Person fremd (und umgekehrt): sie blockiert Schreibwege und lässt sich nur mit `takeover=true` übernehmen.
+- Auf Dateien oder Projekte im Papierkorb werden weder Grants angelegt noch Leases erworben: 409 `FILE_DELETED` beziehungsweise `PROJECT_DELETED` (auch für eine Datei in einem Papierkorb-Projekt), wie bei Umbenennen und Upload-Anlage. Bestehende Grants und Leases bleiben unberührt.
+- Verweigerungen der Lock-Routen folgen dem `gate()`-Muster: nicht sichtbare Objekte 404, sichtbare, aber nicht erlaubte Aktionen 403 (auditierte Verweigerung).
+- Die Personensuche (`GET /organizations/{org_id}/members?query=`) ist je Benutzer ratenbegrenzt (`member_search_limit`, Standard 60 je Fenster, 429 `RATE_LIMITED`); die einfache Mitgliederliste zählt nicht.
 - Die administrative Oberfläche kann nur die vom Server gelieferten `can_share`, `can_force_lock` und Lock-/Grant-Daten als Hinweise nutzen; API-Policy bleibt Autorität.
 
 ## Verworfene Alternativen
