@@ -6,12 +6,12 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11"] }
-egui = "0.36.2"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11"] }
+egui = "0.37.0"
 craftcloud-egui = { path = "../../crates/craftcloud-egui" }
 craftcloud-client = { path = "../../crates/craftcloud-client" }
 craftcloud-client-native = { path = "../../crates/craftcloud-client-native" }
-rfd = "0.17.0"
+rfd = "0.17.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

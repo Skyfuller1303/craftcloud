@@ -16,7 +16,7 @@ Geteilte Erneuerungstokens: Mehrere Clients oder Prozesse mit demselben Schlüss
 
 ## Abweichung bei der Mindestversion
 
-Die Vorgaben egui 0.36 und Rust 1.90 sind nicht gemeinsam erfüllbar: Die vorhandenen egui/eframe-0.36.2-Manifeste verlangen Rust 1.95. Die beiden SDK-Crates zielen auf Rust 1.90; Widget-Crate und Demo deklarieren ehrlich Rust 1.95. Eine ältere egui-Version würde die ausdrücklich vorgegebene Integration in die Ziel-Apps brechen. Die bestehende Server-Mindestversion bleibt unverändert. Rust 1.90 ist lokal nicht installiert; dieser fehlende Build wird ausdrücklich berichtet. Das vorhandene WASM-Target wird gesondert geprüft.
+Die Vorgaben egui 0.37 und Rust 1.90 sind nicht gemeinsam erfüllbar: Die egui/eframe-0.37.0-Manifeste verlangen Rust 1.95 (zuvor 0.36.2, ebenfalls 1.95). Die beiden SDK-Crates zielen weiterhin auf Rust 1.90 (ureq 3.5.0 verlangt 1.85, keyring 3.6.3 verlangt 1.75); Widget-Crate und Demo deklarieren ehrlich Rust 1.95. Seit 2026-10-30 folgt das SDK der Abhängigkeitslinie der Apps (egui/eframe 0.37.0, ureq =3.5.0, rfd 0.17.2), damit es per Pfadabhängigkeit eingebunden werden kann. Rust 1.90 ist lokal nicht installiert; dieser fehlende Build wird ausdrücklich berichtet. Das vorhandene WASM-Target wird gesondert geprüft.
 
 ## Offene Punkte
 

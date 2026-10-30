@@ -11,7 +11,7 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls", "platform-verifier"] }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 zeroize = "1"
 uuid = { version = "1", features = ["serde"] }
