@@ -32,6 +32,8 @@ IMAGE_PREFIX=${IMAGE_PREFIX:-craftcloud-server:}
 case $IMAGE_PREFIX in *[!A-Za-z0-9._:/-]*) printf '%s\n' 'craftcloud-ctl: invalid image prefix' >&2; exit 1 ;; esac
 SYSTEMD_DIR=${CRAFTCLOUD_SYSTEMD_DIR:-/etc/systemd/system}
 CURRENT=$INSTALL_ROOT/current
+. "$(dirname -- "$0")/smtp-overrides.sh"
+smtp_files=$(smtp_overrides "$CONFIG_DIR/craftcloud.env")
 
 fail() { printf '%s\n' "craftcloud-ctl: $*" >&2; exit 1; }
 systemd_running() {
@@ -162,6 +164,8 @@ compose_run() {
             printf '%s\n' "craftcloud-ctl: warning: release $version has no compose.figcraft.yaml; running it without the FigCraft companion" >&2
         fi
     fi
+    # smtp_files contains only fixed -f filenames emitted by smtp_overrides.
+    [ -z "$smtp_files" ] || files="$files $smtp_files"
     [ "$setup" != 1 ] || files="$files -f compose.setup.yaml"
     export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$tag"
     export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"

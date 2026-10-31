@@ -62,6 +62,26 @@ pub async fn create_for_verified_login(
     verified_hash: &str,
     audit: &AuditCtx,
 ) -> Result<Option<Uuid>, DbError> {
+    match create_for_verified_login_with_email(pool, new, verified_hash, audit, false).await? {
+        LoginOutcome::Created(id) => Ok(Some(id)),
+        LoginOutcome::Rejected | LoginOutcome::EmailRateLimited => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Created(Uuid),
+    Rejected,
+    EmailRateLimited,
+}
+
+pub async fn create_for_verified_login_with_email(
+    pool: &PgPool,
+    new: &NewDeviceSession,
+    verified_hash: &str,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<LoginOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let id = Uuid::new_v4();
     let family = Uuid::new_v4();
@@ -73,7 +93,7 @@ pub async fn create_for_verified_login(
     .fetch_optional(&mut *tx)
     .await?;
     if user.is_none() {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let factor_enabled: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
@@ -82,7 +102,7 @@ pub async fn create_for_verified_login(
     .fetch_one(&mut *tx)
     .await?;
     if factor_enabled {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let inserted = sqlx::query(
         "INSERT INTO device_sessions (id,user_id,name,client_kind,client_id,refresh_hash,refresh_family,access_hash,access_expires_at,created_at,last_used_at,idle_expires_at,absolute_expires_at) \
@@ -94,7 +114,7 @@ pub async fn create_for_verified_login(
     .bind(new.access_expires_at).bind(new.now).bind(new.idle_expires_at).bind(new.absolute_expires_at)
     .bind(verified_hash).execute(&mut *tx).await?.rows_affected();
     if inserted != 1 {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let by = AuditCtx {
         actor_id: Some(new.user_id),
@@ -106,8 +126,21 @@ pub async fn create_for_verified_login(
         &NewEvent::new("auth.device_login").target("device_session", id),
     )
     .await?;
+    if mail_enabled
+        && crate::mail_security::enqueue_in(
+            &mut tx,
+            new.user_id,
+            new.now,
+            crate::mail_security::SecurityEvent::NewLogin,
+        )
+        .await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(LoginOutcome::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(Some(id))
+    Ok(LoginOutcome::Created(id))
 }
 
 /// Find a live access token and opportunistically update device activity.

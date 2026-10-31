@@ -56,3 +56,9 @@ Zusätzlich: OpenAPI aktualisiert; aussagekräftige Tests erfolgreich; negative 
 ## Nichtumfang und Abnahmefragen
 
 Keine ungeprüfte Cross-App-/Cloud-Kopplung, keine proprietären Lizenzen kopieren, keine zusätzlichen Infrastruktur-Abhängigkeiten ohne ADR. Vor Merge prüfen: **API-Owner?** **Datenmigration?** **Offline-Verhalten?** **Echte Pilot-Validierung?**
+
+## AC-09: Einladungen mit SMTP
+
+Wenn `feature_flags.email_delivery` aktiv ist, erhält die einladende Person nur eine Versandbestätigung und eine Aktion zum erneuten Senden; kein Bearertoken wird an sie ausgegeben. Der gleiche Antwortvertrag gilt für bestehende und neue Konten. Ein neues Konto wird erst mit dem zugestellten Link und einem neu gewählten Passwort angelegt und dabei als adressverifiziert markiert. Ein bestehendes unverifiziertes Konto muss seine Adresse bestätigen, bevor es eine weitere Einladung annimmt. Ohne SMTP bleiben der einmalig sichtbare Link und die bisherigen Annahmeregeln erhalten.
+
+Die Einladung akzeptiert eine Vorlagensprache (`en` oder `de`), ansonsten Englisch. Versand und Einladungsänderung liegen in derselben Datenbanktransaktion. Ein erneuter Versand rotiert den Token; alte Links verlieren ihre Gültigkeit. Empfänger-, Akteur- und Resend-Limits verhindern unbegrenzten Versand. Der Operator kann Bestätigungsmails für unverifizierte Konten anstoßen, sieht aber keine Mailinhalte. [ADR-0025](../09-decisions/adr-0025-email-delivery.md) ersetzt ADR-0017 für Instanzen mit aktiviertem Versand.

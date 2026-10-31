@@ -1,0 +1,4 @@
+Hello {{recipient_name}},
+
+Verify your CraftCloud email address: {{action_url}}
+This link expires {{expires_at}}. If you did not request this, ignore this message.

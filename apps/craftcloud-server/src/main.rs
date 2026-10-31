@@ -12,6 +12,7 @@
 mod admin_ui;
 mod config;
 mod healthcheck;
+mod mail_worker;
 mod secret;
 mod server;
 
@@ -539,6 +540,9 @@ async fn issue_password_reset(config: &Config, email: &str) -> Result<(), Failur
         craftcloud_db::password_reset::IssueOutcome::NoSuchUser => {
             return Err(Failure::runtime("no account with that e-mail address"));
         }
+        craftcloud_db::password_reset::IssueOutcome::EmailRateLimited => {
+            return Err(Failure::runtime("email delivery rate limit exceeded"));
+        }
     }
     // The link is a credential: it goes to stdout only (never to the log),
     // and stderr carries the warning so it is visible next to the link.
@@ -971,6 +975,35 @@ async fn run(config: Config) -> Result<(), Failure> {
     if two_factor_key.is_none() {
         tracing::warn!("two-factor setup is unavailable: current secret key is not usable");
     }
+    let mail_transport = if let Some(settings) = &config.mail {
+        if two_factor_key.is_none() {
+            return Err(Failure::config(
+                "CRAFTCLOUD_SECRET_KEY_FILE must contain a valid AC-02 key when SMTP mail delivery is enabled",
+            ));
+        }
+        let password = settings
+            .password_file
+            .as_deref()
+            .map(secret::load_secret_file)
+            .transpose()
+            .map_err(|_| {
+                Failure::config("CRAFTCLOUD_SMTP_PASSWORD_FILE is unavailable or invalid")
+            })?;
+        let smtp_config = craftcloud_mail::SmtpConfig::new(
+            settings.host.clone(),
+            settings.port,
+            settings.tls,
+            settings.username.clone(),
+            password.as_ref().map(|value| value.expose().to_owned()),
+            settings.from.clone(),
+        );
+        Some(std::sync::Arc::new(
+            craftcloud_mail::SmtpTransport::new(&smtp_config)
+                .map_err(|_| Failure::config("SMTP configuration is invalid"))?,
+        ))
+    } else {
+        None
+    };
     let metrics = std::sync::Arc::new(Metrics::new());
     // Migrations are never applied implicitly: only verify the schema.
     let pool = connect_database(&config.database).await?;
@@ -1120,6 +1153,7 @@ async fn run(config: Config) -> Result<(), Failure> {
     let services = pool.as_ref().map(|pool| {
         let services = Services::new(pool.clone(), bootstrap, auth_settings)
             .with_two_factor_keys(two_factor_key, two_factor_old_key)
+            .with_email_delivery(config.mail.is_some())
             .with_metrics(std::sync::Arc::clone(&metrics));
         let services = match serving_store {
             Some(store) => services.with_storage(store),
@@ -1152,6 +1186,24 @@ async fn run(config: Config) -> Result<(), Failure> {
             stop_maintenance.subscribe(),
         ))
     });
+    let mail_task = match (&pool, &mail_transport, two_factor_key) {
+        (Some(pool), Some(transport), Some(key)) => {
+            let public_url = config.public_url.as_deref().unwrap_or_default();
+            let domain = mail_message_id_domain(public_url);
+            tracing::info!("SMTP mail delivery worker enabled");
+            let public_url = config.public_url.clone().unwrap_or_default();
+            Some(tokio::spawn(mail_worker::run(
+                pool.clone(),
+                std::sync::Arc::clone(transport),
+                key,
+                two_factor_old_key,
+                public_url,
+                domain,
+                stop_maintenance.subscribe(),
+            )))
+        }
+        _ => None,
+    };
     let router = match admin_ui {
         Some(assets) => {
             tracing::info!("serving the admin UI under /admin");
@@ -1221,6 +1273,15 @@ async fn run(config: Config) -> Result<(), Failure> {
         let _ = task.await;
         tracing::warn!("FigCraft worker stopped at shutdown deadline; durable work remains queued");
     }
+    if let Some(mut task) = mail_task
+        && tokio::time::timeout(config.shutdown_grace, &mut task)
+            .await
+            .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+        tracing::warn!("mail worker stopped at shutdown deadline; durable mail remains queued");
+    }
     if let Some(task) = metrics_task
         && tokio::time::timeout(config.shutdown_grace, task)
             .await
@@ -1250,6 +1311,18 @@ async fn run(config: Config) -> Result<(), Failure> {
         tracing::warn!("database pool did not close before the shutdown deadline");
     }
     Ok(())
+}
+
+fn mail_message_id_domain(public_url: &str) -> String {
+    match url::Url::parse(public_url)
+        .ok()
+        .and_then(|url| url.host().map(|host| host.to_owned()))
+    {
+        Some(url::Host::Ipv4(address)) => format!("[{address}]"),
+        Some(url::Host::Ipv6(address)) => format!("[{address}]"),
+        Some(url::Host::Domain(domain)) => domain,
+        None => "craftcloud.invalid".to_owned(),
+    }
 }
 
 /// Resolves on Ctrl-C and, on unix, SIGTERM. If a handler cannot be

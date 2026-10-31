@@ -46,6 +46,10 @@ pub struct Invitation {
     pub workspace_id: Option<Uuid>,
     /// Workspace role granted, if any.
     pub workspace_role: Option<String>,
+    /// Language selected by the inviter for delivery.
+    pub language: String,
+    /// True only when this capability was delivered by the mail system.
+    pub email_delivery: bool,
     /// Who created it.
     pub created_by: Uuid,
     /// Creation time.
@@ -101,8 +105,8 @@ impl Invitation {
     }
 }
 
-const COLUMNS: &str = "id, org_id, normalized_email AS email, org_role, workspace_id, workspace_role, \
-     created_by_user_id AS created_by, created_at, expires_at, accepted_at, revoked_at, invalidated_at";
+const COLUMNS: &str = "id, org_id, normalized_email AS email, org_role, workspace_id, workspace_role, language, \
+     email_delivery, created_by_user_id AS created_by, created_at, expires_at, accepted_at, revoked_at, invalidated_at";
 
 /// Input for [`OrgTx::invitation_create`].
 #[derive(Debug, Clone)]
@@ -117,6 +121,10 @@ pub struct NewInvitation {
     pub guest_workspace: Option<Uuid>,
     /// SHA-256 of the secret token.
     pub token_hash: [u8; 32],
+    /// Message language (`en` or `de`).
+    pub language: String,
+    /// Whether delivery is active for this invitation capability.
+    pub email_delivery: bool,
     /// The inviter.
     pub created_by: Uuid,
     /// Creation time.
@@ -139,6 +147,16 @@ pub enum CreateInvitationOutcome {
 }
 
 impl OrgTx {
+    /// Reads an account display name using the organization's open transaction.
+    pub async fn user_display_name(&mut self, user_id: Uuid) -> Result<Option<String>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1")
+                .bind(user_id)
+                .fetch_optional(&mut *self.tx)
+                .await?,
+        )
+    }
+
     /// Fetches an invitation of this organization (any status), read under
     /// the organization lock.
     ///
@@ -151,6 +169,36 @@ impl OrgTx {
         ))
         .bind(id)
         .bind(self.org_id)
+        .fetch_optional(&mut *self.tx)
+        .await?)
+    }
+
+    /// Rotates an open invitation capability and expiry in the current
+    /// organization transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invitation_resend(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        token_hash: &[u8; 32],
+        created_by: Uuid,
+        now: OffsetDateTime,
+        expires_at: OffsetDateTime,
+        email_delivery: bool,
+    ) -> Result<Option<Invitation>, DbError> {
+        self.check(scope, Action::InvitationCreate)?;
+        Ok(sqlx::query_as::<_, Invitation>(&format!(
+            "UPDATE invitations SET token_hash=$3,created_by_user_id=$4,created_at=$5,expires_at=$6,email_delivery=$7 \
+             WHERE id=$1 AND org_id=$2 AND accepted_at IS NULL AND revoked_at IS NULL \
+               AND invalidated_at IS NULL AND expires_at>$5 RETURNING {COLUMNS}"
+        ))
+        .bind(id)
+        .bind(self.org_id)
+        .bind(token_hash.as_slice())
+        .bind(created_by)
+        .bind(now)
+        .bind(expires_at)
+        .bind(email_delivery)
         .fetch_optional(&mut *self.tx)
         .await?)
     }
@@ -221,8 +269,8 @@ impl OrgTx {
         }
         let inserted = sqlx::query_as::<_, Invitation>(&format!(
             "INSERT INTO invitations (id, org_id, normalized_email, org_role, workspace_id, \
-                 workspace_role, token_hash, created_by_user_id, created_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING {COLUMNS}"
+                 workspace_role, token_hash, created_by_user_id, created_at, expires_at, language, email_delivery) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING {COLUMNS}"
         ))
         .bind(Uuid::new_v4())
         .bind(self.org_id)
@@ -234,6 +282,8 @@ impl OrgTx {
         .bind(new.created_by)
         .bind(new.now)
         .bind(new.expires_at)
+        .bind(&new.language)
+        .bind(new.email_delivery)
         .fetch_one(&mut *self.tx)
         .await;
         match inserted {
@@ -308,6 +358,8 @@ pub struct Peek {
     pub org_id: Uuid,
     /// The invited (normalized) address.
     pub email: String,
+    /// Whether the capability was issued for delivery-mode proof.
+    pub email_delivery: bool,
 }
 
 /// Looks up an open (pending, unexpired) invitation by token hash without
@@ -322,8 +374,8 @@ pub async fn peek(
     token_hash: &[u8; 32],
     now: OffsetDateTime,
 ) -> Result<Option<Peek>, DbError> {
-    let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT id, org_id, normalized_email FROM invitations \
+    let row: Option<(Uuid, Uuid, String, bool)> = sqlx::query_as(
+        "SELECT id, org_id, normalized_email, email_delivery FROM invitations \
          WHERE token_hash = $1 AND accepted_at IS NULL AND revoked_at IS NULL \
            AND invalidated_at IS NULL AND expires_at > $2",
     )
@@ -331,11 +383,14 @@ pub async fn peek(
     .bind(now)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(invitation_id, org_id, email)| Peek {
-        invitation_id,
-        org_id,
-        email,
-    }))
+    Ok(
+        row.map(|(invitation_id, org_id, email, email_delivery)| Peek {
+            invitation_id,
+            org_id,
+            email,
+            email_delivery,
+        }),
+    )
 }
 
 /// Who accepts.
@@ -430,13 +485,13 @@ async fn accept_inner(
     audit: Option<&AuditCtx>,
 ) -> Result<AcceptOutcome, DbError> {
     // 1. Organization of the invitation (unlocked read), then the org lock.
-    let head: Option<(Uuid, Uuid, String, Uuid)> = sqlx::query_as(
-        "SELECT id, org_id, normalized_email, created_by_user_id FROM invitations WHERE token_hash = $1",
+    let head: Option<(Uuid, Uuid, String, Uuid, bool)> = sqlx::query_as(
+        "SELECT id, org_id, normalized_email, created_by_user_id, email_delivery FROM invitations WHERE token_hash = $1",
     )
     .bind(token_hash.as_slice())
     .fetch_optional(pool)
     .await?;
-    let Some((invitation_id, org_id, email, inviter_id)) = head else {
+    let Some((invitation_id, org_id, email, inviter_id, email_delivery)) = head else {
         return Ok(AcceptOutcome::Invalid);
     };
     let Some(mut otx) = OrgTx::begin(pool, org_id).await? else {
@@ -449,8 +504,9 @@ async fn accept_inner(
             .bind(inviter_id)
             .fetch_optional(&mut *otx.tx)
             .await?;
-    let target: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT id, disabled_at IS NOT NULL FROM users WHERE normalized_email = $1 FOR SHARE",
+    let target: Option<(Uuid, bool, bool)> = sqlx::query_as(
+        "SELECT id, disabled_at IS NOT NULL, email_verified_at IS NOT NULL \
+         FROM users WHERE normalized_email = $1 FOR SHARE",
     )
     .bind(&email)
     .fetch_optional(&mut *otx.tx)
@@ -469,11 +525,22 @@ async fn accept_inner(
     let Some(invitation) = invitation else {
         return Ok(AcceptOutcome::Invalid);
     };
+    if invitation.email_delivery != email_delivery {
+        return Ok(AcceptOutcome::Invalid);
+    }
 
     // 4. Who is accepting.
     let (account, created) = match (&target, by) {
-        (Some((_, true)), _) => return Ok(AcceptOutcome::Invalid),
-        (Some((id, false)), AcceptBy::Existing { session_user }) if id == session_user => {
+        (Some((_, true, _)), _) => return Ok(AcceptOutcome::Invalid),
+        (Some((_, false, false)), _) if invitation.email_delivery => {
+            return Ok(AcceptOutcome::Invalid);
+        }
+        (Some((id, false, false)), AcceptBy::Existing { session_user })
+            if id == session_user && !invitation.email_delivery =>
+        {
+            (*id, false)
+        }
+        (Some((id, false, true)), AcceptBy::Existing { session_user }) if id == session_user => {
             (*id, false)
         }
         (Some(_), AcceptBy::Existing { .. }) | (None, AcceptBy::Existing { .. }) => {
@@ -539,14 +606,16 @@ async fn accept_inner(
         };
         let inserted = sqlx::query(
             "INSERT INTO users \
-                 (id, normalized_email, display_name, password_hash, created_via_invitation_id) \
-             VALUES ($1, $2, $3, $4, $5)",
+                 (id, normalized_email, display_name, password_hash, created_via_invitation_id, email_verified_at) \
+             VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN $7 ELSE NULL END)",
         )
         .bind(account)
         .bind(&email)
         .bind(display_name)
         .bind(password_hash)
         .bind(invitation_id)
+        .bind(invitation.email_delivery)
+        .bind(now)
         .execute(&mut *otx.tx)
         .await;
         match inserted {

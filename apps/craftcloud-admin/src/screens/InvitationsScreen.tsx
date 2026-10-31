@@ -18,6 +18,7 @@ import { canCreateInvitations, canListInvitations, isOrgManager } from "../permi
 import type { Scope } from "../permissions.ts";
 import { useRoleNames } from "../roles.ts";
 import { usePagedList } from "../usePagedList.ts";
+import { ResendInvitation, useEmailDelivery } from "./EmailAccount.tsx";
 
 const NO_WORKSPACE = "";
 
@@ -29,6 +30,7 @@ export function InvitationsScreen({
   workspaces: Workspace[];
 }) {
   const { t, language } = useI18n();
+  const emailDelivery = useEmailDelivery();
   const { api } = useAuth();
   const announce = useAnnounce();
   const names = useRoleNames();
@@ -86,10 +88,13 @@ export function InvitationsScreen({
             onCreated={(result) => {
               setCreated(result);
               invitations.refresh();
-              announce(t("Invitation created. Copy the link now; it is shown only once."));
+              announce(result.sent_to !== undefined ? t("Invitation sent.") : t("Invitation created. Copy the link now; it is shown only once."));
             }}
           />
-          {created !== null && <InviteLink invitation={created} onDismiss={() => setCreated(null)} />}
+          {created !== null && (created.sent_to !== undefined ? <div className="stack">
+            <Alert tone="success">{t("Invitation sent to {email}.", { email: created.sent_to })}</Alert>
+            <ResendInvitation orgId={orgId} invitationId={created.invitation_id} initiallySent />
+          </div> : <InviteLink invitation={created} onDismiss={() => setCreated(null)} />)}
         </section>
       )}
 
@@ -131,6 +136,7 @@ export function InvitationsScreen({
                       <td data-label={t("Status")}><Badge tone={invitation.status === "accepted" ? "good" : invitation.status === "pending" ? "info" : invitation.status === "revoked" ? "bad" : "neutral"}>{statusName[invitation.status]}</Badge></td>
                       <td className="numeric" data-label={t("Expires")}>{formatDateTime(language, invitation.expires_at)}</td>
                       <td data-label={t("Actions")}>
+                        {emailDelivery && invitation.status === "pending" && <ResendInvitation orgId={orgId} invitationId={invitation.id} />}
                         {invitation.status === "pending" && (
                           <Button
                             className="button button--danger-quiet button--sm"
@@ -197,7 +203,7 @@ function InviteForm({
   workspaces: Workspace[];
   onCreated: (created: CreatedInvitation) => void;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const { api } = useAuth();
   const names = useRoleNames();
   const manager = isOrgManager(scope.organization);
@@ -231,6 +237,7 @@ function InviteForm({
       try {
         return await api.createInvitation(orgId, {
           email: trimmed,
+          language: language === "de" ? "de" : "en",
           org_role: canInviteGuest ? orgRole : manager ? orgRole : "member",
           ...(effectiveWorkspace !== NO_WORKSPACE
             ? orgRole === "guest"
@@ -326,6 +333,7 @@ function InviteLink({
   const [copyFailed, setCopyFailed] = useState(false);
 
   async function copy() {
+    if (invitation.invite_url === undefined) return;
     try {
       await navigator.clipboard.writeText(invitation.invite_url);
       setCopyFailed(false);

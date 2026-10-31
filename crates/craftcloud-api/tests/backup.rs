@@ -477,7 +477,7 @@ mod tests {
         let backup_time = started.elapsed();
         assert!(created.audit_recorded);
         assert_eq!(created.blobs, 5, "{:?}", created.manifest.blobs);
-        assert_eq!(created.manifest.migration_version, 18);
+        assert_eq!(created.manifest.migration_version, 19);
 
         let report = craftcloud_backup::verify(&out, Some(&created.manifest_sha256)).unwrap();
         assert_eq!(report.blobs, 5);
@@ -860,7 +860,7 @@ mod tests {
 
         // Forged manifests with a matching checksum file: unknown versions.
         rewrite_manifest(&out, |m| m["migration_version"] = json!(99));
-        expect(&out, ErrorKind::Format, "only knows up to 18");
+        expect(&out, ErrorKind::Format, "only knows up to 19");
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
             m["format_version"] = json!(2);
@@ -872,7 +872,7 @@ mod tests {
         );
         rewrite_manifest(&out, |m| {
             m["format_version"] = json!(1);
-            m["migration_version"] = json!(18);
+            m["migration_version"] = json!(19);
             m["tables"][0]["rows"] = json!(77);
         });
         expect(&out, ErrorKind::Integrity, "rows but the manifest says 77");
@@ -1064,6 +1064,32 @@ mod tests {
             })
             .collect();
         std::fs::write(&org_path, &old_orgs).unwrap();
+        // AC-09 adds the invitation language column. Strip it from the old
+        // schema fixture and update the manifest checksum.
+        let invitations_path = out.join("tables").join("invitations.copy");
+        let current_invitations = std::fs::read_to_string(&invitations_path).unwrap();
+        let old_invitations: String = current_invitations
+            .lines()
+            .map(|line| {
+                let (without_delivery, email_delivery) = line.rsplit_once('\t').unwrap();
+                assert_eq!(email_delivery, "f");
+                let (old_columns, language) = without_delivery.rsplit_once('\t').unwrap();
+                assert!(matches!(language, "en" | "de"));
+                format!("{old_columns}\n")
+            })
+            .collect();
+        std::fs::write(&invitations_path, &old_invitations).unwrap();
+        let users_path = out.join("tables").join("users.copy");
+        let current_users = std::fs::read_to_string(&users_path).unwrap();
+        let old_users: String = current_users
+            .lines()
+            .map(|line| {
+                let (old_columns, security_version) = line.rsplit_once('\t').unwrap();
+                assert_eq!(security_version, "0");
+                format!("{old_columns}\n")
+            })
+            .collect();
+        std::fs::write(&users_path, &old_users).unwrap();
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(11);
             m["tables"].as_array_mut().unwrap().retain(|t| {
@@ -1095,6 +1121,22 @@ mod tests {
                 .unwrap();
             versions["bytes"] = json!(old_versions.len());
             versions["sha256"] = json!(sha_hex(old_versions.as_bytes()));
+            let invitations = m["tables"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|t| t["name"] == "invitations")
+                .unwrap();
+            invitations["bytes"] = json!(old_invitations.len());
+            invitations["sha256"] = json!(sha_hex(old_invitations.as_bytes()));
+            let users = m["tables"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|t| t["name"] == "users")
+                .unwrap();
+            users["bytes"] = json!(old_users.len());
+            users["sha256"] = json!(sha_hex(old_users.as_bytes()));
             m["excluded_tables"] = json!([
                 "sessions",
                 "password_reset_tokens",
@@ -1116,7 +1158,7 @@ mod tests {
 
         // Restore, then migrate.
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 7);
+        assert_eq!(applied.len(), 8);
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         assert_eq!(
             dump(&w.env.pool, "users").await,
@@ -1528,7 +1570,7 @@ mod tests {
         .unwrap();
         assert_eq!((row.0, row.1, row.2.as_str()), (None, None, "success"));
         assert_eq!(row.3["blobs"], 1);
-        assert_eq!(row.3["migration"], 18);
+        assert_eq!(row.3["migration"], 19);
 
         // The manifest holds no secrets: neither a connection string nor the
         // password of the database URL, and no names.

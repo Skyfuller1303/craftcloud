@@ -1,0 +1,4 @@
+Hallo {{recipient_name}},
+
+Sicherheitshinweis: {{security_event}}.
+Wenn du das nicht warst, wende dich an deine CraftCloud-Administration.

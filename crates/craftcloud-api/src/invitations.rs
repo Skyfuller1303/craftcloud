@@ -30,6 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use time::OffsetDateTime;
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::audit::{Change, commit_audited};
@@ -76,6 +77,8 @@ fn invalid_invitation(headers: &HeaderMap) -> Response {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateInvitationRequest {
     email: String,
+    #[serde(default)]
+    language: Option<String>,
     org_role: String,
     workspace_id: Option<String>,
     workspace_role: Option<String>,
@@ -97,6 +100,14 @@ pub(crate) async fn create_invitation(
     };
     if let Err(response) = services.rate_limit_invite(session.user_id, &headers) {
         return *response;
+    }
+    if !services.email_delivery_enabled() && services.settings.public_url.is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUTH_UNAVAILABLE",
+            "CRAFTCLOUD_PUBLIC_URL must be configured to build invitation links.",
+            &headers,
+        );
     }
 
     // Structural validation (no state involved).
@@ -123,6 +134,10 @@ pub(crate) async fn create_invitation(
     let mut invalid = Vec::new();
     if email.is_err() {
         invalid.push("email");
+    }
+    let language = request.language.as_deref().unwrap_or("en");
+    if !matches!(language, "en" | "de") {
+        invalid.push("language");
     }
     if org_role.is_none() {
         invalid.push("org_role");
@@ -217,6 +232,8 @@ pub(crate) async fn create_invitation(
             &scope,
             &NewInvitation {
                 email: email.as_str().to_owned(),
+                language: language.to_owned(),
+                email_delivery: services.email_delivery_enabled(),
                 org_role,
                 workspace,
                 guest_workspace,
@@ -229,6 +246,58 @@ pub(crate) async fn create_invitation(
         .await;
     match created {
         Ok(CreateInvitationOutcome::Created(invitation)) => {
+            let invitation = *invitation;
+            if services.email_delivery_enabled() {
+                let outbox_id = Uuid::new_v4();
+                let encrypted_token =
+                    match services.encrypt_email_token(outbox_id, token.expose().as_bytes()) {
+                        Ok(value) => value,
+                        Err(_) => return unavailable(&headers, "TWO_FACTOR_UNAVAILABLE"),
+                    };
+                let organization_name = match tx.current_name().await {
+                    Ok(name) => name,
+                    Err(error) => {
+                        return db_failure(&error, &headers, "organization lookup failed");
+                    }
+                };
+                let inviter_name = match tx.user_display_name(session.user_id).await {
+                    Ok(Some(name)) => name,
+                    Ok(None) => return not_found(&headers),
+                    Err(error) => return db_failure(&error, &headers, "inviter lookup failed"),
+                };
+                let draft = craftcloud_db::email_outbox::EmailDraft {
+                    id: outbox_id,
+                    recipient: email.as_str().to_owned(),
+                    template: "invitation".to_owned(),
+                    language: language.to_owned(),
+                    params: json!({
+                        "recipient_name": email.as_str(),
+                        "inviter_name": inviter_name,
+                        "organization_name": organization_name,
+                        "org_role": org_role.as_str(),
+                        "invitation_id": invitation.id.to_string(),
+                    }),
+                    encrypted_token: Some(encrypted_token),
+                    expires_at: invitation.expires_at,
+                    actor_id: Some(session.user_id),
+                    is_resend: false,
+                    now,
+                };
+                match tx.enqueue_email(&draft).await {
+                    Ok(craftcloud_db::email_outbox::EnqueueOutcome::Queued) => {}
+                    Ok(_) => {
+                        return error_response(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "RATE_LIMITED",
+                            "Too many email messages were requested. Try again later.",
+                            &headers,
+                        );
+                    }
+                    Err(error) => {
+                        return db_failure(&error, &headers, "invitation email enqueue failed");
+                    }
+                }
+            }
             if let Err(error) = commit_audited(
                 tx,
                 Change::new(
@@ -243,6 +312,17 @@ pub(crate) async fn create_invitation(
             .await
             {
                 return db_failure(&error, &headers, "invitation creation failed");
+            }
+            if services.email_delivery_enabled() {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "invitation_id": invitation.id.to_string(),
+                        "sent_to": invitation.email,
+                        "expires_at": rfc3339(invitation.expires_at),
+                    })),
+                )
+                    .into_response();
             }
             // The token travels in the URL fragment: not sent to servers or Referer.
             let invite_url = format!("{public_url}/invite#token={}", token.expose());
@@ -449,6 +529,195 @@ pub(crate) async fn revoke_invitation(
     }
 }
 
+// ---- POST /organizations/{org_id}/invitations/{id}/resend ------------------
+
+pub(crate) async fn resend_invitation(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path((org_raw, id_raw)): Path<(String, String)>,
+) -> Response {
+    let Some(services) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(response) = services.rate_limit_invite(session.user_id, &headers) {
+        return *response;
+    }
+    if !services.email_delivery_enabled() && services.settings.public_url.is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUTH_UNAVAILABLE",
+            "CRAFTCLOUD_PUBLIC_URL must be configured to build invitation links.",
+            &headers,
+        );
+    }
+    let Some(org_id) = parse_id(&org_raw) else {
+        return not_found(&headers);
+    };
+    let invitation_id = parse_id(&id_raw);
+    let mut tx = match OrgTx::begin(&services.pool, org_id).await {
+        Ok(Some(tx)) => tx,
+        Ok(None) => return not_found(&headers),
+        Err(error) => return db_failure(&error, &headers, "invitation transaction failed"),
+    };
+    let loaded = async {
+        let role = tx.role_of(session.user_id).await?;
+        let invitation = match invitation_id {
+            Some(id) => tx.invitation_get(id).await?,
+            None => None,
+        };
+        let spec = match &invitation {
+            Some(invitation) => tx.invitation_spec(invitation).await?,
+            None => None,
+        };
+        let invited_workspace = spec
+            .as_ref()
+            .and_then(|s| s.workspace.map(|(id, _)| id).or(s.guest_workspace));
+        let ws_role = match invited_workspace {
+            Some(workspace_id) => tx.workspace_role_of(workspace_id, session.user_id).await?,
+            None => None,
+        };
+        Ok::<_, DbError>((role, invitation, spec, invited_workspace, ws_role))
+    }
+    .await;
+    let (role, invitation, spec, invited_workspace, ws_role) = match loaded {
+        Ok(value) => value,
+        Err(error) => return db_failure(&error, &headers, "invitation lookup failed"),
+    };
+    let Some(_invitation) = invitation else {
+        return not_found(&headers);
+    };
+    let actor = Actor {
+        user_id: session.user_id,
+        instance_operator: false,
+        membership: role.map(|role| OrgMembership { org_id, role }),
+        workspace: invited_workspace
+            .zip(ws_role)
+            .map(|(workspace_id, role)| WorkspaceMembership { workspace_id, role }),
+    };
+    let decision = can(
+        &actor,
+        Action::InvitationCreate,
+        &Resource::Invitation { org_id, spec },
+    );
+    let permit = match gate(
+        decision,
+        &headers,
+        session.user_id,
+        "invitation.resend",
+        Some(org_id),
+        invitation_id,
+    ) {
+        Gate::Open(permit) => permit,
+        Gate::Closed(response) => return response,
+    };
+    let (Some(scope), Some(invitation_id)) = (OrgScope::from_permit(&permit), invitation_id) else {
+        return internal(&headers);
+    };
+    let Ok(token) = OpaqueToken::generate() else {
+        return internal(&headers);
+    };
+    let now = services.clock.now();
+    let expires_at = now + INVITATION_TTL;
+    let rotated = match tx
+        .invitation_resend(
+            &scope,
+            invitation_id,
+            &token.hash(),
+            session.user_id,
+            now,
+            expires_at,
+            services.email_delivery_enabled(),
+        )
+        .await
+    {
+        Ok(Some(invitation)) => invitation,
+        Ok(None) => return not_found(&headers),
+        Err(error) => return db_failure(&error, &headers, "invitation rotation failed"),
+    };
+    if services.email_delivery_enabled() {
+        let outbox_id = Uuid::new_v4();
+        let encrypted_token =
+            match services.encrypt_email_token(outbox_id, token.expose().as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return unavailable(&headers, "TWO_FACTOR_UNAVAILABLE"),
+            };
+        let organization_name = match tx.current_name().await {
+            Ok(name) => name,
+            Err(error) => return db_failure(&error, &headers, "organization lookup failed"),
+        };
+        let inviter_name = match tx.user_display_name(session.user_id).await {
+            Ok(Some(name)) => name,
+            Ok(None) => return not_found(&headers),
+            Err(error) => return db_failure(&error, &headers, "inviter lookup failed"),
+        };
+        let draft = craftcloud_db::email_outbox::EmailDraft {
+            id: outbox_id,
+            recipient: rotated.email.clone(),
+            template: "invitation".to_owned(),
+            language: rotated.language.clone(),
+            params: json!({
+                "recipient_name": rotated.email.clone(),
+                "inviter_name": inviter_name,
+                "organization_name": organization_name,
+                "org_role": rotated.org_role.clone(),
+                "invitation_id": rotated.id.to_string(),
+            }),
+            encrypted_token: Some(encrypted_token),
+            expires_at,
+            actor_id: Some(session.user_id),
+            is_resend: true,
+            now,
+        };
+        match tx.enqueue_email(&draft).await {
+            Ok(craftcloud_db::email_outbox::EnqueueOutcome::Queued) => {}
+            Ok(_) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "RATE_LIMITED",
+                    "Too many email messages were requested. Try again later.",
+                    &headers,
+                );
+            }
+            Err(error) => return db_failure(&error, &headers, "invitation email enqueue failed"),
+        }
+    }
+    if let Err(error) = tx
+        .audit(
+            &crate::audit::ctx(&headers, Some(session.user_id)),
+            craftcloud_db::audit::NewEvent::new("invitation.resend")
+                .org(org_id)
+                .target("invitation", invitation_id),
+        )
+        .await
+    {
+        return db_failure(&error, &headers, "invitation resend audit failed");
+    }
+    if let Err(error) = tx.commit().await {
+        return db_failure(&error, &headers, "invitation resend failed");
+    }
+    if services.email_delivery_enabled() {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"invitation_id": rotated.id.to_string(), "sent_to": rotated.email, "expires_at": rfc3339(rotated.expires_at)})),
+        )
+            .into_response();
+    }
+    let Some(public_url) = services.settings.public_url.as_deref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AUTH_UNAVAILABLE",
+            "CRAFTCLOUD_PUBLIC_URL must be configured to build invitation links.",
+            &headers,
+        );
+    };
+    (
+        StatusCode::CREATED,
+        Json(json!({"invitation_id": rotated.id.to_string(), "invite_url": format!("{public_url}/invite#token={}", token.expose()), "expires_at": rfc3339(rotated.expires_at)})),
+    )
+        .into_response()
+}
+
 // ---- POST /invitations/accept -----------------------------------------------------
 
 #[derive(Deserialize)]
@@ -522,6 +791,16 @@ pub(crate) async fn accept_invitation(
         Ok(account) => account,
         Err(error) => return db_failure(&error, &headers, "account lookup failed"),
     };
+    if services.email_delivery_enabled() && !peek.email_delivery {
+        return invalid_invitation(&headers);
+    }
+    if peek.email_delivery
+        && account
+            .as_ref()
+            .is_some_and(|account| account.email_verified_at.is_none())
+    {
+        return invalid_invitation(&headers);
+    }
 
     let mut issued_hash: Option<String> = None;
     let by = match (&account, &session) {

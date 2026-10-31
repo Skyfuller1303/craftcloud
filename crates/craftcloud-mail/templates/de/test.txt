@@ -1,0 +1,1 @@
+Dies ist eine CraftCloud-Testnachricht für {{recipient_name}}. Der SMTP-Versand funktioniert.

@@ -562,6 +562,152 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/email-verification:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Send an address verification link to the current account
+      description: >-
+        Always returns the same generic 202 for verified and unverified accounts. Requires active email delivery;
+        request limits are durable per recipient/template and actor. The token is encrypted in the outbox and never
+        returned in the response.
+      responses:
+        '202': {description: Generic verification request accepted, content: {application/json: {schema: {$ref: '#/components/schemas/EmailRequestResponse'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/email-verification/confirm:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Confirm the current account address
+      description: Requires a matching Origin for browser requests; optionally accepts a valid session and enforces CSRF for cookie credentials. Rate limited by client address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailTokenRequest'}
+      responses:
+        '204': {description: Address verified}
+        '400': {description: INVALID_EMAIL_TOKEN or invalid body, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/email-change:
+    post:
+      tags: [Auth]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Request a verified change to the current account address
+      description: >-
+        Requires the current password and, when TOTP is active, exactly one current TOTP or recovery code. The proof
+        is rechecked and consumed under the account lock with the pending address and encrypted mail outbox writes.
+        A confirmation link goes to the new address and a no-link security notice goes to the old address. The old
+        address stays active until confirmation. A target already in use produces the same generic response as a queued request. Response never returns the link.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailChangeRequest'}
+      responses:
+        '202': {description: Generic request accepted, content: {application/json: {schema: {$ref: '#/components/schemas/EmailRequestResponse'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /auth/email-change/confirm:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Confirm and apply a pending account address change
+      description: Requires a matching Origin for browser requests; optionally accepts a valid session and enforces CSRF for cookie credentials. Rate limited by client address. Invalid, expired, consumed and stale proofs share one error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmailTokenRequest'}
+      responses:
+        '204': {description: Address changed and verified}
+        '400': {description: INVALID_EMAIL_TOKEN or invalid body, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/email-delivery:
+    get:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      summary: Read aggregate email delivery status (instance operator only)
+      responses:
+        '200': {description: Delivery status, content: {application/json: {schema: {$ref: '#/components/schemas/EmailDeliveryStatus'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/email-delivery/test:
+    post:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Queue a test message to the operator's own address
+      responses:
+        '202': {description: Test message queued, content: {application/json: {schema: {$ref: '#/components/schemas/EmailRequestResponse'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/users/email-verification:
+    post:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Queue verification messages for unverified accounts (instance operator only)
+      description: >-
+        Processes at most 500 eligible accounts after the optional cursor. Continue with `next_cursor` while it is
+        non-null. A response with `limited=true` stopped at the durable actor limit; retry after `retry_after_seconds`
+        using the returned cursor.
+      parameters:
+        - in: query
+          name: after
+          required: false
+          schema: {type: string, format: uuid}
+      responses:
+        '202': {description: Batch accepted, content: {application/json: {schema: {$ref: '#/components/schemas/EmailVerificationBatchResponse'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /auth/profile:
     patch:
       tags: [Auth]
@@ -745,12 +891,13 @@ paths:
         - cookieAuth: []
           csrfToken: []
         - bearerAuth: []
-      summary: Issue a password reset link (instance operator only)
+      summary: Issue and deliver a password reset link (instance operator only)
       description: >-
         Until the policy engine (PR-006) only the instance operator recorded by the one-time setup may call
         this (others: 403 FORBIDDEN). Issuing a link is a compromise response (ADR-0013): it immediately
-        revokes every active session of the target account and voids older pending links of that account. The
-        link is returned once; only a hash of its token is stored. The token sits in the URL fragment so it is
+        revokes every active session of the target account and voids older pending links of that account. With
+        active delivery the encrypted outbox sends the link and the response contains only the recipient. With
+        delivery disabled the link is returned once; only its hash is stored. The token sits in the URL fragment so it is
         not sent to servers or in Referer headers. Requires CRAFTCLOUD_PUBLIC_URL (otherwise 503
         AUTH_UNAVAILABLE). Disabled accounts: 409 ACCOUNT_DISABLED. Offline alternative:
         craftcloud-server admin issue-password-reset --email <address>.
@@ -766,10 +913,15 @@ paths:
       responses:
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
-          description: Reset link issued
+          description: Reset link issued with delivery disabled
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ResetLinkResponse'}
+        '202':
+          description: Reset link queued for delivery
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EmailQueuedResponse'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
           description: CSRF_FAILED or FORBIDDEN (not the instance operator)
@@ -1198,7 +1350,7 @@ paths:
       description: >-
         Instance-level account metadata, no organization data: id, address, display name, creation time, disabled flag,
         email_verified and, for accounts created by an invitation, the origin (organization, inviting user, invitation).
-        email_verified is false for every account until an e-mail verification flow exists (also for the setup
+        email_verified reflects whether that account completed the e-mail verification flow (also for the setup
         operator). Use `?unverified=true` to list accounts without verified address. This is the operator's tool
         against account squatting: an inviter who accepts their own link creates an instance-wide account for an
         address they may not own; the operator can see who created it and disable it
@@ -2876,14 +3028,15 @@ paths:
         - cookieAuth: []
           csrfToken: []
         - bearerAuth: []
-      summary: Invite a person by link (no e-mail is sent in this phase)
+      summary: Invite a person by delivery email or offline link
       description: >-
         Owners and admins may invite as admin or member (never owner), optionally with a workspace and any
         workspace role. A workspace admin may invite only as member, only into the own workspace, with at most
         editor, and only while the organization setting workspace_admin_invites_enabled is true (otherwise 403).
-        The response contains the one-time invite_url (`<PUBLIC_URL>/invite#token=<token>`; the token is in the URL
-        fragment and shown only here; only its SHA-256 is stored). The link is valid for 72 hours, single use and
-        revocable; possession of the link is the proof of the e-mail address until e-mail delivery exists. One open
+        With email delivery active, the outbox atomically sends the link and the response contains only the invited
+        address; no account is created until the recipient opens the emailed link and sets a password. Without email
+        delivery, the response preserves the one-time invite_url (`<PUBLIC_URL>/invite#token=<token>`). The link is
+        valid for 72 hours, single use and revocable; only its SHA-256 is stored. One open
         invitation per organization and normalized address (409 INVITATION_PENDING), at most 1000 open invitations
         per organization (409 INVITATION_LIMIT), rate limited per user (429). 503 AUTH_UNAVAILABLE when
         CRAFTCLOUD_PUBLIC_URL is not configured. A workspace of another organization or an unknown workspace
@@ -2896,10 +3049,15 @@ paths:
       responses:
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '201':
-          description: Created
+          description: Created with delivery disabled; one-time link shown
           content:
             application/json:
               schema: {$ref: '#/components/schemas/CreatedInvitation'}
+        '202':
+          description: Created and queued for delivery; no capability returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InvitationDeliveryResponse'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2937,6 +3095,31 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/invitations/{invitation_id}/resend:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+      - in: path
+        name: invitation_id
+        required: true
+        schema: {type: string, format: uuid}
+    post:
+      tags: [Invitations]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Rotate and resend an open invitation
+      description: Rotates the capability and expiry atomically with the delivery outbox. Returns no token when delivery is active. Owners/admins may resend; workspace admins only invitations they create.
+      responses:
+        '202': {description: Queued, content: {application/json: {schema: {$ref: '#/components/schemas/InvitationDeliveryResponse'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /projects/{project_id}/grants:
@@ -3518,10 +3701,11 @@ components:
         expires_at: {type: string, format: date-time, description: Earliest of idle expiry from now and the absolute expiry}
     SessionInfo:
       type: object
-      required: [user_id, email, display_name, instance_role, csrf_token, created_at, expires_at]
+      required: [user_id, email, email_verified, display_name, instance_role, csrf_token, created_at, expires_at]
       properties:
         user_id: {type: string, format: uuid}
         email: {type: string}
+        email_verified: {type: boolean}
         display_name: {type: string}
         instance_role: {type: [string, 'null'], enum: [operator, null]}
         csrf_token: {type: string}
@@ -3769,10 +3953,52 @@ components:
         new_password: {type: string, writeOnly: true, minLength: 12, maxLength: 128}
     ResetLinkResponse:
       type: object
-      required: [reset_url, expires_at]
+      required: [expires_at]
       properties:
-        reset_url: {type: string, description: "Shown once. Form: <public url>/reset-password#token=<token>"}
+        reset_url: {type: string, description: "Legacy mode only; shown once. Form: <public url>/reset-password#token=<token>"}
+        sent_to: {type: string, format: email, description: "Delivery mode only; recipient address already supplied by operator"}
         expires_at: {type: string, format: date-time}
+    EmailQueuedResponse:
+      type: object
+      required: [sent_to, expires_at]
+      properties:
+        sent_to: {type: string, format: email}
+        expires_at: {type: string, format: date-time}
+    EmailTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token: {type: string, writeOnly: true, description: Capability token from the link fragment}
+    EmailRequestResponse:
+      type: object
+      required: [message]
+      properties:
+        message: {type: string}
+    EmailChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: {type: string, format: email, maxLength: 320}
+        password: {type: string, writeOnly: true}
+        code: {type: string, pattern: '^[0-9]{6}$', writeOnly: true}
+        recovery_code: {type: string, minLength: 10, maxLength: 10, writeOnly: true}
+    EmailDeliveryStatus:
+      type: object
+      required: [configured, last_success_at, failed_count]
+      properties:
+        configured: {type: boolean}
+        last_success_at: {type: [string, 'null'], format: date-time}
+        failed_count: {type: integer, format: int64, minimum: 0}
+    EmailVerificationBatchResponse:
+      type: object
+      required: [queued, next_cursor, limited, retry_after_seconds]
+      properties:
+        queued: {type: integer, minimum: 0}
+        next_cursor: {type: [string, 'null'], format: uuid}
+        limited: {type: boolean}
+        retry_after_seconds: {type: [integer, 'null'], minimum: 1}
     Workspace:
       type: object
       required: [id, organization_id, slug, name, workspace_role, version, created_at]
@@ -4299,6 +4525,7 @@ components:
       required: [email, org_role]
       properties:
         email: {type: string, maxLength: 320}
+        language: {type: string, enum: [en, de], description: Optional invitation message language; defaults to English}
         org_role: {type: string, enum: [admin, member, guest]}
         workspace_id: {type: [string, 'null'], format: uuid, description: Guest invitation context only without workspace_role; otherwise required together with workspace_role}
         workspace_role: {type: [string, 'null'], enum: [admin, editor, viewer, null], description: Forbidden for guest invitations; required with workspace_id for other roles}
@@ -4310,6 +4537,13 @@ components:
         invite_url:
           type: string
           description: Shown once. `<PUBLIC_URL>/invite#token=<token>`; treat as a secret.
+        expires_at: {type: string, format: date-time}
+    InvitationDeliveryResponse:
+      type: object
+      required: [invitation_id, sent_to, expires_at]
+      properties:
+        invitation_id: {type: string, format: uuid}
+        sent_to: {type: string, format: email}
         expires_at: {type: string, format: date-time}
     Invitation:
       type: object

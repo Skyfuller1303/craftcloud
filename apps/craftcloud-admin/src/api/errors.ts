@@ -82,6 +82,10 @@ export function classifyError(error: unknown): ErrorKind {
 
 function codeMessage(t: Translate, error: ApiError): string | undefined {
   switch (error.code) {
+    case "EMAIL_DELIVERY_UNAVAILABLE":
+      return t("E-mail delivery is not available on this server.");
+    case "INVALID_EMAIL_TOKEN":
+      return t("This email confirmation link is invalid, expired or already used.");
     case "QUOTA_EXCEEDED":
       return t("The storage quota is used up. Free space or ask an administrator for more.");
     case "PAYLOAD_TOO_LARGE":

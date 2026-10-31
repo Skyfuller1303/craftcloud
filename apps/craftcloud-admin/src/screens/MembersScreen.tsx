@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "react-aria-components";
 import type { IssuedPasswordReset, OrgMember, Page, WorkspaceMember, WorkspaceRole } from "../api/types.ts";
+import { useEmailDelivery } from "./EmailAccount.tsx";
 import { useAuth } from "../auth.tsx";
 import { useAnnounce } from "../components/Announcer.tsx";
 import { Badge } from "../components/Badge.tsx";
@@ -47,6 +48,7 @@ export function MembersScreen({
   isOperator: boolean;
 }) {
   const { t, language } = useI18n();
+  const emailDelivery = useEmailDelivery();
   const { api } = useAuth();
   const announce = useAnnounce();
   const names = useRoleNames();
@@ -428,7 +430,7 @@ export function MembersScreen({
 
       {dialog?.kind === "account-reset" && (
         <AppModal title={t("Issue account reset link")} onClose={close} busy={action.pending} size="md">
-          <p>{t("Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.")}</p>
+          <p>{emailDelivery ? t("This signs out the account on all devices and sends a password reset email.") : t("Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.")}</p>
           <label className="two-factor-policy">
             <input
               type="checkbox"
@@ -450,6 +452,7 @@ export function MembersScreen({
 
       {resetResult !== null && (
         <AppModal title={t("Password reset link")} onClose={() => setResetResult(null)} size="md">
+          {resetResult.result.sent_to !== undefined ? <Alert tone="success">{t("Password reset email sent.")}</Alert> : <>
           <Alert tone="info">
             {t("Copy this link now. It is shown once and expires at {expires}.", {
               expires: formatDateTime(language, resetResult.result.expires_at),
@@ -459,6 +462,7 @@ export function MembersScreen({
             <span className="field__label">{t("One-time reset link")}</span>
             <input className="field__input field__input--mono" readOnly value={resetResult.result.reset_url} onFocus={(event) => event.currentTarget.select()} />
           </label>
+          </>}
           <div className="form__actions">
             <Button className="button button--primary" onPress={() => setResetResult(null)}>{t("Close")}</Button>
           </div>

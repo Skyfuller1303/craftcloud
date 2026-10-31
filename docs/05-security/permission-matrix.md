@@ -146,6 +146,12 @@ Die bestehende Mitgliedersuche für Freigaben behält ihre Rechte und Ratenbegre
 
 Entscheidungen und Vertragspräzisierungen: [ADR-0024](../09-decisions/adr-0024-admin-console.md). Rollenmatrix, HTTP- und Datenbankprüfungen sowie Browserbelege werden im AC-08-Abnahmebericht ausgewiesen; dieser Abschnitt allein ist kein Testnachweis.
 
-## Allgemeine Negativtests
+## AC-09: E-Mail und Adressverifikation
+
+`POST /auth/email-verification` und `POST /auth/email-change` sind Selbstbedienungsaktionen ausschließlich für das authentifizierte Konto. Die Adressänderung verlangt zusätzlich aktuelles Passwort und eingerichteten zweiten Faktor. Die Bestätigungsrouten verwenden einen kurzlebigen Einmaltoken, Origin-Prüfung und bei Cookie-Sitzungen den bestehenden CSRF-Schutz. Einladungs-Resends behalten die Rechteprüfung der ursprünglichen Einladung und geben bei aktivem Versand niemals Links zurück.
+
+`GET /admin/email-delivery`, `POST /admin/email-delivery/test` und `POST /admin/users/email-verification` sind operatorgeschützt. Die Testmail hat keinen frei wählbaren Empfänger; sie geht ausschließlich an das eigene Konto. Statusantworten enthalten nur Konfiguration, letzten Erfolg und Fehleranzahl. Organisationsrollen verleihen keine Rechte auf diese Instanzfunktionen.
+
+## Allgemeine Negativtests (weiterhin verbindlich)
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.

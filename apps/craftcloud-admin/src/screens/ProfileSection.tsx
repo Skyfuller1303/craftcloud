@@ -9,6 +9,7 @@ import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Alert, Field, focusFirstInvalid } from "../components/forms.tsx";
 import { useAction } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
+import { EmailChangeForm, useEmailDelivery } from "./EmailAccount.tsx";
 
 const NAME_MAX_CHARS = 100;
 // Same limits as the server (craftcloud-auth PASSWORD_MIN_CHARS / PASSWORD_MAX_CHARS), counted in characters.
@@ -26,6 +27,7 @@ function nameProblem(name: string): boolean {
  * operator can change it until the server can send e-mail.
  */
 export function ProfileSection({ session }: { session: SessionInfo }) {
+  const emailDelivery = useEmailDelivery();
   const { t } = useI18n();
   const { api, replaceSession } = useAuth();
   const announce = useAnnounce();
@@ -94,7 +96,7 @@ export function ProfileSection({ session }: { session: SessionInfo }) {
         <dt>{t("E-mail address")}</dt>
         <dd>{session.email}</dd>
       </dl>
-      <p className="muted">{t("Your e-mail address can only be changed by an instance operator for now.")}</p>
+      {emailDelivery ? <EmailChangeForm /> : <p className="muted">{t("Your e-mail address can only be changed by an instance operator for now.")}</p>}
       <PasswordForm />
       <nav aria-label={t("Account security")}>
         <ul className="link-list">

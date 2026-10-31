@@ -6,9 +6,12 @@ mod common;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use axum::http::StatusCode;
+    use craftcloud_api::{ApiConfig, Services, router_with_shared};
+    use craftcloud_core::Capabilities;
     use serde_json::{Value, json};
     use uuid::Uuid;
 
@@ -140,6 +143,204 @@ mod tests {
             .nth(1)
             .unwrap()
             .to_owned()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn smtp_rejects_legacy_invite_until_resend_rotates_mailbox_proof() {
+        let mut w = W::new().await;
+        let (owner, owner_session) = w.user("legacy-inviter").await;
+        let org = w.org("legacy-invite", owner).await;
+        let legacy = w
+            .invite(
+                &owner_session,
+                org,
+                json!({"email": "new-person@example.test", "org_role": "member"}),
+            )
+            .await;
+        assert_eq!(legacy.status, StatusCode::CREATED, "{}", legacy.text);
+        let old_token = token_of(&legacy);
+        let invitation_id = legacy.body["invitation_id"].as_str().unwrap();
+        let (existing_id, existing_session) = w.user("existing-unverified").await;
+        let existing_invitation = w
+            .invite(
+                &owner_session,
+                org,
+                json!({"email": "existing-unverified@example.test", "org_role": "member"}),
+            )
+            .await;
+        assert_eq!(
+            existing_invitation.status,
+            StatusCode::CREATED,
+            "{}",
+            existing_invitation.text
+        );
+        let existing_invitation_id = existing_invitation.body["invitation_id"].as_str().unwrap();
+
+        let services = Arc::new(
+            Services::new(w.env.pool.clone(), None, crate::common::settings())
+                .with_clock(w.env.clock.clone())
+                .with_two_factor_keys(Some([0x42; 32]), None)
+                .with_email_delivery(true),
+        );
+        w.env.app = router_with_shared(
+            Capabilities::development_defaults(),
+            &ApiConfig::default(),
+            Some(Arc::clone(&services)),
+        );
+        w.env.services = services;
+
+        let old_link = w
+            .accept(
+                None,
+                json!({
+                    "token": old_token,
+                    "display_name": "New Person",
+                    "password": "long-enough-password"
+                }),
+            )
+            .await;
+        assert_status(&old_link, StatusCode::BAD_REQUEST, "INVALID_INVITATION");
+        assert_eq!(
+            w.env
+                .count(
+                    "SELECT count(*) FROM users WHERE normalized_email='new-person@example.test'"
+                )
+                .await,
+            0
+        );
+
+        let resent = call(
+            &w.env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/organizations/{org}/invitations/{invitation_id}/resend"),
+            )
+            .session(&owner_session),
+        )
+        .await;
+        assert_eq!(resent.status, StatusCode::ACCEPTED, "{}", resent.text);
+        let (outbox_id, ciphertext): (Uuid, Vec<u8>) = sqlx::query_as(
+            "SELECT id,encrypted_token FROM outbound_emails WHERE template='invitation' ORDER BY created_at DESC LIMIT 1"
+        ).fetch_one(&w.env.pool).await.unwrap();
+        let token =
+            craftcloud_auth::decrypt_secret_for(&[0x42; 32], &ciphertext, outbox_id, b"email")
+                .unwrap();
+        let token = String::from_utf8(token).unwrap();
+        let accepted = w
+            .accept(
+                None,
+                json!({
+                    "token": token,
+                    "display_name": "New Person",
+                    "password": "long-enough-password"
+                }),
+            )
+            .await;
+        assert_eq!(accepted.status, StatusCode::OK);
+        assert_eq!(w.env.count("SELECT count(*) FROM users WHERE normalized_email='new-person@example.test' AND email_verified_at IS NOT NULL").await, 1);
+
+        let resent_existing = call(
+            &w.env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/organizations/{org}/invitations/{existing_invitation_id}/resend"),
+            )
+            .session(&owner_session),
+        )
+        .await;
+        assert_eq!(
+            resent_existing.status,
+            StatusCode::ACCEPTED,
+            "{}",
+            resent_existing.text
+        );
+        let (outbox_id, ciphertext): (Uuid, Vec<u8>) = sqlx::query_as(
+            "SELECT id,encrypted_token FROM outbound_emails WHERE template='invitation' AND params->>'invitation_id'=$1 ORDER BY created_at DESC LIMIT 1"
+        ).bind(existing_invitation_id).fetch_one(&w.env.pool).await.unwrap();
+        let token =
+            craftcloud_auth::decrypt_secret_for(&[0x42; 32], &ciphertext, outbox_id, b"email")
+                .unwrap();
+        let existing_token = String::from_utf8(token).unwrap();
+        let premature = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/invitations/accept")
+                .session(&existing_session)
+                .json(json!({"token": existing_token.clone()})),
+        )
+        .await;
+        assert_status(&premature, StatusCode::BAD_REQUEST, "INVALID_INVITATION");
+        assert!(
+            sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+                "SELECT email_verified_at FROM users WHERE id=$1"
+            )
+            .bind(existing_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let verification = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/auth/email-verification").session(&existing_session),
+        )
+        .await;
+        assert_eq!(
+            verification.status,
+            StatusCode::ACCEPTED,
+            "{}",
+            verification.text
+        );
+        let (outbox_id, ciphertext): (Uuid, Vec<u8>) = sqlx::query_as(
+            "SELECT id,encrypted_token FROM outbound_emails WHERE template='email_verification' AND actor_id=$1 ORDER BY created_at DESC LIMIT 1"
+        ).bind(existing_id).fetch_one(&w.env.pool).await.unwrap();
+        let token =
+            craftcloud_auth::decrypt_secret_for(&[0x42; 32], &ciphertext, outbox_id, b"email")
+                .unwrap();
+        let token = String::from_utf8(token).unwrap();
+        let verified = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/auth/email-verification/confirm")
+                .json(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(verified.status, StatusCode::NO_CONTENT, "{}", verified.text);
+        let accepted_existing = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/invitations/accept")
+                .session(&existing_session)
+                .json(json!({"token": existing_token})),
+        )
+        .await;
+        assert_eq!(
+            accepted_existing.status,
+            StatusCode::OK,
+            "{}",
+            accepted_existing.text
+        );
+
+        let available = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/auth/email-change")
+                .session(&owner_session)
+                .json(json!({"email":"change-a@example.test", "password":crate::common::PASSWORD})),
+        )
+        .await;
+        let occupied = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/auth/email-change")
+                .session(&owner_session)
+                .json(
+                    json!({"email":"new-person@example.test", "password":crate::common::PASSWORD}),
+                ),
+        )
+        .await;
+        assert_eq!(available.status, StatusCode::ACCEPTED, "{}", available.text);
+        assert_eq!(
+            (occupied.status, occupied.body),
+            (available.status, available.body)
+        );
     }
 
     fn assert_status(resp: &Resp, status: StatusCode, code: &str) {

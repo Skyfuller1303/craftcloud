@@ -1,5 +1,13 @@
 # Threat model (STRIDE / trust boundary review)
 
+## AC-09: Transactional email and address ownership
+
+The email-delivery mode closes inviter account squatting by keeping invitation bearer links away from the inviter and requiring mailbox proof before account creation. Legacy installations without SMTP retain ADR-0017's residual risk. Verification never silently trusts pre-existing accounts. Address changes require current password and configured second factor, bind a single-use capability to current account state, and take effect only after confirmation at the new address.
+
+SMTP requires certificate-verified STARTTLS or implicit TLS. Credentials come from protected files. Templates escape HTML and substitute only original placeholders; user content cannot introduce new substitutions. Only the configured public URL can form capability links. No message, token, password, or recipient appears in operational logs. The operator view provides aggregate status only, and test delivery targets its own authenticated account.
+
+The business transaction and outbox insert commit together. Tokens use authenticated encryption with a distinct `email` AAD and per-row UUID; terminal or expired messages lose their ciphertext. Durable recipient/template, actor and resend limits serialize admission. Leased worker claims, bounded sends and current-capability checks limit stale or concurrent delivery. SMTP is at least once: a crash after SMTP acceptance may cause duplicate messages. Queue and outstanding confirmation capabilities are excluded from backups. Delivery does not prove that the mailbox provider ultimately placed the message in the inbox. Relay and mailbox compromise remain outside application protection.
+
 ## Assets
 
 Benutzeridentitäten, Session-/Device-Tokens, Org-/Workspace-Metadaten, private Entwurfsdateien, Dateiversionen und -Hashes, Einladungen, Audit-Historie, Storage-Buckets, Secrets, Backup-Archive und Restore-Kontrolle. Betreiber mit Root-/DB-/Storagezugriff kann **unverschlüsselte Dateien lesen**; E2EE ist nicht Bestandteil des MVP.

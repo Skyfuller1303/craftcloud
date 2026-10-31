@@ -14,6 +14,7 @@ import type { ThemeChoice } from "../preferences.ts";
 import { usePagedList } from "../usePagedList.ts";
 import { ScreenBoundary } from "../components/ScreenBoundary.tsx";
 import { ProfileSection } from "./ProfileSection.tsx";
+import { VerificationNotice } from "./EmailAccount.tsx";
 
 // Every screen is its own chunk, loaded on first use, so the first paint only
 // needs the shell (code splitting; the strict CSP forbids inline code, and a
@@ -398,6 +399,7 @@ export function Shell({
             />
           )}
           {notice !== undefined && <Alert tone="success">{notice}</Alert>}
+          {serverInfo?.feature_flags?.email_delivery === true && session.email_verified === false && <VerificationNotice />}
           {needsTwoFactorSetup && organization !== null && (
             <Alert tone="info">
               {t("This organization requires two-factor authentication. Set it up to continue here; other organizations remain available.")}

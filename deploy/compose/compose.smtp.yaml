@@ -1,0 +1,16 @@
+# Opt-in SMTP relay delivery. No test sink is part of this production overlay.
+# Add compose.smtp-auth.yaml only when the relay requires a password.
+services:
+  server:
+    environment:
+      CRAFTCLOUD_MAIL_TRANSPORT: smtp
+      CRAFTCLOUD_SMTP_HOST: ${CRAFTCLOUD_SMTP_HOST:?set SMTP host}
+      CRAFTCLOUD_SMTP_PORT: ${CRAFTCLOUD_SMTP_PORT:-587}
+      CRAFTCLOUD_SMTP_TLS: ${CRAFTCLOUD_SMTP_TLS:-starttls}
+      CRAFTCLOUD_SMTP_FROM: ${CRAFTCLOUD_SMTP_FROM:?set SMTP sender}
+    networks: [smtp_egress]
+
+networks:
+  # SMTP requires an outbound route. Restrict host firewall egress to the
+  # configured relay and its port; only the server joins this network.
+  smtp_egress: {}

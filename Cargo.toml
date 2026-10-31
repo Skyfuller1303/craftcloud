@@ -13,6 +13,7 @@ members = [
     "crates/craftcloud-db",
     "crates/craftcloud-storage",
     "crates/craftcloud-figcraft",
+    "crates/craftcloud-mail",
     "xtask",
 ]
 
@@ -31,6 +32,8 @@ craftcloud-db = { path = "crates/craftcloud-db" }
 craftcloud-auth = { path = "crates/craftcloud-auth" }
 craftcloud-storage = { path = "crates/craftcloud-storage" }
 craftcloud-figcraft = { path = "crates/craftcloud-figcraft" }
+craftcloud-mail = { path = "crates/craftcloud-mail" }
+lettre = { version = "=0.11.23", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 argon2 = { version = "0.5", features = ["std"] }
 aes-gcm = "0.10"
 hmac = "0.12"

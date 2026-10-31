@@ -181,6 +181,7 @@ pub struct Services {
     pub(crate) storage: Option<craftcloud_storage::LocalStore>,
     pub(crate) figcraft: Option<Arc<dyn craftcloud_figcraft::Backend>>,
     pub(crate) figcraft_public_url: Option<String>,
+    pub(crate) email_delivery_enabled: bool,
     pub(crate) figcraft_permits: Arc<Semaphore>,
     pub(crate) figcraft_job_permits: Arc<Semaphore>,
     hash_permits: Arc<Semaphore>,
@@ -264,6 +265,7 @@ impl Services {
             storage: None,
             figcraft: None,
             figcraft_public_url: None,
+            email_delivery_enabled: false,
             figcraft_permits: Arc::new(Semaphore::new(4)),
             figcraft_job_permits: Arc::new(Semaphore::new(crate::figcraft_jobs::MAX_FIGCRAFT_JOBS)),
             hash_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HASHES)),
@@ -297,6 +299,32 @@ impl Services {
     ) -> Self {
         self.two_factor_keys = TwoFactorKeys { current, old };
         self
+    }
+
+    /// Marks email delivery active after the server validates SMTP settings.
+    #[must_use]
+    pub fn with_email_delivery(mut self, enabled: bool) -> Self {
+        self.email_delivery_enabled = enabled;
+        self
+    }
+
+    /// Whether the server has an active mail transport.
+    pub(crate) const fn email_delivery_enabled(&self) -> bool {
+        self.email_delivery_enabled
+    }
+
+    /// Encrypts a one-use mail capability under the AC-02 key and email AAD.
+    pub(crate) fn encrypt_email_token(
+        &self,
+        owner: Uuid,
+        token: &[u8],
+    ) -> Result<Vec<u8>, craftcloud_auth::SecretBoxError> {
+        let key = self
+            .two_factor_keys
+            .current
+            .as_ref()
+            .ok_or(craftcloud_auth::SecretBoxError::InvalidKey)?;
+        craftcloud_auth::encrypt_secret_for(key, owner, b"email", token)
     }
 
     /// Whether a current key is available for setting up new TOTP factors.

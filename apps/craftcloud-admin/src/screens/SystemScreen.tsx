@@ -8,6 +8,7 @@ import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Alert } from "../components/forms.tsx";
 import { formatBytes, formatDateTime } from "../format.ts";
 import { useI18n } from "../i18n/index.tsx";
+import { EmailSystem } from "./EmailSystem.tsx";
 
 type State =
   | { status: "loading" }
@@ -52,6 +53,7 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
 
   return (
     <div className="stack">
+      <EmailSystem revision={round} />
       <p>
         <Button className="button" onPress={reload} isDisabled={state.status === "loading"}>
           {t("Refresh")}

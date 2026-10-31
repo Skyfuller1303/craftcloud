@@ -346,16 +346,25 @@ pub(crate) async fn login(
         idle_expires_at: idle_expiry,
         absolute_expires_at: absolute,
     };
-    let created = device_sessions::create_for_verified_login(
+    let created = device_sessions::create_for_verified_login_with_email(
         &services.pool,
         &new,
         &stored_hash,
         &audit_ctx(&headers, Some(account.user_id)),
+        services.email_delivery_enabled(),
     )
     .await;
     let id = match created {
-        Ok(Some(id)) => id,
-        Ok(None) => {
+        Ok(device_sessions::LoginOutcome::Created(id)) => id,
+        Ok(device_sessions::LoginOutcome::EmailRateLimited) => {
+            return crate::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "Try again later.",
+                &headers,
+            );
+        }
+        Ok(device_sessions::LoginOutcome::Rejected) => {
             match second_factor_decision(
                 &services,
                 account.user_id,

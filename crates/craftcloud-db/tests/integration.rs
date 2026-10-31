@@ -91,6 +91,639 @@ mod tests {
         db
     }
 
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_outbox_applies_recipient_actor_and_resend_limits_durably() {
+        let db = migrated().await;
+        let actor = user(&db.pool, "email-actor@example.test").await;
+        let now = time::OffsetDateTime::now_utc();
+        let draft = |recipient: String, is_resend: bool| craftcloud_db::email_outbox::EmailDraft {
+            id: Uuid::new_v4(),
+            recipient,
+            template: "email_verification".to_owned(),
+            language: "en".to_owned(),
+            params: serde_json::json!({"recipient_name": "Test"}),
+            encrypted_token: None,
+            expires_at: now + time::Duration::hours(24),
+            actor_id: Some(actor.id),
+            is_resend,
+            now,
+        };
+        let recipient = "target@example.test".to_owned();
+        for _ in 0..5 {
+            let mut tx = db.pool.begin().await.unwrap();
+            assert_eq!(
+                craftcloud_db::email_outbox::enqueue_in(&mut tx, &draft(recipient.clone(), false))
+                    .await
+                    .unwrap(),
+                craftcloud_db::email_outbox::EnqueueOutcome::Queued
+            );
+            tx.commit().await.unwrap();
+        }
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_outbox::enqueue_in(&mut tx, &draft(recipient.clone(), true))
+                .await
+                .unwrap(),
+            craftcloud_db::email_outbox::EnqueueOutcome::ResendTooSoon
+        );
+        tx.rollback().await.unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_outbox::enqueue_in(&mut tx, &draft(recipient.clone(), false))
+                .await
+                .unwrap(),
+            craftcloud_db::email_outbox::EnqueueOutcome::RecipientLimit
+        );
+        tx.rollback().await.unwrap();
+        for index in 0..25 {
+            let mut tx = db.pool.begin().await.unwrap();
+            assert_eq!(
+                craftcloud_db::email_outbox::enqueue_in(
+                    &mut tx,
+                    &draft(format!("actor-{index}@example.test"), false)
+                )
+                .await
+                .unwrap(),
+                craftcloud_db::email_outbox::EnqueueOutcome::Queued
+            );
+            tx.commit().await.unwrap();
+        }
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_outbox::enqueue_in(
+                &mut tx,
+                &draft("actor-limit@example.test".to_owned(), false)
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_outbox::EnqueueOutcome::ActorLimit
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_outbox_lifecycle_retains_then_erases_ciphertext_and_fences_leases() {
+        let db = migrated().await;
+        let actor = user(&db.pool, "email-lifecycle@example.test").await;
+        let now = time::OffsetDateTime::now_utc();
+        let make_draft = |recipient: &str, expires_at| craftcloud_db::email_outbox::EmailDraft {
+            id: Uuid::new_v4(),
+            recipient: recipient.to_owned(),
+            template: "test".to_owned(),
+            language: "en".to_owned(),
+            params: serde_json::json!({"recipient_name":"Test"}),
+            encrypted_token: Some(vec![0x5a; 32]),
+            expires_at,
+            actor_id: Some(actor.id),
+            is_resend: false,
+            now,
+        };
+        let retry = make_draft("retry@example.test", now + time::Duration::hours(24));
+        let permanent = make_draft("permanent@example.test", now + time::Duration::hours(24));
+        let expiring = make_draft("expiry@example.test", now + time::Duration::hours(1));
+        for draft in [&retry, &permanent, &expiring] {
+            let mut tx = db.pool.begin().await.unwrap();
+            assert_eq!(
+                craftcloud_db::email_outbox::enqueue_in(&mut tx, draft)
+                    .await
+                    .unwrap(),
+                craftcloud_db::email_outbox::EnqueueOutcome::Queued
+            );
+            tx.commit().await.unwrap();
+        }
+
+        let lease_until = now + time::Duration::seconds(30);
+        let claims = craftcloud_db::email_outbox::claim_batch(&db.pool, now, lease_until, 3)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 3);
+        let retry_claim = claims.iter().find(|claim| claim.id == retry.id).unwrap();
+        let permanent_claim = claims
+            .iter()
+            .find(|claim| claim.id == permanent.id)
+            .unwrap();
+        let expiry_claim = claims.iter().find(|claim| claim.id == expiring.id).unwrap();
+        assert!(retry_claim.encrypted_token.is_some());
+        assert!(
+            craftcloud_db::email_outbox::mark_failed(
+                &db.pool,
+                retry.id,
+                retry_claim.lease_token,
+                now,
+                now + time::Duration::minutes(1),
+                false,
+                "smtp_timeout"
+            )
+            .await
+            .unwrap()
+        );
+        let retained: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT encrypted_token FROM outbound_emails WHERE id=$1")
+                .bind(retry.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(retained, Some(vec![0x5a; 32]));
+
+        assert!(
+            craftcloud_db::email_outbox::mark_failed(
+                &db.pool,
+                permanent.id,
+                permanent_claim.lease_token,
+                now,
+                now,
+                true,
+                "smtp_rejected"
+            )
+            .await
+            .unwrap()
+        );
+        let (status, ciphertext): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT status,encrypted_token FROM outbound_emails WHERE id=$1")
+                .bind(permanent.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(ciphertext.is_none());
+
+        let expired_at = now + time::Duration::hours(1);
+        assert_eq!(
+            craftcloud_db::email_outbox::expire_pending(&db.pool, expired_at)
+                .await
+                .unwrap(),
+            1
+        );
+        let (status, ciphertext): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT status,encrypted_token FROM outbound_emails WHERE id=$1")
+                .bind(expiring.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "expired");
+        assert!(ciphertext.is_none());
+        assert!(
+            !craftcloud_db::email_outbox::mark_sent(
+                &db.pool,
+                expiring.id,
+                expiry_claim.lease_token,
+                expired_at
+            )
+            .await
+            .unwrap()
+        );
+
+        let retry_at = now + time::Duration::minutes(1);
+        let retried = craftcloud_db::email_outbox::claim_batch(
+            &db.pool,
+            retry_at,
+            retry_at + time::Duration::seconds(30),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.len(), 1);
+        let retry_claim = &retried[0];
+        assert_eq!(retry_claim.id, retry.id);
+        assert_eq!(retry_claim.attempts, 2);
+        assert!(retry_claim.encrypted_token.is_some());
+        assert!(
+            craftcloud_db::email_outbox::mark_sent(
+                &db.pool,
+                retry.id,
+                retry_claim.lease_token,
+                retry_at
+            )
+            .await
+            .unwrap()
+        );
+        let (status, ciphertext): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT status,encrypted_token FROM outbound_emails WHERE id=$1")
+                .bind(retry.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "sent");
+        assert!(ciphertext.is_none());
+        assert!(
+            !craftcloud_db::email_outbox::mark_sent(
+                &db.pool,
+                retry.id,
+                retry_claim.lease_token,
+                retry_at
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !craftcloud_db::email_outbox::mark_failed(
+                &db.pool,
+                retry.id,
+                retry_claim.lease_token,
+                retry_at,
+                retry_at,
+                true,
+                "smtp_rejected"
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_capabilities_reject_changed_address_and_stale_security_proof() {
+        let db = migrated().await;
+        let account = user(&db.pool, "email-proof@example.test").await;
+        let now = time::OffsetDateTime::now_utc();
+        let verify_hash = [11_u8; 32];
+        let mut tx = db.pool.begin().await.unwrap();
+        assert!(
+            craftcloud_db::email_verification::issue_verification_in(
+                &mut tx,
+                account.id,
+                "email-proof@example.test",
+                &verify_hash,
+                now,
+                now + time::Duration::hours(1)
+            )
+            .await
+            .unwrap()
+        );
+        tx.commit().await.unwrap();
+        sqlx::query("UPDATE users SET normalized_email='changed@example.test' WHERE id=$1")
+            .bind(account.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::confirm_verification(&db.pool, &verify_hash, now)
+                .await
+                .unwrap(),
+            None
+        );
+        let verified: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("SELECT email_verified_at FROM users WHERE id=$1")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(verified.is_none());
+
+        sqlx::query("UPDATE users SET password_hash='test-hash' WHERE id=$1")
+            .bind(account.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let email_session = email_change_session(&db.pool, account.id, now).await;
+        let change_hash = [12_u8; 32];
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                account.id,
+                "test-hash",
+                "new-address@example.test",
+                &change_hash,
+                now,
+                now + time::Duration::hours(1),
+                None,
+                email_session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::Staged
+        );
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            craftcloud_db::password_reset::create(
+                &db.pool,
+                &craftcloud_db::password_reset::NewResetToken {
+                    user_id: account.id,
+                    token_hash: [13_u8; 32],
+                    created_by: None,
+                    reset_two_factor: false,
+                    now,
+                    expires_at: now + time::Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::password_reset::IssueOutcome::Issued { .. }
+        ));
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                account.id,
+                "test-hash",
+                "another-address@example.test",
+                &[14_u8; 32],
+                now,
+                now + time::Duration::hours(1),
+                None,
+                email_session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::ProofInvalid
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::confirm_email_change(&db.pool, &change_hash, now)
+                .await
+                .unwrap(),
+            craftcloud_db::email_verification::ConfirmEmailChangeOutcome::Invalid
+        );
+        let (address, pending): (String, bool) = sqlx::query_as(
+            "SELECT normalized_email,EXISTS(SELECT 1 FROM pending_email_changes WHERE user_id=$1) FROM users WHERE id=$1"
+        ).bind(account.id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(address, "changed@example.test");
+        assert!(!pending);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_verification_and_outbox_roll_back_as_one_unit() {
+        let db = migrated().await;
+        let account = user(&db.pool, "email-atomic@example.test").await;
+        let now = time::OffsetDateTime::now_utc();
+        let hash = [21_u8; 32];
+        let mut tx = db.pool.begin().await.unwrap();
+        assert!(
+            craftcloud_db::email_verification::issue_verification_in(
+                &mut tx,
+                account.id,
+                "email-atomic@example.test",
+                &hash,
+                now,
+                now + time::Duration::hours(1),
+            )
+            .await
+            .unwrap()
+        );
+        let draft = craftcloud_db::email_outbox::EmailDraft {
+            id: Uuid::new_v4(),
+            recipient: "email-atomic@example.test".to_owned(),
+            template: "email_verification".to_owned(),
+            language: "en".to_owned(),
+            params: serde_json::json!({"recipient_name":"Test"}),
+            encrypted_token: Some(vec![9; 32]),
+            expires_at: now + time::Duration::hours(1),
+            actor_id: Some(account.id),
+            is_resend: true,
+            now,
+        };
+        assert_eq!(
+            craftcloud_db::email_outbox::enqueue_in(&mut tx, &draft)
+                .await
+                .unwrap(),
+            craftcloud_db::email_outbox::EnqueueOutcome::Queued
+        );
+        tx.rollback().await.unwrap();
+        let (tokens, messages): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM email_verification_tokens WHERE user_id=$1), \
+             (SELECT count(*) FROM outbound_emails WHERE id=$2)",
+        )
+        .bind(account.id)
+        .bind(draft.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!((tokens, messages), (0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_change_releases_an_expired_cross_user_reservation() {
+        let db = migrated().await;
+        let first = user(&db.pool, "email-reservation-first@example.test").await;
+        let second = user(&db.pool, "email-reservation-second@example.test").await;
+        sqlx::query("UPDATE users SET password_hash='reservation-hash' WHERE id IN ($1,$2)")
+            .bind(first.id)
+            .bind(second.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let first_session = email_change_session(&db.pool, first.id, now).await;
+        let target = "reserved-target@example.test";
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                first.id,
+                "reservation-hash",
+                target,
+                &[41_u8; 32],
+                now,
+                now + time::Duration::seconds(1),
+                None,
+                first_session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::Staged
+        );
+        tx.commit().await.unwrap();
+
+        let later = now + time::Duration::seconds(2);
+        let second_session = email_change_session(&db.pool, second.id, later).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                second.id,
+                "reservation-hash",
+                target,
+                &[42_u8; 32],
+                later,
+                later + time::Duration::hours(1),
+                None,
+                second_session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::Staged
+        );
+        tx.commit().await.unwrap();
+        let (first_pending, second_pending): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM pending_email_changes WHERE user_id=$1), \
+             EXISTS(SELECT 1 FROM pending_email_changes WHERE user_id=$2 AND normalized_email=$3)",
+        )
+        .bind(first.id)
+        .bind(second.id)
+        .bind(target)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!first_pending);
+        assert!(second_pending);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_change_consumes_current_totp_and_rejects_factor_rotation() {
+        let db = migrated().await;
+        let account = user(&db.pool, "email-factor@example.test").await;
+        let now = time::OffsetDateTime::now_utc();
+        let secret = vec![7_u8; 32];
+        sqlx::query("UPDATE users SET password_hash='factor-hash' WHERE id=$1")
+            .bind(account.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,created_at) VALUES($1,$2,$3,$3)")
+            .bind(account.id).bind(&secret).bind(now).execute(&db.pool).await.unwrap();
+        let email_session = email_change_session(&db.pool, account.id, now).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                account.id,
+                "factor-hash",
+                "factor-new@example.test",
+                &[31_u8; 32],
+                now,
+                now + time::Duration::hours(1),
+                Some((
+                    &secret,
+                    craftcloud_db::two_factor::VerifiedFactor::TotpStep(100)
+                )),
+                email_session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::Staged
+        );
+        tx.commit().await.unwrap();
+        let accepted_step: Option<i64> =
+            sqlx::query_scalar("SELECT last_accepted_step FROM user_two_factor WHERE user_id=$1")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(accepted_step, Some(100));
+
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                account.id,
+                "factor-hash",
+                "factor-other@example.test",
+                &[32_u8; 32],
+                now,
+                now + time::Duration::hours(1),
+                Some((
+                    &secret,
+                    craftcloud_db::two_factor::VerifiedFactor::TotpStep(100)
+                )),
+                email_session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::ProofInvalid
+        );
+        tx.rollback().await.unwrap();
+
+        sqlx::query("UPDATE user_two_factor SET secret_ciphertext=$2 WHERE user_id=$1")
+            .bind(account.id)
+            .bind(vec![8_u8; 32])
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::confirm_email_change(&db.pool, &[31_u8; 32], now)
+                .await
+                .unwrap(),
+            craftcloud_db::email_verification::ConfirmEmailChangeOutcome::Invalid
+        );
+        let remains: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pending_email_changes WHERE user_id=$1)",
+        )
+        .bind(account.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!remains);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn email_change_confirmation_revokes_sessions_locks_and_login_challenges() {
+        let db = migrated().await;
+        let account = user(&db.pool, "email-revoke@example.test").await;
+        let (scope, owner) = org(&db.pool, "email-revoke").await;
+        let workspace = workspaces::create(
+            &db.pool,
+            &sc(&scope, craftcloud_core::policy::Action::WorkspaceCreate),
+            &NewWorkspace {
+                slug: "email-revoke".to_owned(),
+                name: "Email revoke".to_owned(),
+                quota_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+        let project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects(id,org_id,workspace_id,name,name_key,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,'Email revoke','email-revoke',$4,$5,$4,$5)")
+            .bind(project_id).bind(scope.org_id()).bind(workspace.id).bind(owner.id).bind(time::OffsetDateTime::now_utc()).execute(&db.pool).await.unwrap();
+        let file_id = Uuid::new_v4();
+        let now = time::OffsetDateTime::now_utc();
+        sqlx::query("INSERT INTO files(id,org_id,workspace_id,project_id,name,name_key,app,format,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,$4,'File','file','figcraft','figcraft',$5,$6,$5,$6)")
+            .bind(file_id).bind(scope.org_id()).bind(workspace.id).bind(project_id).bind(owner.id).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE users SET password_hash='revoke-hash' WHERE id=$1")
+            .bind(account.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let session = email_change_session(&db.pool, account.id, now).await;
+        sqlx::query("INSERT INTO file_locks(file_id,org_id,holder_user_id,holder_session_kind,holder_session_id,client_id,acquired_at,refreshed_at,expires_at) VALUES($1,$2,$3,'browser',$4,'browser-test',$5,$5,$6)")
+            .bind(file_id).bind(scope.org_id()).bind(account.id).bind(session.id).bind(now).bind(now + time::Duration::hours(1)).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO two_factor_login_challenges(id_hash,user_id,password_hash_digest,login_kind,client_address,created_at,expires_at) VALUES($1,$2,$3,'browser','127.0.0.1',$4,$5)")
+            .bind([51_u8; 32].as_slice()).bind(account.id).bind([52_u8; 32].as_slice()).bind(now).bind(now + time::Duration::minutes(3)).execute(&db.pool).await.unwrap();
+
+        let token_hash = [53_u8; 32];
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::stage_email_change_verified_in(
+                &mut tx,
+                account.id,
+                "revoke-hash",
+                "email-revoked@example.test",
+                &token_hash,
+                now,
+                now + time::Duration::hours(1),
+                None,
+                session,
+            )
+            .await
+            .unwrap(),
+            craftcloud_db::email_verification::StageEmailChangeOutcome::Staged
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::confirm_email_change(&db.pool, &token_hash, now)
+                .await
+                .unwrap(),
+            craftcloud_db::email_verification::ConfirmEmailChangeOutcome::Confirmed
+        );
+        let (revoked, locks, challenges): (bool, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT revoked_at IS NOT NULL FROM sessions WHERE id=$1), \
+             (SELECT count(*) FROM file_locks WHERE holder_user_id=$2), \
+             (SELECT count(*) FROM two_factor_login_challenges WHERE user_id=$2)",
+        )
+        .bind(session.id)
+        .bind(account.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(revoked);
+        assert_eq!((locks, challenges), (0, 0));
+    }
+
     async fn user(pool: &PgPool, email: &str) -> User {
         users::insert(
             pool,
@@ -101,6 +734,34 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn email_change_session(
+        pool: &PgPool,
+        user_id: Uuid,
+        now: time::OffsetDateTime,
+    ) -> craftcloud_db::email_verification::EmailChangeSession {
+        let id = Uuid::new_v4();
+        let mut token_hash = [0_u8; 32];
+        token_hash[..16].copy_from_slice(id.as_bytes());
+        let expires_at = now + time::Duration::hours(2);
+        sqlx::query(
+            "INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at) \
+             VALUES($1,$2,$3,$4,$4,$5)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(token_hash.as_slice())
+        .bind(now)
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        craftcloud_db::email_verification::EmailChangeSession {
+            id,
+            device: false,
+            expires_at,
+        }
     }
 
     /// Creates an organization owned by a fresh user who is also its owner member.
@@ -287,7 +948,7 @@ mod tests {
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
             ]
         );
         migrate::verify(&db.pool).await.unwrap();
@@ -1201,14 +1862,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            18,
+            19,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 18);
+        assert_eq!(count, 19);
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -1223,7 +1884,7 @@ mod tests {
         assert_eq!(
             migrate::verify(&db.pool).await,
             Err(DbError::Schema(SchemaProblem::Pending(vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
             ])))
         );
 
@@ -1232,7 +1893,9 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+            vec![
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            ]
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -1831,7 +2494,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+            vec![3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
         migrate::verify(&db.pool).await.unwrap();
         let ws = workspaces::get(&db.pool, &scope, ws_id)

@@ -248,6 +248,7 @@ describe("invitations", () => {
     expect(calls.find((c) => c.method === "POST")?.body).toEqual({
       email: "new@example.test",
       org_role: "member",
+      language: "en",
       workspace_id: WS_1.id,
       workspace_role: "editor",
     });
@@ -302,6 +303,7 @@ describe("invitations", () => {
     expect(calls.find((c) => c.method === "POST")?.body).toEqual({
       email: "new@example.test",
       org_role: "member",
+      language: "en",
       workspace_id: WS_1.id,
       workspace_role: "viewer", // least privilege is the default; editor is the most they may pick
     });
@@ -327,6 +329,7 @@ describe("invitations", () => {
     expect(calls.find((call) => call.method === "POST")?.body).toEqual({
       email: "guest@example.test",
       org_role: "guest",
+      language: "en",
       workspace_id: WS_1.id,
     });
   });

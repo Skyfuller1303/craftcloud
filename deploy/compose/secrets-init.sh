@@ -127,6 +127,10 @@ if [ "${COPY_METRICS_TOKEN:-0}" = 1 ]; then
     copy 65532 server metrics_token
     server_files="$server_files metrics_token"
 fi
+if [ "${COPY_SMTP_PASSWORD:-0}" = 1 ]; then
+    copy 65532 server smtp_password
+    server_files="$server_files smtp_password"
+fi
 # shellcheck disable=SC2086 # intentional word splitting of fixed names
 prune server $server_files
 

@@ -397,11 +397,11 @@ mod tests {
 
     #[test]
     fn embedded_migrations_are_ordered_and_complete() {
-        // Migration 15 is reserved for AC-01; AC-03 adds migration 16 independently.
+        // Migration 19 adds email delivery state and one-use verification records.
         assert_eq!(
             embedded_versions(),
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
             ]
         );
     }
@@ -414,6 +414,7 @@ mod tests {
         assert_eq!(migrator_up_to(16).iter().count(), 16);
         assert_eq!(migrator_up_to(17).iter().count(), 17);
         assert_eq!(migrator_up_to(18).iter().count(), 18);
-        assert_eq!(migrator_up_to(99).iter().count(), 18);
+        assert_eq!(migrator_up_to(19).iter().count(), 19);
+        assert_eq!(migrator_up_to(99).iter().count(), 19);
     }
 }

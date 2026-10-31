@@ -86,6 +86,9 @@ pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("maintenance_runs", 10),
     ("file_locks", 16),
     ("two_factor_login_challenges", 17),
+    ("outbound_emails", 19),
+    ("email_verification_tokens", 19),
+    ("pending_email_changes", 19),
 ];
 
 /// The names of [`EXCLUDED_WITH_VERSION`].
@@ -98,6 +101,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "maintenance_runs",
     "file_locks",
     "two_factor_login_challenges",
+    "outbound_emails",
+    "email_verification_tokens",
+    "pending_email_changes",
 ];
 
 /// The migration bookkeeping table: recreated by running the migrations.
@@ -176,7 +182,7 @@ mod tests {
     fn the_table_set_follows_the_migration_version() {
         // AC-03 adds grants at 16; AC-02 adds factor state and ephemeral
         // challenges at 17.
-        // AC-06 adds the three FigCraft state tables at 18.
+        // AC-06 adds FigCraft state at 18; AC-09 adds one-use email state at 19.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
             BACKUP_TABLES.len() - 6
@@ -240,7 +246,26 @@ mod tests {
                 .iter()
                 .any(|table| table.name == "two_factor_login_challenges")
         );
-        assert_eq!(excluded_tables_for(17), EXCLUDED_TABLES);
+        assert!(!excluded_tables_for(17).contains(&"outbound_emails"));
+        assert_eq!(
+            excluded_tables_for(19),
+            [
+                "sessions",
+                "password_reset_tokens",
+                "device_sessions",
+                "device_refresh_history",
+                "storage_binding",
+                "maintenance_runs",
+                "file_locks",
+                "two_factor_login_challenges",
+                "outbound_emails",
+                "email_verification_tokens",
+                "pending_email_changes"
+            ]
+        );
+        assert!(!is_backup_table("outbound_emails"));
+        assert!(!is_backup_table("email_verification_tokens"));
+        assert!(!is_backup_table("pending_email_changes"));
         // Older schemas are refused with a clear reason.
         let error = backup_tables_for(MIN_BACKUP_MIGRATION - 1).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Format);

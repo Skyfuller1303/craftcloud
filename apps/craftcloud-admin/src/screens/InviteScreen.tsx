@@ -7,6 +7,7 @@ import type { AcceptedInvitation } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { Alert, Field, ScreenHeading, focusFirstInvalid } from "../components/forms.tsx";
 import { useI18n } from "../i18n/index.tsx";
+import { useEmailDelivery, VerificationNotice } from "./EmailAccount.tsx";
 
 const MIN_PASSWORD = 12;
 const MAX_PASSWORD = 128;
@@ -29,6 +30,7 @@ export function InviteScreen({
   const { t } = useI18n();
   const { api, state, refresh } = useAuth();
   const loggedIn = state.phase === "authenticated";
+  const emailDelivery = useEmailDelivery();
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [errors, setErrors] = useState<{ name?: string; password?: string }>({});
@@ -100,6 +102,7 @@ export function InviteScreen({
           : t("You are invited to join an organization. Create your account to accept.")}
       </p>
       {failure !== null && <Alert>{failure}</Alert>}
+      {emailDelivery && state.phase === "authenticated" && state.session.email_verified === false && <VerificationNotice />}
       <Form className="form" onSubmit={submit} ref={form} validationBehavior="aria">
         {!loggedIn && (
           <>

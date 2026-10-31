@@ -1,5 +1,9 @@
 # Ranked gaps — documentation-first RFC
 
+## AC-09: SMTP und Adressverifikation
+
+[ADR-0025](09-decisions/adr-0025-email-delivery.md) ersetzt die historische SMTP-Lücke für Instanzen mit eingerichtetem Versand. Ohne SMTP gilt das Account-Squatting-Risiko aus ADR-0017 weiterhin. SMTP-Zustellung ist mindestens einmal: Ein Absturz nach Relay-Annahme kann Duplikate verursachen; eine Relay-Annahme garantiert keinen Postfacheingang. Clientzertifikate für SMTP benötigen einen vorgeschalteten Relay, Graph und OAuth folgen in AC-09b. Externe Relay-Konfigurationen, SPF/DKIM/DMARC und reale Postfachzustellung müssen Betreiber prüfen. Lokale Test- und Reviewnachweise stehen im AC-09-Bericht; diese Dokumentation allein ist kein Nachweis einer Produktionsabnahme.
+
 ## OPS-01: Installation und Releases
 
 OPS-01 ergänzt Quellarchive mit SHA-256 und CycloneDX, lokale Image-Builds, Installations- und Steuerbefehle sowie systemd-Start und tägliche Backups. Die [Betreiberanleitung](06-operations/install.md) und [ADR-0023](09-decisions/adr-0023-install-and-releases.md) beschreiben den Ablauf. Der externe Betreiber-Test auf einer echten Debian-13-VM bleibt offen, ebenso Ubuntu 24.04, arm64, die Mindestversionen von Docker/Compose, öffentliches ACME, eigene Zertifikate, Host-Neustart und tatsächlicher Timerbetrieb. Ein Docker-Desktop-Test ist dafür kein Ersatz. Es gibt keinen Projektschlüssel für minisign, keine Release-Veröffentlichung, keinen vollständigen Image-SBOM-/Schwachstellenscan, keine Windows-Server-Unterstützung und weiterhin keinen SMTP-Versand. Off-site-Sicherung, Verschlüsselung und Restore-Proben verantwortet der Betreiber; ein Symlink-Rollback stellt keine bereits migrierte Datenbank wieder her.

@@ -55,6 +55,8 @@ pub enum IssueOutcome {
     AccountDisabled,
     /// The account does not exist; nothing was stored.
     NoSuchUser,
+    /// Durable email limits refused atomic link delivery.
+    EmailRateLimited,
 }
 
 /// Issues a reset token in one transaction: older pending tokens of the user
@@ -65,7 +67,7 @@ pub enum IssueOutcome {
 ///
 /// Database failures only; nothing changes on failure.
 pub async fn create(pool: &PgPool, new: &NewResetToken) -> Result<IssueOutcome, DbError> {
-    create_inner(pool, new, None).await
+    create_inner(pool, new, None, None).await
 }
 
 /// Like [`create`], and records the `password_reset.issue` audit event (actor
@@ -80,13 +82,24 @@ pub async fn create_audited(
     new: &NewResetToken,
     audit: &AuditCtx,
 ) -> Result<IssueOutcome, DbError> {
-    create_inner(pool, new, Some(audit)).await
+    create_inner(pool, new, Some(audit), None).await
+}
+
+/// Like [`create_audited`], with an email inserted in the same transaction.
+pub async fn create_audited_with_email(
+    pool: &PgPool,
+    new: &NewResetToken,
+    audit: &AuditCtx,
+    draft: &crate::email_outbox::EmailDraft,
+) -> Result<IssueOutcome, DbError> {
+    create_inner(pool, new, Some(audit), Some(draft)).await
 }
 
 async fn create_inner(
     pool: &PgPool,
     new: &NewResetToken,
     audit: Option<&AuditCtx>,
+    email: Option<&crate::email_outbox::EmailDraft>,
 ) -> Result<IssueOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let disabled: Option<bool> =
@@ -99,11 +112,33 @@ async fn create_inner(
         Some(true) => return Ok(IssueOutcome::AccountDisabled),
         Some(false) => {}
     }
+    // Reset issuance is already a compromise-response boundary (it revokes
+    // sessions). Invalidate previously authorized address changes immediately,
+    // without waiting for the recipient to consume the reset link.
+    sqlx::query("UPDATE users SET security_version=security_version+1 WHERE id=$1")
+        .bind(new.user_id)
+        .execute(&mut *tx)
+        .await?;
     if new.reset_two_factor {
-        sqlx::query("DELETE FROM user_two_factor WHERE user_id=$1")
+        let factor_removed = sqlx::query("DELETE FROM user_two_factor WHERE user_id=$1")
             .bind(new.user_id)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
+        if factor_removed > 0
+            && email.is_some()
+            && crate::mail_security::enqueue_in(
+                &mut tx,
+                new.user_id,
+                new.now,
+                crate::mail_security::SecurityEvent::TwoFactorReset,
+            )
+            .await?
+                != crate::email_outbox::EnqueueOutcome::Queued
+        {
+            tx.rollback().await?;
+            return Ok(IssueOutcome::EmailRateLimited);
+        }
     }
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
         .bind(new.user_id)
@@ -124,6 +159,13 @@ async fn create_inner(
     .bind(new.now)
     .execute(&mut *tx)
     .await?;
+    if let Some(draft) = email {
+        let queued = crate::email_outbox::enqueue_in(&mut tx, draft).await?;
+        if queued != crate::email_outbox::EnqueueOutcome::Queued {
+            tx.rollback().await?;
+            return Ok(IssueOutcome::EmailRateLimited);
+        }
+    }
     let revoked_sessions = sqlx::query(
         "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
     )
@@ -281,7 +323,11 @@ pub async fn consume(
     new_password_hash: &str,
     now: OffsetDateTime,
 ) -> Result<Option<Uuid>, DbError> {
-    consume_inner(pool, token_hash, new_password_hash, now, None).await
+    Ok(
+        consume_inner(pool, token_hash, new_password_hash, now, None, None)
+            .await?
+            .user_id(),
+    )
 }
 
 /// Like [`consume`], and records the `password_reset.use` audit event (actor:
@@ -299,7 +345,47 @@ pub async fn consume_audited(
     now: OffsetDateTime,
     audit: &AuditCtx,
 ) -> Result<Option<Uuid>, DbError> {
-    consume_inner(pool, token_hash, new_password_hash, now, Some(audit)).await
+    Ok(
+        consume_inner(pool, token_hash, new_password_hash, now, Some(audit), None)
+            .await?
+            .user_id(),
+    )
+}
+
+/// Like [`consume_audited`], and atomically queues a post-reset notice when enabled.
+pub async fn consume_audited_with_email(
+    pool: &PgPool,
+    token_hash: &[u8; 32],
+    new_password_hash: &str,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<ConsumeOutcome, DbError> {
+    consume_inner(
+        pool,
+        token_hash,
+        new_password_hash,
+        now,
+        Some(audit),
+        mail_enabled.then_some(crate::mail_security::SecurityEvent::PasswordReset),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumeOutcome {
+    Consumed(Uuid),
+    InvalidToken,
+    EmailRateLimited,
+}
+
+impl ConsumeOutcome {
+    fn user_id(self) -> Option<Uuid> {
+        match self {
+            Self::Consumed(user_id) => Some(user_id),
+            Self::InvalidToken | Self::EmailRateLimited => None,
+        }
+    }
 }
 
 async fn consume_inner(
@@ -308,7 +394,8 @@ async fn consume_inner(
     new_password_hash: &str,
     now: OffsetDateTime,
     audit: Option<&AuditCtx>,
-) -> Result<Option<Uuid>, DbError> {
+    email_event: Option<crate::mail_security::SecurityEvent>,
+) -> Result<ConsumeOutcome, DbError> {
     let mut tx = pool.begin().await?;
     // Lock order: the users row first (like `create` and
     // `accounts::change_password`), then tokens and sessions. The token's
@@ -320,7 +407,7 @@ async fn consume_inner(
             .fetch_optional(&mut *tx)
             .await?;
     let Some(owner) = owner else {
-        return Ok(None);
+        return Ok(ConsumeOutcome::InvalidToken);
     };
     sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
         .bind(owner)
@@ -338,13 +425,15 @@ async fn consume_inner(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(user_id) = user_id else {
-        return Ok(None);
+        return Ok(ConsumeOutcome::InvalidToken);
     };
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
-        .bind(user_id)
-        .bind(new_password_hash)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE users SET password_hash = $2, security_version=security_version+1 WHERE id = $1",
+    )
+    .bind(user_id)
+    .bind(new_password_hash)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
         .bind(user_id)
         .execute(&mut *tx)
@@ -387,8 +476,15 @@ async fn consume_inner(
         )
         .await?;
     }
+    if let Some(event) = email_event
+        && crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(ConsumeOutcome::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(Some(user_id))
+    Ok(ConsumeOutcome::Consumed(user_id))
 }
 
 /// Deletes reset tokens that expired or were used before `cutoff`.

@@ -64,3 +64,9 @@ Zusätzlich: OpenAPI aktualisiert; aussagekräftige Tests erfolgreich; negative 
 ## Nichtumfang und Abnahmefragen
 
 Keine ungeprüfte Cross-App-/Cloud-Kopplung, keine proprietären Lizenzen kopieren, keine zusätzlichen Infrastruktur-Abhängigkeiten ohne ADR. Vor Merge prüfen: **API-Owner?** **Datenmigration?** **Offline-Verhalten?** **Echte Pilot-Validierung?**
+
+## AC-09: Verifizierte Adressen und Sicherheitsnachrichten
+
+Bei aktiviertem SMTP-Versand zeigt die Sitzung `email_verified`; unverifizierte Konten können einen Bestätigungslink anfordern. Vorhandene Adressen werden durch die Migration nicht als bestätigt markiert. Die öffentliche Bestätigung nimmt nur einen kurzlebigen Einmaltoken entgegen; die Oberfläche entfernt dessen URL-Fragment vor der ersten Anfrage und verlangt eine ausdrückliche Bestätigung.
+
+`POST /api/v1/auth/email-change` verlangt die neue Adresse, das aktuelle Passwort und bei eingerichtetem 2FA einen aktuellen Code oder Wiederherstellungscode. Erst die Bestätigung an der neuen Adresse innerhalb von 24 Stunden ändert das Konto. Die alte Adresse erhält eine Nachricht ohne Aktionslink. Passwortänderung, 2FA-Aktivierung/-Deaktivierung und neue Geräte-Anmeldung erzeugen ebenfalls Sicherheitsnachrichten. Alle auslösenden Änderungen und Outbox-Einträge sind transaktional gekoppelt. Ohne SMTP bleibt der bestehende Resetlink-Ablauf erhalten. Details und Grenzen: [ADR-0025](../09-decisions/adr-0025-email-delivery.md).

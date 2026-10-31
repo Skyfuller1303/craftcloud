@@ -15,6 +15,7 @@ mod auth;
 mod client_ip;
 mod clock;
 mod device;
+mod email;
 mod figcraft;
 mod figcraft_jobs;
 mod files;
@@ -141,6 +142,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
         "/api/v1/organizations/{org_id}/invitations/{invitation_id}",
         &["DELETE"],
     ),
+    (
+        "/api/v1/organizations/{org_id}/invitations/{invitation_id}/resend",
+        &["POST"],
+    ),
     ("/api/v1/invitations/accept", &["POST"]),
     (
         "/api/v1/workspaces/{workspace_id}/projects",
@@ -178,6 +183,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/organizations/{org_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
+    ("/api/v1/admin/users/email-verification", &["POST"]),
+    ("/api/v1/admin/email-delivery", &["GET"]),
+    ("/api/v1/admin/email-delivery/test", &["POST"]),
     ("/api/v1/admin/users/{user_id}/devices", &["GET"]),
     (
         "/api/v1/admin/users/{user_id}/devices/{device_ref}",
@@ -205,6 +213,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/auth/devices", &["GET"]),
     ("/api/v1/auth/devices/{id}", &["DELETE"]),
     ("/api/v1/auth/session", &["GET"]),
+    ("/api/v1/auth/email-verification", &["POST"]),
+    ("/api/v1/auth/email-verification/confirm", &["POST"]),
+    ("/api/v1/auth/email-change", &["POST"]),
+    ("/api/v1/auth/email-change/confirm", &["POST"]),
     ("/api/v1/auth/profile", &["PATCH"]),
     ("/api/v1/auth/sessions", &["GET"]),
     ("/api/v1/auth/sessions/{session_id}", &["DELETE"]),
@@ -310,6 +322,10 @@ pub fn router_with_shared(
         .route(
             "/api/v1/organizations/{org_id}/invitations/{invitation_id}",
             delete(invitations::revoke_invitation),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/invitations/{invitation_id}/resend",
+            post(invitations::resend_invitation),
         )
         .route(
             "/api/v1/invitations/accept",
@@ -470,6 +486,19 @@ pub fn router_with_shared(
         .route("/api/v1/auth/devices", get(device::list))
         .route("/api/v1/auth/devices/{id}", delete(device::revoke))
         .route("/api/v1/auth/session", get(auth::session))
+        .route(
+            "/api/v1/auth/email-verification",
+            post(email::request_verification),
+        )
+        .route(
+            "/api/v1/auth/email-verification/confirm",
+            post(email::confirm_verification),
+        )
+        .route("/api/v1/auth/email-change", post(email::change_email))
+        .route(
+            "/api/v1/auth/email-change/confirm",
+            post(email::confirm_change),
+        )
         .route("/api/v1/auth/profile", patch(auth::update_profile))
         .route("/api/v1/auth/sessions", get(auth::list_sessions))
         .route(
@@ -484,6 +513,12 @@ pub fn router_with_shared(
             "/api/v1/admin/users/{user_id}/password-reset",
             post(auth::issue_password_reset).delete(auth::void_password_reset),
         )
+        .route(
+            "/api/v1/admin/users/email-verification",
+            post(email::request_all_verification),
+        )
+        .route("/api/v1/admin/email-delivery", get(email::status))
+        .route("/api/v1/admin/email-delivery/test", post(email::test_email))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state.clone());

@@ -31,7 +31,7 @@ fn session_kind(session: &AuthenticatedSession) -> &'static str {
     }
 }
 
-fn management_attempt(
+pub(crate) fn management_attempt(
     services: &Services,
     session: &AuthenticatedSession,
     ip: Option<ClientIp>,
@@ -53,7 +53,7 @@ fn management_failure(
 
 /// A wrong second-factor proof on a management route: counts toward the persistent
 /// per-account cap in addition to the management budget.
-async fn proof_failure(
+pub(crate) async fn proof_failure(
     services: &Services,
     reservation: crate::ratelimit::Reservation,
     session: &AuthenticatedSession,
@@ -367,7 +367,7 @@ pub(crate) async fn confirm(
             code_hash: hash.to_vec(),
         });
     }
-    match two_factor::confirm_setup(
+    match two_factor::confirm_setup_with_email(
         &services.pool,
         session.user_id,
         session.session_id,
@@ -377,19 +377,32 @@ pub(crate) async fn confirm(
         &hashes,
         services.clock.now(),
         &crate::audit::ctx(&headers, Some(session.user_id)),
+        services.email_delivery_enabled(),
     )
     .await
     {
-        Ok(true) => {
+        Ok(two_factor::FactorChangeOutcome::Changed) => {
             reservation.record_success();
             Json(json!({"recovery_codes": codes})).into_response()
         }
-        Ok(false) => management_failure(&services, reservation, &session, &headers),
+        Ok(two_factor::FactorChangeOutcome::EmailRateLimited) => crate::error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Try again later.",
+            &headers,
+        ),
+        Ok(two_factor::FactorChangeOutcome::Unchanged) => {
+            management_failure(&services, reservation, &session, &headers)
+        }
         Err(error) => failed(&error, &headers),
     }
 }
 
-fn decrypt_for_keys(services: &Services, user_id: Uuid, ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decrypt_for_keys(
+    services: &Services,
+    user_id: Uuid,
+    ciphertext: &[u8],
+) -> Option<Vec<u8>> {
     services
         .two_factor_keys
         .current
@@ -404,7 +417,7 @@ fn decrypt_for_keys(services: &Services, user_id: Uuid, ciphertext: &[u8]) -> Op
         })
 }
 
-fn invalid(headers: &HeaderMap) -> Response {
+pub(crate) fn invalid(headers: &HeaderMap) -> Response {
     error_response(
         StatusCode::UNAUTHORIZED,
         "INVALID_CREDENTIALS",
@@ -413,7 +426,7 @@ fn invalid(headers: &HeaderMap) -> Response {
     )
 }
 
-async fn verify_account_password(
+pub(crate) async fn verify_account_password(
     services: &Services,
     user_id: Uuid,
     password: String,
@@ -497,7 +510,7 @@ pub(crate) async fn disable(
     let Some(proof) = proof else {
         return proof_failure(&services, reservation, &session, &headers).await;
     };
-    match two_factor::reset_for_user(
+    match two_factor::reset_for_user_with_email(
         &services.pool,
         session.user_id,
         Some(session.session_id),
@@ -508,19 +521,28 @@ pub(crate) async fn disable(
         services.clock.now(),
         &crate::audit::ctx(&headers, Some(session.user_id)),
         "auth.two_factor_disabled",
+        services.email_delivery_enabled(),
     )
     .await
     {
-        Ok(true) => {
+        Ok(two_factor::FactorChangeOutcome::Changed) => {
             reservation.record_success();
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(false) => management_failure(&services, reservation, &session, &headers),
+        Ok(two_factor::FactorChangeOutcome::EmailRateLimited) => crate::error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Try again later.",
+            &headers,
+        ),
+        Ok(two_factor::FactorChangeOutcome::Unchanged) => {
+            management_failure(&services, reservation, &session, &headers)
+        }
         Err(error) => failed(&error, &headers),
     }
 }
 
-async fn verify_recovery_code(
+pub(crate) async fn verify_recovery_code(
     services: &Services,
     user_id: Uuid,
     code: &str,
@@ -833,7 +855,7 @@ pub(crate) async fn browser_login(
     };
     let now = services.clock.now();
     let absolute = now + services.settings.absolute_timeout;
-    match two_factor::complete_browser_login(
+    match two_factor::complete_browser_login_with_email(
         &services.pool,
         &id_hash,
         challenge.user_id,
@@ -848,11 +870,20 @@ pub(crate) async fn browser_login(
             absolute_expires_at: absolute,
         },
         &crate::audit::ctx(&headers, Some(challenge.user_id)),
+        services.email_delivery_enabled(),
     )
     .await
     {
-        Ok(Some(_)) => reservation.record_success(),
-        Ok(None) => {
+        Ok(two_factor::LoginOutcome::Created(_)) => reservation.record_success(),
+        Ok(two_factor::LoginOutcome::EmailRateLimited) => {
+            return crate::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "Try again later.",
+                &headers,
+            );
+        }
+        Ok(two_factor::LoginOutcome::Rejected) => {
             reservation.record_failure(services.now_secs());
             return invalid(&headers);
         }
@@ -969,7 +1000,7 @@ pub(crate) async fn device_login(
         idle_expires_at: idle_expiry,
         absolute_expires_at: absolute,
     };
-    let id = match two_factor::complete_device_login(
+    let id = match two_factor::complete_device_login_with_email(
         &services.pool,
         &id_hash,
         challenge.user_id,
@@ -979,14 +1010,23 @@ pub(crate) async fn device_login(
         verified_factor,
         &new,
         &crate::audit::ctx(&headers, Some(challenge.user_id)),
+        services.email_delivery_enabled(),
     )
     .await
     {
-        Ok(Some(id)) => {
+        Ok(two_factor::LoginOutcome::Created(id)) => {
             reservation.record_success();
             id
         }
-        Ok(None) => {
+        Ok(two_factor::LoginOutcome::EmailRateLimited) => {
+            return crate::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "Try again later.",
+                &headers,
+            );
+        }
+        Ok(two_factor::LoginOutcome::Rejected) => {
             reservation.record_failure(services.now_secs());
             return invalid(&headers);
         }

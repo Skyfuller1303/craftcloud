@@ -66,7 +66,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 38] = [
+const SUPPORTED_KEYS: [&str; 45] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -105,7 +105,25 @@ const SUPPORTED_KEYS: [&str; 38] = [
     "FIGCRAFT_PUBLIC_URL",
     "FIGCRAFT_KEY_FILE",
     "FIGCRAFT_ALLOW_INSECURE_INTERNAL",
+    "MAIL_TRANSPORT",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_TLS",
+    "SMTP_USERNAME",
+    "SMTP_PASSWORD_FILE",
+    "SMTP_FROM",
 ];
+
+/// SMTP relay settings. The password itself is read only by the server startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailSettings {
+    pub host: String,
+    pub port: u16,
+    pub tls: craftcloud_mail::SmtpTls,
+    pub username: Option<String>,
+    pub password_file: Option<PathBuf>,
+    pub from: String,
+}
 
 /// Optional FigCraft companion service. Secrets are loaded only at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +271,8 @@ pub struct Config {
     /// (`CRAFTCLOUD_METRICS_TOKEN_FILE`). Required when the listener is not
     /// bound to a loopback address.
     pub metrics_token_file: Option<PathBuf>,
+    /// Optional SMTP delivery. `None` preserves link-copy mode.
+    pub mail: Option<MailSettings>,
 }
 
 impl Config {
@@ -410,6 +430,21 @@ impl Config {
         let secret_key_file = field(&mut errors, env, "SECRET_KEY_FILE", parse_absolute_path);
         let secret_key_old_file =
             field(&mut errors, env, "SECRET_KEY_OLD_FILE", parse_absolute_path);
+        let mail = parse_mail(env, &mut errors);
+        if mail.is_some() {
+            for (key, present) in [
+                ("DATABASE_URL_FILE", db_url_file.is_some()),
+                ("SECRET_KEY_FILE", secret_key_file.is_some()),
+                ("PUBLIC_URL", public_url.is_some()),
+            ] {
+                if !present {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{key}"),
+                        "required when SMTP mail delivery is enabled",
+                    ));
+                }
+            }
+        }
         if bootstrap_secret_file.is_some() && db_url_file.is_none() {
             errors.push(ConfigError::new(
                 &format!("{PREFIX}BOOTSTRAP_SECRET_FILE"),
@@ -647,6 +682,7 @@ impl Config {
                 audit_downloads,
                 metrics_addr,
                 metrics_token_file,
+                mail,
             })
         } else {
             Err(errors)
@@ -763,6 +799,119 @@ fn supported_list() -> String {
         .map(|k| format!("{PREFIX}{k}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn parse_mail(
+    env: &BTreeMap<String, String>,
+    errors: &mut Vec<ConfigError>,
+) -> Option<MailSettings> {
+    let transport = env.get("CRAFTCLOUD_MAIL_TRANSPORT").map(String::as_str);
+    let smtp_keys = [
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_TLS",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD_FILE",
+        "SMTP_FROM",
+    ];
+    if transport.is_none() {
+        for suffix in smtp_keys {
+            if env.contains_key(&format!("CRAFTCLOUD_{suffix}")) {
+                errors.push(ConfigError::new(
+                    &format!("CRAFTCLOUD_{suffix}"),
+                    "requires CRAFTCLOUD_MAIL_TRANSPORT=smtp",
+                ));
+            }
+        }
+        return None;
+    }
+    if transport != Some("smtp") {
+        errors.push(ConfigError::new(
+            "CRAFTCLOUD_MAIL_TRANSPORT",
+            "expected `smtp`",
+        ));
+        return None;
+    }
+    let get = |suffix: &str| env.get(&format!("CRAFTCLOUD_{suffix}")).map(|v| v.trim());
+    let host = get("SMTP_HOST")
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    if host.is_none() {
+        errors.push(ConfigError::new(
+            "CRAFTCLOUD_SMTP_HOST",
+            "required when SMTP transport is enabled",
+        ));
+    }
+    let port = get("SMTP_PORT")
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|port| *port != 0);
+    if port.is_none() {
+        errors.push(ConfigError::new(
+            "CRAFTCLOUD_SMTP_PORT",
+            "required; expected a port from 1 to 65535",
+        ));
+    }
+    let tls = match get("SMTP_TLS") {
+        Some("starttls") => Some(craftcloud_mail::SmtpTls::StartTls),
+        Some("tls") => Some(craftcloud_mail::SmtpTls::ImplicitTls),
+        _ => {
+            errors.push(ConfigError::new(
+                "CRAFTCLOUD_SMTP_TLS",
+                "required; expected `starttls` or `tls`",
+            ));
+            None
+        }
+    };
+    let username = get("SMTP_USERNAME")
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    let password_file = get("SMTP_PASSWORD_FILE")
+        .map(|raw| parse_absolute_path("CRAFTCLOUD_SMTP_PASSWORD_FILE", raw))
+        .transpose();
+    let password_file = match password_file {
+        Ok(path) => path,
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    };
+    if username.is_some() != password_file.is_some() {
+        errors.push(ConfigError::new(
+            "CRAFTCLOUD_SMTP_USERNAME",
+            "SMTP_USERNAME and SMTP_PASSWORD_FILE must be set together",
+        ));
+    }
+    let from = get("SMTP_FROM")
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    if from.is_none() {
+        errors.push(ConfigError::new(
+            "CRAFTCLOUD_SMTP_FROM",
+            "required; expected an email address, optionally with display name",
+        ));
+    }
+    if errors.iter().any(|e| {
+        [
+            "CRAFTCLOUD_MAIL_TRANSPORT",
+            "CRAFTCLOUD_SMTP_HOST",
+            "CRAFTCLOUD_SMTP_PORT",
+            "CRAFTCLOUD_SMTP_TLS",
+            "CRAFTCLOUD_SMTP_USERNAME",
+            "CRAFTCLOUD_SMTP_PASSWORD_FILE",
+            "CRAFTCLOUD_SMTP_FROM",
+        ]
+        .contains(&e.key.as_str())
+    }) {
+        return None;
+    }
+    Some(MailSettings {
+        host: host?,
+        port: port?,
+        tls: tls?,
+        username,
+        password_file,
+        from: from?,
+    })
 }
 
 fn default_bind() -> SocketAddr {
@@ -1647,6 +1796,78 @@ mod tests {
             let error = parse_figcraft_url("FIGCRAFT_PUBLIC_URL", bad, true, false).unwrap_err();
             assert!(!error.message.contains("private"));
             assert!(!error.message.contains(bad));
+        }
+    }
+
+    #[test]
+    fn mail_is_disabled_without_transport_and_rejects_orphan_smtp_settings() {
+        let defaults = Config::from_env_map(&BTreeMap::new()).unwrap();
+        assert!(defaults.mail.is_none());
+        let errors = errors_of(&[("CRAFTCLOUD_SMTP_HOST", "smtp.example.org")]);
+        assert!(keys(&errors).contains(&"CRAFTCLOUD_SMTP_HOST"));
+    }
+
+    #[test]
+    fn smtp_requires_tls_and_paired_credentials_and_server_secrets() {
+        let errors = errors_of(&[("CRAFTCLOUD_MAIL_TRANSPORT", "smtp")]);
+        for key in [
+            "CRAFTCLOUD_SMTP_HOST",
+            "CRAFTCLOUD_SMTP_PORT",
+            "CRAFTCLOUD_SMTP_TLS",
+            "CRAFTCLOUD_SMTP_FROM",
+        ] {
+            assert!(keys(&errors).contains(&key), "missing {key}");
+        }
+        // Shared service prerequisites are checked once the SMTP settings parse.
+        let errors = errors_of(&[
+            ("CRAFTCLOUD_MAIL_TRANSPORT", "smtp"),
+            ("CRAFTCLOUD_SMTP_HOST", "smtp.example.org"),
+            ("CRAFTCLOUD_SMTP_PORT", "587"),
+            ("CRAFTCLOUD_SMTP_TLS", "starttls"),
+            ("CRAFTCLOUD_SMTP_FROM", "Cloud <mail@example.org>"),
+        ]);
+        for key in [
+            "CRAFTCLOUD_DATABASE_URL_FILE",
+            "CRAFTCLOUD_SECRET_KEY_FILE",
+            "CRAFTCLOUD_PUBLIC_URL",
+        ] {
+            assert!(keys(&errors).contains(&key), "missing {key}");
+        }
+        let errors = errors_of(&[
+            ("CRAFTCLOUD_MAIL_TRANSPORT", "smtp"),
+            ("CRAFTCLOUD_SMTP_HOST", "smtp.example.org"),
+            ("CRAFTCLOUD_SMTP_PORT", "587"),
+            ("CRAFTCLOUD_SMTP_TLS", "starttls"),
+            ("CRAFTCLOUD_SMTP_USERNAME", "mailer"),
+            ("CRAFTCLOUD_SMTP_FROM", "Cloud <mail@example.org>"),
+        ]);
+        assert!(keys(&errors).contains(&"CRAFTCLOUD_SMTP_USERNAME"));
+    }
+
+    #[test]
+    fn smtp_configuration_accepts_anonymous_relay_and_tls_modes() {
+        for (tls, expected) in [
+            ("starttls", craftcloud_mail::SmtpTls::StartTls),
+            ("tls", craftcloud_mail::SmtpTls::ImplicitTls),
+        ] {
+            let config = Config::from_env_map(&env(&[
+                ("CRAFTCLOUD_MAIL_TRANSPORT", "smtp"),
+                ("CRAFTCLOUD_SMTP_HOST", "smtp.example.org"),
+                ("CRAFTCLOUD_SMTP_PORT", "587"),
+                ("CRAFTCLOUD_SMTP_TLS", tls),
+                ("CRAFTCLOUD_SMTP_FROM", "Cloud <mail@example.org>"),
+                ("CRAFTCLOUD_DATABASE_URL_FILE", "C:/secrets/database"),
+                ("CRAFTCLOUD_SECRET_KEY_FILE", "C:/secrets/key"),
+                ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org"),
+            ]))
+            .unwrap();
+            assert_eq!(config.mail.as_ref().map(|mail| mail.tls), Some(expected));
+            assert!(
+                config
+                    .mail
+                    .as_ref()
+                    .is_some_and(|mail| mail.username.is_none())
+            );
         }
     }
 }

@@ -13,6 +13,7 @@ import { InviteScreen } from "./screens/InviteScreen.tsx";
 import { LoginScreen } from "./screens/LoginScreen.tsx";
 import { ResetPasswordScreen } from "./screens/ResetPasswordScreen.tsx";
 import { SetupScreen } from "./screens/SetupScreen.tsx";
+import { EmailConfirmationScreen } from "./screens/EmailAccount.tsx";
 import { ScreenBoundary } from "./components/ScreenBoundary.tsx";
 
 // The signed-in dashboard is loaded on demand; login, setup and the token
@@ -21,6 +22,14 @@ const Shell = lazy(() => import("./screens/Shell.tsx").then((m) => ({ default: m
 
 const INVITE_PATH = /\/invite\/?$/;
 const RESET_PATH = /\/reset-password\/?$/;
+export type EmailToken = { token: string; kind: "verify" | "change" };
+
+export function takeEmailToken(location: Pick<Location, "pathname" | "hash">, history: Pick<History, "replaceState">, baseUrl: string): EmailToken | null {
+  const kind = /\/verify-email\/?$/.test(location.pathname) ? "verify" : /\/change-email\/?$/.test(location.pathname) ? "change" : null;
+  if (kind === null) return null;
+  const token = takeFragmentToken(/\/(?:verify|change)-email\/?$/, location, history, baseUrl);
+  return token === null ? null : { token, kind };
+}
 
 function takeFragmentToken(
   path: RegExp,
@@ -66,15 +75,17 @@ export function App({
   createClient,
   inviteToken: initialInviteToken = null,
   resetToken: initialResetToken = null,
+  emailToken: initialEmailToken = null,
 }: {
   createClient: (onUnauthenticated: () => void) => ApiClient;
   inviteToken?: string | null;
   resetToken?: string | null;
+  emailToken?: EmailToken | null;
 }) {
   return (
     <AnnouncerProvider>
       <AuthProvider createClient={createClient}>
-        <Screens initialInviteToken={initialInviteToken} initialResetToken={initialResetToken} />
+        <Screens initialInviteToken={initialInviteToken} initialResetToken={initialResetToken} initialEmailToken={initialEmailToken} />
       </AuthProvider>
     </AnnouncerProvider>
   );
@@ -83,15 +94,18 @@ export function App({
 function Screens({
   initialInviteToken,
   initialResetToken,
+  initialEmailToken,
 }: {
   initialInviteToken: string | null;
   initialResetToken: string | null;
+  initialEmailToken: EmailToken | null;
 }) {
   const { t } = useI18n();
   const { state, refresh } = useAuth();
   const [theme, setTheme] = useState<ThemeChoice>(readTheme);
   const [inviteToken, setInviteToken] = useState(initialInviteToken);
   const [resetToken, setResetToken] = useState(initialResetToken);
+  const [emailToken, setEmailToken] = useState(initialEmailToken);
   const [wantsLogin, setWantsLogin] = useState(false);
   const [loginNotice, setLoginNotice] = useState<string | undefined>(undefined);
   const [shellNotice, setShellNotice] = useState<string | undefined>(undefined);
@@ -130,6 +144,13 @@ function Screens({
     content = (
       <SetupScreen onDone={() => setLoginNotice(t("Setup is complete. Log in with the new operator account."))} />
     );
+  } else if (emailToken !== null) {
+    content = <EmailConfirmationScreen token={emailToken.token} kind={emailToken.kind} onFinished={() => {
+      setEmailToken(null);
+      setLoginNotice(t("E-mail address confirmed."));
+      setShellNotice(t("E-mail address confirmed."));
+      void refresh();
+    }} />;
   } else if (resetToken !== null) {
     content = (
       <ResetPasswordScreen
@@ -174,7 +195,7 @@ function Screens({
     );
   }
 
-  const framed = state.phase !== "authenticated" || inviteToken !== null || resetToken !== null;
+  const framed = state.phase !== "authenticated" || inviteToken !== null || resetToken !== null || emailToken !== null;
   return (
     <>
       <a className="skip-link" href="#main">

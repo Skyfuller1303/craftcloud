@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "react-aria-components";
 import type { AdminDevice, AdminOrganization, AdminUser, AuditEvent, Invitation, Organization, OrganizationGrant, OrganizationLock, OrgMember, Page, Workspace } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
+import { useAnnounce } from "../components/Announcer.tsx";
+import { useEmailDelivery, ResendInvitation } from "./EmailAccount.tsx";
 import { AppModal, ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { ListStatus, LoadMoreButton } from "../components/ListStatus.tsx";
@@ -25,7 +27,7 @@ async function collectPages<T>(load: (cursor?: string) => Promise<Page<T>>, maxP
 }
 
 export function AdminPeopleScreen({ organization, onChanged }: { organization: Organization | null; onChanged: () => void }) {
-  const { t } = useI18n(); const { api } = useAuth(); const names = useRoleNames();
+  const { t, language } = useI18n(); const { api } = useAuth(); const names = useRoleNames();
   const [query, setQuery] = useState(""); const debounced = useDebounced(query.trim());
   const [role, setRole] = useState(""); const [status, setStatus] = useState("all"); const [twoFactor, setTwoFactor] = useState(""); const [sort, setSort] = useState("joined_desc");
   const [selected, setSelected] = useState<string[]>([]); const [action, setAction] = useState(""); const [results, setResults] = useState<Record<string, { name: string; result: string }>>({}); const [detail, setDetail] = useState<OrgMember | null>(null); const [roleToApply, setRoleToApply] = useState<"owner" | "admin" | "member" | "guest">("member"); const [confirmRemove, setConfirmRemove] = useState(false);
@@ -73,8 +75,8 @@ export function AdminPeopleScreen({ organization, onChanged }: { organization: O
         continue;
       }
       try {
-        const result = await api.createInvitation(organization.id, { email: row.email, org_role: inviteRole });
-        next.push({ email: row.email, result: t("Invitation created"), url: result.invite_url });
+        const result = await api.createInvitation(organization.id, { email: row.email, org_role: inviteRole, language: language === "de" ? "de" : "en" });
+        next.push({ email: row.email, result: result.sent_to !== undefined ? t("Invitation sent.") : t("Invitation created"), ...(result.invite_url === undefined ? {} : { url: result.invite_url }) });
       } catch {
         next.push({ email: row.email, result: t("Failed") });
       }
@@ -288,6 +290,7 @@ function WorkspaceMembers({ workspace, onClose }: { workspace: Workspace; onClos
 }
 
 function AdminInvitationList({ organization }: { organization: Organization }) {
+  const emailDelivery = useEmailDelivery();
   const { t, language } = useI18n(); const { api } = useAuth(); const names = useRoleNames();
   const load = useMemo(() => (cursor?: string) => api.listInvitations(organization.id, cursor), [api, organization.id]);
   const list = usePagedList<Invitation>(load);
@@ -302,7 +305,10 @@ function AdminInvitationList({ organization }: { organization: Organization }) {
         <th>{item.email}</th><td data-label={t("Role")}>{names.orgRole(item.org_role)}</td>
         <td data-label={t("Status")}>{t(item.status === "pending" ? "Open" : item.status === "invalid" ? "No longer valid" : item.status.charAt(0).toUpperCase() + item.status.slice(1))}</td>
         <td data-label={t("Expires")}>{formatDateTime(language, item.expires_at)}</td>
-        <td data-label={t("Actions")}>{item.status === "pending" && <Button className="button button--danger-quiet button--sm" onPress={() => setPending(item)}>{t("Revoke")}</Button>}</td>
+        <td data-label={t("Actions")}>{item.status === "pending" && <>
+          {emailDelivery && <ResendInvitation orgId={organization.id} invitationId={item.id} />}
+          <Button className="button button--danger-quiet button--sm" onPress={() => setPending(item)}>{t("Revoke")}</Button>
+        </>}</td>
       </tr>)}</tbody>
     </table></div>}
     <LoadMoreButton list={list} />
@@ -434,6 +440,8 @@ export function AdminLocksScreen({ organization, workspaces }: { organization: O
 }
 
 export function AdminOperatorScreen({ section }: { section: "organizations" | "accounts" }) {
+  const announce = useAnnounce();
+  const emailDelivery = useEmailDelivery();
   const { t, language } = useI18n(); const { api } = useAuth(); const [query, setQuery] = useState(""); const debounced = useDebounced(query.trim());
   const loadOrganizations = useMemo(() => section === "organizations" ? (cursor?: string) => api.listAdminOrganizations(cursor) : null, [api, section]);
   const loadUsers = useMemo(() => section === "accounts" ? (cursor?: string) => api.listAdminUsers(cursor, debounced.length >= 2 ? debounced : undefined) : null, [api, section, debounced]);
@@ -515,7 +523,7 @@ export function AdminOperatorScreen({ section }: { section: "organizations" | "a
     {error !== null && <ErrorNotice error={error} />}
     {resetFor && <ConfirmDialog
       title={t("Issue account reset link")}
-      message={t("Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.")}
+      message={emailDelivery ? t("This signs out the account on all devices and sends a password reset email.") : t("Issuing a reset link signs out this account on all devices. The link is shown once and must be shared securely.")}
       confirmLabel={t("Issue reset link")}
       busy={resetBusy}
       error={resetError}
@@ -526,7 +534,8 @@ export function AdminOperatorScreen({ section }: { section: "organizations" | "a
         void api.issuePasswordReset(account.id, {}).then((result) => {
           setResetFor(null);
           setResetError(null);
-          setResetUrl(result.reset_url);
+          setResetUrl(result.reset_url ?? null);
+          if (result.sent_to !== undefined) announce(t("Password reset email sent."));
           setResetExpiry(result.expires_at);
           setResetCopied(false);
           setResetCopyFailed(false);

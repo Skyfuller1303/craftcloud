@@ -63,11 +63,13 @@ export interface RecoveryCodesResponse {
 }
 
 export interface IssuedPasswordReset {
-  reset_url: string;
+  reset_url?: string;
+  sent_to?: string;
   expires_at: string;
 }
 
 export interface SessionInfo {
+  email_verified?: boolean;
   user_id: Uuid;
   email: string;
   display_name: string;
@@ -241,6 +243,7 @@ export interface Invitation {
 }
 
 export interface CreateInvitationRequest {
+  language?: string;
   email: string;
   org_role: "admin" | "member" | "guest";
   workspace_id?: Uuid;
@@ -250,7 +253,8 @@ export interface CreateInvitationRequest {
 /** Returned once; `invite_url` is a secret and must never be stored. */
 export interface CreatedInvitation {
   invitation_id: Uuid;
-  invite_url: string;
+  invite_url?: string;
+  sent_to?: string;
   expires_at: string;
 }
 
@@ -322,7 +326,13 @@ export interface SharedItem {
 
 export interface ServerInfo {
   features: string[];
-  feature_flags?: { two_factor?: boolean; grants?: boolean; locks?: boolean; figcraft_live?: boolean };
+  feature_flags?: { two_factor?: boolean; grants?: boolean; locks?: boolean; figcraft_live?: boolean; email_delivery?: boolean };
+}
+
+export interface EmailDeliveryStatus {
+  configured: boolean;
+  last_success_at: string | null;
+  failed_count: number;
 }
 
 export interface FigcraftLiveStatus {

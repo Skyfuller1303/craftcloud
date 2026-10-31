@@ -1,0 +1,4 @@
+Hello {{recipient_name}},
+
+Security notice: {{security_event}}.
+If this was not you, contact your CraftCloud administrator.

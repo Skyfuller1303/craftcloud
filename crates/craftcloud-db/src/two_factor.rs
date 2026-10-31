@@ -34,6 +34,45 @@ pub async fn complete_browser_login(
     new: &NewSession,
     audit: &AuditCtx,
 ) -> Result<Option<Uuid>, DbError> {
+    match complete_browser_login_with_email(
+        pool,
+        id_hash,
+        user_id,
+        client_address,
+        verified_hash,
+        secret_ciphertext,
+        factor,
+        new,
+        audit,
+        false,
+    )
+    .await?
+    {
+        LoginOutcome::Created(id) => Ok(Some(id)),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Created(Uuid),
+    Rejected,
+    EmailRateLimited,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_browser_login_with_email(
+    pool: &PgPool,
+    id_hash: &[u8; 32],
+    user_id: Uuid,
+    client_address: &str,
+    verified_hash: &str,
+    secret_ciphertext: &[u8],
+    factor: VerifiedFactor,
+    new: &NewSession,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<LoginOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let account: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM users WHERE id=$1 AND password_hash=$2 AND disabled_at IS NULL FOR UPDATE",
@@ -43,17 +82,17 @@ pub async fn complete_browser_login(
     .fetch_optional(&mut *tx)
     .await?;
     if account.is_none() {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let live: Option<Vec<u8>> = sqlx::query_scalar("SELECT id_hash FROM two_factor_login_challenges WHERE id_hash=$1 AND user_id=$2 AND login_kind='browser' AND client_address=$3 AND attempts<5 AND used_at IS NULL AND expires_at>$4 FOR UPDATE")
         .bind(id_hash.as_slice()).bind(user_id).bind(client_address).bind(new.now).fetch_optional(&mut *tx).await?;
     if live.is_none() {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let enabled: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
         .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
     if enabled.as_deref() != Some(secret_ciphertext) {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let recovery_used = match factor {
         VerifiedFactor::TotpStep(step) => sqlx::query("UPDATE user_two_factor SET last_accepted_step=$2,failed_attempts=0 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step<$2)")
@@ -62,19 +101,19 @@ pub async fn complete_browser_login(
             .bind(user_id).bind(salt.as_slice()).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1,
     };
     if !recovery_used {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     reset_failed_attempts(&mut tx, user_id).await?;
     let consumed = sqlx::query("UPDATE two_factor_login_challenges SET used_at=$3 WHERE id_hash=$1 AND user_id=$2 AND used_at IS NULL AND attempts<5 AND expires_at>$3")
         .bind(id_hash.as_slice()).bind(user_id).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1;
     if !consumed {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let id = Uuid::new_v4();
     let inserted = sqlx::query("INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at) VALUES($1,$2,$3,$4,$4,$5)")
         .bind(id).bind(user_id).bind(new.token_hash.as_slice()).bind(new.now).bind(new.absolute_expires_at).execute(&mut *tx).await?.rows_affected() == 1;
     if !inserted {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let by = AuditCtx {
         actor_id: Some(user_id),
@@ -94,8 +133,21 @@ pub async fn complete_browser_login(
         )
         .await?;
     }
+    if mail_enabled
+        && crate::mail_security::enqueue_in(
+            &mut tx,
+            user_id,
+            new.now,
+            crate::mail_security::SecurityEvent::NewLogin,
+        )
+        .await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(LoginOutcome::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(Some(id))
+    Ok(LoginOutcome::Created(id))
 }
 
 /// Desktop counterpart of [`complete_browser_login`].
@@ -111,6 +163,38 @@ pub async fn complete_device_login(
     new: &NewDeviceSession,
     audit: &AuditCtx,
 ) -> Result<Option<Uuid>, DbError> {
+    match complete_device_login_with_email(
+        pool,
+        id_hash,
+        user_id,
+        client_address,
+        verified_hash,
+        secret_ciphertext,
+        factor,
+        new,
+        audit,
+        false,
+    )
+    .await?
+    {
+        LoginOutcome::Created(id) => Ok(Some(id)),
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_device_login_with_email(
+    pool: &PgPool,
+    id_hash: &[u8; 32],
+    user_id: Uuid,
+    client_address: &str,
+    verified_hash: &str,
+    secret_ciphertext: &[u8],
+    factor: VerifiedFactor,
+    new: &NewDeviceSession,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<LoginOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let account: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM users WHERE id=$1 AND password_hash=$2 AND disabled_at IS NULL FOR UPDATE",
@@ -120,17 +204,17 @@ pub async fn complete_device_login(
     .fetch_optional(&mut *tx)
     .await?;
     if account.is_none() {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let live: Option<Vec<u8>> = sqlx::query_scalar("SELECT id_hash FROM two_factor_login_challenges WHERE id_hash=$1 AND user_id=$2 AND login_kind='device' AND client_address=$3 AND attempts<5 AND used_at IS NULL AND expires_at>$4 FOR UPDATE")
         .bind(id_hash.as_slice()).bind(user_id).bind(client_address).bind(new.now).fetch_optional(&mut *tx).await?;
     if live.is_none() {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let enabled: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
         .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
     if enabled.as_deref() != Some(secret_ciphertext) {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let accepted = match factor {
         VerifiedFactor::TotpStep(step) => sqlx::query("UPDATE user_two_factor SET last_accepted_step=$2,failed_attempts=0 WHERE user_id=$1 AND enabled_at IS NOT NULL AND (last_accepted_step IS NULL OR last_accepted_step<$2)")
@@ -139,13 +223,13 @@ pub async fn complete_device_login(
             .bind(user_id).bind(salt.as_slice()).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1,
     };
     if !accepted {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     reset_failed_attempts(&mut tx, user_id).await?;
     let consumed = sqlx::query("UPDATE two_factor_login_challenges SET used_at=$3 WHERE id_hash=$1 AND user_id=$2 AND used_at IS NULL AND attempts<5 AND expires_at>$3")
         .bind(id_hash.as_slice()).bind(user_id).bind(new.now).execute(&mut *tx).await?.rows_affected() == 1;
     if !consumed {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let id = Uuid::new_v4();
     let family = Uuid::new_v4();
@@ -169,8 +253,21 @@ pub async fn complete_device_login(
         )
         .await?;
     }
+    if mail_enabled
+        && crate::mail_security::enqueue_in(
+            &mut tx,
+            user_id,
+            new.now,
+            crate::mail_security::SecurityEvent::NewLogin,
+        )
+        .await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(LoginOutcome::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(Some(id))
+    Ok(LoginOutcome::Created(id))
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -313,6 +410,45 @@ pub async fn confirm_setup(
     now: OffsetDateTime,
     audit: &AuditCtx,
 ) -> Result<bool, DbError> {
+    match confirm_setup_with_email(
+        pool,
+        user_id,
+        session_id,
+        session_kind,
+        expected_ciphertext,
+        accepted_step,
+        hashes,
+        now,
+        audit,
+        false,
+    )
+    .await?
+    {
+        FactorChangeOutcome::Changed => Ok(true),
+        FactorChangeOutcome::Unchanged | FactorChangeOutcome::EmailRateLimited => Ok(false),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactorChangeOutcome {
+    Changed,
+    Unchanged,
+    EmailRateLimited,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn confirm_setup_with_email(
+    pool: &PgPool,
+    user_id: Uuid,
+    session_id: Uuid,
+    session_kind: &str,
+    expected_ciphertext: &[u8],
+    accepted_step: i64,
+    hashes: &[RecoveryHash],
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<FactorChangeOutcome, DbError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
         .bind(user_id)
@@ -324,7 +460,7 @@ pub async fn confirm_setup(
         sqlx::query_scalar("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE").bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *tx).await?
     };
     if live_session.is_none() {
-        return Ok(false);
+        return Ok(FactorChangeOutcome::Unchanged);
     }
     let changed = sqlx::query(
         "UPDATE user_two_factor SET enabled_at=$5,last_accepted_step=$2,pending_session_id=NULL,pending_session_kind=NULL,pending_expires_at=NULL WHERE user_id=$1 AND enabled_at IS NULL AND pending_session_id=$3 AND pending_session_kind=$4 AND pending_expires_at>$5 AND secret_ciphertext=$6 RETURNING user_id",
@@ -339,6 +475,10 @@ pub async fn confirm_setup(
     .await?
     .is_some();
     if changed {
+        sqlx::query("UPDATE users SET security_version=security_version+1 WHERE id=$1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         for hash in hashes {
             sqlx::query("INSERT INTO user_two_factor_recovery_codes(user_id,salt,code_hash,created_at) VALUES($1,$2,$3,$4)")
                 .bind(user_id)
@@ -403,8 +543,26 @@ pub async fn confirm_setup(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    if changed
+        && mail_enabled
+        && crate::mail_security::enqueue_in(
+            &mut tx,
+            user_id,
+            now,
+            crate::mail_security::SecurityEvent::TwoFactorEnabled,
+        )
+        .await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(FactorChangeOutcome::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(changed)
+    Ok(if changed {
+        FactorChangeOutcome::Changed
+    } else {
+        FactorChangeOutcome::Unchanged
+    })
 }
 
 /// Replays a TOTP step and rotates recovery hashes as one transaction.
@@ -502,6 +660,40 @@ pub async fn reset_for_user(
     audit: &AuditCtx,
     action: &str,
 ) -> Result<bool, DbError> {
+    match reset_for_user_with_email(
+        pool,
+        user_id,
+        keep_session,
+        keep_session_kind,
+        verified_hash,
+        expected_ciphertext,
+        proof,
+        now,
+        audit,
+        action,
+        false,
+    )
+    .await?
+    {
+        FactorChangeOutcome::Changed => Ok(true),
+        FactorChangeOutcome::Unchanged | FactorChangeOutcome::EmailRateLimited => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn reset_for_user_with_email(
+    pool: &PgPool,
+    user_id: Uuid,
+    keep_session: Option<Uuid>,
+    keep_session_kind: Option<&str>,
+    verified_hash: Option<&str>,
+    expected_ciphertext: Option<&[u8]>,
+    proof: Option<VerifiedFactor>,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+    action: &str,
+    mail_enabled: bool,
+) -> Result<FactorChangeOutcome, DbError> {
     let mut tx = pool.begin().await?;
     let user: Option<Uuid> = if let Some(hash) = verified_hash {
         sqlx::query_scalar("SELECT id FROM users WHERE id=$1 AND password_hash=$2 FOR UPDATE")
@@ -516,7 +708,7 @@ pub async fn reset_for_user(
             .await?
     };
     if user.is_none() {
-        return Ok(false);
+        return Ok(FactorChangeOutcome::Unchanged);
     }
     if let Some(session_id) = keep_session {
         let live: Option<Uuid> = if keep_session_kind == Some("device") {
@@ -525,7 +717,7 @@ pub async fn reset_for_user(
             sqlx::query_scalar("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND absolute_expires_at>$3 FOR SHARE").bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *tx).await?
         };
         if live.is_none() {
-            return Ok(false);
+            return Ok(FactorChangeOutcome::Unchanged);
         }
     }
     if let Some(expected_ciphertext) = expected_ciphertext {
@@ -533,7 +725,7 @@ pub async fn reset_for_user(
         let current_ciphertext: Option<Vec<u8>> = sqlx::query_scalar("SELECT secret_ciphertext FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts<$2 FOR UPDATE")
             .bind(user_id).bind(MAX_FAILED_ATTEMPTS).fetch_optional(&mut *tx).await?;
         if current_ciphertext.as_deref() != Some(expected_ciphertext) {
-            return Ok(false);
+            return Ok(FactorChangeOutcome::Unchanged);
         }
     }
     if let Some(proof) = proof {
@@ -544,7 +736,7 @@ pub async fn reset_for_user(
                 .bind(user_id).bind(salt.as_slice()).bind(now).execute(&mut *tx).await?.rows_affected() == 1,
         };
         if !accepted {
-            return Ok(false);
+            return Ok(FactorChangeOutcome::Unchanged);
         }
     }
     let changed = sqlx::query("DELETE FROM user_two_factor WHERE user_id=$1")
@@ -558,6 +750,10 @@ pub async fn reset_for_user(
         .execute(&mut *tx)
         .await?;
     if changed {
+        sqlx::query("UPDATE users SET security_version=security_version+1 WHERE id=$1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
             .await?;
         if let Some(session_id) = keep_session {
@@ -645,8 +841,25 @@ pub async fn reset_for_user(
             .await?;
         }
     }
+    if changed && mail_enabled {
+        let event = if action == "auth.two_factor_disabled" {
+            crate::mail_security::SecurityEvent::TwoFactorDisabled
+        } else {
+            crate::mail_security::SecurityEvent::TwoFactorReset
+        };
+        if crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+        {
+            tx.rollback().await?;
+            return Ok(FactorChangeOutcome::EmailRateLimited);
+        }
+    }
     tx.commit().await?;
-    Ok(changed)
+    Ok(if changed {
+        FactorChangeOutcome::Changed
+    } else {
+        FactorChangeOutcome::Unchanged
+    })
 }
 
 /// Inserts a challenge only if the account remains enabled and owns an active factor.

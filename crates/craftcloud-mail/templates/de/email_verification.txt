@@ -1,0 +1,4 @@
+Hallo {{recipient_name}},
+
+Bestätige deine CraftCloud-E-Mail-Adresse: {{action_url}}
+Dieser Link läuft am {{expires_at}} ab. Wenn du das nicht angefordert hast, ignoriere diese Nachricht.

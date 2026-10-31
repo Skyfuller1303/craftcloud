@@ -1,0 +1,27 @@
+[package]
+name = "craftcloud-mail"
+description = "CraftCloud transactional email templates and SMTP transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lettre.workspace = true
+tokio = { workspace = true, features = ["time"] }
+zeroize.workspace = true
+
+[features]
+default = []
+test-util = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "smtp_container"
+path = "tests/smtp_container.rs"
+required-features = ["test-util"]
+
+[lints]
+workspace = true

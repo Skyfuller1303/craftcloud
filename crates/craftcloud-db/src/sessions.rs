@@ -58,7 +58,12 @@ pub async fn create_for_verified_login(
     new: &NewSession,
     verified_hash: &str,
 ) -> Result<Option<Uuid>, DbError> {
-    create_for_verified_login_inner(pool, new, verified_hash, None).await
+    create_for_verified_login_inner(pool, new, verified_hash, None, false)
+        .await
+        .map(|r| match r {
+            LoginOutcome::Created(id) => Some(id),
+            _ => None,
+        })
 }
 
 /// Like [`create_for_verified_login`], and records the `auth.login` audit
@@ -73,7 +78,29 @@ pub async fn create_for_verified_login_audited(
     verified_hash: &str,
     audit: &AuditCtx,
 ) -> Result<Option<Uuid>, DbError> {
-    create_for_verified_login_inner(pool, new, verified_hash, Some(audit)).await
+    create_for_verified_login_inner(pool, new, verified_hash, Some(audit), false)
+        .await
+        .map(|r| match r {
+            LoginOutcome::Created(id) => Some(id),
+            _ => None,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Created(Uuid),
+    Rejected,
+    EmailRateLimited,
+}
+
+pub async fn create_for_verified_login_with_email(
+    pool: &PgPool,
+    new: &NewSession,
+    verified_hash: &str,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<LoginOutcome, DbError> {
+    create_for_verified_login_inner(pool, new, verified_hash, Some(audit), mail_enabled).await
 }
 
 async fn create_for_verified_login_inner(
@@ -81,7 +108,8 @@ async fn create_for_verified_login_inner(
     new: &NewSession,
     verified_hash: &str,
     audit: Option<&AuditCtx>,
-) -> Result<Option<Uuid>, DbError> {
+    mail_enabled: bool,
+) -> Result<LoginOutcome, DbError> {
     let id = Uuid::new_v4();
     let mut tx = pool.begin().await?;
     let user: Option<Uuid> = sqlx::query_scalar(
@@ -92,7 +120,7 @@ async fn create_for_verified_login_inner(
     .fetch_optional(&mut *tx)
     .await?;
     if user.is_none() {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let factor_enabled: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)",
@@ -101,7 +129,7 @@ async fn create_for_verified_login_inner(
     .fetch_one(&mut *tx)
     .await?;
     if factor_enabled {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     let result = sqlx::query(
         "INSERT INTO sessions (id, user_id, token_hash, created_at, last_seen_at, absolute_expires_at) \
@@ -118,7 +146,7 @@ async fn create_for_verified_login_inner(
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() != 1 {
-        return Ok(None);
+        return Ok(LoginOutcome::Rejected);
     }
     if let Some(audit) = audit {
         let by = AuditCtx {
@@ -132,8 +160,21 @@ async fn create_for_verified_login_inner(
         )
         .await?;
     }
+    if mail_enabled
+        && crate::mail_security::enqueue_in(
+            &mut tx,
+            new.user_id,
+            new.now,
+            crate::mail_security::SecurityEvent::NewLogin,
+        )
+        .await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(LoginOutcome::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(Some(id))
+    Ok(LoginOutcome::Created(id))
 }
 
 /// Finds the active session for a token hash: not revoked, not past its

@@ -664,3 +664,38 @@
 	FigCraft live collaboration is unavailable. Try again later.	Die Live-Zusammenarbeit mit FigCraft ist nicht verfügbar. Versuche es später erneut.
 	Another live operation is in progress. Reload and try again shortly.	Eine andere Live-Aktion läuft gerade. Lade neu und versuche es gleich erneut.
 	Live collaboration requires an intact native .figcraft file.	Die Live-Zusammenarbeit benötigt eine intakte native .figcraft-Datei.
+
+# Email delivery (AC-09)
+	Continue sending confirmation links…	Weitere Bestätigungslinks senden…
+	E-mail delivery is not available on this server.	Der E-Mail-Versand ist auf diesem Server nicht verfügbar.
+	This email confirmation link is invalid, expired or already used.	Dieser E-Mail-Bestätigungslink ist ungültig, abgelaufen oder bereits verwendet.
+	Your e-mail address is not verified yet.	Deine E-Mail-Adresse ist noch nicht bestätigt.
+	Check your inbox for the confirmation link.	Den Bestätigungslink findest du in deinem Postfach.
+	Send again in {seconds} s	Erneut senden in {seconds} s
+	Send confirmation link	Bestätigungslink senden
+	Change e-mail address	E-Mail-Adresse ändern
+	Confirm the new address within 24 hours. Your current address receives a security notice.	Bestätige die neue Adresse innerhalb von 24 Stunden. Deine bisherige Adresse erhält einen Sicherheitshinweis.
+	New e-mail address	Neue E-Mail-Adresse
+	Second factor (if enabled)	Zweiter Faktor (falls eingerichtet)
+	Authenticator code	Authenticator-Code
+	If the address can be used, a confirmation email will be sent.	Wenn die Adresse verwendet werden kann, wird eine Bestätigungsmail gesendet.
+	Confirm e-mail address	E-Mail-Adresse bestätigen
+	Confirm this address for your CraftCloud account.	Bestätige diese Adresse für dein CraftCloud-Konto.
+	E-mail address confirmed.	E-Mail-Adresse bestätigt.
+	Invitation sent.	Einladung gesendet.
+	Resend invitation	Einladung erneut senden
+	Invitation sent to {email}.	Einladung an {email} gesendet.
+	E-mail delivery	E-Mail-Versand
+	Configured	Eingerichtet
+	Last successful delivery	Letzte erfolgreiche Zustellung
+	Failed messages	Fehlgeschlagene Nachrichten
+	Test messages are sent only to your own address.	Testnachrichten werden nur an deine eigene Adresse gesendet.
+	Send test email	Testmail senden
+	Verify all unverified accounts…	Alle unbestätigten Konten bestätigen…
+	Test email queued. Check your inbox and refresh the delivery status.	Testmail eingereiht. Prüfe dein Postfach und aktualisiere den Versandstatus.
+	Confirmation emails queued: {count}.	Eingereihte Bestätigungsmails: {count}.
+	Verify all unverified accounts	Alle unbestätigten Konten bestätigen
+	Send confirmation links to unverified accounts. Rate limits still apply.	Sende Bestätigungslinks an unbestätigte Konten. Die Versandlimits gelten weiterhin.
+	Send confirmation links	Bestätigungslinks senden
+	Password reset email sent.	E-Mail zum Zurücksetzen des Passworts gesendet.
+	This signs out the account on all devices and sends a password reset email.	Das Konto wird auf allen Geräten abgemeldet und erhält eine E-Mail zum Zurücksetzen des Passworts.

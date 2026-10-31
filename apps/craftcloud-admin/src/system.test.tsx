@@ -239,7 +239,9 @@ describe.each(languages)("axe: system view (%s)", (language) => {
 
     // Request error: the notice replaces the data.
     await user.click(refresh());
-    await waitFor(() => expect(document.querySelectorAll("dl.facts").length).toBe(0));
+    // Mail status comes from its own successful request and remains visible.
+    await waitFor(() => expect(Array.from(document.querySelectorAll("dl.facts"))
+      .filter((facts) => !facts.closest('[aria-labelledby="email-delivery-title"]'))).toHaveLength(0));
     await screen.findByRole("alert");
     await expectNoAxeViolations();
   });

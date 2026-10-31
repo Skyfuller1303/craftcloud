@@ -272,6 +272,8 @@ ensure_figcraft_files() {
 compose_files() {
     printf '%s' '-f compose.yaml -f compose.install.yaml'
     [ "$FIGCRAFT" != enabled ] || printf '%s' ' -f compose.figcraft.yaml'
+    # smtp_files contains only fixed -f filenames emitted by smtp_overrides.
+    [ -z "${smtp_files:-}" ] || printf ' %s' "$smtp_files"
     [ "$1" != 1 ] || printf '%s' ' -f compose.setup.yaml'
 }
 
@@ -589,6 +591,8 @@ version_image_tag=$(image_tag "$version")
 [ "${#version_image_tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
 export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$version_image_tag"
 export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR" CRAFTCLOUD_CADDY_CONFIG_DIR="$CADDY_CONFIG_DIR"
+. "$SELF_DIR/smtp-overrides.sh"
+smtp_files=$(smtp_overrides "$env_file")
 # compose <with-setup 0|1> <docker compose arguments...>
 compose() {
     compose_setup=$1; shift

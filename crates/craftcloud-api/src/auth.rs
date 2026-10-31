@@ -112,7 +112,7 @@ fn db_failure(error: &DbError, headers: &HeaderMap, what: &str) -> Response {
     }
 }
 
-fn invalid_credentials(headers: &HeaderMap) -> Response {
+pub(crate) fn invalid_credentials(headers: &HeaderMap) -> Response {
     error_response(
         StatusCode::UNAUTHORIZED,
         "INVALID_CREDENTIALS",
@@ -328,7 +328,7 @@ pub(crate) async fn login(
     };
     let now = services.clock.now();
     let absolute = now + services.settings.absolute_timeout;
-    let created = sessions::create_for_verified_login_audited(
+    let created = sessions::create_for_verified_login_with_email(
         &services.pool,
         &sessions::NewSession {
             user_id: account.user_id,
@@ -338,11 +338,20 @@ pub(crate) async fn login(
         },
         &stored_hash,
         &audit_ctx(&headers, Some(account.user_id)),
+        services.email_delivery_enabled(),
     )
     .await;
     match created {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+        Ok(sessions::LoginOutcome::Created(_)) => {}
+        Ok(sessions::LoginOutcome::EmailRateLimited) => {
+            return crate::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "Try again later.",
+                &headers,
+            );
+        }
+        Ok(sessions::LoginOutcome::Rejected) => {
             match crate::two_factor::issue_login_challenge(
                 &services,
                 account.user_id,
@@ -455,6 +464,7 @@ async fn session_response(
     Json(json!({
         "user_id": account.id.to_string(),
         "email": account.normalized_email,
+        "email_verified": account.email_verified_at.is_some(),
         "display_name": account.display_name,
         "instance_role": account.instance_role,
         "csrf_token": session.csrf_token(),
@@ -732,7 +742,7 @@ pub(crate) async fn change_password(
     };
     let now = services.clock.now();
     let changed = if session.credential_kind == crate::session::CredentialKind::Device {
-        accounts::change_password_device_audited(
+        accounts::change_password_device_audited_with_email(
             &services.pool,
             session.user_id,
             &verified_hash,
@@ -740,10 +750,11 @@ pub(crate) async fn change_password(
             session.session_id,
             now,
             &audit_ctx(&headers, Some(session.user_id)),
+            services.email_delivery_enabled(),
         )
         .await
     } else {
-        accounts::change_password_audited(
+        accounts::change_password_audited_with_email(
             &services.pool,
             session.user_id,
             &verified_hash,
@@ -751,17 +762,24 @@ pub(crate) async fn change_password(
             session.session_id,
             now,
             &audit_ctx(&headers, Some(session.user_id)),
+            services.email_delivery_enabled(),
         )
         .await
     };
     match changed {
-        Ok(Some(_)) => {
+        Ok(accounts::PasswordChangeResult::Changed(_)) => {
             tracing::info!("password changed; other sessions and pending reset links revoked");
             StatusCode::NO_CONTENT.into_response()
         }
         // The password was changed or reset, or this session was revoked,
         // while the request was being processed: the session is gone (401).
-        Ok(None) => {
+        Ok(accounts::PasswordChangeResult::EmailRateLimited) => crate::error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Try again later.",
+            &headers,
+        ),
+        Ok(accounts::PasswordChangeResult::NotChanged) => {
             let response = error_response(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHENTICATED",
@@ -850,19 +868,46 @@ pub(crate) async fn issue_password_reset(
     };
     let now = services.clock.now();
     let expires_at = now + PASSWORD_RESET_TTL;
-    let outcome = password_reset::create_audited(
-        &services.pool,
-        &password_reset::NewResetToken {
-            user_id,
-            token_hash: token.hash(),
-            created_by: Some(session.user_id),
-            reset_two_factor,
-            now,
+    let new = password_reset::NewResetToken {
+        user_id,
+        token_hash: token.hash(),
+        created_by: Some(session.user_id),
+        reset_two_factor,
+        now,
+        expires_at,
+    };
+    let email_draft = if services.email_delivery_enabled() {
+        let account = match accounts::get(&services.pool, user_id).await {
+            Ok(Some(account)) => account,
+            Ok(None) => return not_found(&headers),
+            Err(error) => return db_failure(&error, &headers, "account lookup failed"),
+        };
+        let id = Uuid::new_v4();
+        let encrypted_token = match services.encrypt_email_token(id, token.expose().as_bytes()) {
+            Ok(value) => value,
+            Err(_) => return unavailable(&headers, "TWO_FACTOR_UNAVAILABLE"),
+        };
+        Some(craftcloud_db::email_outbox::EmailDraft {
+            id,
+            recipient: account.normalized_email,
+            template: "password_reset".to_owned(),
+            language: "en".to_owned(),
+            params: json!({"recipient_name": account.display_name}),
+            encrypted_token: Some(encrypted_token),
             expires_at,
-        },
-        &audit_ctx(&headers, Some(session.user_id)),
-    )
-    .await;
+            actor_id: Some(session.user_id),
+            is_resend: false,
+            now,
+        })
+    } else {
+        None
+    };
+    let audit = audit_ctx(&headers, Some(session.user_id));
+    let outcome = if let Some(draft) = email_draft.as_ref() {
+        password_reset::create_audited_with_email(&services.pool, &new, &audit, draft).await
+    } else {
+        password_reset::create_audited(&services.pool, &new, &audit).await
+    };
     match outcome {
         Ok(IssueOutcome::Issued { .. }) => {}
         Ok(IssueOutcome::AccountDisabled) => {
@@ -874,9 +919,28 @@ pub(crate) async fn issue_password_reset(
             );
         }
         Ok(IssueOutcome::NoSuchUser) => return not_found(&headers),
+        Ok(IssueOutcome::EmailRateLimited) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "Too many email messages were requested. Try again later.",
+                &headers,
+            );
+        }
         Err(error) => return db_failure(&error, &headers, "reset token creation failed"),
     }
     tracing::info!("password reset link issued; sessions of the account revoked");
+    if services.email_delivery_enabled() {
+        let recipient = email_draft
+            .as_ref()
+            .map(|draft| draft.recipient.as_str())
+            .unwrap_or_default();
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({ "sent_to": recipient, "expires_at": rfc3339(expires_at) })),
+        )
+            .into_response();
+    }
     // The token travels in the URL fragment so it is not sent to servers,
     // proxies or Referer headers.
     let reset_url = format!("{public_url}/reset-password#token={}", token.expose());
@@ -985,21 +1049,28 @@ pub(crate) async fn reset_password(
         return internal(&headers);
     };
 
-    match password_reset::consume_audited(
+    match password_reset::consume_audited_with_email(
         &services.pool,
         &token.hash(),
         &new_hash,
         services.clock.now(),
         &audit_ctx(&headers, None),
+        services.email_delivery_enabled(),
     )
     .await
     {
-        Ok(Some(_)) => {
+        Ok(password_reset::ConsumeOutcome::Consumed(_)) => {
             tracing::info!("password reset completed; all sessions revoked");
             StatusCode::NO_CONTENT.into_response()
         }
         // Consumed, expired or the account got disabled in the meantime.
-        Ok(None) => invalid_token(),
+        Ok(password_reset::ConsumeOutcome::EmailRateLimited) => crate::error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Try again later.",
+            &headers,
+        ),
+        Ok(password_reset::ConsumeOutcome::InvalidToken) => invalid_token(),
         Err(error) => db_failure(&error, &headers, "password reset failed"),
     }
 }

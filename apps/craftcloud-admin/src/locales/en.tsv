@@ -667,3 +667,38 @@
 	FigCraft live collaboration is unavailable. Try again later.	FigCraft live collaboration is unavailable. Try again later.
 	Another live operation is in progress. Reload and try again shortly.	Another live operation is in progress. Reload and try again shortly.
 	Live collaboration requires an intact native .figcraft file.	Live collaboration requires an intact native .figcraft file.
+
+# Email delivery (AC-09)
+	Continue sending confirmation links…	Continue sending confirmation links…
+	E-mail delivery is not available on this server.	E-mail delivery is not available on this server.
+	This email confirmation link is invalid, expired or already used.	This email confirmation link is invalid, expired or already used.
+	Your e-mail address is not verified yet.	Your e-mail address is not verified yet.
+	Check your inbox for the confirmation link.	Check your inbox for the confirmation link.
+	Send again in {seconds} s	Send again in {seconds} s
+	Send confirmation link	Send confirmation link
+	Change e-mail address	Change e-mail address
+	Confirm the new address within 24 hours. Your current address receives a security notice.	Confirm the new address within 24 hours. Your current address receives a security notice.
+	New e-mail address	New e-mail address
+	Second factor (if enabled)	Second factor (if enabled)
+	Authenticator code	Authenticator code
+	If the address can be used, a confirmation email will be sent.	If the address can be used, a confirmation email will be sent.
+	Confirm e-mail address	Confirm e-mail address
+	Confirm this address for your CraftCloud account.	Confirm this address for your CraftCloud account.
+	E-mail address confirmed.	E-mail address confirmed.
+	Invitation sent.	Invitation sent.
+	Resend invitation	Resend invitation
+	Invitation sent to {email}.	Invitation sent to {email}.
+	E-mail delivery	E-mail delivery
+	Configured	Configured
+	Last successful delivery	Last successful delivery
+	Failed messages	Failed messages
+	Test messages are sent only to your own address.	Test messages are sent only to your own address.
+	Send test email	Send test email
+	Verify all unverified accounts…	Verify all unverified accounts…
+	Test email queued. Check your inbox and refresh the delivery status.	Test email queued. Check your inbox and refresh the delivery status.
+	Confirmation emails queued: {count}.	Confirmation emails queued: {count}.
+	Verify all unverified accounts	Verify all unverified accounts
+	Send confirmation links to unverified accounts. Rate limits still apply.	Send confirmation links to unverified accounts. Rate limits still apply.
+	Send confirmation links	Send confirmation links
+	Password reset email sent.	Password reset email sent.
+	This signs out the account on all devices and sends a password reset email.	This signs out the account on all devices and sends a password reset email.

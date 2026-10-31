@@ -12,6 +12,7 @@ craftcloud-auth.workspace = true
 craftcloud-backup.workspace = true
 craftcloud-core.workspace = true
 craftcloud-figcraft.workspace = true
+craftcloud-mail.workspace = true
 time.workspace = true
 craftcloud-db.workspace = true
 craftcloud-storage.workspace = true

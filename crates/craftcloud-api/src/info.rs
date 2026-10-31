@@ -25,6 +25,7 @@ struct FeatureFlags {
     grants: bool,
     locks: bool,
     figcraft_live: bool,
+    email_delivery: bool,
 }
 
 #[derive(Serialize)]
@@ -55,6 +56,10 @@ pub(crate) async fn discover(State(state): State<ApiState>) -> Json<Discovery> {
                 .services
                 .as_ref()
                 .is_some_and(|services| services.figcraft_available()),
+            email_delivery: state
+                .services
+                .as_ref()
+                .is_some_and(|services| services.email_delivery_enabled()),
         },
         limits: Limits {
             max_file_size,

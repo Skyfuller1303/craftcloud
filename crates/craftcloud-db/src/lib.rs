@@ -16,12 +16,15 @@
 pub mod accounts;
 pub mod audit;
 pub mod device_sessions;
+pub mod email_outbox;
+pub mod email_verification;
 mod error;
 pub mod figcraft;
 pub mod files;
 pub mod grants;
 pub mod invitations;
 pub mod locks;
+pub mod mail_security;
 pub mod maintenance;
 pub mod members;
 pub mod migrate;

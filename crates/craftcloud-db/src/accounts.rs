@@ -35,6 +35,8 @@ pub struct Account {
     pub instance_role: Option<String>,
     /// Time the account was disabled, if it is.
     pub disabled_at: Option<OffsetDateTime>,
+    /// Time the address was verified, if any.
+    pub email_verified_at: Option<OffsetDateTime>,
 }
 
 /// Instance-level account metadata for the operator. Contains no credentials
@@ -122,7 +124,7 @@ pub async fn find_login(
 /// Database failures only.
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Account>, DbError> {
     Ok(sqlx::query_as::<_, Account>(
-        "SELECT id, normalized_email, display_name, instance_role, disabled_at \
+        "SELECT id, normalized_email, display_name, instance_role, disabled_at, email_verified_at \
          FROM users WHERE id = $1",
     )
     .bind(id)
@@ -140,7 +142,7 @@ pub async fn find_by_email(
     normalized_email: &str,
 ) -> Result<Option<Account>, DbError> {
     Ok(sqlx::query_as::<_, Account>(
-        "SELECT id, normalized_email, display_name, instance_role, disabled_at \
+        "SELECT id, normalized_email, display_name, instance_role, disabled_at, email_verified_at \
          FROM users WHERE normalized_email = $1",
     )
     .bind(normalized_email)
@@ -234,7 +236,9 @@ pub async fn change_password(
         keep_device_session: false,
         now,
     };
-    change_password_inner(pool, &change, None).await
+    Ok(change_password_inner(pool, &change, None, None)
+        .await?
+        .changed())
 }
 
 /// Like [`change_password`], and records the `auth.password_change` audit
@@ -260,7 +264,38 @@ pub async fn change_password_audited(
         keep_device_session: false,
         now,
     };
-    change_password_inner(pool, &change, Some(audit)).await
+    Ok(change_password_inner(pool, &change, Some(audit), None)
+        .await?
+        .changed())
+}
+
+/// Like [`change_password_audited`], and atomically queues a security notice.
+#[allow(clippy::too_many_arguments)]
+pub async fn change_password_audited_with_email(
+    pool: &PgPool,
+    user_id: Uuid,
+    verified_hash: &str,
+    new_hash: &str,
+    keep_session: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<PasswordChangeResult, DbError> {
+    let change = PasswordChange {
+        user_id,
+        verified_hash,
+        new_hash,
+        keep_session,
+        keep_device_session: false,
+        now,
+    };
+    change_password_inner(
+        pool,
+        &change,
+        Some(audit),
+        mail_enabled.then_some(crate::mail_security::SecurityEvent::PasswordChanged),
+    )
+    .await
 }
 
 /// Changes password from a device bearer actor and revokes every browser and device session.
@@ -281,7 +316,54 @@ pub async fn change_password_device_audited(
         keep_device_session: true,
         now,
     };
-    change_password_inner(pool, &change, Some(audit)).await
+    Ok(change_password_inner(pool, &change, Some(audit), None)
+        .await?
+        .changed())
+}
+
+/// Device-session counterpart of [`change_password_audited_with_email`].
+#[allow(clippy::too_many_arguments)]
+pub async fn change_password_device_audited_with_email(
+    pool: &PgPool,
+    user_id: Uuid,
+    verified_hash: &str,
+    new_hash: &str,
+    keep_session: Uuid,
+    now: OffsetDateTime,
+    audit: &AuditCtx,
+    mail_enabled: bool,
+) -> Result<PasswordChangeResult, DbError> {
+    let change = PasswordChange {
+        user_id,
+        verified_hash,
+        new_hash,
+        keep_session,
+        keep_device_session: true,
+        now,
+    };
+    change_password_inner(
+        pool,
+        &change,
+        Some(audit),
+        mail_enabled.then_some(crate::mail_security::SecurityEvent::PasswordChanged),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordChangeResult {
+    Changed(u64),
+    NotChanged,
+    EmailRateLimited,
+}
+
+impl PasswordChangeResult {
+    fn changed(self) -> Option<u64> {
+        match self {
+            Self::Changed(revoked) => Some(revoked),
+            Self::NotChanged | Self::EmailRateLimited => None,
+        }
+    }
 }
 
 struct PasswordChange<'a> {
@@ -297,7 +379,8 @@ async fn change_password_inner(
     pool: &PgPool,
     change: &PasswordChange<'_>,
     audit: Option<&AuditCtx>,
-) -> Result<Option<u64>, DbError> {
+    email_event: Option<crate::mail_security::SecurityEvent>,
+) -> Result<PasswordChangeResult, DbError> {
     let PasswordChange {
         user_id,
         verified_hash,
@@ -308,7 +391,7 @@ async fn change_password_inner(
     } = *change;
     let mut tx = pool.begin().await?;
     let updated =
-        sqlx::query("UPDATE users SET password_hash = $3 WHERE id = $1 AND password_hash = $2")
+        sqlx::query("UPDATE users SET password_hash = $3, security_version=security_version+1 WHERE id = $1 AND password_hash = $2")
             .bind(user_id)
             .bind(verified_hash)
             .bind(new_hash)
@@ -316,7 +399,7 @@ async fn change_password_inner(
             .await?
             .rows_affected();
     if updated != 1 {
-        return Ok(None);
+        return Ok(PasswordChangeResult::NotChanged);
     }
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
         .bind(user_id)
@@ -338,7 +421,7 @@ async fn change_password_inner(
         .await?
     };
     if session_alive.is_none() {
-        return Ok(None);
+        return Ok(PasswordChangeResult::NotChanged);
     }
     let revoked = if keep_device_session {
         sqlx::query("UPDATE sessions SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL")
@@ -395,8 +478,15 @@ async fn change_password_inner(
         )
         .await?;
     }
+    if let Some(event) = email_event
+        && crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?
+            != crate::email_outbox::EnqueueOutcome::Queued
+    {
+        tx.rollback().await?;
+        return Ok(PasswordChangeResult::EmailRateLimited);
+    }
     tx.commit().await?;
-    Ok(Some(revoked))
+    Ok(PasswordChangeResult::Changed(revoked))
 }
 
 /// Sets the display name of an account and records `auth.profile_updated`
@@ -526,7 +616,7 @@ async fn set_disabled_inner(
     let changed = currently_disabled != disabled;
     if changed {
         sqlx::query(
-            "UPDATE users SET disabled_at = CASE WHEN $2 THEN $3::timestamptz ELSE NULL END WHERE id = $1",
+            "UPDATE users SET disabled_at = CASE WHEN $2 THEN $3::timestamptz ELSE NULL END, security_version=security_version+1 WHERE id = $1",
         )
         .bind(user_id)
         .bind(disabled)

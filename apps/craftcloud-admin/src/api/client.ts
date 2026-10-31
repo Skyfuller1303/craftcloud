@@ -13,6 +13,7 @@ import type {
   CreatedInvitation,
   DeviceSession,
   ErrorBody,
+  EmailDeliveryStatus,
   FileRecord,
   FileLock,
   FileVersion,
@@ -60,6 +61,14 @@ export interface Endpoint {
 
 /** Every operation the UI calls. `endpoints.test.ts` checks these against contracts/openapi.yaml. */
 export const ENDPOINTS = {
+  requestEmailVerification: { method: "POST", path: "/auth/email-verification" },
+  confirmEmailVerification: { method: "POST", path: "/auth/email-verification/confirm" },
+  requestEmailChange: { method: "POST", path: "/auth/email-change" },
+  confirmEmailChange: { method: "POST", path: "/auth/email-change/confirm" },
+  requestAllEmailVerifications: { method: "POST", path: "/admin/users/email-verification" },
+  emailDeliveryStatus: { method: "GET", path: "/admin/email-delivery" },
+  sendTestEmail: { method: "POST", path: "/admin/email-delivery/test" },
+  resendInvitation: { method: "POST", path: "/organizations/{org_id}/invitations/{invitation_id}/resend" },
   setupStatus: { method: "GET", path: "/setup/status" },
   serverInfo: { method: "GET", path: "/info" },
   setupComplete: { method: "POST", path: "/setup/complete" },
@@ -292,6 +301,14 @@ export interface ApiClientOptions {
 }
 
 export interface ApiClient {
+  requestEmailVerification(): Promise<unknown>;
+  confirmEmailVerification(token: string): Promise<void>;
+  requestEmailChange(body: { email: string; password: string; code?: string; recovery_code?: string }): Promise<unknown>;
+  confirmEmailChange(token: string): Promise<void>;
+  requestAllEmailVerifications(after?: string): Promise<{ queued: number; next_cursor: string | null; limited: boolean; retry_after_seconds: number | null }>;
+  emailDeliveryStatus(): Promise<EmailDeliveryStatus>;
+  sendTestEmail(): Promise<unknown>;
+  resendInvitation(orgId: string, invitationId: string): Promise<unknown>;
   /** The CSRF token lives in memory only (never in storage or URLs). */
   setCsrfToken(token: string | null): void;
   hasCsrfToken(): boolean;
@@ -539,6 +556,14 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     hasCsrfToken: () => csrfToken !== null,
     setupStatus: () => call(ENDPOINTS.setupStatus, { anonymous: true }),
     serverInfo: () => call(ENDPOINTS.serverInfo, { anonymous: true }),
+    requestEmailVerification: () => call(ENDPOINTS.requestEmailVerification, { body: {} }),
+    confirmEmailVerification: (token) => call(ENDPOINTS.confirmEmailVerification, { body: { token }, anonymous: true }),
+    requestEmailChange: (body) => call(ENDPOINTS.requestEmailChange, { body }),
+    confirmEmailChange: (token) => call(ENDPOINTS.confirmEmailChange, { body: { token }, anonymous: true }),
+    requestAllEmailVerifications: (after) => call(ENDPOINTS.requestAllEmailVerifications, { query: { after }, body: {} }),
+    emailDeliveryStatus: () => call(ENDPOINTS.emailDeliveryStatus),
+    sendTestEmail: () => call(ENDPOINTS.sendTestEmail, { body: {} }),
+    resendInvitation: (orgId, invitationId) => call(ENDPOINTS.resendInvitation, { params: { org_id: orgId, invitation_id: invitationId }, body: {} }),
     setupComplete: (body) => call(ENDPOINTS.setupComplete, { body, anonymous: true }),
     async login(body) {
       const result = await call<LoginResponse>(ENDPOINTS.login, { body, anonymous: true });

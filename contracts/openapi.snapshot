@@ -1,17 +1,20 @@
 # Normalized view of contracts/openapi.yaml. Regenerate with `cargo xtask openapi-snapshot --update`.
 GET /api/v1/admin/audit auth=cookie|bearer req=- ok=AuditEventPage codes=200,400,401,403,422,500,503
 GET /api/v1/admin/audit/export auth=cookie|bearer req=- ok=- codes=200,400,401,403,422,500,503
+GET /api/v1/admin/email-delivery auth=cookie|bearer req=- ok=EmailDeliveryStatus codes=200,400,401,403,500,503
+POST /api/v1/admin/email-delivery/test auth=cookie+csrf|bearer req=- ok=EmailRequestResponse codes=202,400,401,403,429,500,503
 GET /api/v1/admin/health auth=cookie|bearer req=- ok=AdminHealth codes=200,400,401,403,500,503
 GET /api/v1/admin/maintenance auth=cookie|bearer req=- ok=MaintenanceStatus codes=200,400,401,403,500,503
 GET /api/v1/admin/organizations auth=cookie|bearer req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
 GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
+POST /api/v1/admin/users/email-verification auth=cookie+csrf|bearer req=- ok=EmailVerificationBatchResponse codes=202,400,401,403,429,500,503
 GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,422,500,503
 DELETE /api/v1/admin/users/{user_id}/devices/{device_ref} auth=cookie+csrf|bearer req=- ok=- codes=204,401,403,404,500,503
 POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,404,409,500,503
 POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
 DELETE /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
-POST /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=IssuePasswordResetRequest ok=ResetLinkResponse codes=201,400,401,403,404,409,500,503
+POST /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=IssuePasswordResetRequest ok=ResetLinkResponse codes=201,202,400,401,403,404,409,500,503
 GET /api/v1/auth/2fa auth=cookie|bearer req=- ok=TwoFactorStatus codes=200,400,401,500,503
 POST /api/v1/auth/2fa/confirm auth=cookie+csrf|bearer req=TwoFactorConfirmRequest ok=RecoveryCodesResponse codes=200,400,401,403,409,413,415,422,429,500,503
 POST /api/v1/auth/2fa/disable auth=cookie+csrf|bearer req=TwoFactorDisableRequest ok=- codes=204,400,401,403,409,413,415,422,429,500,503
@@ -23,6 +26,10 @@ POST /api/v1/auth/device/logout auth=bearer req=- ok=- codes=204,400,401,500,503
 POST /api/v1/auth/device/refresh auth=none req=- ok=DeviceTokenResponse codes=200,400,401,413,415,422,429,500,503
 GET /api/v1/auth/devices auth=cookie|bearer req=- ok=DeviceList codes=200,400,401,500,503
 DELETE /api/v1/auth/devices/{id} auth=cookie+csrf|bearer|bearer req=- ok=- codes=204,400,401,403,404,500,503
+POST /api/v1/auth/email-change auth=cookie+csrf|bearer req=EmailChangeRequest ok=EmailRequestResponse codes=202,400,401,403,413,415,422,429,500,503
+POST /api/v1/auth/email-change/confirm auth=none req=EmailTokenRequest ok=- codes=204,400,403,413,415,422,429,500,503
+POST /api/v1/auth/email-verification auth=cookie+csrf|bearer req=- ok=EmailRequestResponse codes=202,400,401,403,429,500,503
+POST /api/v1/auth/email-verification/confirm auth=none req=EmailTokenRequest ok=- codes=204,400,403,413,415,422,429,500,503
 POST /api/v1/auth/login auth=none req=LoginRequest ok=LoginResponse codes=200,401,403,413,415,422,429,500,503
 POST /api/v1/auth/login/second-factor auth=none req=SecondFactorLoginRequest ok=LoginResponse codes=200,400,401,403,413,415,422,429,500,503
 POST /api/v1/auth/logout auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,500,503
@@ -64,8 +71,9 @@ GET /api/v1/organizations/{org_id}/audit auth=cookie|bearer req=- ok=AuditEventP
 GET /api/v1/organizations/{org_id}/audit/export auth=cookie|bearer req=- ok=- codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/grants auth=cookie|bearer req=- ok=GrantPage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/invitations auth=cookie|bearer req=- ok=InvitationPage codes=200,400,401,403,404,422,500,503
-POST /api/v1/organizations/{org_id}/invitations auth=cookie+csrf|bearer req=CreateInvitationRequest ok=CreatedInvitation codes=201,400,401,403,404,409,413,415,422,429,500,503
+POST /api/v1/organizations/{org_id}/invitations auth=cookie+csrf|bearer req=CreateInvitationRequest ok=CreatedInvitation codes=201,202,400,401,403,404,409,413,415,422,429,500,503
 DELETE /api/v1/organizations/{org_id}/invitations/{invitation_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
+POST /api/v1/organizations/{org_id}/invitations/{invitation_id}/resend auth=cookie+csrf|bearer req=- ok=InvitationDeliveryResponse codes=202,400,401,403,404,409,429,500,503
 GET /api/v1/organizations/{org_id}/locks auth=cookie|bearer req=- ok=LockPage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/members auth=cookie|bearer req=- ok=MemberPage codes=200,400,401,403,404,422,429,500,503
 POST /api/v1/organizations/{org_id}/members auth=cookie+csrf|bearer req=AddMemberRequest ok=Member codes=201,400,401,403,404,409,413,415,422,500,503
@@ -128,6 +136,12 @@ DeviceList
 DeviceLoginRequest
 DeviceLoginResponse
 DeviceTokenResponse
+EmailChangeRequest
+EmailDeliveryStatus
+EmailQueuedResponse
+EmailRequestResponse
+EmailTokenRequest
+EmailVerificationBatchResponse
 Error
 FigCraftLiveLink
 FigCraftLiveRequest
@@ -141,6 +155,7 @@ GrantCreateRequest
 GrantPage
 HealthLevel
 Invitation
+InvitationDeliveryResponse
 InvitationPage
 IssuePasswordResetRequest
 LockAcquireRequest

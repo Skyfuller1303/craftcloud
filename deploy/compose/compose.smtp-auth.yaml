@@ -1,0 +1,15 @@
+# Optional password authentication, layered after compose.smtp.yaml.
+# The password remains in a host file and in the server-only secret directory.
+services:
+  secrets-init:
+    environment:
+      COPY_SMTP_PASSWORD: "1"
+    secrets: [smtp_password]
+  server:
+    environment:
+      CRAFTCLOUD_SMTP_USERNAME: ${CRAFTCLOUD_SMTP_USERNAME:?set SMTP username}
+      CRAFTCLOUD_SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+
+secrets:
+  smtp_password:
+    file: ${CRAFTCLOUD_SMTP_PASSWORD_SOURCE:?set absolute SMTP password file path}

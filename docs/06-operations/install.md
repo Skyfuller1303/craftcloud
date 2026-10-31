@@ -2,7 +2,7 @@
 
 Diese Anleitung richtet sich an Administratoren, die CraftCloud erstmals betreiben. CraftCloud speichert Konten, Organisationen und Dateien; PostgreSQL und der HTTPS-Proxy Caddy laufen im mitgelieferten Docker-Stack. Auf dem Host müssen Sie weder PostgreSQL noch Rust oder Node.js installieren. Der Installationsbefehl baut das Server-Image aus dem Quellarchiv; es werden keine fertigen CraftCloud-Images aus einer Registry geladen.
 
-Der Stand ist ein lokaler Prototyp. Ein externer Betreiber muss die unten beschriebene Abnahme auf einer echten VM noch durchführen. Insbesondere sind eine Docker-Desktop-Probe und ein funktionierender Healthcheck keine Freigabe für einen Mehrmandanten-Produktivbetrieb: SMTP und E-Mail-Verifikation fehlen weiterhin.
+Der Stand ist ein lokaler Prototyp. Ein externer Betreiber muss die unten beschriebene Abnahme auf einer echten VM noch durchführen. Insbesondere sind eine Docker-Desktop-Probe und ein funktionierender Healthcheck keine Freigabe für einen Mehrmandanten-Produktivbetrieb. SMTP und E-Mail-Verifikation müssen für diesen Betrieb ausdrücklich eingerichtet und geprüft werden.
 
 ## Host, Software und Netzwerk vorbereiten
 
@@ -127,6 +127,49 @@ Bei einer falschen Prüfsumme brechen Sie ab und beschaffen Archiv und Prüfsumm
 Das offene [P3-Gate](../07-roadmap/phase-03-dashboard.md) benötigt eine projektfremde Person auf einer frischen Debian-13-VM. Sie muss nur mit dieser Anleitung Software, DNS und Firewall einrichten, ein echtes ACME-Zertifikat beziehen, installieren, einrichten, anmelden, Personen einladen, Rollen ändern sowie Dateien hoch- und herunterladen. Zusätzlich sind Host-Neustart mit systemd-Wiederanlauf, tatsächlicher Timerlauf mit Rotation, verschlüsselte Kopie außer Haus, Restore in eine getrennte Instanz, Upgrade, Fehlerfall nach Migration, Rückwechsel und beide Deinstallationsvarianten zu prüfen. Ubuntu 24.04, arm64, die Mindestversionen von Docker/Compose und eigene Zertifikate benötigen eigene Nachweise.
 
 Windows Server ist kein Ziel dieser Installation. Eine spätere Unterstützung benötigt eine gesonderte Entscheidung über Linux-VM oder Windows-Container, Dienstverwaltung, Dateirechte, Pfad- und Netzwerkverhalten sowie einen vollständigen Installations- und Restore-Test. Docker Desktop unter Windows bleibt eine Entwicklungsumgebung.
+
+## E-Mail-Versand (AC-09)
+
+Ohne `CRAFTCLOUD_MAIL_TRANSPORT` bleibt der Versand abgeschaltet. Einladungs- und Resetlinks werden dann wie bisher einmalig zum Kopieren angezeigt; das Restrisiko aus ADR-0017 bleibt in diesem Modus bestehen. Mit SMTP liefert `/api/v1/info` das Merkmal `feature_flags.email_delivery=true`. Einladende erhalten keine geheimen Links mehr. Bereits vorhandene unbestätigte Konten werden nicht automatisch als bestätigt markiert.
+
+Die Installation verwendet optionale Compose-Dateien `compose.smtp.yaml` und bei Passwortanmeldung zusätzlich `compose.smtp-auth.yaml`. `install.sh` und `craftcloud-ctl` wählen diese anhand von `/etc/craftcloud/craftcloud.env` automatisch. Der SMTP-Testcontainer gehört ausschließlich zu Entwicklungstests und wird nie installiert. Fügen Sie beispielsweise diese nicht geheimen Einstellungen in die geschützte Konfigurationsdatei ein:
+
+```dotenv
+CRAFTCLOUD_MAIL_TRANSPORT=smtp
+CRAFTCLOUD_SMTP_HOST=mail.example.org
+CRAFTCLOUD_SMTP_PORT=587
+CRAFTCLOUD_SMTP_TLS=starttls
+CRAFTCLOUD_SMTP_FROM=CraftCloud <craftcloud@example.org>
+```
+
+Der Server benötigt weiterhin `CRAFTCLOUD_SECRET_KEY_FILE` und `CRAFTCLOUD_PUBLIC_URL`. `starttls` erzwingt das TLS-Upgrade; `tls` verwendet implizites TLS, typischerweise auf Port 465. Die Zertifikatsprüfung bleibt immer aktiv. Der konfigurierte Host muss zum Zertifikat passen. Die Produktionskonfiguration hat keinen Schalter für unsichere Zertifikate und keine Option für Clientzertifikate; ein Relay mit dieser Anforderung muss durch einen separat verwalteten lokalen SMTP-Relay vermittelt werden.
+
+Für einen Versanddienst mit SMTP-Passwort ergänzen Sie:
+
+```dotenv
+CRAFTCLOUD_SMTP_USERNAME=craftcloud-smtp-user
+CRAFTCLOUD_SMTP_PASSWORD_SOURCE=/etc/craftcloud/smtp-password
+```
+
+Legen Sie die Passwortdatei mit Eigentümer root und Modus 0600 an, ohne das Passwort als Befehlsargument oder Umgebungsvariable zu verwenden. `secrets-init` kopiert sie mit Modus 0400 in das ausschließlich vom Server gelesene Secret-Verzeichnis; der Server erhält `CRAFTCLOUD_SMTP_PASSWORD_FILE=/run/secrets/smtp_password`. Benutzername und Passwort müssen gemeinsam vorhanden sein. Bei direktem Betrieb ohne Compose setzen Sie `CRAFTCLOUD_SMTP_PASSWORD_FILE` auf eine nur vom Serverkonto lesbare Datei; `CRAFTCLOUD_SMTP_PASSWORD_SOURCE` ist nur eine Compose-Einstellung. Verwenden Sie die Host-, Port-, Absender- und Zugangsdaten Ihres SMTP-Dienstes; richten Sie SPF, DKIM und DMARC nach dessen Anleitung ein. CraftCloud signiert DKIM nicht selbst.
+
+Für den eigenen Postfix oder ein anderes Relay können Benutzername und Passwort beide entfallen, wenn das Relay ausschließlich die freigegebene Ausgangs-IP akzeptiert. Kein offenes Relay betreiben. Auch dieser Weg benötigt ein gültiges Serverzertifikat und TLS.
+
+Für Microsoft 365 verwenden Sie einen für Ihre Ausgangs-IP freigegebenen Eingangsconnector, den MX-Endpunkt Ihrer akzeptierten Domain als SMTP-Host, Port 25 und `starttls`, ohne Benutzername oder Passwort. Die Absenderdomain muss im Tenant akzeptiert sein. Port 25 muss ausgehend erreichbar sein. Ein zertifikatsbasierter Connector benötigt einen vorgeschalteten Relay mit passendem Clientzertifikat. Microsoft Graph und OAuth werden erst in AC-09b behandelt. Siehe [Microsofts Connector-Anleitung](https://learn.microsoft.com/en-us/exchange/mail-flow-best-practices/how-to-set-up-a-multifunction-device-or-application-to-send-email-using-microsoft-365-or-office-365).
+
+Für Google Workspace konfigurieren Sie den SMTP-Relay-Dienst mit Ihrer freigegebenen Ausgangs-IP und TLS-Pflicht. Verwenden Sie `smtp-relay.gmail.com`, Port 587, `starttls` und einen zulässigen Absender Ihrer Domain; bei IP-Freigabe entfallen beide Zugangsdaten. Beachten Sie die [Google-Relay-Konfiguration](https://knowledge.workspace.google.com/admin/gmail/advanced/route-outgoing-smtp-relay-messages-through-google).
+
+Das SMTP-Overlay verbindet nur den Server zusätzlich mit einem Netz mit Ausgangsroute. Beschränken Sie den ausgehenden Verkehr auf dem Host auf den Relay und dessen Port. Die internen Datenbanknetze bleiben intern. Bei manueller Compose-Nutzung hängen Sie `-f compose.smtp.yaml` und gegebenenfalls `-f compose.smtp-auth.yaml` an die bisherigen Compose-Dateien an. Nach Änderungen verwenden Sie in einem Wartungsfenster `craftcloud-ctl stop` und danach `craftcloud-ctl start`; so werden auch ausgetauschte Passwortdateien erneut verteilt. Prüfen Sie im Bereich **System** den Versandstatus und senden Sie eine Testmail an Ihre eigene Adresse. Der Status zeigt nur Konfiguration, letzten erfolgreichen Versand und Fehleranzahl, niemals Mailinhalte.
+
+Der Worker versucht vorübergehende Fehler höchstens achtmal innerhalb von 24 Stunden mit exponentiellen Abständen. Eine SMTP-Annahme bestätigt die Übergabe an den Relay, nicht die Zustellung im Postfach. Prüfen Sie bei ausbleibender Mail auch Spamordner und Relay-Protokolle. Permanente Fehler oder ausgeschöpfte Versuche werden auditiert. Resends sind auf einmal pro Minute begrenzt; zusätzlich gelten fünf Mails pro Empfänger und Vorlage pro Stunde sowie dreißig pro auslösender Person. Bei einem Absturz zwischen SMTP-Annahme und Datenbankbestätigung kann eine Mail doppelt eintreffen.
+
+Sicherheitsänderungen und ihre Hinweise bilden eine gemeinsame Transaktion. Ist das Versandlimit für Sicherheitshinweise ausgeschöpft, wird auch die Kontoänderung beziehungsweise neue Anmeldung mit einer Ratenbegrenzung abgelehnt; die Daten bleiben unverändert. Wiederholen Sie die Aktion nach Ablauf des Zeitfensters. Bereits aktive Sitzungen werden durch dieses Versandlimit nicht beendet.
+
+Bestätigungslinks verwenden URL-Fragmente und kurzlebige, einmalige Tokens. Die Outbox speichert Tokens nur verschlüsselt mit dem AC-02-Serverschlüssel und löscht sie nach erfolgreichem Versand oder Ablauf. Queue und offene Adressänderungen gehören nicht ins Backup; nach Restore werden alte Mails nicht nachgesendet. Schützen und rotieren Sie den Serverschlüssel wie für 2FA beschrieben. Alte Einladungen müssen nach Restore weiterhin geprüft und gegebenenfalls widerrufen werden. Für bestehende unbestätigte Konten kann der Operator im Bereich **System** Bestätigungsmails anstoßen; Versandlimits gelten auch dabei.
+
+Bei vielen unbestätigten Konten arbeitet die Oberfläche in begrenzten Gruppen. Verwenden Sie nach einer angezeigten Wartezeit „Weitere Bestätigungslinks senden…“, um am zurückgegebenen Fortsetzungspunkt weiterzuarbeiten. Bereits früher kopierte Einladungslinks gelten nach Aktivierung von SMTP nicht als Adressnachweis; senden Sie solche Einladungen erneut. Der neue Link ersetzt den alten.
+
+Die nur auf dem Serverhost verfügbare Passwort-Wiederherstellung bleibt ein Notfallweg: Sie gibt weiterhin den ausdrücklich als geheim gekennzeichneten Resetlink aus. Verwenden Sie diesen Befehl interaktiv und schützen Sie seine Ausgabe; die normalen Webpanel-Aktionen versenden den Link bei aktiviertem SMTP ausschließlich per E-Mail.
 
 ## Releases lokal vorbereiten
 

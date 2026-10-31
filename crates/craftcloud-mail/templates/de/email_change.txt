@@ -1,0 +1,4 @@
+Hallo {{recipient_name}},
+
+Bestätige die Änderung deiner CraftCloud-Adresse auf {{new_email}}: {{action_url}}
+Dieser Link läuft am {{expires_at}} ab. Wenn du die Änderung nicht angefordert hast, wende dich an deine CraftCloud-Administration.

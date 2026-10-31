@@ -274,7 +274,7 @@ mod tests {
             "must not have bound"
         );
 
-        // 2. migrate applies both versions, second run applies none.
+        // 2. migrate applies the pending schema, second run applies none.
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         assert!(text(&out).contains("applied migration 1"));
@@ -287,7 +287,8 @@ mod tests {
         assert!(text(&out).contains("applied migration 16"));
         assert!(text(&out).contains("applied migration 17"));
         assert!(text(&out).contains("applied migration 18"));
-        assert!(text(&out).contains("applied 18 migration(s)"));
+        assert!(text(&out).contains("applied migration 19"));
+        assert!(text(&out).contains("applied 19 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));

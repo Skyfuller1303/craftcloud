@@ -1,0 +1,8 @@
+Hello {{recipient_name}},
+
+{{inviter_name}} invited you to {{organization_name}} ({{org_role}}).
+{{workspace_name}}
+Accept the invitation: {{action_url}}
+This link expires {{expires_at}}.
+
+If you did not expect this message, you can ignore it.
