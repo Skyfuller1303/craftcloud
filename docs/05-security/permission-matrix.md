@@ -154,4 +154,16 @@ Entscheidungen und Vertragspräzisierungen: [ADR-0024](../09-decisions/adr-0024-
 
 ## Allgemeine Negativtests (weiterhin verbindlich)
 
+## AC-11: App-Zuweisung und Plätze
+
+| Aktion | Owner | Admin | Member | Guest | Operator |
+|---|---:|---:|---:|---:|---:|
+| App-Modus lesen | Ja | Ja | Ja | Nein | Nein |
+| App-Modus ändern | Ja | Ja | Nein | Nein | Nein |
+| Mitglieds-App-Zuweisung ändern | Ja | Ja | Nein | Nein | Nein |
+| Seat-Limit setzen | Nein | Nein | Nein | Nein | Ja |
+| App-Zugriff | Alle | Alle | Modus/Zuweisung | Keine individuelle Zuweisung; Rollenpolicy gilt | Keine organisationsgebundene Mitgliedsrolle |
+
+App-Gerätelogin erfordert nach 2FA mindestens eine aktive Organisation, die die App zulässt; jede Tenant-Anfrage prüft separat gegen ihre Organisation. Launcher, CLI und Browserzugriff umgehen nur die App-Zuweisung, nicht die übrige Authentisierung oder Tenant-Policy. Gäste werden nicht individuell zugewiesen; ihre Aktionen bleiben durch Rollenpolicy begrenzt. Platzbelegung zählt aktive Nichtgäste; offene Nichtgast-Einladungen reservieren Plätze. Gäste und deaktivierte Mitglieder zählen nicht.
+
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.

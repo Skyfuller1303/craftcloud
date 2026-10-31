@@ -172,6 +172,15 @@ pub(crate) fn gate(
             });
             Gate::Closed(response)
         }
+        Decision::AppNotAssigned => {
+            audit(headers, actor, action_name, org, target, "app_not_assigned");
+            Gate::Closed(error_response(
+                StatusCode::FORBIDDEN,
+                "APP_NOT_ASSIGNED",
+                "This app is not assigned in this organization.",
+                headers,
+            ))
+        }
         Decision::Hidden => {
             audit(headers, actor, action_name, org, target, "hidden");
             Gate::Closed(not_found(headers))
@@ -221,6 +230,7 @@ fn member_json(member: &Member) -> Value {
         "display_name": member.display_name,
         "email": member.email,
         "role": member.role,
+        "apps": member.apps,
         "joined_at": rfc3339(member.joined_at),
     })
 }
@@ -926,6 +936,11 @@ pub(crate) async fn add_member(
         AddOutcome::UserDisabled => {
             conflict("ACCOUNT_DISABLED", "The account is disabled.", &headers)
         }
+        AddOutcome::SeatLimitReached => conflict(
+            "SEAT_LIMIT_REACHED",
+            "The organization has no available seats.",
+            &headers,
+        ),
     }
 }
 
@@ -1029,6 +1044,11 @@ pub(crate) async fn change_role(
         }
         Ok(RoleOutcome::Unchanged(member)) => Json(member_json(&member)).into_response(),
         Ok(RoleOutcome::NotMember) => not_found(&headers),
+        Ok(RoleOutcome::SeatLimitReached) => conflict(
+            "SEAT_LIMIT_REACHED",
+            "The organization has no available seats.",
+            &headers,
+        ),
         Ok(RoleOutcome::LastOwner) => {
             audit(
                 &headers,
@@ -1327,6 +1347,7 @@ pub(crate) async fn list_all_orgs(
                 "id": o.id.to_string(), "slug": o.slug, "name": o.name,
                 "member_count": o.member_count, "committed_bytes": o.committed_bytes,
                 "reserved_bytes": o.reserved_bytes, "quota_bytes": o.quota_bytes,
+                "seat_limit": o.seat_limit,
                 "created_at": rfc3339(o.created_at),
             })
         })
@@ -1525,6 +1546,16 @@ async fn set_user_disabled(
         Ok(DisableOutcome::IsOperator) => conflict(
             "CANNOT_DISABLE_OPERATOR",
             "The instance operator cannot be disabled.",
+            &headers,
+        ),
+        Ok(DisableOutcome::SeatLimitReached { .. }) => conflict(
+            "SEAT_LIMIT_REACHED",
+            "The account cannot be reactivated because one or more organizations have no available seats.",
+            &headers,
+        ),
+        Ok(DisableOutcome::MembershipStateChanged) => conflict(
+            "MEMBERSHIP_STATE_CHANGED",
+            "Organization membership changed while the account was being reactivated; retry the request.",
             &headers,
         ),
         Err(error) => db_failure(&error, &headers, "account state change failed"),

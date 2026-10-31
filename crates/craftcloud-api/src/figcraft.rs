@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use craftcloud_auth::{decrypt_secret_for, encrypt_secret_for};
-use craftcloud_core::policy::{Action, can};
+use craftcloud_core::policy::{Action, Decision, can};
 use craftcloud_db::{
     OrgScope, figcraft as db,
     uploads::{BeginOutcome, NewUpload, StoreOutcome, UploadCreateOutcome},
@@ -210,11 +210,12 @@ async fn verify_existing_link(
     headers: &HeaderMap,
 ) -> Result<(), Response> {
     let crate::workspaces::Locked { mut tx, actor } = lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         headers,
+        session.app_id.as_deref(),
     )
     .await
     .map_err(|e| *e)?;
@@ -286,11 +287,12 @@ async fn persist_link_with_current_authority(
     headers: &HeaderMap,
 ) -> Result<(), Response> {
     let crate::workspaces::Locked { mut tx, actor } = lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         headers,
+        session.app_id.as_deref(),
     )
     .await
     .map_err(|e| *e)?;
@@ -365,6 +367,8 @@ async fn persist_link_with_current_authority(
                 ciphertext: link.ciphertext,
                 now,
                 workspace_id: resolved.workspace_id,
+                source_kind: &session.client_kind,
+                source_app: session.app_id.as_deref(),
             },
             &ctx,
         )
@@ -446,10 +450,11 @@ pub(crate) async fn status(
         Err(e) => return *e,
     };
     let actor = match read_actor(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -564,10 +569,11 @@ pub(crate) async fn open(
         }
     };
     let actor = match read_actor(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -600,6 +606,8 @@ pub(crate) async fn open(
         resolved.id,
         session.user_id,
         access_text,
+        &session.client_kind,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -704,11 +712,12 @@ pub(crate) async fn open(
                 Err(e) => return e,
             };
         let (mut tx, fresh_actor) = match lock(
-            &resolved.services.pool,
+            &resolved.services,
             session.user_id,
             resolved.org_id,
             resolved.workspace_id,
             &headers,
+            session.app_id.as_deref(),
         )
         .await
         {
@@ -893,11 +902,17 @@ pub(crate) async fn open(
     let Some(Ok(link)) = created else {
         return unavailable(&headers, "FIGCRAFT_UNAVAILABLE");
     };
-    let old_links = match db::links(&resolved.services.pool, resolved.id).await {
-        Ok(v) => v
-            .into_iter()
-            .filter(|v| v.user_id == session.user_id)
-            .collect::<Vec<_>>(),
+    let old_links = match db::links_for_source(
+        &resolved.services.pool,
+        resolved.id,
+        session.user_id,
+        access_text,
+        &session.client_kind,
+        session.app_id.as_deref(),
+    )
+    .await
+    {
+        Ok(v) => v,
         Err(e) => {
             let backend = Arc::clone(&backend);
             let file = remote_id.clone();
@@ -1105,11 +1120,12 @@ pub(crate) async fn snapshot(
     let digest: [u8; 32] = Sha256::digest(&export.bytes).into();
     let now = resolved.services.clock.now();
     let (mut tx, actor) = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -1225,11 +1241,12 @@ pub(crate) async fn snapshot(
     };
     let now = resolved.services.clock.now();
     let (mut tx, actor) = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -1325,11 +1342,12 @@ pub(crate) async fn snapshot(
     }
     let now = resolved.services.clock.now();
     let (mut tx, actor) = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -1511,11 +1529,12 @@ pub(crate) async fn stop(
         }
     };
     let (mut tx, actor) = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -2197,6 +2216,12 @@ const FINAL_SNAPSHOT_RETRY_SECS: i64 = 60;
 
 /// Claims and executes due link invalidations. Called ahead of and between the
 /// slow snapshot and stop items so revocations never wait behind an export.
+pub(crate) async fn process_app_access_revocations(services: &Arc<Services>) {
+    if services.figcraft_available() {
+        process_revocations(services).await;
+    }
+}
+
 async fn process_revocations(services: &Arc<Services>) {
     let rows = match db::claim_revocations(&services.pool, 32, services.clock.now()).await {
         Ok(v) => v,
@@ -2208,7 +2233,7 @@ async fn process_revocations(services: &Arc<Services>) {
     for row in rows {
         let _file_guard = match FileGuard::acquire(&services.pool, row.file_id).await {
             Ok(v) => v,
-            Err(()) => {
+            Err(_) => {
                 // Local contention is not a remote failure: retry shortly and keep the attempt count.
                 let _ = db::defer_revocation(
                     &services.pool,
@@ -2220,7 +2245,33 @@ async fn process_revocations(services: &Arc<Services>) {
                 continue;
             }
         };
-        let links = match db::links(&services.pool, row.file_id).await {
+        let app_source = match db::parse_app_revocation_reason(&row.reason) {
+            Ok(source) => source,
+            Err(_) => {
+                tracing::error!(reason = %row.reason, "invalid FigCraft app revocation reason; keeping fail-closed retry");
+                let _ = db::retry_revocation(&services.pool, row.id, services.clock.now()).await;
+                continue;
+            }
+        };
+        let links = match match app_source.as_ref() {
+            Some(source) => match row.user_id {
+                Some(user_id) => {
+                    let source_app = match source {
+                        db::AppRevocationSource::Legacy => None,
+                        db::AppRevocationSource::App(app) => Some(app.as_str()),
+                    };
+                    db::app_access_revocation_links(
+                        &services.pool,
+                        row.file_id,
+                        user_id,
+                        source_app,
+                    )
+                    .await
+                }
+                None => Err(craftcloud_db::DbError::Internal),
+            },
+            None => db::links(&services.pool, row.file_id).await,
+        } {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(%e,"FigCraft outbox lookup failed");
@@ -2267,19 +2318,27 @@ async fn process_revocations(services: &Arc<Services>) {
     }
 }
 
+type ReconcileLinkRow = (Uuid, Uuid, Uuid, Uuid, Uuid, String, String, Option<String>);
+
 async fn reconcile_links(services: &Arc<Services>, after: &mut Option<Uuid>) -> bool {
-    let rows:Vec<(Uuid,Uuid,Uuid,Uuid,Uuid,String)>=match sqlx::query_as("SELECT l.id,l.file_id,l.user_id,f.org_id,f.workspace_id,l.access FROM figcraft_links l JOIN files f ON f.id=l.file_id JOIN figcraft_live_files lf ON lf.file_id=l.file_id WHERE l.revoked_at IS NULL AND lf.state='live' AND ($1::uuid IS NULL OR l.id>$1) ORDER BY l.id LIMIT 1000")
+    let rows:Vec<ReconcileLinkRow>=match sqlx::query_as("SELECT l.id,l.file_id,l.user_id,f.org_id,f.workspace_id,l.access,l.source_kind,l.source_app FROM figcraft_links l JOIN files f ON f.id=l.file_id JOIN figcraft_live_files lf ON lf.file_id=l.file_id WHERE l.revoked_at IS NULL AND lf.state='live' AND ($1::uuid IS NULL OR l.id>$1) ORDER BY l.id LIMIT 1000")
         .bind(*after).fetch_all(&services.pool).await {Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft reconciliation query failed");return false}};
     if rows.is_empty() {
         *after = None;
         return true;
     }
     *after = rows.last().map(|r| r.0);
-    for (_, file_id, user_id, org_id, workspace_id, access) in rows {
+    for (_, file_id, user_id, org_id, workspace_id, access, source_kind, source_app) in rows {
+        let policy_app = match source_kind.as_str() {
+            "app" => source_app.as_deref(),
+            "legacy" => Some("figcraft"),
+            _ => None,
+        };
         let allowed:bool=match sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND disabled_at IS NULL) AND (NOT (SELECT require_two_factor FROM organizations WHERE id=$2) OR EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL))")
             .bind(user_id).bind(org_id).fetch_one(&services.pool).await {Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft user reconciliation failed");continue}};
+        let mut app_denied = false;
         let policy = if allowed {
-            match read_actor(&services.pool, user_id, org_id, workspace_id).await {
+            match read_actor(services, user_id, org_id, workspace_id, policy_app).await {
                 Ok(actor) => match policy_resource(
                     &services.pool,
                     user_id,
@@ -2291,9 +2350,21 @@ async fn reconcile_links(services: &Arc<Services>, after: &mut Option<Uuid>) -> 
                 .await
                 {
                     Ok(resource) => {
-                        can(&actor, Action::FileRead, &resource).is_allow()
-                            && (access != "edit"
-                                || can(&actor, Action::VersionCommit, &resource).is_allow())
+                        let read = can(&actor, Action::FileRead, &resource);
+                        if matches!(read, Decision::AppNotAssigned) {
+                            app_denied = true;
+                        }
+                        if !read.is_allow() {
+                            false
+                        } else if access == "edit" {
+                            let write = can(&actor, Action::VersionCommit, &resource);
+                            if matches!(write, Decision::AppNotAssigned) {
+                                app_denied = true;
+                            }
+                            write.is_allow()
+                        } else {
+                            true
+                        }
                     }
                     Err(_) => false,
                 },
@@ -2302,17 +2373,31 @@ async fn reconcile_links(services: &Arc<Services>, after: &mut Option<Uuid>) -> 
         } else {
             false
         };
-        if !policy
-            && let Err(e) = db::enqueue_file_user_revocations_pool(
-                &services.pool,
-                file_id,
-                user_id,
-                "security_changed",
-                services.clock.now(),
-            )
-            .await
-        {
-            tracing::warn!(%e,"FigCraft entitlement revocation enqueue failed");
+        if !policy {
+            let enqueue = if app_denied {
+                let source_app = (source_kind != "legacy").then_some(policy_app).flatten();
+                db::enqueue_file_app_revocations_pool(
+                    &services.pool,
+                    org_id,
+                    file_id,
+                    user_id,
+                    source_app,
+                    services.clock.now(),
+                )
+                .await
+            } else {
+                db::enqueue_file_user_revocations_pool(
+                    &services.pool,
+                    file_id,
+                    user_id,
+                    "security_changed",
+                    services.clock.now(),
+                )
+                .await
+            };
+            if let Err(e) = enqueue {
+                tracing::warn!(%e,"FigCraft entitlement revocation enqueue failed");
+            }
         }
     }
     false

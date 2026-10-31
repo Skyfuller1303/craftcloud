@@ -346,6 +346,11 @@ pub(crate) async fn create_invitation(
             "The organization has too many open invitations.",
             &headers,
         ),
+        Ok(CreateInvitationOutcome::SeatLimitReached) => conflict(
+            "SEAT_LIMIT_REACHED",
+            "The organization has no available seats.",
+            &headers,
+        ),
         Ok(CreateInvitationOutcome::WorkspaceMissing) => not_found(&headers),
         Err(error) => db_failure(&error, &headers, "invitation creation failed"),
     }
@@ -917,6 +922,13 @@ pub(crate) async fn accept_invitation(
             return conflict(
                 "ALREADY_MEMBER",
                 "You are already a member of this organization.",
+                &headers,
+            );
+        }
+        Ok(AcceptOutcome::SeatLimitReached) => {
+            return conflict(
+                "SEAT_LIMIT_REACHED",
+                "The organization has no available seats.",
                 &headers,
             );
         }

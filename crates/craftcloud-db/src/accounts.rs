@@ -543,14 +543,23 @@ pub enum DisableOutcome {
     NoSuchUser,
     /// The instance operator cannot be disabled.
     IsOperator,
+    /// Re-enabling would exceed a seat limit in one or more organizations.
+    SeatLimitReached {
+        /// Organizations whose seat limit prevents reactivation.
+        organizations: Vec<Uuid>,
+    },
+    /// Membership organizations changed during reactivation retries.
+    MembershipStateChanged,
 }
 
 /// Upper bound of the orphan list in a disable result.
 const MAX_ORPHANS: i64 = 1000;
 
 /// Disables or enables an account. Disabling revokes every session of the
-/// account and voids its pending reset links in the same transaction (lock
-/// order: users row first). The instance operator is never disabled.
+/// account and voids its pending reset links in the same transaction. Enables
+/// lock organizations in sorted order before the users row, matching member
+/// admission's organization-then-user order. Disables retain users-first order
+/// because they take no organization locks. The instance operator is never disabled.
 ///
 /// Disabling is **not** blocked when the account is the last enabled owner of
 /// organizations (a security response must not be blocked); those
@@ -586,6 +595,133 @@ pub async fn set_disabled_audited(
     set_disabled_inner(pool, user_id, disabled, now, Some(audit)).await
 }
 
+/// Maximum whole-transaction retries when membership organizations change
+/// while their sorted lock set is acquired.
+const MAX_ENABLE_LOCK_ATTEMPTS: usize = 4;
+
+async fn set_enabled_inner(
+    pool: &PgPool,
+    user_id: Uuid,
+    now: OffsetDateTime,
+    audit: Option<&AuditCtx>,
+) -> Result<DisableOutcome, DbError> {
+    let mut lockset = Vec::<Uuid>::new();
+    for attempt in 0..MAX_ENABLE_LOCK_ATTEMPTS {
+        let mut tx = pool.begin().await?;
+        let discovered: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT org_id FROM organization_members WHERE user_id=$1 ORDER BY org_id",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        lockset.extend(discovered);
+        lockset.sort_unstable();
+        lockset.dedup();
+
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM organizations WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        )
+        .bind(&lockset)
+        .fetch_all(&mut *tx)
+        .await?;
+        let row: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT disabled_at IS NOT NULL, \
+                    EXISTS (SELECT 1 FROM instance_setup s WHERE s.operator_user_id = users.id) \
+             FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((currently_disabled, _is_operator)) = row else {
+            return Ok(DisableOutcome::NoSuchUser);
+        };
+        if !currently_disabled {
+            return Ok(DisableOutcome::Unchanged {
+                orphaned_organizations: Vec::new(),
+            });
+        }
+
+        // Membership writers take the organization lock before the user row.
+        // If the pre-lock snapshot missed an organization, release every lock
+        // before retrying with the expanded, globally sorted set.
+        let current_memberships: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT org_id FROM organization_members WHERE user_id=$1 ORDER BY org_id",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let missing: Vec<Uuid> = current_memberships
+            .iter()
+            .copied()
+            .filter(|org_id| lockset.binary_search(org_id).is_err())
+            .collect();
+        if !missing.is_empty() {
+            lockset.extend(missing);
+            lockset.sort_unstable();
+            lockset.dedup();
+            tx.rollback().await?;
+            if attempt + 1 == MAX_ENABLE_LOCK_ATTEMPTS {
+                return Ok(DisableOutcome::MembershipStateChanged);
+            }
+            continue;
+        }
+
+        let blocked_organizations: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT m.org_id FROM organization_members m \
+             JOIN organizations o ON o.id=m.org_id \
+             JOIN users target ON target.id=m.user_id \
+             WHERE m.user_id=$1 AND m.status='active' AND m.role <> 'guest' \
+               AND o.seat_limit IS NOT NULL AND ( \
+                 (SELECT count(*) FROM organization_members active \
+                  JOIN users u ON u.id=active.user_id \
+                  WHERE active.org_id=m.org_id AND active.status='active' \
+                    AND active.role <> 'guest' AND u.disabled_at IS NULL \
+                    AND active.user_id<>$1) + \
+                 (SELECT count(*) FROM invitations i \
+                  LEFT JOIN users invitee ON invitee.normalized_email=i.normalized_email \
+                  LEFT JOIN organization_members im ON im.org_id=i.org_id AND im.user_id=invitee.id \
+                  WHERE i.org_id=m.org_id AND i.org_role <> 'guest' \
+                    AND i.accepted_at IS NULL AND i.revoked_at IS NULL \
+                    AND i.invalidated_at IS NULL AND i.expires_at>$2 \
+                    AND (im.user_id IS NULL OR im.status <> 'active') \
+                    AND i.normalized_email<>target.normalized_email) \
+               ) >= o.seat_limit \
+             ORDER BY m.org_id",
+        )
+        .bind(user_id)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !blocked_organizations.is_empty() {
+            return Ok(DisableOutcome::SeatLimitReached {
+                organizations: blocked_organizations,
+            });
+        }
+
+        sqlx::query(
+            "UPDATE users SET disabled_at=NULL, security_version=security_version+1 WHERE id=$1",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(audit) = audit {
+            record_in(
+                &mut tx,
+                audit,
+                &NewEvent::new("user.enable")
+                    .target("user", user_id)
+                    .detail("orphaned_organizations", Detail::Count(0)),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(DisableOutcome::Changed {
+            orphaned_organizations: Vec::new(),
+        });
+    }
+    Ok(DisableOutcome::MembershipStateChanged)
+}
+
 async fn set_disabled_inner(
     pool: &PgPool,
     user_id: Uuid,
@@ -593,6 +729,9 @@ async fn set_disabled_inner(
     now: OffsetDateTime,
     audit: Option<&AuditCtx>,
 ) -> Result<DisableOutcome, DbError> {
+    if !disabled {
+        return set_enabled_inner(pool, user_id, now, audit).await;
+    }
     let mut tx = pool.begin().await?;
     let row: Option<(bool, bool)> = sqlx::query_as(
         "SELECT disabled_at IS NOT NULL, \

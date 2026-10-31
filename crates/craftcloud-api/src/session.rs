@@ -46,6 +46,10 @@ pub struct AuthenticatedSession {
     pub credential_kind: CredentialKind,
     /// The authenticated account.
     pub user_id: Uuid,
+    /// Application ID for an `app` device session; absent for browser and launcher sessions.
+    pub app_id: Option<String>,
+    /// Origin kind for capability provenance (`app`, `launcher`, `cli`, `browser`).
+    pub client_kind: String,
     /// Session creation time.
     pub created_at: OffsetDateTime,
     /// Time at which the session expires if it stays idle from now on
@@ -160,83 +164,95 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
             return Err(AuthRejection::new(Kind::Ambiguous, parts));
         }
         let now = services.clock.now();
-        let (session_id, user_id, created_at, expires_at, csrf_token, credential_kind) =
-            if let Some(token) = bearer {
-                let found = craftcloud_db::device_sessions::find_active_access(
-                    &services.pool,
-                    &token.hash(),
-                    now,
-                    services.settings.touch_interval,
-                    services.settings.device_idle_timeout,
-                )
-                .await;
-                let record = match found {
-                    Ok(Some(record)) => record,
-                    Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
-                    Err(error) => {
-                        tracing::error!(%error, "device session lookup failed");
-                        return Err(AuthRejection::new(Kind::Internal, parts));
-                    }
-                };
-                (
-                    record.id,
-                    record.user_id,
-                    record.created_at,
-                    record
-                        .access_expires_at
-                        .min(record.idle_expires_at)
-                        .min(record.absolute_expires_at),
-                    String::new(),
-                    CredentialKind::Device,
-                )
-            } else {
-                let Some(token) = session_token(&parts.headers, &services.settings) else {
-                    return Err(AuthRejection::new(Kind::Unauthenticated, parts));
-                };
-                let found = sessions::find_active(
-                    &services.pool,
-                    &token.hash(),
-                    now,
-                    services.settings.idle_timeout,
-                )
-                .await;
-                let record = match found {
-                    Ok(Some(record)) => record,
-                    Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
-                    Err(error) => {
-                        tracing::error!(%error, "session lookup failed");
-                        return Err(AuthRejection::new(Kind::Internal, parts));
-                    }
-                };
-                if !is_safe_method(&parts.method)
-                    && !csrf_ok(&parts.headers, &services.settings, &token)
-                {
-                    return Err(AuthRejection::new(Kind::CsrfFailed, parts));
+        let (
+            session_id,
+            user_id,
+            created_at,
+            expires_at,
+            csrf_token,
+            credential_kind,
+            app_id,
+            client_kind,
+        ) = if let Some(token) = bearer {
+            let found = craftcloud_db::device_sessions::find_active_access(
+                &services.pool,
+                &token.hash(),
+                now,
+                services.settings.touch_interval,
+                services.settings.device_idle_timeout,
+            )
+            .await;
+            let record = match found {
+                Ok(Some(record)) => record,
+                Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
+                Err(error) => {
+                    tracing::error!(%error, "device session lookup failed");
+                    return Err(AuthRejection::new(Kind::Internal, parts));
                 }
-                let touched = match sessions::touch(
-                    &services.pool,
-                    record.id,
-                    now,
-                    services.settings.touch_interval,
-                )
-                .await
-                {
-                    Ok(wrote) => wrote,
-                    Err(error) => {
-                        tracing::warn!(%error, "session activity update failed");
-                        false
-                    }
-                };
-                let last_seen = if touched { now } else { record.last_seen_at };
-                (
-                    record.id,
-                    record.user_id,
-                    record.created_at,
-                    (last_seen + services.settings.idle_timeout).min(record.absolute_expires_at),
-                    token.csrf_token(),
-                    CredentialKind::Cookie,
-                )
             };
+            (
+                record.id,
+                record.user_id,
+                record.created_at,
+                record
+                    .access_expires_at
+                    .min(record.idle_expires_at)
+                    .min(record.absolute_expires_at),
+                String::new(),
+                CredentialKind::Device,
+                (record.client_kind == "app").then_some(record.client_id),
+                record.client_kind,
+            )
+        } else {
+            let Some(token) = session_token(&parts.headers, &services.settings) else {
+                return Err(AuthRejection::new(Kind::Unauthenticated, parts));
+            };
+            let found = sessions::find_active(
+                &services.pool,
+                &token.hash(),
+                now,
+                services.settings.idle_timeout,
+            )
+            .await;
+            let record = match found {
+                Ok(Some(record)) => record,
+                Ok(None) => return Err(AuthRejection::new(Kind::Unauthenticated, parts)),
+                Err(error) => {
+                    tracing::error!(%error, "session lookup failed");
+                    return Err(AuthRejection::new(Kind::Internal, parts));
+                }
+            };
+            if !is_safe_method(&parts.method)
+                && !csrf_ok(&parts.headers, &services.settings, &token)
+            {
+                return Err(AuthRejection::new(Kind::CsrfFailed, parts));
+            }
+            let touched = match sessions::touch(
+                &services.pool,
+                record.id,
+                now,
+                services.settings.touch_interval,
+            )
+            .await
+            {
+                Ok(wrote) => wrote,
+                Err(error) => {
+                    tracing::warn!(%error, "session activity update failed");
+                    false
+                }
+            };
+            let last_seen = if touched { now } else { record.last_seen_at };
+            (
+                record.id,
+                record.user_id,
+                record.created_at,
+                (last_seen + services.settings.idle_timeout).min(record.absolute_expires_at),
+                token.csrf_token(),
+                CredentialKind::Cookie,
+                None,
+                "browser".to_owned(),
+            )
+        };
 
         match organization_requires_two_factor(&services, user_id, parts.uri.path()).await {
             Ok(true) => return Err(AuthRejection::new(Kind::TwoFactorSetupRequired, parts)),
@@ -251,6 +267,8 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
             session_id,
             credential_kind,
             user_id,
+            app_id,
+            client_kind,
             created_at,
             expires_at,
             csrf_token,

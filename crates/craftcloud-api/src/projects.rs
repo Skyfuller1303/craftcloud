@@ -320,10 +320,11 @@ pub(crate) async fn read_gate(
     target: Uuid,
 ) -> Result<OrgScope, Box<Response>> {
     let actor = read_actor(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
+        session.app_id.as_deref(),
     )
     .await
     .map_err(|error| Box::new(db_failure(&error, headers, "actor lookup failed")))?;
@@ -364,11 +365,12 @@ pub(crate) async fn write_gate(
     target: Uuid,
 ) -> Result<(OrgTx, OrgScope), Box<Response>> {
     let Locked { mut tx, actor } = lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         headers,
+        session.app_id.as_deref(),
     )
     .await?;
     let resource = tx
@@ -658,10 +660,11 @@ pub(crate) async fn list_projects(
         None
     };
     let actor = match crate::workspaces::read_actor(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -726,10 +729,11 @@ pub(crate) async fn get_project(
     match projects::get(&resolved.services.pool, &scope, resolved.id).await {
         Ok(Some(project)) => {
             let actor = match crate::workspaces::read_actor(
-                &resolved.services.pool,
+                &resolved.services,
                 session.user_id,
                 resolved.org_id,
                 resolved.workspace_id,
+                session.app_id.as_deref(),
             )
             .await
             {

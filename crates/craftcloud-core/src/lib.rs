@@ -3,6 +3,7 @@
 //! This crate performs no IO and has no HTTP, database or runtime
 //! dependencies; it only uses `serde` for the wire representation.
 
+pub mod apps;
 mod capabilities;
 pub mod formats;
 mod identity;

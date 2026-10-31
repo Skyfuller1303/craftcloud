@@ -73,3 +73,9 @@ Offen nach AC-07 und AC-08 (2026-10-30):
   - Webtests: Bildschirme laden seit AC-08b lazy; neue Tests sollten `findBy*` statt `getBy*` direkt nach dem Rendern verwenden. `testTimeout` steht auf 20 s.
   - Der Server liest `CRAFTCLOUD_ADMIN_DIR` beim Start in den Speicher; nach einem neuen Web-Build ist ein Neustart nötig.
   - Launcher (AC-07, nur lokal): Öffnen aus der Cloud ist erst mit einer AC-05-App prüfbar, der FigCraft-Livelink erst mit AC-06. Der Gast-Freigabeempfang ist nach dem Serverfix erneut durchgängig zu prüfen. SDK-Lizenz und Verteilung ohne absolute Pfade sind vor einer Einreichung zu klären.
+
+AC-11 Abnahmehinweise (2026-10-31):
+
+  - Der OpenAPI-Snapshot ist aktualisiert. Die vollständige Datenbankabnahme scheitert noch an nicht angepassten Backup-Tabellen, FigCraft-Linkspalten und älteren Versionsannahmen außerhalb der erlaubten AC-11-Pfade.
+  - Neue `src/app_access_tests.rs` deckt Default-Modus, Browser-Sitzung, App-Login nach 2FA mit nachträglichem Zuweisungsentzug, Sitzungs- und Lock-Widerruf, app-vs-launcher-Policy, fremde Org-404, active-device-Zähler ohne Zuweisung, Admin-Demotion, Member-Apps in der Adminliste und 404 beim Operator-Limit für unbekannte Organisation ab. Diese sieben ignorierten PostgreSQL-Tests bestanden im echten `cargo xtask db-test`-Lauf; der Gesamtlauf scheiterte später an Backup-Tests.
+  - Bestehende DB-Seat-Tests prüfen Konkurrenz, Gäste, Reaktivierung und Einladungsannahme. Sieben Sitzplatztests und ein Herkunfts-/Widerrufstest bestanden gegen einen eigenen PostgreSQL-Container. Die vollständige Docker-DB-/API-Suite muss nach dem Backup-Fix wiederholt werden.

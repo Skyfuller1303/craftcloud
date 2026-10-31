@@ -48,3 +48,7 @@ Zusätzlich: OpenAPI aktualisiert; aussagekräftige Tests erfolgreich; negative 
 ## Nichtumfang und Abnahmefragen
 
 Keine ungeprüfte Cross-App-/Cloud-Kopplung, keine proprietären Lizenzen kopieren, keine zusätzlichen Infrastruktur-Abhängigkeiten ohne ADR. Vor Merge prüfen: **API-Owner?** **Datenmigration?** **Offline-Verhalten?** **Echte Pilot-Validierung?**
+
+## Organisationsplätze (AC-11)
+
+Plätze sind ein eigenes Organisationslimit und zählen aktive Mitglieder außer Gästen. Offene Nichtgast-Einladungen reservieren Plätze. Operatoren können ein Limit ändern oder auf unbegrenzt setzen. Eine Senkung unter die aktuelle Nutzung lässt bestehende Mitglieder aktiv und blockiert neue Zulassungen, bis wieder Kapazität besteht. Das Platzlimit verändert weder Storage-Quota noch Aufbewahrung.

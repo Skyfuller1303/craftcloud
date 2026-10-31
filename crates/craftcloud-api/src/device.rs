@@ -339,6 +339,12 @@ pub(crate) async fn login(
         name: cleaned_device_name.clone(),
         client_kind: request.client_kind.clone(),
         client_id: request.client_id.clone(),
+        known_app_ids: services
+            .settings
+            .app_catalog
+            .iter()
+            .map(|app| app.id.clone())
+            .collect(),
         refresh_hash: refresh.hash(),
         access_hash: access.hash(),
         now,
@@ -356,6 +362,14 @@ pub(crate) async fn login(
     .await;
     let id = match created {
         Ok(device_sessions::LoginOutcome::Created(id)) => id,
+        Ok(device_sessions::LoginOutcome::AppNotAssigned) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "APP_NOT_ASSIGNED",
+                "Your administrator has not assigned this app for cloud access.",
+                &headers,
+            );
+        }
         Ok(device_sessions::LoginOutcome::Rejected) => {
             match second_factor_decision(
                 &services,

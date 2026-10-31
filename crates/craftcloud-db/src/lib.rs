@@ -14,6 +14,7 @@
 //! supplies the connection URL.
 
 pub mod accounts;
+pub mod app_access;
 pub mod audit;
 pub mod device_sessions;
 pub mod email_outbox;

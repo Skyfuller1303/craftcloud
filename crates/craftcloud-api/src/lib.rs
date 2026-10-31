@@ -10,6 +10,9 @@
 //! from `Host` or `X-Forwarded-*` headers (see [`ClientIp`] for how forwarded
 //! client addresses are treated).
 
+mod app_access;
+#[cfg(test)]
+mod app_access_tests;
 mod audit;
 mod auth;
 mod client_ip;
@@ -115,6 +118,12 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/organizations", &["GET", "POST"]),
     ("/api/v1/organizations/{org_id}", &["GET", "PATCH"]),
     ("/api/v1/organizations/{org_id}/members", &["GET", "POST"]),
+    ("/api/v1/organizations/{org_id}/apps", &["GET"]),
+    ("/api/v1/organizations/{org_id}/app-access", &["PATCH"]),
+    (
+        "/api/v1/organizations/{org_id}/members/{user_id}/apps",
+        &["PUT"],
+    ),
     ("/api/v1/organizations/{org_id}/grants", &["GET"]),
     ("/api/v1/organizations/{org_id}/locks", &["GET"]),
     (
@@ -181,6 +190,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/organizations/{org_id}/overview", &["GET"]),
     ("/api/v1/workspaces/{workspace_id}/quota", &["PUT"]),
     ("/api/v1/admin/organizations/{org_id}/quota", &["PUT"]),
+    ("/api/v1/admin/organizations/{org_id}/seats", &["PATCH"]),
     ("/api/v1/admin/organizations", &["GET"]),
     ("/api/v1/admin/users", &["GET"]),
     ("/api/v1/admin/users/email-verification", &["POST"]),
@@ -286,6 +296,15 @@ pub fn router_with_shared(
         .route(
             "/api/v1/organizations/{org_id}/members",
             get(orgs::list_members).post(orgs::add_member),
+        )
+        .route("/api/v1/organizations/{org_id}/apps", get(app_access::get))
+        .route(
+            "/api/v1/organizations/{org_id}/app-access",
+            axum::routing::patch(app_access::set_mode),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/members/{user_id}/apps",
+            put(app_access::assign),
         )
         .route(
             "/api/v1/organizations/{org_id}/grants",
@@ -429,6 +448,10 @@ pub fn router_with_shared(
         .route(
             "/api/v1/admin/organizations/{org_id}/quota",
             put(uploads::set_org_quota),
+        )
+        .route(
+            "/api/v1/admin/organizations/{org_id}/seats",
+            axum::routing::patch(app_access::set_seats),
         )
         .route("/api/v1/admin/organizations", get(orgs::list_all_orgs))
         .route("/api/v1/admin/users", get(orgs::list_all_users))

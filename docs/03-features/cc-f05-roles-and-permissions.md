@@ -55,3 +55,9 @@ Zusätzlich: OpenAPI aktualisiert; aussagekräftige Tests erfolgreich; negative 
 ## Nichtumfang und Abnahmefragen
 
 Keine ungeprüfte Cross-App-/Cloud-Kopplung, keine proprietären Lizenzen kopieren, keine zusätzlichen Infrastruktur-Abhängigkeiten ohne ADR. Vor Merge prüfen: **API-Owner?** **Datenmigration?** **Offline-Verhalten?** **Echte Pilot-Validierung?**
+
+## AC-11: App-Zuweisung und Organisationsplätze
+
+Owner und Admin verwalten den App-Modus und App-Zuweisungen. Im Modus `all` stehen Katalog-Apps aktiven Mitgliedern zur Verfügung; im Modus `assigned` benötigen Mitglieder eine explizite Zuweisung. Owner, Admins und Gäste werden nicht über individuelle Zuweisungen eingeschränkt; Gäste behalten die Ressourcenrechte ihrer Rolle. Die Prüfung greift beim App-Gerätelogin nach dem zweiten Faktor und bei den geschützten Datei-, Versions-, Upload-, Sperr- und FigCraft-Aktionen im jeweiligen Organisationskontext erneut. Launcher, CLI und Browserzugriff sind von App-Zuweisungen unabhängig. Nicht sichtbare Organisationen antworten mit 404.
+
+Operatoren setzen je Organisation ein optionales Platzlimit. Aktive Nichtgast-Mitglieder belegen einen Platz; Gäste, deaktivierte Personen und noch nicht angenommene Mitglieder nicht. Offene Einladungen für Nichtgäste reservieren Plätze. Annahme, Einladung, Mitgliedsaufnahme, Gast-Hochstufung und Reaktivierung prüfen unter derselben Organisationssperre. Das Senken unter die aktuelle Belegung deaktiviert niemanden; neue Zulassungen erhalten 409 `SEAT_LIMIT_REACHED`. Globale Konto-Reaktivierung prüft alle betroffenen Organisationen und kann nach konkurrierenden Mitgliedschaftsänderungen mit 409 `MEMBERSHIP_STATE_CHANGED` zum Wiederholen auffordern.

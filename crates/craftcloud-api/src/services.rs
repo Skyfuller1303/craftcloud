@@ -58,6 +58,8 @@ const FIGCRAFT_LIMIT: u32 = 20;
 /// Session, cookie and rate limit settings.
 #[derive(Debug, Clone)]
 pub struct AuthSettings {
+    /// Server-maintained app catalog, optionally extended by operator config.
+    pub app_catalog: Vec<craftcloud_core::apps::AppDefinition>,
     /// A session expires after this long without (recorded) activity.
     pub idle_timeout: Duration,
     /// A session expires this long after login regardless of activity.
@@ -127,6 +129,7 @@ pub struct AuthSettings {
 impl Default for AuthSettings {
     fn default() -> Self {
         Self {
+            app_catalog: craftcloud_core::apps::default_app_catalog(),
             idle_timeout: Duration::from_secs(8 * 3600),
             absolute_timeout: Duration::from_secs(7 * 24 * 3600),
             device_access_ttl: Duration::from_secs(15 * 60),

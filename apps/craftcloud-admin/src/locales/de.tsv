@@ -708,3 +708,23 @@
 	Microsoft Graph	Microsoft Graph
 
 	SMTP	SMTP
+
+	Apps	Apps
+	Loading apps…	Apps werden geladen …
+	App access	App-Zugriff
+	Apps usage	App-Nutzung
+	All apps are available to organization members by default.	Organisationsmitglieder können standardmäßig alle Apps verwenden.
+	Members can use only apps assigned to them.	Mitglieder können nur zugewiesene Apps verwenden.
+	All apps for all members	Alle Apps für alle Mitglieder
+	Only assigned apps	Nur zugewiesene Apps
+	Assigned people	Zugewiesene Personen
+	Active devices	Aktive Geräte
+	Assign selected app	Ausgewählte App zuweisen
+	Remove selected app	Ausgewählte App entziehen
+	Choose an app	App auswählen
+	None assigned	Keine zugewiesen
+	Not required for guests	Für Gäste nicht erforderlich
+	Seat limit	Platzlimit
+	Seat limit for {name}	Platzlimit für {name}
+	Enter a whole number of seats.	Gib eine ganze Zahl von Plätzen ein.
+	Seats used	Belegte Plätze

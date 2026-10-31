@@ -27,15 +27,24 @@ async function collectPages<T>(load: (cursor?: string) => Promise<Page<T>>, maxP
 }
 
 export function AdminPeopleScreen({ organization, onChanged }: { organization: Organization | null; onChanged: () => void }) {
-  const { t, language } = useI18n(); const { api } = useAuth(); const names = useRoleNames();
+  const { t, language } = useI18n(); const { api, state: authState } = useAuth(); const names = useRoleNames();
   const [query, setQuery] = useState(""); const debounced = useDebounced(query.trim());
   const [role, setRole] = useState(""); const [status, setStatus] = useState("all"); const [twoFactor, setTwoFactor] = useState(""); const [sort, setSort] = useState("joined_desc");
   const [selected, setSelected] = useState<string[]>([]); const [action, setAction] = useState(""); const [results, setResults] = useState<Record<string, { name: string; result: string }>>({}); const [detail, setDetail] = useState<OrgMember | null>(null); const [roleToApply, setRoleToApply] = useState<"owner" | "admin" | "member" | "guest">("member"); const [confirmRemove, setConfirmRemove] = useState(false);
+  const [appData, setAppData] = useState<import("../api/types.ts").OrganizationApps | null>(null); const [selectedApp, setSelectedApp] = useState("");
+  const currentScope = useRef({ orgId: organization?.id ?? null, userId: authState.phase === "authenticated" ? authState.session.user_id : null });
+  currentScope.current = { orgId: organization?.id ?? null, userId: authState.phase === "authenticated" ? authState.session.user_id : null };
   const [inviteText, setInviteText] = useState(""); const [inviteRole, setInviteRole] = useState<"admin" | "member" | "guest">("member"); const [inviteResults, setInviteResults] = useState<{ email: string; result: string; url?: string }[]>([]); const [inviting, setInviting] = useState(false);
   const load = useMemo(() => organization === null ? null : (cursor?: string) => api.listOrgMembers(organization.id, cursor, debounced.length >= 2 ? debounced : undefined, { status, ...(role ? { role } : {}), ...(twoFactor ? { two_factor: twoFactor } : {}), sort }), [api, organization?.id, debounced, role, status, twoFactor, sort]);
   const members = usePagedList<OrgMember>(load);
+  useEffect(() => {
+    if (organization === null) return;
+    let live = true;
+    void api.getOrganizationApps(organization.id).then((value) => { if (live) setAppData(value); }, () => { if (live) setAppData(null); });
+    return () => { live = false; };
+  }, [api, organization?.id]);
   useEffect(() => { setSelected([]); setDetail(null); }, [organization?.id, debounced, role, status, twoFactor, sort]);
-  useEffect(() => { setResults({}); setInviteResults([]); setSelected([]); setDetail(null); }, [organization?.id]);
+  useEffect(() => { setResults({}); setInviteResults([]); setSelected([]); setDetail(null); setAction(""); }, [organization?.id, authState.phase === "authenticated" ? authState.session.user_id : null]);
   const toggle = (id: string) => setSelected((s) => s.includes(id) ? s.filter((x) => x !== id) : [...s, id]);
   async function bulk(kind: "remove" | "role") {
     if (organization === null || selected.length === 0 || action !== "") return;
@@ -58,6 +67,34 @@ export function AdminPeopleScreen({ organization, onChanged }: { organization: O
     setConfirmRemove(false);
     members.refresh();
     onChanged();
+  }
+  async function bulkApps(kind: "assign" | "remove") {
+    if (organization === null || selected.length === 0 || selectedApp === "" || action !== "") return;
+    const orgId = organization.id;
+    const userId = authState.phase === "authenticated" ? authState.session.user_id : null;
+    const scopeIsCurrent = () => currentScope.current.orgId === orgId && currentScope.current.userId === userId;
+    setAction(`apps-${kind}`); setResults({});
+    const next: Record<string, { name: string; result: string }> = {};
+    for (const id of selected) {
+      const person = members.items.find((item) => item.user_id === id);
+      if (!person || person.role === "guest" || person.status !== "active") continue;
+      if (!scopeIsCurrent()) return;
+      const current = person.apps ?? [];
+      const apps = kind === "assign"
+        ? [...new Set([...current, selectedApp])]
+        : current.filter((app) => app !== selectedApp);
+      try {
+        const updated = await api.updateMemberApps(orgId, id, apps);
+        if (!scopeIsCurrent()) return;
+        members.mutate((items) => items.map((item) => item.user_id === updated.user_id ? { ...item, apps: updated.apps } : item));
+        next[id] = { name: person.display_name, result: t("Done") };
+      } catch {
+        if (!scopeIsCurrent()) return;
+        next[id] = { name: person.display_name, result: t("Failed") };
+      }
+    }
+    if (!scopeIsCurrent()) return;
+    setResults(next); setAction("");
   }
   async function inviteBatch() {
     if (organization === null || inviting) return;
@@ -124,12 +161,17 @@ export function AdminPeopleScreen({ organization, onChanged }: { organization: O
           <Button className="button button--danger-quiet" isDisabled={selected.length === 0 || action !== ""} onPress={() => setConfirmRemove(true)}>
             {t("Remove selected")}
           </Button>
+          {appData !== null && <>
+            <AdminSelect label={t("App")} value={selectedApp} onChange={setSelectedApp} options={[["", t("Choose an app")], ...appData.apps.map((app) => [app.id, app.name] as [string, string])]} />
+            <Button className="button" isDisabled={selected.length === 0 || selectedApp === "" || action !== ""} onPress={() => void bulkApps("assign")}>{t("Assign selected app")}</Button>
+            <Button className="button" isDisabled={selected.length === 0 || selectedApp === "" || action !== ""} onPress={() => void bulkApps("remove")}>{t("Remove selected app")}</Button>
+          </>}
         </div>
         <ListStatus list={members} empty={t("No people found.")} loadingLabel={t("Loading members…")} />
         {members.items.length > 0 && <div className="table-wrap">
           <table className="table">
             <thead><tr>
-              <th>{t("Select")}</th><th>{t("Name")}</th><th>{t("Role")}</th>
+              <th>{t("Select")}</th><th>{t("Name")}</th><th>{t("Role")}</th><th>{t("Apps")}</th>
               <th>{t("Status")}</th><th>{t("Two-factor authentication")}</th><th>{t("Actions")}</th>
             </tr></thead>
             <tbody>{members.items.map((person) => <tr key={person.user_id}>
@@ -138,6 +180,7 @@ export function AdminPeopleScreen({ organization, onChanged }: { organization: O
               </td>
               <th>{person.display_name}<span className="cell__sub cell__sub--email">{person.email}</span></th>
               <td data-label={t("Role")}>{names.orgRole(person.role)}</td>
+              <td data-label={t("Apps")}>{person.role === "guest" ? t("Not required for guests") : (person.apps ?? []).map((appId) => appData?.apps.find((app) => app.id === appId)?.name ?? appId).join(", ") || t("None assigned")}</td>
               <td data-label={t("Status")}>{person.status === "invited" ? t("Invited") : person.status === "disabled" ? t("Disabled") : t("Active")}</td>
               <td data-label={t("Two-factor authentication")}>{person.two_factor_enabled ? t("Enabled") : t("Not enabled")}</td>
               <td data-label={t("Actions")}><div className="row-actions">
@@ -493,12 +536,13 @@ export function AdminOperatorScreen({ section }: { section: "organizations" | "a
   if (section === "organizations") return <>
     <ListStatus list={organizations} empty={t("No organizations found.")} loadingLabel={t("Loading organizations…")} />
     {organizations.items.length > 0 && <div className="table-wrap"><table className="table">
-      <thead><tr><th>{t("Organization")}</th><th>{t("People")}</th><th>{t("Storage")}</th><th>{t("Quota")}</th></tr></thead>
+      <thead><tr><th>{t("Organization")}</th><th>{t("People")}</th><th>{t("Storage")}</th><th>{t("Quota")}</th><th>{t("Seat limit")}</th></tr></thead>
       <tbody>{organizations.items.map((organization) => <tr key={organization.id}>
         <th>{organization.name}<span className="cell__sub">{organization.slug}</span></th>
         <td data-label={t("People")}>{organization.member_count}</td>
         <td data-label={t("Storage")}>{formatBytes(organization.committed_bytes + organization.reserved_bytes)}</td>
         <td data-label={t("Quota")}><QuotaEditor organization={organization} onSave={(bytes) => api.updateAdminOrganizationQuota(organization.id, bytes).then(() => organizations.refresh())} /></td>
+        <td data-label={t("Seat limit")}><SeatLimitEditor organization={organization} onSave={(limit) => api.updateAdminOrganizationSeats(organization.id, limit).then(() => organizations.refresh())} /></td>
       </tr>)}</tbody>
     </table></div>}
     <LoadMoreButton list={organizations} />
@@ -582,6 +626,7 @@ export function AdminOperatorScreen({ section }: { section: "organizations" | "a
 }
 
 function QuotaEditor({ organization, onSave }: { organization: AdminOrganization; onSave: (bytes: number | null) => Promise<unknown> }) { const { t } = useI18n(); const [value, setValue] = useState(organization.quota_bytes?.toString() ?? ""); const [error, setError] = useState<unknown>(null); return <div className="quota-editor"><input className="field__input" aria-label={t("Quota for {name}", { name: organization.name })} value={value} onChange={(e) => setValue(e.currentTarget.value)} placeholder={t("Unlimited")}/><Button className="button button--sm" onPress={() => { const n = value.trim() === "" ? null : Number(value); if (n !== null && (!Number.isSafeInteger(n) || n < 0)) { setError(new Error(t("Enter a whole number of bytes."))); return; } void onSave(n).then(() => setError(null), setError); }}>{t("Save")}</Button>{error !== null && <ErrorNotice error={error}/>}</div>; }
+function SeatLimitEditor({ organization, onSave }: { organization: AdminOrganization; onSave: (limit: number | null) => Promise<unknown> }) { const { t } = useI18n(); const [value, setValue] = useState(organization.seat_limit?.toString() ?? ""); const [error, setError] = useState<unknown>(null); return <div className="quota-editor"><input className="field__input" type="number" min="0" step="1" aria-label={t("Seat limit for {name}", { name: organization.name })} value={value} onChange={(e) => setValue(e.currentTarget.value)} placeholder={t("Unlimited")}/><Button className="button button--sm" onPress={() => { const n = value.trim() === "" ? null : Number(value); if (n !== null && (!Number.isSafeInteger(n) || n < 0)) { setError(new Error(t("Enter a whole number of seats."))); return; } void onSave(n).then(() => setError(null), setError); }}>{t("Save")}</Button>{error !== null && <ErrorNotice error={error}/>}</div>; }
 
 function AdminSelect({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: [string, string][] }) {
   return <NativeSelect label={label} value={value} onChange={onChange} options={options.map(([id, text]) => ({ id, label: text }))} />;

@@ -711,3 +711,23 @@
 	Microsoft Graph	Microsoft Graph
 
 	SMTP	SMTP
+
+	Apps	Apps
+	Loading apps…	Loading apps…
+	App access	App access
+	Apps usage	Apps usage
+	All apps are available to organization members by default.	All apps are available to organization members by default.
+	Members can use only apps assigned to them.	Members can use only apps assigned to them.
+	All apps for all members	All apps for all members
+	Only assigned apps	Only assigned apps
+	Assigned people	Assigned people
+	Active devices	Active devices
+	Assign selected app	Assign selected app
+	Remove selected app	Remove selected app
+	Choose an app	Choose an app
+	None assigned	None assigned
+	Not required for guests	Not required for guests
+	Seat limit	Seat limit
+	Seat limit for {name}	Seat limit for {name}
+	Enter a whole number of seats.	Enter a whole number of seats.
+	Seats used	Seats used

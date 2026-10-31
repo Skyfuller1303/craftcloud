@@ -48,6 +48,8 @@ pub struct Member {
     pub role: String,
     /// When the user became an active member.
     pub joined_at: OffsetDateTime,
+    /// Assigned app IDs; empty means no explicit assignments.
+    pub apps: Vec<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -68,7 +70,7 @@ impl Member {
 }
 
 const MEMBER_SELECT: &str = "SELECT u.id AS user_id, u.display_name, u.normalized_email AS email, \
-     m.role, m.created_at AS joined_at \
+     m.role, m.created_at AS joined_at, COALESCE((SELECT array_agg(a.app ORDER BY a.app) FROM member_app_access a WHERE a.org_id=m.org_id AND a.user_id=m.user_id), ARRAY[]::text[]) AS apps \
      FROM organization_members m JOIN users u ON u.id = m.user_id";
 
 /// Lists active members of the scoped organization ordered by
@@ -158,7 +160,7 @@ pub async fn list_admin(
         }
     };
     let sql = format!(
-        "SELECT u.id AS user_id,u.display_name,u.normalized_email AS email,m.role,m.created_at AS joined_at,CASE WHEN u.disabled_at IS NOT NULL OR m.status='disabled' THEN 'disabled' ELSE m.status END AS status,(u.disabled_at IS NOT NULL) AS account_disabled,EXISTS(SELECT 1 FROM user_two_factor tf WHERE tf.user_id=u.id AND tf.enabled_at IS NOT NULL) AS two_factor_enabled FROM organization_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=$1 AND ($2::text IS NULL OR position($2 in lower(u.display_name))>0 OR position($2 in u.normalized_email)>0) AND ($3::text IS NULL OR m.role=$3) AND ($4::text IS NULL OR $4='all' OR ($4='disabled' AND (m.status='disabled' OR u.disabled_at IS NOT NULL)) OR ($4<>'disabled' AND m.status=$4 AND u.disabled_at IS NULL)) AND ($5::boolean IS NULL OR EXISTS(SELECT 1 FROM user_two_factor tf WHERE tf.user_id=u.id AND tf.enabled_at IS NOT NULL)=$5) AND ($6::uuid IS NULL OR {after}) ORDER BY {order} LIMIT $7"
+        "SELECT u.id AS user_id,u.display_name,u.normalized_email AS email,m.role,m.created_at AS joined_at,COALESCE((SELECT array_agg(a.app ORDER BY a.app) FROM member_app_access a WHERE a.org_id=m.org_id AND a.user_id=m.user_id), ARRAY[]::text[]) AS apps,CASE WHEN u.disabled_at IS NOT NULL OR m.status='disabled' THEN 'disabled' ELSE m.status END AS status,(u.disabled_at IS NOT NULL) AS account_disabled,EXISTS(SELECT 1 FROM user_two_factor tf WHERE tf.user_id=u.id AND tf.enabled_at IS NOT NULL) AS two_factor_enabled FROM organization_members m JOIN users u ON u.id=m.user_id WHERE m.org_id=$1 AND ($2::text IS NULL OR position($2 in lower(u.display_name))>0 OR position($2 in u.normalized_email)>0) AND ($3::text IS NULL OR m.role=$3) AND ($4::text IS NULL OR $4='all' OR ($4='disabled' AND (m.status='disabled' OR u.disabled_at IS NOT NULL)) OR ($4<>'disabled' AND m.status=$4 AND u.disabled_at IS NULL)) AND ($5::boolean IS NULL OR EXISTS(SELECT 1 FROM user_two_factor tf WHERE tf.user_id=u.id AND tf.enabled_at IS NOT NULL)=$5) AND ($6::uuid IS NULL OR {after}) ORDER BY {order} LIMIT $7"
     );
     Ok(sqlx::query_as::<_, AdminMember>(&sql)
         .bind(scope.org_id())
@@ -215,6 +217,8 @@ pub enum AddOutcome {
     UserNotFound,
     /// The account is disabled.
     UserDisabled,
+    /// Adding or reactivating would exceed the organization's seat limit.
+    SeatLimitReached,
 }
 
 /// Result of [`OrgTx::set_role`].
@@ -228,6 +232,8 @@ pub enum RoleOutcome {
     NotMember,
     /// The change would leave the organization without an enabled owner.
     LastOwner,
+    /// Promoting a guest would exceed the organization's seat limit.
+    SeatLimitReached,
 }
 
 /// Result of [`OrgTx::remove`].
@@ -282,6 +288,29 @@ impl OrgTx {
         Ok(role.as_deref().and_then(OrgRole::parse))
     }
 
+    /// Checks the current device app assignment while holding this
+    /// organization's transaction lock.
+    pub async fn app_allowed(
+        &mut self,
+        user_id: Uuid,
+        app_id: &str,
+        known_app_ids: &[String],
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM organization_members m JOIN organizations o ON o.id=m.org_id \
+             WHERE m.org_id=$1 AND m.user_id=$2 AND m.status='active' \
+               AND (o.app_access_mode='all' OR (($3 = ANY($4::text[])) AND \
+                 (m.role IN ('owner','admin','guest') OR EXISTS(SELECT 1 FROM member_app_access a \
+                   WHERE a.org_id=m.org_id AND a.user_id=m.user_id AND a.app=$3)))))",
+        )
+        .bind(self.org_id)
+        .bind(user_id)
+        .bind(app_id)
+        .bind(known_app_ids)
+        .fetch_one(&mut *self.tx)
+        .await?)
+    }
+
     /// The stored role of a membership row of **any** status (used to decide
     /// who may clean up invited/disabled rows), read under the lock.
     ///
@@ -315,6 +344,36 @@ impl OrgTx {
         .bind(self.org_id)
         .bind(user_id)
         .fetch_optional(&mut *self.tx)
+        .await?)
+    }
+
+    /// Counts active seats and unexpired, open non-guest invitation reservations.
+    /// Caller holds the organization lock. A matching invitee email can be
+    /// excluded when that invitation is being converted into membership.
+    pub(crate) async fn seat_occupancy(
+        &mut self,
+        now: OffsetDateTime,
+        excluded_email: Option<&str>,
+        excluded_invitation: Option<Uuid>,
+    ) -> Result<i64, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT \
+               (SELECT count(*) FROM organization_members m JOIN users u ON u.id=m.user_id \
+                WHERE m.org_id=$1 AND m.status='active' AND m.role <> 'guest' AND u.disabled_at IS NULL) + \
+               (SELECT count(*) FROM invitations i \
+                LEFT JOIN users iu ON iu.normalized_email=i.normalized_email \
+                LEFT JOIN organization_members im ON im.org_id=i.org_id AND im.user_id=iu.id \
+                WHERE i.org_id=$1 AND i.org_role <> 'guest' AND i.accepted_at IS NULL \
+                  AND i.revoked_at IS NULL AND i.invalidated_at IS NULL AND i.expires_at>$2 \
+                  AND (im.user_id IS NULL OR im.status <> 'active') \
+                  AND ($3::text IS NULL OR i.normalized_email <> $3) \
+                  AND ($4::uuid IS NULL OR i.id <> $4))",
+        )
+        .bind(self.org_id)
+        .bind(now)
+        .bind(excluded_email)
+        .bind(excluded_invitation)
+        .fetch_one(&mut *self.tx)
         .await?)
     }
 
@@ -374,6 +433,32 @@ impl OrgTx {
             Some(true) => return Ok(AddOutcome::UserDisabled),
             Some(false) => {}
         }
+        if role != OrgRole::Guest {
+            let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM organization_members WHERE org_id=$1 AND user_id=$2 AND status='active')")
+                .bind(self.org_id).bind(user_id).fetch_one(&mut *self.tx).await?;
+            if active {
+                return Ok(AddOutcome::AlreadyMember);
+            }
+            let limit: Option<i32> =
+                sqlx::query_scalar("SELECT seat_limit FROM organizations WHERE id=$1")
+                    .bind(self.org_id)
+                    .fetch_one(&mut *self.tx)
+                    .await?;
+            if let Some(limit) = limit {
+                let email: String =
+                    sqlx::query_scalar("SELECT normalized_email FROM users WHERE id=$1")
+                        .bind(user_id)
+                        .fetch_one(&mut *self.tx)
+                        .await?;
+                if self
+                    .seat_occupancy(OffsetDateTime::now_utc(), Some(&email), None)
+                    .await?
+                    >= i64::from(limit)
+                {
+                    return Ok(AddOutcome::SeatLimitReached);
+                }
+            }
+        }
         let written = sqlx::query(
             "INSERT INTO organization_members (org_id, user_id, role, status) \
              VALUES ($1, $2, $3, 'active') \
@@ -419,6 +504,27 @@ impl OrgTx {
         }
         if current_role == Some(OrgRole::Owner) && self.would_orphan(user_id).await? {
             return Ok(RoleOutcome::LastOwner);
+        }
+        if current_role == Some(OrgRole::Guest) && new_role != OrgRole::Guest {
+            let limit: Option<i32> =
+                sqlx::query_scalar("SELECT seat_limit FROM organizations WHERE id=$1")
+                    .bind(self.org_id)
+                    .fetch_one(&mut *self.tx)
+                    .await?;
+            if let Some(limit) = limit {
+                let email: String =
+                    sqlx::query_scalar("SELECT normalized_email FROM users WHERE id=$1")
+                        .bind(user_id)
+                        .fetch_one(&mut *self.tx)
+                        .await?;
+                if self
+                    .seat_occupancy(OffsetDateTime::now_utc(), Some(&email), None)
+                    .await?
+                    >= i64::from(limit)
+                {
+                    return Ok(RoleOutcome::SeatLimitReached);
+                }
+            }
         }
         sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2")
             .bind(self.org_id)

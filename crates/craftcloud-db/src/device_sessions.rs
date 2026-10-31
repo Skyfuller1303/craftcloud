@@ -15,6 +15,7 @@ pub struct NewDeviceSession {
     pub name: String,
     pub client_kind: String,
     pub client_id: String,
+    pub known_app_ids: Vec<String>,
     pub refresh_hash: [u8; 32],
     pub access_hash: [u8; 32],
     pub now: OffsetDateTime,
@@ -41,6 +42,8 @@ pub struct DeviceSession {
 pub struct DeviceActor {
     pub id: Uuid,
     pub user_id: Uuid,
+    pub client_kind: String,
+    pub client_id: String,
     pub created_at: OffsetDateTime,
     pub last_used_at: OffsetDateTime,
     pub idle_expires_at: OffsetDateTime,
@@ -64,7 +67,7 @@ pub async fn create_for_verified_login(
 ) -> Result<Option<Uuid>, DbError> {
     match create_for_verified_login_with_email(pool, new, verified_hash, audit, false).await? {
         LoginOutcome::Created(id) => Ok(Some(id)),
-        LoginOutcome::Rejected => Ok(None),
+        LoginOutcome::Rejected | LoginOutcome::AppNotAssigned => Ok(None),
     }
 }
 
@@ -72,6 +75,7 @@ pub async fn create_for_verified_login(
 pub enum LoginOutcome {
     Created(Uuid),
     Rejected,
+    AppNotAssigned,
 }
 
 pub async fn create_for_verified_login_with_email(
@@ -82,6 +86,17 @@ pub async fn create_for_verified_login_with_email(
     mail_enabled: bool,
 ) -> Result<LoginOutcome, DbError> {
     let mut tx = pool.begin().await?;
+    if !crate::app_access::device_login_allowed(
+        &mut tx,
+        new.user_id,
+        &new.client_kind,
+        &new.client_id,
+        &new.known_app_ids,
+    )
+    .await?
+    {
+        return Ok(LoginOutcome::AppNotAssigned);
+    }
     let id = Uuid::new_v4();
     let family = Uuid::new_v4();
     let user: Option<Uuid> = sqlx::query_scalar(
@@ -148,7 +163,7 @@ pub async fn find_active_access(
 ) -> Result<Option<DeviceActor>, DbError> {
     let cutoff = now - touch_interval;
     let row = sqlx::query_as::<_, DeviceActor>(
-        "SELECT d.id,d.user_id,d.created_at,d.last_used_at,d.idle_expires_at,d.absolute_expires_at,d.access_expires_at \
+        "SELECT d.id,d.user_id,d.client_kind,d.client_id,d.created_at,d.last_used_at,d.idle_expires_at,d.absolute_expires_at,d.access_expires_at \
          FROM device_sessions d JOIN users u ON u.id=d.user_id \
          WHERE d.access_hash=$1 AND d.revoked_at IS NULL AND d.access_expires_at>$2 \
            AND d.idle_expires_at>$2 AND d.absolute_expires_at>$2 AND u.disabled_at IS NULL",

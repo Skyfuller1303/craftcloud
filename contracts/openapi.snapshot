@@ -7,12 +7,13 @@ GET /api/v1/admin/health auth=cookie|bearer req=- ok=AdminHealth codes=200,400,4
 GET /api/v1/admin/maintenance auth=cookie|bearer req=- ok=MaintenanceStatus codes=200,400,401,403,500,503
 GET /api/v1/admin/organizations auth=cookie|bearer req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
+PATCH /api/v1/admin/organizations/{org_id}/seats auth=cookie|bearer req=- ok=SeatLimitResponse codes=200,400,401,403,404,422,500,503
 GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
 POST /api/v1/admin/users/email-verification auth=cookie+csrf|bearer req=- ok=EmailVerificationBatchResponse codes=202,400,401,403,429,500,503
 GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,422,500,503
 DELETE /api/v1/admin/users/{user_id}/devices/{device_ref} auth=cookie+csrf|bearer req=- ok=- codes=204,401,403,404,500,503
 POST /api/v1/admin/users/{user_id}/disable auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,404,409,500,503
-POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
+POST /api/v1/admin/users/{user_id}/enable auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
 DELETE /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
 POST /api/v1/admin/users/{user_id}/password-reset auth=cookie+csrf|bearer req=IssuePasswordResetRequest ok=ResetLinkResponse codes=201,202,400,401,403,404,409,500,503
 GET /api/v1/auth/2fa auth=cookie|bearer req=- ok=TwoFactorStatus codes=200,400,401,500,503
@@ -20,8 +21,8 @@ POST /api/v1/auth/2fa/confirm auth=cookie+csrf|bearer req=TwoFactorConfirmReques
 POST /api/v1/auth/2fa/disable auth=cookie+csrf|bearer req=TwoFactorDisableRequest ok=- codes=204,400,401,403,409,413,415,422,429,500,503
 POST /api/v1/auth/2fa/recovery-codes auth=cookie+csrf|bearer req=SecondFactorProof ok=RecoveryCodesResponse codes=200,400,401,403,409,413,415,422,429,500,503
 POST /api/v1/auth/2fa/setup auth=cookie+csrf|bearer req=TwoFactorSetupRequest ok=TwoFactorSetupResponse codes=200,400,401,403,409,413,415,422,429,500,503
-POST /api/v1/auth/device/login auth=none req=DeviceLoginRequest ok=DeviceLoginResponse codes=200,400,401,413,415,422,429,500,503
-POST /api/v1/auth/device/login/second-factor auth=none req=SecondFactorLoginRequest ok=DeviceLoginResponse codes=200,400,401,413,415,422,429,500,503
+POST /api/v1/auth/device/login auth=none req=DeviceLoginRequest ok=DeviceLoginResponse codes=200,400,401,403,413,415,422,429,500,503
+POST /api/v1/auth/device/login/second-factor auth=none req=SecondFactorLoginRequest ok=DeviceLoginResponse codes=200,400,401,403,413,415,422,429,500,503
 POST /api/v1/auth/device/logout auth=bearer req=- ok=- codes=204,400,401,500,503
 POST /api/v1/auth/device/refresh auth=none req=- ok=DeviceTokenResponse codes=200,400,401,413,415,422,429,500,503
 GET /api/v1/auth/devices auth=cookie|bearer req=- ok=DeviceList codes=200,400,401,500,503
@@ -67,6 +68,8 @@ GET /api/v1/organizations auth=cookie|bearer req=- ok=MyOrganizationPage codes=2
 POST /api/v1/organizations auth=cookie+csrf|bearer req=CreateOrganizationRequest ok=CreatedOrganization codes=201,400,401,403,413,415,422,500,503
 GET /api/v1/organizations/{org_id} auth=cookie|bearer req=- ok=Organization codes=200,400,401,404,500,503
 PATCH /api/v1/organizations/{org_id} auth=cookie+csrf|bearer req=UpdateOrganizationRequest ok=Organization codes=200,400,401,403,404,412,413,415,422,428,500,503
+PATCH /api/v1/organizations/{org_id}/app-access auth=cookie|bearer req=- ok=AppAccessModeResponse codes=200,400,401,403,404,422,500,503
+GET /api/v1/organizations/{org_id}/apps auth=cookie|bearer req=- ok=OrganizationApps codes=200,401,403,404,500,503
 GET /api/v1/organizations/{org_id}/audit auth=cookie|bearer req=- ok=AuditEventPage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/audit/export auth=cookie|bearer req=- ok=- codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/grants auth=cookie|bearer req=- ok=GrantPage codes=200,400,401,403,404,422,500,503
@@ -79,6 +82,7 @@ GET /api/v1/organizations/{org_id}/members auth=cookie|bearer req=- ok=MemberPag
 POST /api/v1/organizations/{org_id}/members auth=cookie+csrf|bearer req=AddMemberRequest ok=Member codes=201,400,401,403,404,409,413,415,422,500,503
 DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
 PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf|bearer req=ChangeRoleRequest ok=Member codes=200,400,401,403,404,409,413,415,422,500,503
+PUT /api/v1/organizations/{org_id}/members/{user_id}/apps auth=cookie|bearer req=MemberAppAssignmentsRequest ok=MemberAppAssignmentsResponse codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/overview auth=cookie|bearer req=- ok=OrganizationOverview codes=200,401,403,404,500,503
 GET /api/v1/organizations/{org_id}/shared-with-me auth=cookie|bearer req=- ok=SharedWithMeResponse codes=200,400,401,404,422,500,503
 GET /api/v1/organizations/{org_id}/usage auth=cookie|bearer req=- ok=UsagePage codes=200,400,401,403,404,422,500,503
@@ -118,6 +122,7 @@ AdminHealth
 AdminMember
 AdminUser
 AdminUserPage
+AppAccessModeResponse
 AuditEvent
 AuditEventPage
 ChangePasswordRequest
@@ -165,9 +170,12 @@ LoginResponse
 MaintenanceRun
 MaintenanceStatus
 Member
+MemberAppAssignmentsRequest
+MemberAppAssignmentsResponse
 MemberPage
 MyOrganizationPage
 Organization
+OrganizationApps
 OrganizationLock
 OrganizationOverview
 OrganizationSummaryPage
@@ -179,6 +187,7 @@ Readiness
 RecoveryCodesResponse
 ResetLinkResponse
 ResetPasswordRequest
+SeatLimitResponse
 SecondFactorLoginRequest
 SecondFactorProof
 SessionInfo

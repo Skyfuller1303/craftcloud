@@ -31,6 +31,7 @@ const AdminGrantsScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({
 const AdminLocksScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminLocksScreen })));
 const AdminOperatorScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminOperatorScreen })));
 const AdminOverview = lazy(() => import("./OverviewScreen.tsx").then((m) => ({ default: m.AdminOverview })));
+const AppsScreen = lazy(() => import("./AppsScreen.tsx").then((m) => ({ default: m.AppsScreen })));
 const AdminPeopleScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminPeopleScreen })));
 const AdminWorkspacesScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminWorkspacesScreen })));
 
@@ -47,14 +48,14 @@ const CONTENT_SECTIONS = [
   "activity",
   "shared",
 ] as const;
-const ADMIN_SECTIONS = ["admin-overview", "admin-people", "admin-workspaces", "admin-grants", "admin-locks", "admin-activity", "org-settings", "settings", "instance-organizations", "instance-accounts", "system"] as const;
+const ADMIN_SECTIONS = ["admin-overview", "admin-people", "admin-workspaces", "admin-apps", "admin-grants", "admin-locks", "admin-activity", "org-settings", "settings", "instance-organizations", "instance-accounts", "system"] as const;
 type Section = (typeof CONTENT_SECTIONS)[number] | (typeof ADMIN_SECTIONS)[number];
 
 function sectionFromPath(path: string): Section {
   const tail = path.replace(/\/+$/, "").split("/").at(-1) ?? "";
   if (path.includes("/workspaces/") && (tail === "members" || tail === "invitations")) return tail;
   if (path.includes("/organizations/") && tail === "activity") return "admin-activity";
-  const aliases: Record<string, Section> = { people: "admin-people", workspaces: "admin-workspaces", grants: "admin-grants", locks: "admin-locks", "org-settings": "org-settings", organizations: "instance-organizations", accounts: "instance-accounts", overview: "admin-overview", members: "admin-people", invitations: "admin-people", activity: "activity", settings: "settings", system: "system", projects: "projects", files: "files", shared: "shared" };
+  const aliases: Record<string, Section> = { people: "admin-people", workspaces: "admin-workspaces", apps: "admin-apps", grants: "admin-grants", locks: "admin-locks", "org-settings": "org-settings", organizations: "instance-organizations", accounts: "instance-accounts", overview: "admin-overview", members: "admin-people", invitations: "admin-people", activity: "activity", settings: "settings", system: "system", projects: "projects", files: "files", shared: "shared" };
   return aliases[tail] ?? "overview";
 }
 
@@ -186,6 +187,7 @@ export function Shell({
     "admin-overview": t("Overview"),
     "admin-people": t("People"),
     "admin-workspaces": t("Workspaces"),
+    "admin-apps": t("Apps"),
     "admin-grants": t("Grants"),
     "admin-locks": t("Locks"),
     "admin-activity": t("Activity"),
@@ -358,10 +360,10 @@ export function Shell({
               </li>
             )}
           </ul>
-          {visibleAdminSections.some((key) => ["admin-overview", "admin-people", "admin-workspaces", "admin-grants", "admin-locks", "admin-activity", "org-settings"].includes(key)) && <>
+          {visibleAdminSections.some((key) => ["admin-overview", "admin-people", "admin-workspaces", "admin-apps", "admin-grants", "admin-locks", "admin-activity", "org-settings"].includes(key)) && <>
             <h2 className="shell__nav-heading">{t("Administration")}</h2>
             <ul>
-              {visibleAdminSections.filter((key) => ["admin-overview", "admin-people", "admin-workspaces", "admin-grants", "admin-locks", "admin-activity", "org-settings"].includes(key)).map((key) => (
+              {visibleAdminSections.filter((key) => ["admin-overview", "admin-people", "admin-workspaces", "admin-apps", "admin-grants", "admin-locks", "admin-activity", "org-settings"].includes(key)).map((key) => (
                 <li key={key}>
                   <button type="button" className="nav__item" aria-current={section === key ? "page" : undefined} onClick={() => setSection(key)}>
                     {sectionLabel[key]}
@@ -452,6 +454,8 @@ export function Shell({
             <AdminPeopleScreen key={organizationId} organization={orgAdmin ? organization : null} onChanged={organizations.refresh} />
           ) : section === "admin-workspaces" ? (
             <AdminWorkspacesScreen key={organizationId} organization={orgAdmin ? organization : null} workspaces={workspaces.items} hasMore={workspaces.hasMore} onLoadMore={workspaces.loadMore} onRefresh={workspaces.refresh} />
+          ) : section === "admin-apps" ? (
+            orgAdmin ? <AppsScreen key={organizationId} organization={organization} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "admin-grants" ? (
             mayAdmin ? <AdminGrantsScreen key={`${organizationId}:${workspaceId}`} organization={organization} workspaces={workspaces.items} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "admin-locks" ? (

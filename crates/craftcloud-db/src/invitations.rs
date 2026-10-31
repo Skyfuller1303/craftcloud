@@ -142,6 +142,8 @@ pub enum CreateInvitationOutcome {
     Pending,
     /// The organization has reached [`MAX_PENDING_PER_ORG`] open invitations.
     LimitReached,
+    /// The invitation would reserve a seat beyond the organization's limit.
+    SeatLimitReached,
     /// The workspace does not exist in this organization.
     WorkspaceMissing,
 }
@@ -266,6 +268,18 @@ impl OrgTx {
         .await?;
         if duplicate {
             return Ok(CreateInvitationOutcome::Pending);
+        }
+        if new.org_role != OrgRole::Guest {
+            let limit: Option<i32> =
+                sqlx::query_scalar("SELECT seat_limit FROM organizations WHERE id=$1")
+                    .bind(self.org_id)
+                    .fetch_one(&mut *self.tx)
+                    .await?;
+            if let Some(limit) = limit
+                && self.seat_occupancy(new.now, Some(&new.email), None).await? >= i64::from(limit)
+            {
+                return Ok(CreateInvitationOutcome::SeatLimitReached);
+            }
         }
         let inserted = sqlx::query_as::<_, Invitation>(&format!(
             "INSERT INTO invitations (id, org_id, normalized_email, org_role, workspace_id, \
@@ -423,6 +437,8 @@ pub enum AcceptOutcome {
     /// Organization-only invitation for an existing active member; the
     /// invitation is **not** consumed.
     AlreadyMember,
+    /// Accepting would exceed the organization's seat limit.
+    SeatLimitReached,
     /// Accepted.
     Accepted {
         /// The account that joined.
@@ -596,6 +612,37 @@ async fn accept_inner(
             _ => None,
         }
     };
+    let existing_membership: Option<(String, String)> = if created {
+        None
+    } else {
+        sqlx::query_as(
+            "SELECT role, status FROM organization_members WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(account)
+        .fetch_optional(&mut *otx.tx)
+        .await?
+    };
+    let admission = match existing_membership.as_ref() {
+        Some((_, status)) if status == "active" => false,
+        Some((role, _)) if role == "owner" => false,
+        _ => org_role != OrgRole::Guest,
+    };
+    if admission {
+        let limit: Option<i32> =
+            sqlx::query_scalar("SELECT seat_limit FROM organizations WHERE id=$1")
+                .bind(org_id)
+                .fetch_one(&mut *otx.tx)
+                .await?;
+        if let Some(limit) = limit
+            && otx
+                .seat_occupancy(now, Some(&email), Some(invitation_id))
+                .await?
+                >= i64::from(limit)
+        {
+            return Ok(AcceptOutcome::SeatLimitReached);
+        }
+    }
     if created {
         let AcceptBy::NewAccount {
             display_name,
@@ -635,14 +682,7 @@ async fn accept_inner(
         .execute(&mut *otx.tx)
         .await?;
     } else {
-        let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT role, status FROM organization_members WHERE org_id = $1 AND user_id = $2",
-        )
-        .bind(org_id)
-        .bind(account)
-        .fetch_optional(&mut *otx.tx)
-        .await?;
-        match existing {
+        match existing_membership {
             Some((existing_role, status)) if status == "active" => {
                 if existing_role == "guest" {
                     // An older invitation may carry a workspace role. Existing guests never gain it.

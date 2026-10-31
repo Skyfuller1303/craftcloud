@@ -68,7 +68,7 @@ describe("file list and downloads", () => {
     };
     const lockedFile = { ...FILE_1, app: "photocraft", lock };
     const { fetch, calls } = mockFetch(viewRoutes({
-      [`GET /projects/${PROJECT_1.id}/files`]: { body: { items: [lockedFile], next_cursor: null } },
+      [`GET /projects/${PROJECT_1.id}/files`]: { body: { items: [{ ...lockedFile, lock: { ...lock, expires_at: new Date(Date.now() + 1800).toISOString() } }], next_cursor: null } },
       [`GET /files/${lockedFile.id}`]: { body: { ...lockedFile, lock: null } },
     }));
     const user = userEvent.setup();
@@ -76,9 +76,9 @@ describe("file list and downloads", () => {
     await openFiles(user);
     const row = screen.getByRole("row", { name: /logo\.fig/ });
     expect(within(row).getByRole("button", { name: /Upload a new version of logo\.fig/ }).hasAttribute("disabled")).toBe(true);
-    await waitFor(() => expect(within(screen.getByRole("row", { name: /logo\.fig/ })).getByRole("button", { name: /Upload a new version of logo\.fig/ }).hasAttribute("disabled")).toBe(false), { timeout: 3000 });
+    await waitFor(() => expect(within(screen.getByRole("row", { name: /logo\.fig/ })).getByRole("button", { name: /Upload a new version of logo\.fig/ }).hasAttribute("disabled")).toBe(false), { timeout: 8000 });
     expect(calls.some((call) => call.path === `/files/${lockedFile.id}` && call.method === "GET")).toBe(true);
-  });
+  }, 20_000);
 
   it("rechecks expired locks on loaded later pages by file id", async () => {
     const lock = {
@@ -97,7 +97,7 @@ describe("file list and downloads", () => {
     };
     const { fetch, calls } = mockFetch(viewRoutes({
       [`GET /projects/${PROJECT_1.id}/files`]: (call) => call.query.has("cursor")
-        ? { body: { items: [laterFile], next_cursor: null } }
+        ? { body: { items: [{ ...laterFile, lock: { ...lock, expires_at: new Date(Date.now() + 1800).toISOString() } }], next_cursor: null } }
         : { body: { items: [FILE_1], next_cursor: "page-2" } },
       [`GET /files/${laterFile.id}`]: { body: { ...laterFile, lock: null } },
     }));
@@ -110,9 +110,9 @@ describe("file list and downloads", () => {
     await waitFor(() => {
       const refreshed = screen.getByRole("row", { name: /later\.png/ });
       expect(within(refreshed).getByRole("button", { name: /Upload a new version of later\.png/ }).hasAttribute("disabled")).toBe(false);
-    }, { timeout: 4000 });
+    }, { timeout: 8000 });
     expect(calls.some((call) => call.path === `/files/${laterFile.id}` && call.method === "GET")).toBe(true);
-  });
+  }, 20_000);
 
   it("expired lock override yields to a later list refresh with a new foreign lock", async () => {
     const expiredLock = {
@@ -128,7 +128,9 @@ describe("file list and downloads", () => {
     const { fetch } = mockFetch(viewRoutes({
       [`GET /projects/${PROJECT_1.id}/files`]: () => {
         lists += 1;
-        return { body: { items: lists === 1 ? [lockedFile, FILE_EMPTY] : [{ ...lockedFile, lock: renewedLock }], next_cursor: null } };
+        return { body: { items: lists === 1
+          ? [{ ...lockedFile, lock: { ...expiredLock, expires_at: new Date(Date.now() + 1800).toISOString() } }, FILE_EMPTY]
+          : [{ ...lockedFile, lock: { ...renewedLock, expires_at: new Date(Date.now() + 60_000).toISOString() } }], next_cursor: null } };
       },
       [`GET /files/${lockedFile.id}`]: { body: { ...lockedFile, lock: null } },
       [`DELETE /files/${FILE_EMPTY.id}`]: { status: 204 },
@@ -137,14 +139,15 @@ describe("file list and downloads", () => {
     renderApp(fetch);
     await openFiles(user);
     const versionButton = () => within(screen.getByRole("row", { name: /logo\.fig/ })).getByRole("button", { name: /Upload a new version of logo\.fig/ });
-    await waitFor(() => expect(versionButton().hasAttribute("disabled")).toBe(false), { timeout: 4000 });
+    expect(versionButton().hasAttribute("disabled")).toBe(true);
+    await waitFor(() => expect(versionButton().hasAttribute("disabled")).toBe(false), { timeout: 8000 });
     await user.click(within(screen.getByRole("row", { name: /draft\.fig/ })).getByRole("button", { name: /Move to trash: draft\.fig/ }));
     const confirmation = await screen.findByRole("dialog", { name: /Move file to the trash/ });
     await user.click(within(confirmation).getByRole("button", { name: "Move to trash" }));
     await waitFor(() => expect(lists).toBeGreaterThan(1));
     await waitFor(() => expect(versionButton().hasAttribute("disabled")).toBe(true));
     expect(screen.getByText(/In progress by Bob/)).toBeTruthy();
-  });
+  }, 20_000);
 
   it("links downloads to the API (no blob in memory) and marks files without content", async () => {
     const { fetch, calls } = mockFetch(viewRoutes());

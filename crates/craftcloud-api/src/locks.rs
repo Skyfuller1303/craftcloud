@@ -203,11 +203,12 @@ pub(crate) async fn acquire(
         Err(r) => return *r,
     };
     let mut opened = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -337,11 +338,12 @@ pub(crate) async fn release(
         Err(r) => return *r,
     };
     let mut opened = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {

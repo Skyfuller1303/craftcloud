@@ -15,8 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use craftcloud_core::policy::{
-    Action, Actor, OrgMembership, OrgRole, Resource, WorkspaceMemberTarget, WorkspaceMembership,
-    WorkspaceRole, can,
+    Action, Actor, AppActor, OrgMembership, OrgRole, Resource, WorkspaceMemberTarget,
+    WorkspaceMembership, WorkspaceRole, can,
 };
 use craftcloud_core::{DisplayName, Slug};
 use craftcloud_db::audit::Detail;
@@ -81,17 +81,38 @@ fn parse_etag(raw: &str) -> Option<i64> {
 /// Read-side actor for a workspace request: org role and workspace role from
 /// the database for this request.
 pub(crate) async fn read_actor(
-    pool: &craftcloud_db::PgPool,
+    services: &crate::Services,
     user_id: Uuid,
     org_id: Uuid,
     workspace_id: Uuid,
-) -> Result<Actor, DbError> {
-    let (org_role, ws_role) = workspaces::roles(pool, org_id, workspace_id, user_id).await?;
-    Ok(Actor {
-        user_id,
-        instance_operator: false,
-        membership: org_role.map(|role| OrgMembership { org_id, role }),
-        workspace: ws_role.map(|role| WorkspaceMembership { workspace_id, role }),
+    app_id: Option<&str>,
+) -> Result<AppActor, DbError> {
+    let (org_role, ws_role) =
+        workspaces::roles(&services.pool, org_id, workspace_id, user_id).await?;
+    let app_access = match app_id {
+        Some(app) => {
+            let ids: Vec<String> = services
+                .settings
+                .app_catalog
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+            Some((
+                app.to_owned(),
+                craftcloud_db::app_access::is_allowed(&services.pool, org_id, user_id, app, &ids)
+                    .await?,
+            ))
+        }
+        None => None,
+    };
+    Ok(AppActor {
+        actor: Actor {
+            user_id,
+            instance_operator: false,
+            membership: org_role.map(|role| OrgMembership { org_id, role }),
+            workspace: ws_role.map(|role| WorkspaceMembership { workspace_id, role }),
+        },
+        app_access,
     })
 }
 
@@ -99,17 +120,18 @@ pub(crate) async fn read_actor(
 /// inside it. `None` responses are the uniform 404.
 pub(crate) struct Locked {
     pub(crate) tx: OrgTx,
-    pub(crate) actor: Actor,
+    pub(crate) actor: AppActor,
 }
 
 pub(crate) async fn lock(
-    pool: &craftcloud_db::PgPool,
+    services: &crate::Services,
     user_id: Uuid,
     org_id: Uuid,
     workspace_id: Uuid,
     headers: &HeaderMap,
+    app_id: Option<&str>,
 ) -> Result<Locked, Box<Response>> {
-    let mut tx = match OrgTx::begin(pool, org_id).await {
+    let mut tx = match OrgTx::begin(&services.pool, org_id).await {
         Ok(Some(tx)) => tx,
         Ok(None) => return Err(Box::new(not_found(headers))),
         Err(error) => {
@@ -141,11 +163,34 @@ pub(crate) async fn lock(
         Ok(roles) => roles,
         Err(error) => return Err(Box::new(db_failure(&error, headers, "role lookup failed"))),
     };
-    let actor = Actor {
-        user_id,
-        instance_operator: false,
-        membership: org_role.map(|role| OrgMembership { org_id, role }),
-        workspace: ws_role.map(|role| WorkspaceMembership { workspace_id, role }),
+    let app_access = if let Some(app) = app_id {
+        let ids: Vec<String> = services
+            .settings
+            .app_catalog
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        match tx.app_allowed(user_id, app, &ids).await {
+            Ok(allowed) => Some((app.to_owned(), allowed)),
+            Err(error) => {
+                return Err(Box::new(db_failure(
+                    &error,
+                    headers,
+                    "app assignment lookup failed",
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    let actor = AppActor {
+        actor: Actor {
+            user_id,
+            instance_operator: false,
+            membership: org_role.map(|role| OrgMembership { org_id, role }),
+            workspace: ws_role.map(|role| WorkspaceMembership { workspace_id, role }),
+        },
+        app_access,
     };
     Ok(Locked { tx, actor })
 }
@@ -385,7 +430,15 @@ pub(crate) async fn get_workspace(
         Ok(found) => found,
         Err(response) => return *response,
     };
-    let actor = match read_actor(&services.pool, session.user_id, org_id, workspace_id).await {
+    let actor = match read_actor(
+        &services,
+        session.user_id,
+        org_id,
+        workspace_id,
+        session.app_id.as_deref(),
+    )
+    .await
+    {
         Ok(actor) => actor,
         Err(error) => return db_failure(&error, &headers, "actor lookup failed"),
     };
@@ -449,11 +502,12 @@ pub(crate) async fn update_workspace(
         Err(response) => return *response,
     };
     let Locked { mut tx, actor } = match lock(
-        &services.pool,
+        &services,
         session.user_id,
         org_id,
         workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -548,7 +602,15 @@ pub(crate) async fn list_members(
         Ok(found) => found,
         Err(response) => return *response,
     };
-    let actor = match read_actor(&services.pool, session.user_id, org_id, workspace_id).await {
+    let actor = match read_actor(
+        &services,
+        session.user_id,
+        org_id,
+        workspace_id,
+        session.app_id.as_deref(),
+    )
+    .await
+    {
         Ok(actor) => actor,
         Err(error) => return db_failure(&error, &headers, "actor lookup failed"),
     };
@@ -652,11 +714,12 @@ pub(crate) async fn add_member(
         Err(response) => return *response,
     };
     let Locked { mut tx, actor } = match lock(
-        &services.pool,
+        &services,
         session.user_id,
         org_id,
         workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -751,11 +814,12 @@ pub(crate) async fn change_member_role(
         Err(response) => return *response,
     };
     let Locked { mut tx, actor } = match lock(
-        &services.pool,
+        &services,
         session.user_id,
         org_id,
         workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -837,11 +901,12 @@ pub(crate) async fn remove_member(
         Err(response) => return *response,
     };
     let Locked { mut tx, actor } = match lock(
-        &services.pool,
+        &services,
         session.user_id,
         org_id,
         workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {

@@ -67,6 +67,10 @@ pub(crate) async fn get_overview(
         Ok(value) => value,
         Err(error) => return db_failure(&error, &headers, "overview activity failed"),
     };
+    let seats = match craftcloud_db::app_access::seat_usage(&services.pool, &scope).await {
+        Ok(value) => value,
+        Err(error) => return db_failure(&error, &headers, "overview seat usage failed"),
+    };
     let total_members: i64 = members.by_status.values().sum();
     let days: Vec<_> = activity
         .iter()
@@ -96,6 +100,7 @@ pub(crate) async fn get_overview(
             "reserved_bytes": totals.reserved_bytes,
             "quota_bytes": totals.quota_bytes,
         },
+        "seats": {"used": seats.0, "limit": seats.1},
         "activity_daily": days,
     }))
     .into_response()

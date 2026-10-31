@@ -863,7 +863,7 @@ pub(crate) async fn browser_login(
     .await
     {
         Ok(two_factor::LoginOutcome::Created(_)) => reservation.record_success(),
-        Ok(two_factor::LoginOutcome::Rejected) => {
+        Ok(two_factor::LoginOutcome::AppNotAssigned | two_factor::LoginOutcome::Rejected) => {
             reservation.record_failure(services.now_secs());
             return invalid(&headers);
         }
@@ -973,6 +973,12 @@ pub(crate) async fn device_login(
         name: device_name,
         client_kind,
         client_id,
+        known_app_ids: services
+            .settings
+            .app_catalog
+            .iter()
+            .map(|app| app.id.clone())
+            .collect(),
         refresh_hash: refresh.hash(),
         access_hash: access.hash(),
         now,
@@ -997,6 +1003,14 @@ pub(crate) async fn device_login(
         Ok(two_factor::LoginOutcome::Created(id)) => {
             reservation.record_success();
             id
+        }
+        Ok(two_factor::LoginOutcome::AppNotAssigned) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "APP_NOT_ASSIGNED",
+                "Your administrator has not assigned this app for cloud access.",
+                &headers,
+            );
         }
         Ok(two_factor::LoginOutcome::Rejected) => {
             reservation.record_failure(services.now_secs());

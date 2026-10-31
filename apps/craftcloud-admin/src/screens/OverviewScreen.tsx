@@ -171,6 +171,7 @@ export function AdminOverview({ organization, workspaces }: { organization: Orga
       ? []
       : [
           [t("Active people"), number(overview.members.by_status.active)],
+          ...(overview.seats === undefined ? [] : [[t("Seats used"), `${number(overview.seats.used)} / ${overview.seats.limit === null ? t("Unlimited") : number(overview.seats.limit)}`] as [string, string]]),
           [t("Open invitations"), number(overview.counts.pending_invitations)],
           [
             t("Storage used"),

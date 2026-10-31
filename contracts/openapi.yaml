@@ -222,7 +222,9 @@ paths:
         tokens. The challenge lasts five minutes, permits five attempts and binds the validated device metadata,
         account, client address and device login kind. Complete it at /auth/device/login/second-factor.
         Browser challenges cannot be used here or vice versa. Cookie plus Bearer is rejected
-        with 400 AMBIGUOUS_CREDENTIALS. Responses must not be cached or logged.
+        with 400 AMBIGUOUS_CREDENTIALS. An app device login returns 403 APP_NOT_ASSIGNED if no active
+        organization allows that app; assignment is checked again after TOTP and on each organization-scoped
+        app operation. Launcher and browser sessions are not governed by app assignment. Responses must not be cached or logged.
       requestBody:
         required: true
         content:
@@ -240,6 +242,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '403': {$ref: '#/components/responses/AppNotAssigned'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '415': {$ref: '#/components/responses/UnsupportedMediaType'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
@@ -295,7 +298,9 @@ paths:
         password step and cannot be replaced here. Browser challenges are rejected. Challenge lifetime,
         one-time proof consumption and login rate limits match the browser second-factor route.
         The persistent 100-failure account lock described for the browser route applies here as well.
-        No cookie is issued; keep the resulting refresh token in the operating system keychain.
+        No cookie is issued; keep the resulting refresh token in the operating system keychain. For
+        client_kind `app`, the final proof returns 403 APP_NOT_ASSIGNED when the app is not allowed by
+        any active organization. `launcher` and `cli` sessions bypass app assignments.
       requestBody:
         required: true
         content:
@@ -309,6 +314,7 @@ paths:
               schema: {$ref: '#/components/schemas/DeviceLoginResponse'}
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/InvalidCredentials'}
+        '403': {$ref: '#/components/responses/AppNotAssigned'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '415': {$ref: '#/components/responses/UnsupportedMediaType'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
@@ -1142,12 +1148,81 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: ALREADY_MEMBER or ACCOUNT_DISABLED
+          description: ALREADY_MEMBER, ACCOUNT_DISABLED or SEAT_LIMIT_REACHED
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/apps:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    get:
+      tags: [Members]
+      summary: Read organization app access and seat usage
+      responses:
+        '200':
+          description: Known apps, current mode and aggregate organization seat usage
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrganizationApps'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/app-access:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    patch:
+      tags: [Members]
+      summary: Set app access mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [mode], properties: {mode: {type: string, enum: [all, assigned]}}}
+      responses:
+        '200':
+          description: Updated mode
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AppAccessModeResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/members/{user_id}/apps:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+      - in: path
+        name: user_id
+        required: true
+        schema: {type: string, format: uuid}
+    put:
+      tags: [Members]
+      summary: Replace one member's app assignments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MemberAppAssignmentsRequest'}
+      responses:
+        '200':
+          description: Replaced app assignments for one active non-guest member
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberAppAssignmentsResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -1187,7 +1262,7 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: LAST_OWNER
+          description: LAST_OWNER or SEAT_LIMIT_REACHED when promoting a guest would exceed the limit
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -1523,7 +1598,10 @@ paths:
           csrfToken: []
         - bearerAuth: []
       summary: Enable an account (operator only)
-      description: Idempotent. Earlier sessions stay revoked.
+      description: >-
+        Idempotent. Earlier sessions stay revoked. Re-enabling is refused with SEAT_LIMIT_REACHED when
+        the account has an active non-guest membership in a full organization. Membership churn during the
+        sorted organization-lock retry can answer MEMBERSHIP_STATE_CHANGED; retry the request.
       parameters:
         - {in: path, name: user_id, required: true, schema: {type: string, format: uuid}}
       responses:
@@ -1532,6 +1610,11 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: SEAT_LIMIT_REACHED or MEMBERSHIP_STATE_CHANGED; retry after membership changes settle
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /info:
@@ -2674,6 +2757,30 @@ paths:
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/organizations/{org_id}/seats:
+    parameters:
+      - {$ref: '#/components/parameters/OrgId'}
+    patch:
+      tags: [Quota, Admin]
+      summary: Set organization seat limit (operator only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [seat_limit], properties: {seat_limit: {type: [integer, 'null'], minimum: 0}}}
+      responses:
+        '200':
+          description: Updated limit; existing members remain active even when usage exceeds the new limit
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SeatLimitResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /files/{file_id}/versions:
     parameters:
       - {$ref: '#/components/parameters/FileId'}
@@ -3062,7 +3169,7 @@ paths:
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: INVITATION_PENDING or INVITATION_LIMIT
+          description: INVITATION_PENDING, INVITATION_LIMIT or SEAT_LIMIT_REACHED
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -3341,7 +3448,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
         '409':
-          description: ALREADY_MEMBER
+          description: ALREADY_MEMBER or SEAT_LIMIT_REACHED
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -3486,6 +3593,51 @@ components:
         are never accepted. Device revocation, password change/reset, account disable, logout-all and removal
         from the final organization revoke access immediately.
   schemas:
+    OrganizationApps:
+      type: object
+      required: [mode, seat_usage, apps]
+      properties:
+        mode: {type: string, enum: [all, assigned]}
+        seat_usage:
+          type: object
+          required: [used, limit]
+          properties:
+            used: {type: integer, minimum: 0}
+            limit: {type: [integer, 'null'], minimum: 0}
+        apps:
+          type: array
+          items:
+            type: object
+            required: [id, name, formats, assigned_members, active_devices, storage_bytes]
+            properties:
+              id: {type: string}
+              name: {type: string}
+              formats: {type: array, items: {type: string}}
+              assigned_members: {type: integer, minimum: 0}
+              active_devices: {type: integer, minimum: 0}
+              storage_bytes: {type: integer, minimum: 0}
+    AppAccessModeResponse:
+      type: object
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [all, assigned]}
+    MemberAppAssignmentsRequest:
+      type: object
+      additionalProperties: false
+      required: [apps]
+      properties:
+        apps: {type: array, uniqueItems: true, maxItems: 64, items: {type: string}}
+    MemberAppAssignmentsResponse:
+      type: object
+      required: [user_id, apps]
+      properties:
+        user_id: {type: string, format: uuid}
+        apps: {type: array, items: {type: string}}
+    SeatLimitResponse:
+      type: object
+      required: [seat_limit]
+      properties:
+        seat_limit: {type: [integer, 'null'], minimum: 0, description: Null means unlimited. Lowering below current usage does not disable members; new admissions are rejected until usage falls below the limit.}
     TwoFactorStatus:
       type: object
       required: [enabled, available, recovery_codes_remaining]
@@ -3751,7 +3903,7 @@ components:
           maxItems: 100
           items:
             type: object
-            required: [id, slug, name, member_count, committed_bytes, reserved_bytes, quota_bytes, created_at]
+            required: [id, slug, name, member_count, committed_bytes, reserved_bytes, quota_bytes, seat_limit, created_at]
             properties:
               id: {type: string, format: uuid}
               slug: {type: string}
@@ -3760,16 +3912,18 @@ components:
               committed_bytes: {type: integer, format: int64, minimum: 0}
               reserved_bytes: {type: integer, format: int64, minimum: 0}
               quota_bytes: {type: [integer, 'null'], format: int64, minimum: 0}
+              seat_limit: {type: [integer, 'null'], minimum: 0}
               created_at: {type: string, format: date-time}
         next_cursor: {type: [string, 'null']}
     Member:
       type: object
-      required: [user_id, display_name, email, role, joined_at]
+      required: [user_id, display_name, email, role, joined_at, apps]
       properties:
         user_id: {type: string, format: uuid}
         display_name: {type: string}
         email: {type: string}
         role: {type: string, enum: [owner, admin, member, guest]}
+        apps: {type: array, items: {type: string}}
         joined_at: {type: string, format: date-time}
     MemberPage:
       type: object
@@ -3881,7 +4035,7 @@ components:
         display_name: {type: string, description: 'Trimmed; 1 to 100 characters, no control or invisible formatting characters'}
     OrganizationOverview:
       type: object
-      required: [members, two_factor, counts, storage, activity_daily]
+      required: [members, two_factor, counts, storage, seats, activity_daily]
       properties:
         members:
           type: object
@@ -3927,6 +4081,12 @@ components:
             committed_bytes: {type: integer, minimum: 0}
             reserved_bytes: {type: integer, minimum: 0}
             quota_bytes: {type: [integer, 'null'], minimum: 0}
+        seats:
+          type: object
+          required: [used, limit]
+          properties:
+            used: {type: integer, minimum: 0}
+            limit: {type: [integer, 'null'], minimum: 0}
         activity_daily:
           type: array
           minItems: 30
@@ -4625,7 +4785,12 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     ForbiddenOrCsrf:
-      description: FORBIDDEN (authenticated but not allowed), CSRF_FAILED, or TWO_FACTOR_SETUP_REQUIRED for a visible organization that requires enrollment
+      description: FORBIDDEN (authenticated but not allowed), CSRF_FAILED, APP_NOT_ASSIGNED for an app-scoped tenant operation, or TWO_FACTOR_SETUP_REQUIRED for a visible organization that requires enrollment
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    AppNotAssigned:
+      description: The app is not allowed by any active organization available to this account (APP_NOT_ASSIGNED).
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

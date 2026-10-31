@@ -348,11 +348,12 @@ async fn list_for(
         Err(r) => return *r,
     };
     let mut opened = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -437,11 +438,12 @@ async fn create_for(
         Err(r) => return *r,
     };
     let mut opened = match lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -723,11 +725,12 @@ pub(crate) async fn change(
         return not_found(&headers);
     };
     let mut opened = match lock(
-        &services.pool,
+        &services,
         session.user_id,
         target.org_id,
         target.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -814,11 +817,12 @@ pub(crate) async fn revoke(
         return not_found(&headers);
     };
     let mut opened = match lock(
-        &services.pool,
+        &services,
         session.user_id,
         target.org_id,
         target.workspace_id,
         &headers,
+        session.app_id.as_deref(),
     )
     .await
     {

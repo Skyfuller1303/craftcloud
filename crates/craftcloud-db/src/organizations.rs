@@ -338,6 +338,8 @@ pub struct OrganizationSummary {
     pub reserved_bytes: i64,
     /// Organization quota.
     pub quota_bytes: Option<i64>,
+    /// Maximum billable active non-guest members; `None` means unlimited.
+    pub seat_limit: Option<i32>,
 }
 
 /// Lists all organizations (metadata only) ordered by `(created_at, id)`,
@@ -355,7 +357,7 @@ pub async fn list_all(
         "SELECT o.id, o.slug, o.name, o.created_at, \
                 (SELECT count(*) FROM organization_members m \
                  WHERE m.org_id = o.id AND m.status = 'active') AS member_count, \
-                o.committed_bytes, o.reserved_bytes, o.quota_bytes \
+                o.committed_bytes, o.reserved_bytes, o.quota_bytes, o.seat_limit \
          FROM organizations o \
          WHERE ($1::timestamptz IS NULL OR (o.created_at, o.id) > ($1::timestamptz, $2::uuid)) \
          ORDER BY o.created_at, o.id LIMIT $3",

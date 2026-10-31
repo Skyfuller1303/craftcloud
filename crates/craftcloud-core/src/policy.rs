@@ -145,6 +145,19 @@ pub struct Actor {
     pub workspace: Option<WorkspaceMembership>,
 }
 
+/// User principal with device app and tenant assignment context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppActor {
+    pub actor: Actor,
+    pub app_access: Option<(String, bool)>,
+}
+impl std::ops::Deref for AppActor {
+    type Target = Actor;
+    fn deref(&self) -> &Actor {
+        &self.actor
+    }
+}
+
 /// Trusted service identity bound to one FigCraft live file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FigcraftService {
@@ -164,12 +177,18 @@ pub enum FigcraftFileState {
 /// Principal accepted by the central authorization decision.
 pub enum Principal<'a> {
     User(&'a Actor),
+    AppUser(&'a AppActor),
     FigcraftLive(&'a FigcraftService),
 }
 
 impl<'a> From<&'a Actor> for Principal<'a> {
     fn from(actor: &'a Actor) -> Self {
         Self::User(actor)
+    }
+}
+impl<'a> From<&'a AppActor> for Principal<'a> {
+    fn from(actor: &'a AppActor) -> Self {
+        Self::AppUser(actor)
     }
 }
 impl<'a> From<&'a FigcraftService> for Principal<'a> {
@@ -273,6 +292,14 @@ pub enum Action {
     UploadAbort,
     /// Set the storage quota of an organization (operator).
     OrganizationQuotaSet,
+    /// Set an organization's seat limit (operator).
+    OrganizationSeatLimitSet,
+    /// Read app assignment and usage for an organization.
+    OrganizationAppsRead,
+    /// Change app assignment mode for an organization.
+    OrganizationAppModeSet,
+    /// Replace one member's app assignments.
+    MemberAppsSet,
     /// Set the storage quota of a workspace.
     WorkspaceQuotaSet,
     /// Read the storage usage of an organization.
@@ -354,6 +381,7 @@ impl Action {
             | Self::OrganizationGrantList
             | Self::OrganizationLockList
             | Self::OrganizationOverviewRead
+            | Self::OrganizationAppsRead
             | Self::SharedWithMe
             | Self::MemberSearch => false,
             Self::OrganizationUpdate
@@ -386,6 +414,9 @@ impl Action {
             | Self::UploadWrite
             | Self::UploadAbort
             | Self::OrganizationQuotaSet
+            | Self::OrganizationSeatLimitSet
+            | Self::OrganizationAppModeSet
+            | Self::MemberAppsSet
             | Self::WorkspaceQuotaSet
             | Self::VersionCommit
             | Self::VersionRestore
@@ -398,7 +429,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 68] = [
+    pub const ALL: [Action; 72] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -445,6 +476,10 @@ impl Action {
         Action::UploadWrite,
         Action::UploadAbort,
         Action::OrganizationQuotaSet,
+        Action::OrganizationSeatLimitSet,
+        Action::OrganizationAppsRead,
+        Action::OrganizationAppModeSet,
+        Action::MemberAppsSet,
         Action::WorkspaceQuotaSet,
         Action::UsageRead,
         Action::VersionList,
@@ -639,6 +674,8 @@ pub enum Decision {
     Allow(Permit),
     /// The actor may see the resource but not do this (403).
     Forbidden,
+    /// Visible resource, but this device app is not assigned (403).
+    AppNotAssigned,
     /// The actor must not learn whether the resource exists (404).
     Hidden,
 }
@@ -711,6 +748,7 @@ pub fn can<'a>(
 ) -> Decision {
     match principal.into() {
         Principal::User(actor) => can_user(actor, action, resource),
+        Principal::AppUser(actor) => can_app_user(actor, action, resource),
         Principal::FigcraftLive(service) => can_figcraft_service(service, action, resource),
     }
 }
@@ -746,6 +784,42 @@ fn can_figcraft_service(
 }
 
 fn can_user(actor: &Actor, action: Action, resource: &Resource) -> Decision {
+    can_user_without_app(actor, action, resource)
+}
+fn can_app_user(actor: &AppActor, action: Action, resource: &Resource) -> Decision {
+    let actor_base = &actor.actor;
+    let decision = can_user_without_app(actor_base, action, resource);
+    if !matches!(decision, Decision::Allow(_)) || !requires_app_assignment(action) {
+        return decision;
+    }
+    match &actor.app_access {
+        Some((_, false)) => Decision::AppNotAssigned,
+        _ => decision,
+    }
+}
+
+fn requires_app_assignment(action: Action) -> bool {
+    matches!(
+        action,
+        Action::FileList
+            | Action::FileRead
+            | Action::FileCreate
+            | Action::FileDownload
+            | Action::UploadCreate
+            | Action::UploadRead
+            | Action::UploadWrite
+            | Action::UploadAbort
+            | Action::VersionList
+            | Action::VersionRead
+            | Action::VersionCommit
+            | Action::VersionRestore
+            | Action::FileLockAcquire
+            | Action::FileLockRelease
+            | Action::FileLockForce
+    )
+}
+
+fn can_user_without_app(actor: &Actor, action: Action, resource: &Resource) -> Decision {
     use Action as A;
     match (action, resource) {
         // ---- instance level ----
@@ -760,6 +834,7 @@ fn can_user(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             | A::HealthRead
             | A::InstanceAuditRead
             | A::OrganizationQuotaSet
+            | A::OrganizationSeatLimitSet
             | A::UserDisable
             | A::UserEnable
             | A::PasswordResetIssue
@@ -783,7 +858,10 @@ fn can_user(actor: &Actor, action: Action, resource: &Resource) -> Decision {
             None => Decision::Hidden,
         },
         (
-            A::OrganizationGrantList | A::OrganizationLockList | A::OrganizationOverviewRead,
+            A::OrganizationGrantList
+            | A::OrganizationLockList
+            | A::OrganizationOverviewRead
+            | A::OrganizationAppsRead,
             Resource::Organization { org_id },
         ) => match role_in(actor, *org_id) {
             Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
@@ -795,6 +873,28 @@ fn can_user(actor: &Actor, action: Action, resource: &Resource) -> Decision {
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
                 Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
                 None => Decision::Hidden,
+            }
+        }
+        (A::OrganizationAppModeSet, Resource::Organization { org_id }) => {
+            match role_in(actor, *org_id) {
+                Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
+                Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
+                None => Decision::Hidden,
+            }
+        }
+        (A::MemberAppsSet, Resource::Member { org_id, target, .. }) => {
+            match (role_in(actor, *org_id), target) {
+                (None, _) => Decision::Hidden,
+                (
+                    Some(OrgRole::Owner | OrgRole::Admin),
+                    Some(MemberTarget {
+                        role: OrgRole::Guest,
+                        ..
+                    }),
+                ) => Decision::Forbidden,
+                (Some(OrgRole::Owner | OrgRole::Admin), Some(_)) => allow(action, Some(*org_id)),
+                (Some(OrgRole::Owner | OrgRole::Admin), None) => Decision::Hidden,
+                (Some(OrgRole::Member | OrgRole::Guest), _) => Decision::Forbidden,
             }
         }
         (A::OrganizationTwoFactorPolicyUpdate, Resource::Organization { org_id }) => {
@@ -1412,6 +1512,7 @@ mod tests {
         match decision {
             Decision::Allow(_) => Want::Allow,
             Decision::Forbidden => Want::Forbidden,
+            Decision::AppNotAssigned => Want::Forbidden,
             Decision::Hidden => Want::Hidden,
         }
     }
@@ -1487,6 +1588,62 @@ mod tests {
             org(),
             [H, F, Y, Y],
         );
+    }
+
+    #[test]
+    fn app_access_admin_seat_policies() {
+        check(Action::OrganizationAppsRead, org(), [H, F, Y, Y]);
+        check(Action::OrganizationAppModeSet, org(), [H, F, Y, Y]);
+        check(
+            Action::MemberAppsSet,
+            member(Some((OTHER, OrgRole::Member)), None),
+            [H, F, Y, Y],
+        );
+        check(
+            Action::MemberAppsSet,
+            member(Some((OTHER, OrgRole::Guest)), None),
+            [H, F, F, F],
+        );
+        assert_eq!(
+            outcome(can(
+                &actor(None, true),
+                Action::OrganizationSeatLimitSet,
+                &Resource::Instance
+            )),
+            Y
+        );
+        assert_eq!(
+            outcome(can(
+                &actor(None, false),
+                Action::OrganizationSeatLimitSet,
+                &Resource::Instance
+            )),
+            F
+        );
+    }
+
+    #[test]
+    fn app_assignment_is_checked_after_resource_visibility() {
+        let denied = with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Editor);
+        let denied = AppActor {
+            actor: denied,
+            app_access: Some(("photocraft".into(), false)),
+        };
+        let resource = Resource::Workspace {
+            org_id: ORG,
+            workspace_id: WS,
+        };
+        assert_eq!(outcome(can(&denied, Action::FileRead, &resource)), F);
+        let hidden = AppActor {
+            actor: actor(Some(OrgRole::Member), false),
+            app_access: Some(("photocraft".into(), false)),
+        };
+        assert_eq!(outcome(can(&hidden, Action::FileRead, &resource)), H);
+        let assigned = AppActor {
+            actor: denied.actor.clone(),
+            app_access: Some(("photocraft".into(), true)),
+        };
+        assert_eq!(outcome(can(&assigned, Action::FileRead, &resource)), Y);
     }
 
     #[test]
@@ -1714,6 +1871,7 @@ mod tests {
             Action::HealthRead,
             Action::InstanceAuditRead,
             Action::OrganizationQuotaSet,
+            Action::OrganizationSeatLimitSet,
             Action::UserDisable,
             Action::UserEnable,
             Action::PasswordResetIssue,
@@ -1950,6 +2108,10 @@ mod tests {
             Action::UploadWrite,
             Action::UploadAbort,
             Action::OrganizationQuotaSet,
+            Action::OrganizationSeatLimitSet,
+            Action::OrganizationAppsRead,
+            Action::OrganizationAppModeSet,
+            Action::MemberAppsSet,
             Action::WorkspaceQuotaSet,
             Action::UsageRead,
             Action::VersionList,
@@ -2024,6 +2186,10 @@ mod tests {
                 | Action::UploadWrite
                 | Action::UploadAbort
                 | Action::OrganizationQuotaSet
+                | Action::OrganizationSeatLimitSet
+                | Action::OrganizationAppsRead
+                | Action::OrganizationAppModeSet
+                | Action::MemberAppsSet
                 | Action::WorkspaceQuotaSet
                 | Action::UsageRead
                 | Action::VersionList
@@ -2077,6 +2243,7 @@ mod tests {
                 Action::FileList,
                 Action::FileRead,
                 Action::UploadRead,
+                Action::OrganizationAppsRead,
                 Action::UsageRead,
                 Action::VersionList,
                 Action::VersionRead,

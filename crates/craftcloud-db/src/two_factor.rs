@@ -57,6 +57,7 @@ pub async fn complete_browser_login(
 pub enum LoginOutcome {
     Created(Uuid),
     Rejected,
+    AppNotAssigned,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,6 +192,17 @@ pub async fn complete_device_login_with_email(
     mail_enabled: bool,
 ) -> Result<LoginOutcome, DbError> {
     let mut tx = pool.begin().await?;
+    if !crate::app_access::device_login_allowed(
+        &mut tx,
+        user_id,
+        &new.client_kind,
+        &new.client_id,
+        &new.known_app_ids,
+    )
+    .await?
+    {
+        return Ok(LoginOutcome::AppNotAssigned);
+    }
     let account: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM users WHERE id=$1 AND password_hash=$2 AND disabled_at IS NULL FOR UPDATE",
     )

@@ -127,6 +127,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "GRAPH_CLIENT_SECRET_FILE",
     "GRAPH_SENDER",
     "GRAPH_SAVE_TO_SENT",
+    "APP_CATALOG_FILE",
 ];
 
 /// Mail delivery settings. Secrets are read only by server startup.
@@ -304,6 +305,8 @@ pub struct Config {
     /// Directory with the built admin UI (`apps/craftcloud-admin/dist`), served
     /// under `/admin`. `None` serves no UI. Validated when the server starts.
     pub admin_dir: Option<PathBuf>,
+    /// Optional operator-maintained app catalog (`id|name|format,format`).
+    pub app_catalog_file: Option<PathBuf>,
     /// Audit events older than this many days are deleted by the maintenance
     /// job (ADR-0016: 365 days by default, at least 30).
     pub audit_retention_days: u32,
@@ -626,6 +629,17 @@ impl Config {
                 Ok(path)
             }
         });
+        let app_catalog_file = field(&mut errors, env, "APP_CATALOG_FILE", |key, raw| {
+            let path = PathBuf::from(raw.trim());
+            if raw.trim().is_empty() || !path.is_absolute() {
+                Err(ConfigError::new(
+                    key,
+                    "must be an absolute path to the app catalog",
+                ))
+            } else {
+                Ok(path)
+            }
+        });
         if admin_dir.is_some()
             && public_url
                 .as_deref()
@@ -724,6 +738,7 @@ impl Config {
                 quarantine_retention: Duration::from_secs(quarantine_days * 24 * 3600),
                 maintenance_enabled,
                 admin_dir,
+                app_catalog_file,
                 audit_retention_days: u32::try_from(audit_retention_days).unwrap_or(u32::MAX),
                 audit_downloads,
                 metrics_addr,

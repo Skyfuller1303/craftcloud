@@ -59,9 +59,23 @@ pub async fn live_link(
     file_id: Uuid,
     user_id: Uuid,
     access: &str,
+    source_kind: &str,
+    source_app: Option<&str>,
 ) -> Result<Option<LiveLink>, DbError> {
-    Ok(sqlx::query_as("SELECT id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,revoked_at FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access=$3 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
-        .bind(file_id).bind(user_id).bind(access).fetch_optional(pool).await?)
+    Ok(sqlx::query_as("SELECT id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,revoked_at FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access=$3 AND source_kind=$4 AND source_app IS NOT DISTINCT FROM $5 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
+        .bind(file_id).bind(user_id).bind(access).bind(source_kind).bind(source_app).fetch_optional(pool).await?)
+}
+
+pub async fn links_for_source(
+    pool: &PgPool,
+    file_id: Uuid,
+    user_id: Uuid,
+    access: &str,
+    source_kind: &str,
+    source_app: Option<&str>,
+) -> Result<Vec<LiveLink>, DbError> {
+    Ok(sqlx::query_as("SELECT id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,revoked_at FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access=$3 AND source_kind=$4 AND source_app IS NOT DISTINCT FROM $5 AND revoked_at IS NULL ORDER BY id")
+        .bind(file_id).bind(user_id).bind(access).bind(source_kind).bind(source_app).fetch_all(pool).await?)
 }
 
 pub async fn links(pool: &PgPool, file_id: Uuid) -> Result<Vec<LiveLink>, DbError> {
@@ -174,6 +188,8 @@ pub struct NewFigcraftLink<'a> {
     pub ciphertext: &'a [u8],
     pub now: OffsetDateTime,
     pub workspace_id: Uuid,
+    pub source_kind: &'a str,
+    pub source_app: Option<&'a str>,
 }
 
 pub async fn revoke_link_audited(
@@ -233,6 +249,85 @@ pub async fn enqueue_user_revocations(
 ) -> Result<(), DbError> {
     sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,$2,$3,$4,$4 FROM figcraft_links l JOIN figcraft_live_files f ON f.file_id=l.file_id WHERE f.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(user_id).bind(reason).bind(now).execute(conn).await?;
+    Ok(())
+}
+
+/// Queue capabilities from one app for one user. Browser, launcher, and CLI
+/// links remain untouched; unknown-origin legacy links are queued separately.
+pub async fn enqueue_user_app_revocations(
+    conn: &mut PgConnection,
+    org_id: Uuid,
+    user_id: Uuid,
+    app: &str,
+    now: OffsetDateTime,
+) -> Result<(), DbError> {
+    let reason = format!("app_access_revoked:app:{app}");
+    let legacy_reason = "app_access_revoked:legacy";
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,$3,$4,$4 \
+        FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+        WHERE lf.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL AND l.source_kind='app' AND l.source_app=$5 \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(org_id).bind(user_id).bind(&reason).bind(now).bind(app).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,$3,$4,$4 \
+        FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+        WHERE lf.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL AND l.source_kind='legacy' \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(org_id).bind(user_id).bind(legacy_reason).bind(now).execute(conn).await?;
+    Ok(())
+}
+
+/// Queue app-origin links denied when an organization switches from all apps
+/// to assigned apps; queue legacy links conservatively for regular members.
+pub async fn enqueue_org_app_revocations(
+    conn: &mut PgConnection,
+    org_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<(), DbError> {
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,'app_access_revoked:app:'||l.source_app,$2,$2 \
+        FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+        JOIN organization_members m ON m.org_id=lf.org_id AND m.user_id=l.user_id AND m.status='active' \
+        WHERE lf.org_id=$1 AND l.source_kind='app' AND l.revoked_at IS NULL \
+          AND m.role NOT IN ('owner','admin','guest') \
+          AND NOT EXISTS(SELECT 1 FROM member_app_access a WHERE a.org_id=lf.org_id AND a.user_id=l.user_id AND a.app=l.source_app) \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(org_id).bind(now).execute(&mut *conn).await?;
+    // Legacy provenance cannot identify which app issued these links; after
+    // narrowing the org to assigned mode, revoke them for regular members.
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,'app_access_revoked:legacy',$2,$2 \
+        FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+        JOIN organization_members m ON m.org_id=lf.org_id AND m.user_id=l.user_id AND m.status='active' \
+        WHERE lf.org_id=$1 AND l.source_kind='legacy' AND l.revoked_at IS NULL \
+          AND m.role NOT IN ('owner','admin','guest') \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(org_id).bind(now).execute(conn).await?;
+    Ok(())
+}
+
+pub async fn enqueue_file_app_revocations_pool(
+    pool: &PgPool,
+    org_id: Uuid,
+    file_id: Uuid,
+    user_id: Uuid,
+    source_app: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), DbError> {
+    let mut tx = pool.begin().await?;
+    let reason = source_app.map_or_else(
+        || "app_access_revoked:legacy".to_owned(),
+        |app| format!("app_access_revoked:app:{app}"),
+    );
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,$5,$4,$4 FROM figcraft_links l \
+        JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+        WHERE lf.org_id=$1 AND l.file_id=$2 AND l.user_id=$3 AND l.revoked_at IS NULL \
+          AND (($6::text IS NULL AND l.source_kind='legacy') OR ($6::text IS NOT NULL AND l.source_kind='app' AND l.source_app=$6)) \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(org_id).bind(file_id).bind(user_id).bind(now).bind(reason).bind(source_app).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -358,6 +453,51 @@ pub struct Revocation {
     pub attempts: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppRevocationSource {
+    Legacy,
+    App(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAppRevocationReason;
+
+impl std::fmt::Display for InvalidAppRevocationReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid app revocation reason")
+    }
+}
+
+impl std::error::Error for InvalidAppRevocationReason {}
+
+/// `None` is an ordinary all-source revocation; malformed app reasons fail closed.
+pub fn parse_app_revocation_reason(
+    reason: &str,
+) -> Result<Option<AppRevocationSource>, InvalidAppRevocationReason> {
+    let Some(source) = reason.strip_prefix("app_access_revoked:") else {
+        return if reason.starts_with("app_access_revoked") {
+            Err(InvalidAppRevocationReason)
+        } else {
+            Ok(None)
+        };
+    };
+    if source == "legacy" {
+        return Ok(Some(AppRevocationSource::Legacy));
+    }
+    let Some(app) = source.strip_prefix("app:") else {
+        return Err(InvalidAppRevocationReason);
+    };
+    if app.is_empty()
+        || app.len() > 32
+        || !app
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(InvalidAppRevocationReason);
+    }
+    Ok(Some(AppRevocationSource::App(app.to_owned())))
+}
+
 pub async fn claim_revocations(
     pool: &PgPool,
     limit: i64,
@@ -370,14 +510,38 @@ pub async fn claim_revocations(
     Ok(rows)
 }
 
+pub async fn app_access_revocation_links(
+    pool: &PgPool,
+    file_id: Uuid,
+    user_id: Uuid,
+    source_app: Option<&str>,
+) -> Result<Vec<LiveLink>, DbError> {
+    Ok(sqlx::query_as("SELECT id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,revoked_at FROM figcraft_links \
+        WHERE file_id=$1 AND user_id=$2 AND revoked_at IS NULL \
+          AND (($3::text IS NULL AND source_kind='legacy') OR ($3::text IS NOT NULL AND source_kind='app' AND source_app=$3)) ORDER BY id")
+        .bind(file_id).bind(user_id).bind(source_app).fetch_all(pool).await?)
+}
+
 pub async fn finish_revocation(
     pool: &PgPool,
     id: Uuid,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
-    let rows:Vec<(Uuid,Uuid,Uuid,String)>=sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
-        .bind(id).bind(now).fetch_all(&mut *tx).await?;
+    let reason: String =
+        sqlx::query_scalar("SELECT reason FROM figcraft_outbox WHERE id=$1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let source = parse_app_revocation_reason(&reason).map_err(|_| DbError::Internal)?;
+    let rows: Vec<(Uuid, Uuid, Uuid, String)> = match source {
+        None => sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
+            .bind(id).bind(now).fetch_all(&mut *tx).await?,
+        Some(AppRevocationSource::Legacy) => sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND source_kind='legacy' AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
+            .bind(id).bind(now).fetch_all(&mut *tx).await?,
+        Some(AppRevocationSource::App(app)) => sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND source_kind='app' AND source_app=$3 AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
+            .bind(id).bind(now).bind(app).fetch_all(&mut *tx).await?,
+    };
     for (link_id, file_id, user_id, access) in rows {
         let (org_id, workspace_id): (Uuid, Uuid) =
             sqlx::query_as("SELECT org_id,workspace_id FROM figcraft_live_files WHERE file_id=$1")
@@ -524,8 +688,8 @@ impl OrgTx {
         if !live {
             return Ok(false);
         }
-        sqlx::query("INSERT INTO figcraft_links(id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
-            .bind(link.id).bind(link.file_id).bind(link.user_id).bind(link.access).bind(link.remote_link).bind(link.ciphertext).bind(link.now).execute(&mut *self.tx).await?;
+        sqlx::query("INSERT INTO figcraft_links(id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,source_kind,source_app) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+            .bind(link.id).bind(link.file_id).bind(link.user_id).bind(link.access).bind(link.remote_link).bind(link.ciphertext).bind(link.now).bind(link.source_kind).bind(link.source_app).execute(&mut *self.tx).await?;
         let event = crate::audit::NewEvent::new("figcraft.link_issued")
             .org(self.org_id)
             .target("file", link.file_id)

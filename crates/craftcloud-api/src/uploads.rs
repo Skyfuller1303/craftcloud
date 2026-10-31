@@ -242,10 +242,11 @@ async fn upload_read_gate(
     file_id: Uuid,
 ) -> Result<OrgScope, Box<Response>> {
     let actor = read_actor(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
+        session.app_id.as_deref(),
     )
     .await
     .map_err(|error| Box::new(db_failure(&error, headers, "actor lookup failed")))?;
@@ -308,11 +309,12 @@ pub(crate) async fn upload_write_gate(
     file_id: Uuid,
 ) -> Result<(OrgTx, OrgScope), Box<Response>> {
     let Locked { mut tx, actor } = lock(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
         headers,
+        session.app_id.as_deref(),
     )
     .await?;
     let resource = if matches!(action, Action::UploadWrite | Action::VersionCommit) {
@@ -743,6 +745,7 @@ struct Finish {
     user_id: Uuid,
     login_session_id: Uuid,
     credential_kind: crate::session::CredentialKind,
+    app_id: Option<String>,
     org_id: Uuid,
     workspace_id: Uuid,
     upload_id: Uuid,
@@ -766,6 +769,7 @@ async fn finish_upload(finish: Finish) -> Response {
         user_id,
         login_session_id,
         credential_kind,
+        app_id,
         org_id,
         workspace_id,
         upload_id,
@@ -790,16 +794,24 @@ async fn finish_upload(finish: Finish) -> Response {
         id: upload_id,
         key: Some(key.clone()),
     };
-    let Locked { mut tx, actor } =
-        match lock(&services.pool, user_id, org_id, workspace_id, &headers).await {
-            Ok(locked) => locked,
-            Err(response) => {
-                guard.key = None;
-                delete_object(&services, &key).await;
-                fail_session(&services, org_id, upload_id).await;
-                return *response;
-            }
-        };
+    let Locked { mut tx, actor } = match lock(
+        &services,
+        user_id,
+        org_id,
+        workspace_id,
+        &headers,
+        app_id.as_deref(),
+    )
+    .await
+    {
+        Ok(locked) => locked,
+        Err(response) => {
+            guard.key = None;
+            delete_object(&services, &key).await;
+            fail_session(&services, org_id, upload_id).await;
+            return *response;
+        }
+    };
     // The request was authenticated when it started; the account may have been
     // disabled or the session revoked while the body streamed in.
     let now = services.clock.now();
@@ -1167,6 +1179,7 @@ pub(crate) async fn put_content(
         user_id: session.user_id,
         login_session_id: session.session_id,
         credential_kind: session.credential_kind,
+        app_id: session.app_id.clone(),
         org_id,
         workspace_id: resolved.workspace_id,
         upload_id,

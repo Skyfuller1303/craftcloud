@@ -143,6 +143,13 @@ export interface OrgMember {
   status?: "active" | "invited" | "disabled";
   account_disabled?: boolean;
   two_factor_enabled?: boolean;
+  apps?: string[];
+}
+
+export interface OrganizationApps {
+  mode: "all" | "assigned";
+  apps: { id: string; name: string; assigned_members: number; active_devices: number; storage_bytes: number }[];
+  seat_usage: { used: number; limit: number | null };
 }
 
 export interface OrganizationGrant extends ShareGrant { target_name: string; }
@@ -156,6 +163,7 @@ export interface WorkspaceUsage {
 }
 export interface UsageEntry { quota_bytes: number | null; reserved_bytes: number; committed_bytes: number; }
 export interface OrganizationOverview {
+  seats?: { used: number; limit: number | null };
   members: {
     total: number;
     by_status: { active: number; invited: number; disabled: number };
@@ -174,6 +182,7 @@ export interface OrganizationUsage { organization: UsageEntry; workspaces: Works
 export interface AdminOrganization {
   id: Uuid; slug: string; name: string; member_count: number; created_at: string;
   committed_bytes: number; reserved_bytes: number; quota_bytes: number | null;
+  seat_limit?: number | null;
 }
 export interface AdminUser {
   id: Uuid; email: string; display_name: string; created_at: string; disabled: boolean;

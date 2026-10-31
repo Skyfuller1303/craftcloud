@@ -270,10 +270,11 @@ pub(crate) async fn list_files(
         None
     };
     let actor = match crate::workspaces::read_actor(
-        &resolved.services.pool,
+        &resolved.services,
         session.user_id,
         resolved.org_id,
         resolved.workspace_id,
+        session.app_id.as_deref(),
     )
     .await
     {
@@ -360,10 +361,11 @@ pub(crate) async fn get_file(
     match files::get(&resolved.services.pool, &scope, resolved.id).await {
         Ok(Some(file)) => {
             let actor = match crate::workspaces::read_actor(
-                &resolved.services.pool,
+                &resolved.services,
                 session.user_id,
                 resolved.org_id,
                 resolved.workspace_id,
+                session.app_id.as_deref(),
             )
             .await
             {

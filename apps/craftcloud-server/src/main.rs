@@ -18,6 +18,7 @@ mod secret;
 mod server;
 
 use base64::Engine;
+use std::io::{self, Read};
 use std::process::ExitCode;
 use zeroize::Zeroize;
 
@@ -37,6 +38,7 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 const EXIT_CONFIG: u8 = 2;
+const MAX_APP_CATALOG_BYTES: u64 = 256 * 1024;
 const VERSION: &str = match option_env!("CRAFTCLOUD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
@@ -61,6 +63,21 @@ const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin iss
     admin backup create --out DIR          consistent backup of the database and all committed blobs into the new or empty DIR\n\
     admin backup verify DIR                check every checksum of a backup (needs no database; --manifest-sha256 pins the manifest)\n\
     admin backup restore DIR               load a verified backup into an EMPTY database and an EMPTY CRAFTCLOUD_STORAGE_DIR\n";
+
+fn read_app_catalog<R: Read>(reader: R) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_APP_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_APP_CATALOG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "app catalog exceeds maximum size",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "app catalog is not UTF-8"))
+}
 
 /// A failure with the exit code it maps to.
 struct Failure {
@@ -966,6 +983,24 @@ async fn run(config: Config) -> Result<(), Failure> {
         ),
         None => None,
     };
+    let app_catalog = match &config.app_catalog_file {
+        Some(path) => {
+            let file = std::fs::File::open(path).map_err(|_| {
+                Failure::config("CRAFTCLOUD_APP_CATALOG_FILE is unavailable or unreadable")
+            })?;
+            let contents = read_app_catalog(file).map_err(|_| {
+                Failure::config(
+                    "CRAFTCLOUD_APP_CATALOG_FILE is oversized, unreadable, or not UTF-8",
+                )
+            })?;
+            craftcloud_core::apps::extend_app_catalog(
+                craftcloud_core::apps::default_app_catalog(),
+                &contents,
+            )
+            .map_err(|_| Failure::config("CRAFTCLOUD_APP_CATALOG_FILE has an invalid catalog"))?
+        }
+        None => craftcloud_core::apps::default_app_catalog(),
+    };
     // Validate the bootstrap secret first: a bad file is a configuration
     // error (exit 2) and must stop startup before anything is bound.
     let bootstrap = load_bootstrap_token(&config)?;
@@ -1056,6 +1091,7 @@ async fn run(config: Config) -> Result<(), Failure> {
         );
     }
     let auth_settings = AuthSettings {
+        app_catalog,
         idle_timeout: config.session_idle_timeout,
         absolute_timeout: config.session_absolute_timeout,
         device_access_ttl: config.device_access_ttl,
@@ -1364,6 +1400,32 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_catalog_read_is_bounded_and_requires_utf8() {
+        let exact = vec![b'a'; MAX_APP_CATALOG_BYTES as usize];
+        assert_eq!(
+            read_app_catalog(std::io::Cursor::new(exact)).unwrap().len(),
+            MAX_APP_CATALOG_BYTES as usize
+        );
+        let oversized = vec![b'a'; MAX_APP_CATALOG_BYTES as usize + 1];
+        assert_eq!(
+            read_app_catalog(std::io::Cursor::new(oversized))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_app_catalog(std::io::Cursor::new(b"short catalog".to_vec())).unwrap(),
+            "short catalog"
+        );
+        assert_eq!(
+            read_app_catalog(std::io::Cursor::new(vec![0xff]))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()

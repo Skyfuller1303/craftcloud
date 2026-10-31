@@ -79,6 +79,7 @@ pub enum CloudError {
     Unauthorized,
     SecondFactorChallenge(String),
     Forbidden,
+    AppNotAssigned,
     IncompatibleServer(String),
     RateLimited(Option<String>),
     QuotaExceeded,
@@ -118,6 +119,9 @@ impl fmt::Display for CloudError {
             Self::Unauthorized => f.write_str("Sign in again"),
             Self::SecondFactorChallenge(_) => f.write_str("A second-factor code is required"),
             Self::Forbidden => f.write_str("Permission denied"),
+            Self::AppNotAssigned => {
+                f.write_str("Dein Admin hat dir diese App für die Cloud nicht zugewiesen")
+            }
             Self::IncompatibleServer(v) => write!(f, "Unsupported CraftCloud API version: {v}"),
             Self::RateLimited(_) => f.write_str("Too many requests"),
             Self::QuotaExceeded => f.write_str("Storage quota exceeded"),
@@ -835,6 +839,7 @@ fn error_for(r: Response) -> CloudError {
         .map(|e| (e.error.code, e.error.message, e.error.details))
         .unwrap_or_else(|| ("UNKNOWN".into(), String::new(), None));
     match (r.status, code.as_str()) {
+        (403, "APP_NOT_ASSIGNED") => CloudError::AppNotAssigned,
         (401, "SECOND_FACTOR_REQUIRED") => CloudError::SecondFactorChallenge(
             details
                 .as_ref()
@@ -961,6 +966,19 @@ mod tests {
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
         }
+    }
+    #[test]
+    fn app_not_assigned_has_specific_recoverable_error() {
+        let error = error_for(response(
+            403,
+            r#"{"error":{"code":"APP_NOT_ASSIGNED","message":"not assigned","request_id":null}}"#,
+        ));
+        assert_eq!(error, CloudError::AppNotAssigned);
+        assert_eq!(
+            error.to_string(),
+            "Dein Admin hat dir diese App für die Cloud nicht zugewiesen"
+        );
+        assert_eq!(error_for(response(403, "{}")), CloudError::Forbidden);
     }
     struct Mock(Mutex<VecDeque<Result<Response, CloudError>>>);
     impl Mock {
