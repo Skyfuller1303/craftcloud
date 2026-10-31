@@ -134,13 +134,17 @@ async fn enqueue_with_status(
             return Ok(EnqueueOutcome::ResendTooSoon);
         }
     }
+    // Security notices are counted per event, so a flood of new-login
+    // notices cannot suppress a later "password changed" notice.
     let recipient_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM outbound_emails WHERE recipient=$1 AND template=$2 \
-         AND status<>'suppressed' AND created_at > $3 - interval '1 hour'",
+         AND status<>'suppressed' AND created_at > $3 - interval '1 hour' \
+         AND coalesce(params->>'security_event','') = coalesce($4::jsonb->>'security_event','')",
     )
     .bind(&draft.recipient)
     .bind(&draft.template)
     .bind(draft.now)
+    .bind(&draft.params)
     .fetch_one(&mut **tx)
     .await?;
     if recipient_count >= 5 {

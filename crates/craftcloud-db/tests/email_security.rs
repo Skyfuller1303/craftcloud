@@ -428,8 +428,19 @@ async fn login_notices_are_limited_without_blocking_logins_or_later_security_cha
         .unwrap(),
         craftcloud_db::accounts::PasswordChangeResult::Changed(_)
     ));
+    // Notices are counted per event: the new-login flood does not suppress the
+    // password-change notice.
+    let password_notice: String = sqlx::query_scalar(
+        "SELECT status FROM outbound_emails WHERE actor_id=$1 AND template='security_notice' \
+         AND params->>'security_event'='Your password was changed.'",
+    )
+    .bind(user)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(password_notice, "queued");
     let status = craftcloud_db::email_outbox::status(&db.pool).await.unwrap();
-    assert_eq!(status.suppressed_count, 2);
+    assert_eq!(status.suppressed_count, 1);
     assert_eq!(status.failed_count, 0);
     // Suppressed rows are not counted against the recipient or actor windows.
     let counted: i64 = sqlx::query_scalar(
@@ -439,7 +450,7 @@ async fn login_notices_are_limited_without_blocking_logins_or_later_security_cha
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(counted, 5);
+    assert_eq!(counted, 6);
 }
 
 #[tokio::test]
