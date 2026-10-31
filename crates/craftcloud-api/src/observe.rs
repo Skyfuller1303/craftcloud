@@ -46,7 +46,7 @@ const BUCKETS: [f64; 11] = [
 ];
 
 /// Rate limit classes with a counter of their own (label `class`).
-const RATE_CLASSES: [&str; 10] = [
+const RATE_CLASSES: [&str; 11] = [
     "login",
     "setup",
     "reset",
@@ -57,6 +57,7 @@ const RATE_CLASSES: [&str; 10] = [
     "member_search",
     "failed_login",
     "two_factor_management",
+    "figcraft",
 ];
 
 /// Routes that are not part of [`ROUTES`] but are served and measured.

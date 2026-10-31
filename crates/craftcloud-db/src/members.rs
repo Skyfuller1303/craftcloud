@@ -441,14 +441,23 @@ impl OrgTx {
         .bind(new_role.as_str())
         .execute(&mut *self.tx)
         .await?;
-        crate::figcraft::enqueue_user_revocations(
-            &mut self.tx,
-            self.org_id,
-            user_id,
-            "role_changed",
-            time::OffsetDateTime::now_utc(),
-        )
-        .await?;
+        // Only a downgrade can remove access a FigCraft capability was issued for.
+        let rank = |role: Option<OrgRole>| match role {
+            Some(OrgRole::Owner) => 3,
+            Some(OrgRole::Admin) => 2,
+            Some(OrgRole::Member) => 1,
+            Some(OrgRole::Guest) | None => 0,
+        };
+        if rank(Some(new_role)) < rank(current_role) {
+            crate::figcraft::enqueue_user_revocations(
+                &mut self.tx,
+                self.org_id,
+                user_id,
+                "role_changed",
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?;
+        }
         match self.member(user_id).await? {
             Some(member) => Ok(RoleOutcome::Changed(member)),
             None => Err(DbError::Internal),
@@ -584,7 +593,8 @@ impl OrgTx {
         .fetch_optional(&mut *self.tx)
         .await?;
         if let Some(org) = updated {
-            if require_two_factor.is_some_and(|value| value != current_two_factor) {
+            // Switching the requirement off grants nothing new to revoke.
+            if require_two_factor == Some(true) && !current_two_factor {
                 crate::figcraft::enqueue_org_revocations(
                     &mut self.tx,
                     self.org_id,

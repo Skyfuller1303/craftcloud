@@ -51,6 +51,10 @@ impl IpClass {
 /// Display name changes a user may make per rate window.
 const PROFILE_LIMIT: u32 = 20;
 
+/// FigCraft live operations (open, renew, snapshot, stop) a user may start per
+/// rate window.
+const FIGCRAFT_LIMIT: u32 = 20;
+
 /// Session, cookie and rate limit settings.
 #[derive(Debug, Clone)]
 pub struct AuthSettings {
@@ -189,6 +193,7 @@ pub struct Services {
     profile: WindowLimiter,
     invite_create: WindowLimiter,
     member_search: WindowLimiter,
+    figcraft_ops: WindowLimiter,
     guard: Arc<AccountGuard>,
     // Separate from login failures: management proofs share one account/address budget.
     two_factor_management_guard: Arc<AccountGuard>,
@@ -270,6 +275,7 @@ impl Services {
             profile: WindowLimiter::new(cap),
             invite_create: WindowLimiter::new(cap),
             member_search: WindowLimiter::new(cap),
+            figcraft_ops: WindowLimiter::new(cap),
             guard,
             two_factor_management_guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
@@ -326,6 +332,14 @@ impl Services {
             && self.figcraft_public_url.is_some()
             && self.two_factor_keys.current.is_some()
             && self.storage.is_some()
+    }
+
+    /// The global FigCraft job permits; a hidden seam so integration tests can
+    /// exhaust capacity and prove which callers are admitted.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn figcraft_job_permits_for_tests(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.figcraft_job_permits)
     }
 
     /// Runs blocking FigCraft network work on the blocking pool with bounded concurrency.
@@ -485,6 +499,22 @@ impl Services {
                 self.window_secs(),
             )
             .map_err(|retry| self.too_many("member_search", retry, headers))
+    }
+
+    /// Per-user rate limit for FigCraft live operations; counts the request.
+    pub(crate) fn rate_limit_figcraft(
+        &self,
+        user_id: Uuid,
+        headers: &HeaderMap,
+    ) -> Result<(), Box<Response>> {
+        self.figcraft_ops
+            .check(
+                &user_id.to_string(),
+                self.now_secs(),
+                FIGCRAFT_LIMIT,
+                self.window_secs(),
+            )
+            .map_err(|retry| self.too_many("figcraft", retry, headers))
     }
 
     /// Checks the failed-login limits for `email` (the normalized address of

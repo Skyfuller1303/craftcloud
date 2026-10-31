@@ -84,6 +84,11 @@ pub(crate) async fn open(
     Path(raw): Path<String>,
     body: Bytes,
 ) -> Response {
+    if let Err(response) =
+        figcraft::preauthorize(&state, &headers, &session, &raw, "figcraft.live.open").await
+    {
+        return *response;
+    }
     let permit = match admit(&state, &headers) {
         Ok(permit) => permit,
         Err(response) => return *response,
@@ -102,6 +107,11 @@ pub(crate) async fn snapshot(
     session: AuthenticatedSession,
     Path(raw): Path<String>,
 ) -> Response {
+    if let Err(response) =
+        figcraft::preauthorize(&state, &headers, &session, &raw, "figcraft.live.snapshot").await
+    {
+        return *response;
+    }
     let permit = match admit(&state, &headers) {
         Ok(permit) => permit,
         Err(response) => return *response,
@@ -120,6 +130,11 @@ pub(crate) async fn stop(
     session: AuthenticatedSession,
     Path(raw): Path<String>,
 ) -> Response {
+    if let Err(response) =
+        figcraft::preauthorize(&state, &headers, &session, &raw, "figcraft.live.stop").await
+    {
+        return *response;
+    }
     let permit = match admit(&state, &headers) {
         Ok(permit) => permit,
         Err(response) => return *response,

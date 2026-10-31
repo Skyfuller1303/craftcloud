@@ -369,6 +369,8 @@ pub async fn revoke_all_for_user(
             .await?
             .rows_affected();
     locks::delete_for_user_tx(&mut tx, user_id, LockSessionKind::Browser, None).await?;
+    crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
+        .await?;
     let audit = AuditCtx {
         actor_id: Some(user_id),
         request_id: None,
@@ -404,6 +406,8 @@ pub async fn revoke_all_for_user_audited(
     .await?
     .rows_affected();
     locks::delete_for_user_tx(&mut tx, user_id, LockSessionKind::Browser, None).await?;
+    crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
+        .await?;
     let device_audit = AuditCtx {
         actor_id: Some(user_id),
         request_id: audit.request_id.clone(),

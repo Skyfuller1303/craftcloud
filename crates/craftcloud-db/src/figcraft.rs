@@ -130,8 +130,8 @@ pub async fn mark_unpublishing(
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,updated_at=$2 WHERE file_id=$1 AND state='live'").bind(file_id).bind(now).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$2,$2 FROM figcraft_links l WHERE l.file_id=$1 AND l.revoked_at IS NULL ON CONFLICT DO NOTHING").bind(file_id).bind(now).execute(&mut *tx).await?;
+    sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,last_snapshot_attempt_at=NULL,updated_at=$2 WHERE file_id=$1 AND state='live'").bind(file_id).bind(now).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$2,$2 FROM figcraft_links l WHERE l.file_id=$1 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)").bind(file_id).bind(now).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -231,7 +231,7 @@ pub async fn enqueue_user_revocations(
     reason: &'static str,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT l.file_id,$2,$3,$4,$4 FROM figcraft_links l JOIN figcraft_live_files f ON f.file_id=l.file_id WHERE f.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO NOTHING")
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,$2,$3,$4,$4 FROM figcraft_links l JOIN figcraft_live_files f ON f.file_id=l.file_id WHERE f.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(user_id).bind(reason).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -243,7 +243,7 @@ pub async fn enqueue_file_user_revocations(
     reason: &'static str,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT file_id,$2,$3,$4,$4 FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO NOTHING")
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT file_id,$2,$3,$4,$4 FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(file_id).bind(user_id).bind(reason).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -256,7 +256,7 @@ pub async fn enqueue_project_user_revocations(
     reason: &'static str,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT l.file_id,$3,$4,$5,$5 FROM figcraft_links l JOIN files f ON f.id=l.file_id WHERE f.org_id=$1 AND f.project_id=$2 AND l.user_id=$3 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO NOTHING")
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,$3,$4,$5,$5 FROM figcraft_links l JOIN files f ON f.id=l.file_id WHERE f.org_id=$1 AND f.project_id=$2 AND l.user_id=$3 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(project_id).bind(user_id).bind(reason).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -269,7 +269,7 @@ pub async fn enqueue_workspace_user_revocations(
     reason: &'static str,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT l.file_id,$3,$4,$5,$5 FROM figcraft_links l JOIN files f ON f.id=l.file_id WHERE f.org_id=$1 AND f.workspace_id=$2 AND l.user_id=$3 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO NOTHING")
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,$3,$4,$5,$5 FROM figcraft_links l JOIN files f ON f.id=l.file_id WHERE f.org_id=$1 AND f.workspace_id=$2 AND l.user_id=$3 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(workspace_id).bind(user_id).bind(reason).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -281,8 +281,8 @@ pub async fn enqueue_file_revocation(
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
     let _ = reason;
-    sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,updated_at=$2 WHERE file_id=$1 AND state='live'").bind(file_id).bind(now).execute(&mut *conn).await?;
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$2,$2 FROM figcraft_links l WHERE l.file_id=$1 AND l.revoked_at IS NULL ON CONFLICT DO NOTHING")
+    sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,last_snapshot_attempt_at=NULL,updated_at=$2 WHERE file_id=$1 AND state='live'").bind(file_id).bind(now).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$2,$2 FROM figcraft_links l WHERE l.file_id=$1 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(file_id).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -293,7 +293,7 @@ pub async fn enqueue_all_user_revocations(
     reason: &'static str,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT l.file_id,$1,$2,$3,$3 FROM figcraft_links l WHERE l.user_id=$1 AND l.revoked_at IS NULL ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,$1,$2,$3,$3 FROM figcraft_links l WHERE l.user_id=$1 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(user_id).bind(reason).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -330,7 +330,7 @@ pub async fn enqueue_org_revocations(
     reason: &'static str,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,$2,$3,$3 FROM figcraft_links l JOIN figcraft_live_files f ON f.file_id=l.file_id WHERE f.org_id=$1 AND l.revoked_at IS NULL ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,$2,$3,$3 FROM figcraft_links l JOIN figcraft_live_files f ON f.file_id=l.file_id WHERE f.org_id=$1 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(reason).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -343,8 +343,8 @@ pub async fn enqueue_project_revocations(
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
     let _ = reason;
-    sqlx::query("UPDATE figcraft_live_files l SET state='unpublishing',final_snapshot_done=false,updated_at=$3 FROM files f WHERE l.file_id=f.id AND f.org_id=$1 AND f.project_id=$2 AND l.state='live'").bind(org_id).bind(project_id).bind(now).execute(&mut *conn).await?;
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$3,$3 FROM figcraft_links l JOIN files f ON f.id=l.file_id WHERE f.org_id=$1 AND f.project_id=$2 AND l.revoked_at IS NULL ON CONFLICT DO NOTHING")
+    sqlx::query("UPDATE figcraft_live_files l SET state='unpublishing',final_snapshot_done=false,last_snapshot_attempt_at=NULL,updated_at=$3 FROM files f WHERE l.file_id=f.id AND f.org_id=$1 AND f.project_id=$2 AND l.state='live'").bind(org_id).bind(project_id).bind(now).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$3,$3 FROM figcraft_links l JOIN files f ON f.id=l.file_id WHERE f.org_id=$1 AND f.project_id=$2 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(project_id).bind(now).execute(conn).await?;
     Ok(())
 }
@@ -408,6 +408,27 @@ pub async fn finish_revocation(
     Ok(())
 }
 
+/// Deletes revoked capability rows revoked before `cutoff`; keeps the table bounded.
+pub async fn prune_revoked_links(pool: &PgPool, cutoff: OffsetDateTime) -> Result<u64, DbError> {
+    Ok(sqlx::query("DELETE FROM figcraft_links WHERE id IN (SELECT id FROM figcraft_links WHERE revoked_at IS NOT NULL AND revoked_at<$1 LIMIT 500)")
+        .bind(cutoff).execute(pool).await?.rows_affected())
+}
+
+/// Reschedules a claimed item after local contention without counting a failed attempt.
+pub async fn defer_revocation(
+    pool: &PgPool,
+    id: Uuid,
+    now: OffsetDateTime,
+    delay: time::Duration,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE figcraft_outbox SET claimed_at=NULL,available_at=$2 WHERE id=$1")
+        .bind(id)
+        .bind(now + delay)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn retry_revocation(pool: &PgPool, id: Uuid, now: OffsetDateTime) -> Result<(), DbError> {
     sqlx::query("UPDATE figcraft_outbox SET attempts=attempts+1,claimed_at=NULL,available_at=$2 + LEAST(300, (1 << LEAST(attempts,8))) * interval '1 second' WHERE id=$1")
         .bind(id).bind(now).execute(pool).await?;
@@ -420,6 +441,16 @@ pub async fn mark_snapshot_attempt(
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
     sqlx::query("UPDATE figcraft_live_files SET last_snapshot_attempt_at=$2 WHERE file_id=$1 AND state='live'").bind(file_id).bind(now).execute(pool).await?;
+    Ok(())
+}
+
+/// Records a final-snapshot attempt of an unpublishing file so failures back off.
+pub async fn mark_final_snapshot_attempt(
+    pool: &PgPool,
+    file_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE figcraft_live_files SET last_snapshot_attempt_at=$2 WHERE file_id=$1 AND state='unpublishing'").bind(file_id).bind(now).execute(pool).await?;
     Ok(())
 }
 
@@ -442,9 +473,9 @@ impl OrgTx {
     ) -> Result<bool, DbError> {
         use craftcloud_core::policy::Action;
         self.check(scope, Action::FileLockForce)?;
-        let changed=sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,updated_at=$3 WHERE org_id=$1 AND file_id=$2 AND state='live'").bind(self.org_id).bind(file_id).bind(now).execute(&mut *self.tx).await?.rows_affected()==1;
+        let changed=sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,last_snapshot_attempt_at=NULL,updated_at=$3 WHERE org_id=$1 AND file_id=$2 AND state='live'").bind(self.org_id).bind(file_id).bind(now).execute(&mut *self.tx).await?.rows_affected()==1;
         if changed {
-            sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$2,$2 FROM figcraft_links l WHERE l.file_id=$1 AND l.revoked_at IS NULL ON CONFLICT DO NOTHING").bind(file_id).bind(now).execute(&mut *self.tx).await?;
+            sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) SELECT DISTINCT l.file_id,l.user_id,'unpublish',$2,$2 FROM figcraft_links l WHERE l.file_id=$1 AND l.revoked_at IS NULL ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)").bind(file_id).bind(now).execute(&mut *self.tx).await?;
         }
         Ok(changed)
     }
@@ -515,21 +546,44 @@ impl OrgTx {
     }
 
     /// Builds an internal FigCraft scope only from the freshly locked live-file row.
+    ///
+    /// Lock order: the publisher's users row (`FOR NO KEY UPDATE`) before the
+    /// live-file row. Account disabling locks the users row first and then
+    /// takes a key-share lock on the live-file row through the outbox foreign
+    /// key, and `upload_create` locks the same users row; taking the live row
+    /// first would close a cycle with either of them.
     pub async fn figcraft_service_scope(
         &mut self,
         file_id: Uuid,
         action: craftcloud_core::policy::Action,
     ) -> Result<Option<OrgScope>, DbError> {
         use craftcloud_core::policy::{FigcraftFileState, FigcraftService, Resource, can};
-        let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT org_id,workspace_id,state FROM figcraft_live_files WHERE file_id=$1 FOR UPDATE",
+        let publisher: Option<Uuid> = sqlx::query_scalar(
+            "SELECT published_by_user_id FROM figcraft_live_files WHERE file_id=$1",
         )
         .bind(file_id)
         .fetch_optional(&mut *self.tx)
         .await?;
-        let Some((org_id, workspace_id, state)) = row else {
+        let Some(publisher) = publisher else {
             return Ok(None);
         };
+        sqlx::query("SELECT 1 FROM users WHERE id=$1 FOR NO KEY UPDATE")
+            .bind(publisher)
+            .execute(&mut *self.tx)
+            .await?;
+        let row: Option<(Uuid, Uuid, String, Uuid)> = sqlx::query_as(
+            "SELECT org_id,workspace_id,state,published_by_user_id FROM figcraft_live_files WHERE file_id=$1 FOR UPDATE",
+        )
+        .bind(file_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let Some((org_id, workspace_id, state, locked_publisher)) = row else {
+            return Ok(None);
+        };
+        // A republish by someone else between the two reads: retry next pass.
+        if locked_publisher != publisher {
+            return Ok(None);
+        }
         if org_id != self.org_id {
             return Ok(None);
         }

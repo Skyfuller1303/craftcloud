@@ -492,6 +492,31 @@ pub(crate) async fn status(
     Json(json!({"state":state_text,"access":if access==Access::Edit{"edit"}else{"view"},"can_snapshot":access==Access::Edit&&state_text=="active","can_stop":can_stop,"last_snapshot_at":last_at,"participants":Value::Null})).into_response()
 }
 
+/// Authorizes and rate limits a live operation before it may take a global job
+/// permit, so callers without read access or over budget cannot occupy capacity.
+/// The operation itself repeats the stricter checks.
+pub(crate) async fn preauthorize(
+    state: &ApiState,
+    headers: &HeaderMap,
+    session: &AuthenticatedSession,
+    raw: &str,
+    name: &str,
+) -> Result<(), Box<Response>> {
+    let resolved = resolve_file(state, headers, raw).await?;
+    read_gate(
+        &resolved,
+        session,
+        headers,
+        Action::FileRead,
+        name,
+        resolved.id,
+    )
+    .await?;
+    resolved
+        .services
+        .rate_limit_figcraft(session.user_id, headers)
+}
+
 pub(crate) async fn open(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -2071,6 +2096,108 @@ pub async fn figcraft_worker_tick(services: Arc<Services>, state: &mut FigcraftW
         state.reconcile_active = false;
         state.reconcile_next = tokio::time::Instant::now() + Duration::from_secs(5 * 60);
     }
+    if let Err(e) = db::prune_revoked_links(
+        &services.pool,
+        services.clock.now() - time::Duration::hours(24),
+    )
+    .await
+    {
+        tracing::warn!(%e,"FigCraft revoked link pruning failed");
+    }
+    process_revocations(&services).await;
+    let snapshot_files:Vec<Uuid>=match sqlx::query_scalar("SELECT file_id FROM figcraft_live_files WHERE state='live' AND ((last_snapshot_at IS NOT NULL AND last_snapshot_at<=$1-interval '15 minutes') OR (last_snapshot_at IS NULL AND updated_at<=$1-interval '15 minutes')) AND (last_snapshot_attempt_at IS NULL OR last_snapshot_attempt_at<=$1-interval '1 minute') ORDER BY last_snapshot_at NULLS FIRST LIMIT 16")
+            .bind(services.clock.now()).fetch_all(&services.pool).await{Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft automatic snapshot lookup failed");Vec::new()}};
+    for file_id in snapshot_files {
+        if let Err(e) =
+            db::mark_snapshot_attempt(&services.pool, file_id, services.clock.now()).await
+        {
+            tracing::warn!(%e,"FigCraft automatic snapshot attempt update failed");
+            continue;
+        }
+        if let Err(response) = service_snapshot(Arc::clone(&services), file_id, false).await {
+            tracing::warn!(status=%response.status(),"FigCraft automatic snapshot failed");
+        }
+        // Revocations queued while the export ran must not wait for the next item or tick.
+        process_revocations(&services).await;
+    }
+    let pending:Vec<(Uuid,Option<String>,Option<time::OffsetDateTime>)>=match sqlx::query_as("SELECT file_id,figcraft_file_id,last_snapshot_attempt_at FROM figcraft_live_files WHERE state='unpublishing' ORDER BY last_snapshot_attempt_at NULLS FIRST,updated_at LIMIT 32").fetch_all(&services.pool).await{Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft stop recovery lookup failed");return}};
+    for (file_id, remote, last_attempt) in pending {
+        process_revocations(&services).await;
+        let _file_guard = match FileGuard::acquire(&services.pool, file_id).await {
+            Ok(v) => v,
+            Err(()) => continue,
+        };
+        let active: bool = match sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM figcraft_links WHERE file_id=$1 AND revoked_at IS NULL)",
+        )
+        .bind(file_id)
+        .fetch_one(&services.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e,"FigCraft stop recovery link lookup failed");
+                continue;
+            }
+        };
+        if active {
+            continue;
+        }
+        let final_done:bool=match sqlx::query_scalar("SELECT final_snapshot_done FROM figcraft_live_files WHERE file_id=$1 AND state='unpublishing'").bind(file_id).fetch_optional(&services.pool).await{Ok(Some(v))=>v,Ok(None)=>continue,Err(e)=>{tracing::warn!(%e,"FigCraft final snapshot state lookup failed");continue}};
+        if !final_done {
+            drop(_file_guard);
+            // A permanent failure (for example QUOTA_EXCEEDED) must not re-export on every tick.
+            let now = services.clock.now();
+            if last_attempt
+                .is_some_and(|at| at > now - time::Duration::seconds(FINAL_SNAPSHOT_RETRY_SECS))
+            {
+                continue;
+            }
+            if let Err(e) = db::mark_final_snapshot_attempt(&services.pool, file_id, now).await {
+                tracing::warn!(%e,"FigCraft final snapshot attempt update failed");
+                continue;
+            }
+            if let Err(response) = service_snapshot(Arc::clone(&services), file_id, true).await {
+                tracing::warn!(status=%response.status(),"FigCraft final snapshot recovery failed");
+            }
+            continue;
+        }
+        let Some(remote) = remote else {
+            let _ = db::finish_unpublish_audited(
+                &services.pool,
+                file_id,
+                services.clock.now(),
+                &craftcloud_db::audit::AuditCtx::system(),
+            )
+            .await;
+            continue;
+        };
+        let Some(backend) = services.figcraft.as_ref().map(Arc::clone) else {
+            continue;
+        };
+        if matches!(
+            services.run_figcraft(move || backend.remove(&remote)).await,
+            Some(Ok(()))
+        ) {
+            let _ = db::finish_unpublish_audited(
+                &services.pool,
+                file_id,
+                services.clock.now(),
+                &craftcloud_db::audit::AuditCtx::system(),
+            )
+            .await;
+        }
+    }
+}
+
+/// Delay before a revocation is retried after the per-file guard was busy.
+const GUARD_BUSY_RETRY_SECS: i64 = 2;
+/// Pause between final-snapshot attempts of one unpublishing file.
+const FINAL_SNAPSHOT_RETRY_SECS: i64 = 60;
+
+/// Claims and executes due link invalidations. Called ahead of and between the
+/// slow snapshot and stop items so revocations never wait behind an export.
+async fn process_revocations(services: &Arc<Services>) {
     let rows = match db::claim_revocations(&services.pool, 32, services.clock.now()).await {
         Ok(v) => v,
         Err(e) => {
@@ -2082,7 +2209,14 @@ pub async fn figcraft_worker_tick(services: Arc<Services>, state: &mut FigcraftW
         let _file_guard = match FileGuard::acquire(&services.pool, row.file_id).await {
             Ok(v) => v,
             Err(()) => {
-                let _ = db::retry_revocation(&services.pool, row.id, services.clock.now()).await;
+                // Local contention is not a remote failure: retry shortly and keep the attempt count.
+                let _ = db::defer_revocation(
+                    &services.pool,
+                    row.id,
+                    services.clock.now(),
+                    time::Duration::seconds(GUARD_BUSY_RETRY_SECS),
+                )
+                .await;
                 continue;
             }
         };
@@ -2129,75 +2263,6 @@ pub async fn figcraft_worker_tick(services: Arc<Services>, state: &mut FigcraftW
             let _ = db::retry_revocation(&services.pool, row.id, services.clock.now()).await;
         } else {
             let _ = db::finish_revocation(&services.pool, row.id, services.clock.now()).await;
-        }
-    }
-    let snapshot_files:Vec<Uuid>=match sqlx::query_scalar("SELECT file_id FROM figcraft_live_files WHERE state='live' AND ((last_snapshot_at IS NOT NULL AND last_snapshot_at<=$1-interval '15 minutes') OR (last_snapshot_at IS NULL AND updated_at<=$1-interval '15 minutes')) AND (last_snapshot_attempt_at IS NULL OR last_snapshot_attempt_at<=$1-interval '1 minute') ORDER BY last_snapshot_at NULLS FIRST LIMIT 16")
-            .bind(services.clock.now()).fetch_all(&services.pool).await{Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft automatic snapshot lookup failed");Vec::new()}};
-    for file_id in snapshot_files {
-        if let Err(e) =
-            db::mark_snapshot_attempt(&services.pool, file_id, services.clock.now()).await
-        {
-            tracing::warn!(%e,"FigCraft automatic snapshot attempt update failed");
-            continue;
-        }
-        if let Err(response) = service_snapshot(Arc::clone(&services), file_id, false).await {
-            tracing::warn!(status=%response.status(),"FigCraft automatic snapshot failed");
-        }
-    }
-    let pending:Vec<(Uuid,Option<String>)>=match sqlx::query_as("SELECT file_id,figcraft_file_id FROM figcraft_live_files WHERE state='unpublishing' ORDER BY updated_at LIMIT 32").fetch_all(&services.pool).await{Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft stop recovery lookup failed");return}};
-    for (file_id, remote) in pending {
-        let _file_guard = match FileGuard::acquire(&services.pool, file_id).await {
-            Ok(v) => v,
-            Err(()) => continue,
-        };
-        let active: bool = match sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM figcraft_links WHERE file_id=$1 AND revoked_at IS NULL)",
-        )
-        .bind(file_id)
-        .fetch_one(&services.pool)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e,"FigCraft stop recovery link lookup failed");
-                continue;
-            }
-        };
-        if active {
-            continue;
-        }
-        let final_done:bool=match sqlx::query_scalar("SELECT final_snapshot_done FROM figcraft_live_files WHERE file_id=$1 AND state='unpublishing'").bind(file_id).fetch_optional(&services.pool).await{Ok(Some(v))=>v,Ok(None)=>continue,Err(e)=>{tracing::warn!(%e,"FigCraft final snapshot state lookup failed");continue}};
-        if !final_done {
-            drop(_file_guard);
-            if let Err(response) = service_snapshot(Arc::clone(&services), file_id, true).await {
-                tracing::warn!(status=%response.status(),"FigCraft final snapshot recovery failed");
-            }
-            continue;
-        }
-        let Some(remote) = remote else {
-            let _ = db::finish_unpublish_audited(
-                &services.pool,
-                file_id,
-                services.clock.now(),
-                &craftcloud_db::audit::AuditCtx::system(),
-            )
-            .await;
-            continue;
-        };
-        let Some(backend) = services.figcraft.as_ref().map(Arc::clone) else {
-            continue;
-        };
-        if matches!(
-            services.run_figcraft(move || backend.remove(&remote)).await,
-            Some(Ok(()))
-        ) {
-            let _ = db::finish_unpublish_audited(
-                &services.pool,
-                file_id,
-                services.clock.now(),
-                &craftcloud_db::audit::AuditCtx::system(),
-            )
-            .await;
         }
     }
 }

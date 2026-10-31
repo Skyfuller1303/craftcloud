@@ -109,6 +109,14 @@ async fn create_inner(
         .bind(new.user_id)
         .execute(&mut *tx)
         .await?;
+    // The user row is locked above, so the outbox FK locks follow the documented order.
+    crate::figcraft::enqueue_all_user_revocations(
+        &mut tx,
+        new.user_id,
+        "security_changed",
+        new.now,
+    )
+    .await?;
     sqlx::query(
         "UPDATE password_reset_tokens SET used_at = $2 WHERE user_id = $1 AND used_at IS NULL",
     )
@@ -340,6 +348,8 @@ async fn consume_inner(
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
         .bind(user_id)
         .execute(&mut *tx)
+        .await?;
+    crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
         .await?;
     sqlx::query("UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL")
         .bind(user_id)

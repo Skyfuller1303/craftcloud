@@ -10,7 +10,7 @@ mod tests {
         str::FromStr,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -41,6 +41,8 @@ mod tests {
         exports: AtomicUsize,
         export_bytes: Mutex<Vec<u8>>,
         revoked: Mutex<Vec<String>>,
+        fail_export: AtomicBool,
+        on_export: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl FakeFigcraft {
@@ -82,6 +84,12 @@ mod tests {
 
         fn export(&self, _file: &str, original: &[u8]) -> Result<Export, Error> {
             self.exports.fetch_add(1, Ordering::SeqCst);
+            if let Some(hook) = self.on_export.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.fail_export.load(Ordering::SeqCst) {
+                return Err(Error::RemoteUnavailable);
+            }
             let bytes = self.export_bytes.lock().unwrap();
             Ok(Export {
                 bytes: if bytes.is_empty() {
@@ -433,6 +441,18 @@ mod tests {
         )
         .await;
         assert_eq!(promoted.status, StatusCode::OK, "{}", promoted.text);
+        let upgrade_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM figcraft_outbox WHERE file_id=$1 AND user_id=$2 AND reason='role_changed'",
+        )
+        .bind(fixture.file)
+        .bind(user)
+        .fetch_one(&fixture.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            upgrade_rows, 0,
+            "a role upgrade must not revoke capabilities"
+        );
         open_live(&fixture, &session).await;
         sqlx::query(
             "DELETE FROM figcraft_outbox WHERE file_id=$1 AND user_id=$2 AND reason='role_changed'",
@@ -542,6 +562,432 @@ mod tests {
         .await;
         assert_eq!(two_factor.status, StatusCode::OK, "{}", two_factor.text);
         assert_outbox(&fixture.env, fixture.file, user, "security_changed").await;
+
+        // Switching the requirement off tightens nothing.
+        sqlx::query("DELETE FROM figcraft_outbox")
+            .execute(&fixture.env.pool)
+            .await
+            .unwrap();
+        let organization = call(
+            &fixture.env.app,
+            Req::new("GET", &format!("/api/v1/organizations/{org}")).session(&fixture.owner),
+        )
+        .await;
+        assert_eq!(organization.status, StatusCode::OK, "{}", organization.text);
+        let relaxed = call(
+            &fixture.env.app,
+            Req::new("PATCH", &format!("/api/v1/organizations/{org}"))
+                .session(&fixture.owner)
+                .if_match(&organization.etag())
+                .json(json!({"require_two_factor":false})),
+        )
+        .await;
+        assert_eq!(relaxed.status, StatusCode::OK, "{}", relaxed.text);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM figcraft_outbox")
+            .fetch_one(&fixture.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "switching the 2FA requirement off must not revoke");
+    }
+
+    /// Counts (and clears) the security outbox rows of one capability holder.
+    async fn take_security_rows(env: &TestEnv, file: Uuid, user: Uuid) -> i64 {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM figcraft_outbox WHERE file_id=$1 AND user_id=$2 AND reason='security_changed'",
+        )
+        .bind(file)
+        .bind(user)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM figcraft_outbox")
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        count
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn account_security_events_enqueue_figcraft_revocations() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let env = &fixture.env;
+        let user = env.operator_id;
+        let now = env.clock.now();
+        let current_hash: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1")
+                .bind(user)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        let session: Uuid = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE user_id=$1 AND revoked_at IS NULL LIMIT 1",
+        )
+        .bind(user)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        let changed = craftcloud_db::accounts::change_password(
+            &env.pool,
+            user,
+            &current_hash,
+            "replacement-hash",
+            session,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(changed.is_some());
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            1,
+            "password change"
+        );
+
+        craftcloud_db::sessions::revoke_all_for_user(&env.pool, user, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            1,
+            "logout all"
+        );
+        craftcloud_db::sessions::revoke_all_for_user_audited(
+            &env.pool,
+            user,
+            now,
+            &craftcloud_db::audit::AuditCtx::system(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            1,
+            "audited logout all"
+        );
+
+        sqlx::query("INSERT INTO user_two_factor(user_id,secret_ciphertext,enabled_at,last_accepted_step,created_at) VALUES($1,$2,$3,NULL,$3) ON CONFLICT (user_id) DO NOTHING")
+            .bind(user)
+            .bind(&[0x42_u8; 32][..])
+            .bind(now)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let token_hash = [7_u8; 32];
+        let issued = craftcloud_db::password_reset::create(
+            &env.pool,
+            &craftcloud_db::password_reset::NewResetToken {
+                user_id: user,
+                token_hash,
+                created_by: None,
+                reset_two_factor: true,
+                now,
+                expires_at: now + time::Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            issued,
+            craftcloud_db::password_reset::IssueOutcome::Issued { .. }
+        ));
+        let two_factor_left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM user_two_factor WHERE user_id=$1")
+                .bind(user)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert_eq!(two_factor_left, 0);
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            1,
+            "reset issue"
+        );
+
+        let consumed =
+            craftcloud_db::password_reset::consume(&env.pool, &token_hash, "reset-hash", now)
+                .await
+                .unwrap();
+        assert_eq!(consumed, Some(user));
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            1,
+            "reset use"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn busy_file_guard_defers_revocation_without_counting_an_attempt() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let env = &fixture.env;
+        let user = env.operator_id;
+        let now = env.clock.now();
+        let mut conn = env.pool.acquire().await.unwrap();
+        let locked: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1,0))")
+                .bind(fixture.file.to_string())
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert!(locked);
+        craftcloud_db::figcraft::enqueue_file_user_revocations_pool(
+            &env.pool,
+            fixture.file,
+            user,
+            "security_changed",
+            now,
+        )
+        .await
+        .unwrap();
+        let mut state = craftcloud_api::FigcraftWorkerState::default();
+        worker_tick(env, &mut state).await;
+        let row: (i32, Option<OffsetDateTime>, OffsetDateTime) = sqlx::query_as(
+            "SELECT attempts,claimed_at,available_at FROM figcraft_outbox WHERE file_id=$1 AND user_id=$2",
+        )
+        .bind(fixture.file)
+        .bind(user)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 0, "local contention is not a failed attempt");
+        assert_eq!(row.1, None);
+        assert!(row.2 > now && row.2 <= now + time::Duration::seconds(3));
+        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1,0))")
+            .bind(fixture.file.to_string())
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        env.clock.advance(Duration::from_secs(3));
+        worker_tick(env, &mut state).await;
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            0,
+            "the deferred revocation completes once the guard is free"
+        );
+        assert!(!fixture.backend.revoked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn enqueue_keeps_attempts_and_pulls_an_existing_item_forward() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let env = &fixture.env;
+        let user = env.operator_id;
+        let now = env.clock.now();
+        craftcloud_db::figcraft::enqueue_file_user_revocations_pool(
+            &env.pool,
+            fixture.file,
+            user,
+            "security_changed",
+            now + time::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE figcraft_outbox SET attempts=3 WHERE file_id=$1")
+            .bind(fixture.file)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        craftcloud_db::figcraft::enqueue_file_user_revocations_pool(
+            &env.pool,
+            fixture.file,
+            user,
+            "security_changed",
+            now,
+        )
+        .await
+        .unwrap();
+        let row: (i32, OffsetDateTime) = sqlx::query_as(
+            "SELECT attempts,available_at FROM figcraft_outbox WHERE file_id=$1 AND user_id=$2",
+        )
+        .bind(fixture.file)
+        .bind(user)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 3);
+        assert!(row.1 <= now + time::Duration::milliseconds(1));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn failing_final_snapshot_backs_off_instead_of_exporting_every_tick() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let env = &fixture.env;
+        sqlx::query("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=$1")
+            .bind(fixture.file)
+            .bind(env.clock.now())
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE figcraft_live_files SET state='unpublishing',final_snapshot_done=false,last_snapshot_attempt_at=NULL WHERE file_id=$1")
+            .bind(fixture.file)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        fixture.backend.fail_export.store(true, Ordering::SeqCst);
+        let mut state = craftcloud_api::FigcraftWorkerState::default();
+        worker_tick(env, &mut state).await;
+        assert_eq!(fixture.backend.exports.load(Ordering::SeqCst), 1);
+        for _ in 0..5 {
+            env.clock.advance(Duration::from_secs(1));
+            worker_tick(env, &mut state).await;
+        }
+        assert_eq!(
+            fixture.backend.exports.load(Ordering::SeqCst),
+            1,
+            "a failed final snapshot waits before the next attempt"
+        );
+        env.clock.advance(Duration::from_secs(61));
+        worker_tick(env, &mut state).await;
+        assert_eq!(fixture.backend.exports.load(Ordering::SeqCst), 2);
+        fixture.backend.fail_export.store(false, Ordering::SeqCst);
+        env.clock.advance(Duration::from_secs(61));
+        worker_tick(env, &mut state).await;
+        env.clock.advance(Duration::from_secs(1));
+        worker_tick(env, &mut state).await;
+        let finished: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM figcraft_live_files WHERE file_id=$1 AND state='republish'",
+        )
+        .bind(fixture.file)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            finished, 1,
+            "recovery completes once the export works again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn revocation_queued_during_an_export_is_processed_in_the_same_pass() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let env = &fixture.env;
+        let (file, user, pool) = (fixture.file, env.operator_id, env.pool.clone());
+        let handle = tokio::runtime::Handle::current();
+        let now = env.clock.now();
+        *fixture.backend.on_export.lock().unwrap() = Some(Box::new(move || {
+            let pool = pool.clone();
+            handle.block_on(async move {
+                craftcloud_db::figcraft::enqueue_file_user_revocations_pool(
+                    &pool,
+                    file,
+                    user,
+                    "security_changed",
+                    now,
+                )
+                .await
+                .unwrap();
+            });
+        }));
+        env.clock.advance(Duration::from_secs(16 * 60));
+        let mut state = craftcloud_api::FigcraftWorkerState::default();
+        worker_tick(env, &mut state).await;
+        assert_eq!(fixture.backend.exports.load(Ordering::SeqCst), 1);
+        assert!(
+            !fixture.backend.revoked.lock().unwrap().is_empty(),
+            "revocation must not wait behind the snapshot item"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn live_operations_are_authorized_and_rate_limited_before_a_job_permit() {
+        let fixture = fixture().await;
+        fixture.env.user("figcraft-outsider").await;
+        let outsider = fixture.env.login_ok("figcraft-outsider").await;
+        let permits = fixture.env.services.figcraft_job_permits_for_tests();
+        let held = permits.clone().acquire_many_owned(4).await.unwrap();
+        let denied = call(
+            &fixture.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/live", fixture.file)).session(&outsider),
+        )
+        .await;
+        assert!(
+            matches!(denied.status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN),
+            "an unauthorized caller is refused before capacity is checked: {} {}",
+            denied.status,
+            denied.text
+        );
+        let busy = call(
+            &fixture.env.app,
+            Req::new("POST", &format!("/api/v1/files/{}/live", fixture.file))
+                .session(&fixture.owner),
+        )
+        .await;
+        assert_eq!(
+            busy.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            busy.text
+        );
+        assert_eq!(busy.code(), "FIGCRAFT_BUSY");
+        drop(held);
+        // Unauthorized attempts never count against any budget.
+        for _ in 0..30 {
+            let denied = call(
+                &fixture.env.app,
+                Req::new("POST", &format!("/api/v1/files/{}/live", fixture.file))
+                    .session(&outsider),
+            )
+            .await;
+            assert_ne!(denied.status, StatusCode::TOO_MANY_REQUESTS);
+        }
+        // The owner already used one operation above; a new window starts clean.
+        fixture.env.clock.advance(Duration::from_secs(61));
+        let mut limited = None;
+        for attempt in 1..=25 {
+            let response = call(
+                &fixture.env.app,
+                Req::new("POST", &format!("/api/v1/files/{}/live", fixture.file))
+                    .session(&fixture.owner),
+            )
+            .await;
+            if response.status == StatusCode::TOO_MANY_REQUESTS {
+                limited = Some(attempt);
+                break;
+            }
+            assert_eq!(response.status, StatusCode::OK, "{}", response.text);
+        }
+        assert_eq!(limited, Some(21), "20 operations per window, then 429");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn revoked_link_rows_are_pruned_after_a_day() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let env = &fixture.env;
+        sqlx::query("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=$1")
+            .bind(fixture.file)
+            .bind(env.clock.now())
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let mut state = craftcloud_api::FigcraftWorkerState::default();
+        worker_tick(env, &mut state).await;
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM figcraft_links WHERE file_id=$1")
+            .bind(fixture.file)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert!(kept > 0, "recently revoked rows stay for diagnosis");
+        env.clock.advance(Duration::from_secs(25 * 3600));
+        worker_tick(env, &mut state).await;
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM figcraft_links WHERE file_id=$1")
+            .bind(fixture.file)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     async fn assert_outbox(env: &TestEnv, file: Uuid, user: Uuid, reason: &str) {

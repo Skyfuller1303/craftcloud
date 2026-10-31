@@ -45,6 +45,8 @@ services:
   server:
     environment:
       CRAFTCLOUD_FIGCRAFT_URL: ws://figcraft:47900/
+      # Plain ws stays on the private `figcraft` network; see deployment.md.
+      CRAFTCLOUD_FIGCRAFT_ALLOW_INSECURE_INTERNAL: "true"
       CRAFTCLOUD_FIGCRAFT_PUBLIC_URL: ${CRAFTCLOUD_FIGCRAFT_PUBLIC_URL:-wss://${CRAFTCLOUD_DOMAIN}/figcraft/}
       CRAFTCLOUD_FIGCRAFT_KEY_FILE: /run/figcraft-secrets/server.key
     volumes:

@@ -41,6 +41,8 @@ CREATE TABLE figcraft_links (
 CREATE UNIQUE INDEX figcraft_links_one_active_idx
     ON figcraft_links(file_id, user_id, access) WHERE revoked_at IS NULL;
 
+CREATE INDEX figcraft_links_revoked_idx ON figcraft_links(revoked_at) WHERE revoked_at IS NOT NULL;
+
 CREATE TABLE figcraft_outbox (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     file_id uuid NOT NULL REFERENCES figcraft_live_files(file_id) ON DELETE RESTRICT,

@@ -43,7 +43,8 @@ Nach Migration `0018_figcraft_live.sql` aktiviert CraftCloud die Funktion nur, w
 
 | Variable | Bedeutung |
 |---|---|
-| `CRAFTCLOUD_FIGCRAFT_URL` | Interner Verwaltungsendpunkt, in Compose `ws://figcraft:47900/`; `ws` ist nur im vertrauenswürdigen internen Netz vorgesehen. |
+| `CRAFTCLOUD_FIGCRAFT_URL` | Interner Verwaltungsendpunkt, in Compose `ws://figcraft:47900/`; `ws` ist nur im vertrauenswürdigen internen Netz vorgesehen und wird außerhalb von Loopback nur mit `CRAFTCLOUD_FIGCRAFT_ALLOW_INSECURE_INTERNAL=true` akzeptiert. |
+| `CRAFTCLOUD_FIGCRAFT_ALLOW_INSECURE_INTERNAL` | Optional, Standard `false`. Erlaubt `ws://` für `CRAFTCLOUD_FIGCRAFT_URL` auf einem Nicht-Loopback-Host. Compose setzt `true`, weil Server und FigCraft nur über das private Netz `figcraft` sprechen; ohne private Netzstrecke stattdessen `wss://` verwenden. Die öffentliche URL ist davon unberührt. |
 | `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` | Öffentlich erreichbarer Endpunkt in persönlichen Links, normalerweise `wss://<Cloud-Domain>/figcraft/`. Unverschlüsseltes `ws` wird nur für Loopback akzeptiert. |
 | `CRAFTCLOUD_FIGCRAFT_KEY_FILE` | Absolute geschützte Datei mit dem FigCraft-Verwaltungsschlüssel; nicht der AC-02-Verschlüsselungsschlüssel. |
 | `CRAFTCLOUD_FIGCRAFT_SECRET_FILE` | Nur Compose: Hostdatei mit 64 zufälligen Hex-Zeichen, aus der `figcraft-init` den Verwaltungsschlüssel bereitstellt. |

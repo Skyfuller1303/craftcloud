@@ -66,7 +66,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 37] = [
+const SUPPORTED_KEYS: [&str; 38] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -104,6 +104,7 @@ const SUPPORTED_KEYS: [&str; 37] = [
     "FIGCRAFT_URL",
     "FIGCRAFT_PUBLIC_URL",
     "FIGCRAFT_KEY_FILE",
+    "FIGCRAFT_ALLOW_INSECURE_INTERNAL",
 ];
 
 /// Optional FigCraft companion service. Secrets are loaded only at startup.
@@ -672,11 +673,24 @@ fn parse_figcraft(
             ));
         }
     }
+    // Plain ws to a non-loopback host is only for a private container network
+    // and needs this explicit opt-in (the compose companion sets it).
+    let allow_insecure_internal = field(
+        errors,
+        env,
+        "FIGCRAFT_ALLOW_INSECURE_INTERNAL",
+        |key, raw| match raw.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ConfigError::new(key, "must be `true` or `false`")),
+        },
+    )
+    .unwrap_or(false);
     let internal_url = field(errors, env, "FIGCRAFT_URL", |key, value| {
-        parse_figcraft_url(key, value, false)
+        parse_figcraft_url(key, value, false, allow_insecure_internal)
     });
     let public_url = field(errors, env, "FIGCRAFT_PUBLIC_URL", |key, value| {
-        parse_figcraft_url(key, value, true)
+        parse_figcraft_url(key, value, true, false)
     });
     let key_file = field(errors, env, "FIGCRAFT_KEY_FILE", parse_absolute_path);
     Some(FigcraftSettings {
@@ -686,11 +700,16 @@ fn parse_figcraft(
     })
 }
 
-fn parse_figcraft_url(key: &str, raw: &str, public: bool) -> Result<String, ConfigError> {
+fn parse_figcraft_url(
+    key: &str,
+    raw: &str,
+    public: bool,
+    allow_insecure_internal: bool,
+) -> Result<String, ConfigError> {
     let invalid = || {
         ConfigError::new(
             key,
-            "must be an absolute ws/wss URL without credentials, query, fragment or whitespace; public ws is allowed only on loopback (value not shown)",
+            "must be an absolute ws/wss URL without credentials, query, fragment or whitespace; ws is allowed only on loopback, or for the internal URL with CRAFTCLOUD_FIGCRAFT_ALLOW_INSECURE_INTERNAL=true (value not shown)",
         )
     };
     if raw.len() > 2048 || raw.chars().any(char::is_whitespace) {
@@ -703,7 +722,9 @@ fn parse_figcraft_url(key: &str, raw: &str, public: bool) -> Result<String, Conf
         || url.query().is_some()
         || url.fragment().is_some()
         || !matches!(url.scheme(), "ws" | "wss")
-        || (public && url.scheme() == "ws" && !is_loopback_host(&host))
+        || (url.scheme() == "ws"
+            && !is_loopback_host(&host)
+            && (public || !allow_insecure_internal))
     {
         return Err(invalid());
     }
@@ -1562,6 +1583,7 @@ mod tests {
         let path = path.to_string_lossy();
         let configured = env(&[
             ("CRAFTCLOUD_FIGCRAFT_URL", "ws://figcraft:47900/"),
+            ("CRAFTCLOUD_FIGCRAFT_ALLOW_INSECURE_INTERNAL", "true"),
             (
                 "CRAFTCLOUD_FIGCRAFT_PUBLIC_URL",
                 "wss://cloud.example/figcraft/",
@@ -1601,9 +1623,19 @@ mod tests {
             "ws://localhost:47900/",
             "ws://[::1]:47900/",
         ] {
-            assert!(parse_figcraft_url("FIGCRAFT_PUBLIC_URL", valid, true).is_ok());
+            assert!(parse_figcraft_url("FIGCRAFT_PUBLIC_URL", valid, true, false).is_ok());
         }
-        assert!(parse_figcraft_url("FIGCRAFT_URL", "ws://figcraft:47900/", false).is_ok());
+        assert!(parse_figcraft_url("FIGCRAFT_URL", "ws://figcraft:47900/", false, true).is_ok());
+        assert!(parse_figcraft_url("FIGCRAFT_URL", "ws://127.0.0.1:47900/", false, false).is_ok());
+        assert!(
+            parse_figcraft_url("FIGCRAFT_URL", "wss://figcraft.internal/", false, false).is_ok()
+        );
+        // Without the explicit opt-in a non-loopback ws URL is refused, and the
+        // opt-in never relaxes the public URL.
+        assert!(parse_figcraft_url("FIGCRAFT_URL", "ws://figcraft:47900/", false, false).is_err());
+        assert!(
+            parse_figcraft_url("FIGCRAFT_PUBLIC_URL", "ws://cloud.example/", true, true).is_err()
+        );
         for bad in [
             "ws://cloud.example/",
             "https://cloud.example/",
@@ -1612,7 +1644,7 @@ mod tests {
             "wss://cloud.example/#private",
             "wss://cloud.example/with space",
         ] {
-            let error = parse_figcraft_url("FIGCRAFT_PUBLIC_URL", bad, true).unwrap_err();
+            let error = parse_figcraft_url("FIGCRAFT_PUBLIC_URL", bad, true, false).unwrap_err();
             assert!(!error.message.contains("private"));
             assert!(!error.message.contains(bad));
         }

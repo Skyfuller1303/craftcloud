@@ -322,6 +322,9 @@ async fn change_password_inner(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    // The UPDATE above holds the users row lock; FigCraft capabilities do not survive it.
+    crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
+        .await?;
     let session_alive: Option<Uuid> = if keep_device_session {
         sqlx::query_scalar("SELECT id FROM device_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND access_expires_at>$3 AND idle_expires_at>$3 AND absolute_expires_at>$3 FOR UPDATE")
             .bind(keep_session).bind(user_id).bind(now).fetch_optional(&mut *tx).await?
