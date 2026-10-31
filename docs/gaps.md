@@ -65,6 +65,7 @@ None of these are implemented by this blueprint. Update this list in the same PR
 
 Offen nach AC-07 und AC-08 (2026-10-30):
 
+  - Zeitabhängige FigCraft-Worker-Tests (`projects_files::figcraft_stop_orders_revoke_snapshot_remove_and_recovers_failures`, `figcraft_worker::busy_file_guard_defers_revocation_without_counting_an_attempt`) schlugen am 2026-10-31 unter paralleler Buildlast je einmal fehl und bestanden bei Wiederholung. Stabilisieren (feste Uhr oder Warten auf Zustand statt fester Wartezeit).
   - Die Geräte-Referenz `ds_<hex>` ist zweimal definiert: als SQL-Ausdruck in `craftcloud-db/src/device_sessions.rs` und in Rust (`admin_device_ref` in `craftcloud-api/src/device.rs`). Beide müssen identisch bleiben; der Integrationstest erkennt eine Abweichung.
   - Bei `GET /organizations/{id}/members` kommt ein 422 für eine ungültige `query` erst nach dem 403 für unerlaubte Admin-Filter.
   - Die Personen-Detailansicht der Admin-Konsole lädt Sammlungen weiterhin über höchstens 100 Seiten; ein Endpunkt je Person fehlt. Die Indizes für den Übersichts-Endpunkt (AC-08b) sind nicht gemessen; Kandidaten bei großen Organisationen: `audit_events (org_id, created_at)` und `file_locks (org_id)`.
