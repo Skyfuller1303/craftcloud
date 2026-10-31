@@ -32,4 +32,4 @@ ALTER TABLE figcraft_outbox DROP CONSTRAINT figcraft_outbox_reason_check;
 ALTER TABLE figcraft_outbox ADD CONSTRAINT figcraft_outbox_reason_check
     CHECK (reason IN ('grant_revoked', 'role_changed', 'membership_removed',
         'account_disabled', 'file_deleted', 'security_changed', 'unpublish')
-        OR reason ~ '^app_access_revoked:(legacy|app:[a-z0-9-]{1,32})$');
+        OR reason ~ '^app_access_revoked:(legacy|app:[a-z0-9-]{1,32}|tool:(launcher|cli))$');

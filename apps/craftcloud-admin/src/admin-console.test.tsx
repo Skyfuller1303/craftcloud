@@ -30,19 +30,26 @@ describe.each([["en"], ["de"]] as const)("admin console (%s)", (language) => {
   it("assigns app access with per-person results and shows apps usage accessibly", async () => {
     window.history.replaceState(null, "", `/admin/organizations/${ORG_A.id}/people`);
     const { fetch, calls } = mockFetch(adminRoutes({
-      [`GET /organizations/${ORG_A.id}/members`]: page(MEMBERS.map((person) => ({ ...person, status: "active", apps: person.user_id === BOB ? ["photocraft"] : [] }))),
-      [`PUT /organizations/${ORG_A.id}/members/${BOB}/apps`]: { body: { user_id: BOB, apps: ["photocraft"] } },
-      [`PUT /organizations/${ORG_A.id}/members/${CARA}/apps`]: apiError(403, "FORBIDDEN"),
+      [`GET /organizations/${ORG_A.id}/members`]: page([
+        ...MEMBERS.map((person) => ({ ...person, role: "member", status: "active", apps: person.user_id === BOB ? ["photocraft"] : [] })),
+        { ...member("00000000-0000-4000-8000-0000000000aa", "Dana Admin", "admin"), status: "active", apps: [] },
+      ]),
+      [`PATCH /organizations/${ORG_A.id}/members/${BOB}/apps`]: { body: { user_id: BOB, apps: ["photocraft"] } },
+      [`PATCH /organizations/${ORG_A.id}/members/${CARA}/apps`]: apiError(403, "FORBIDDEN"),
     }));
     const user = userEvent.setup();
     renderApp(fetch, { language });
     await screen.findAllByText("PhotoCraft");
     await user.click(screen.getByLabelText(language === "en" ? "Select Bob Example" : "Bob Example auswählen"));
     await user.click(screen.getByLabelText(language === "en" ? "Select Cara Example" : "Cara Example auswählen"));
+    await user.click(screen.getByLabelText(language === "en" ? "Select Dana Admin" : "Dana Admin auswählen"));
+    expect(within(screen.getByRole("row", { name: /Dana Admin/ })).getByText(language === "en" ? "Always all apps" : "Immer alle Apps")).toBeTruthy();
     await user.selectOptions(screen.getByLabelText(language === "en" ? "App" : "App"), "photocraft");
     await user.click(screen.getByRole("button", { name: language === "en" ? "Assign selected app" : "Ausgewählte App zuweisen" }));
     await screen.findByText(language === "en" ? /Failed/ : /Fehlgeschlagen/);
-    expect(calls.filter((call) => call.method === "PUT" && call.path.endsWith("/apps"))).toHaveLength(2);
+    expect(calls.filter((call) => call.method === "PATCH" && call.path.endsWith("/apps"))).toHaveLength(2);
+    expect(calls.some((call) => call.path.includes("0000000000aa"))).toBe(false);
+    expect(calls.filter((call) => call.method === "PUT" && call.path.endsWith("/apps"))).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: language === "en" ? "Apps" : "Apps" }));
     await screen.findByRole("heading", { level: 2, name: language === "en" ? "Apps usage" : "App-Nutzung" });
     await expectNoAxeViolations();
@@ -59,6 +66,7 @@ describe.each([["en"], ["de"]] as const)("admin console (%s)", (language) => {
     }));
     const laterPerson = { ...member(BOB, "Bob Example", "member"), status: "active", apps: ["photocraft"] };
     const laterCara = { ...member(CARA, "Cara Example", "member"), status: "active", apps: [] };
+    let bobApps = ["photocraft"];
     const releaseSave: { current?: (reply: { body: unknown }) => void } = {};
     const pending = new Promise<{ body: unknown }>((resolve) => { releaseSave.current = resolve; });
     const { fetch, calls } = mockFetch(adminRoutes({
@@ -69,8 +77,12 @@ describe.each([["en"], ["de"]] as const)("admin console (%s)", (language) => {
         { id: "photocraft", name: "PhotoCraft", assigned_members: 1, active_devices: 1, storage_bytes: 1024 },
         { id: "figcraft", name: "FigCraft", assigned_members: 1, active_devices: 1, storage_bytes: 2048 },
       ], seat_usage: { used: 51, limit: null } } },
-      [`PUT /organizations/${ORG_A.id}/members/${BOB}/apps`]: (call) => ({ body: { user_id: BOB, apps: (call.body as { apps: string[] }).apps } }),
-      [`PUT /organizations/${ORG_A.id}/members/${CARA}/apps`]: () => pending,
+      [`PATCH /organizations/${ORG_A.id}/members/${BOB}/apps`]: (call) => {
+        const change = call.body as { add?: string[]; remove?: string[] };
+        bobApps = [...bobApps.filter((app) => !(change.remove ?? []).includes(app)), ...(change.add ?? [])];
+        return { body: { user_id: BOB, apps: bobApps } };
+      },
+      [`PATCH /organizations/${ORG_A.id}/members/${CARA}/apps`]: () => pending,
     }));
     const user = userEvent.setup();
     renderApp(fetch, { language });
@@ -81,25 +93,25 @@ describe.each([["en"], ["de"]] as const)("admin console (%s)", (language) => {
     const appSelect = screen.getByLabelText("App");
     await user.selectOptions(appSelect, "photocraft");
     await user.click(screen.getByRole("button", { name: language === "en" ? "Remove selected app" : "Ausgewählte App entziehen" }));
-    await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(1));
+    await waitFor(() => expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(1));
     await waitFor(() => expect(within(screen.getByRole("row", { name: /Bob Example/ })).getByText(language === "en" ? "None assigned" : "Keine zugewiesen")).toBeTruthy());
     await user.selectOptions(appSelect, "figcraft");
     await user.click(screen.getByRole("button", { name: language === "en" ? "Assign selected app" : "Ausgewählte App zuweisen" }));
-    await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(2));
-    const writes = calls.filter((call) => call.method === "PUT");
-    expect(writes.map((call) => call.body)).toEqual([{ apps: [] }, { apps: ["figcraft"] }]);
+    await waitFor(() => expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(2));
+    const writes = calls.filter((call) => call.method === "PATCH");
+    expect(writes.map((call) => call.body)).toEqual([{ remove: ["photocraft"] }, { add: ["figcraft"] }]);
     await waitFor(() => expect(within(screen.getByRole("row", { name: /Bob Example/ })).getByText("FigCraft")).toBeTruthy());
 
     await user.click(screen.getByLabelText(language === "en" ? "Select Bob Example" : "Bob Example auswählen"));
     await user.click(screen.getByLabelText(language === "en" ? "Select Cara Example" : "Cara Example auswählen"));
     await user.selectOptions(appSelect, "photocraft");
     await user.click(screen.getByRole("button", { name: language === "en" ? "Assign selected app" : "Ausgewählte App zuweisen" }));
-    await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(3));
+    await waitFor(() => expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(3));
     await user.click(screen.getByRole("button", { name: `${ORG_A.name} ${language === "en" ? "Organization" : "Organisation"}` }));
     await user.click(await screen.findByRole("option", { name: "Beta Lab" }));
     releaseSave.current?.({ body: { user_id: CARA, apps: ["photocraft"] } });
-    await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(3));
-    expect(calls.filter((call) => call.method === "PUT").map((call) => call.path)).toEqual([
+    await waitFor(() => expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(3));
+    expect(calls.filter((call) => call.method === "PATCH").map((call) => call.path)).toEqual([
       `/organizations/${ORG_A.id}/members/${BOB}/apps`,
       `/organizations/${ORG_A.id}/members/${BOB}/apps`,
       `/organizations/${ORG_A.id}/members/${CARA}/apps`,

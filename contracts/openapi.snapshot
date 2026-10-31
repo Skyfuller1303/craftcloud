@@ -82,7 +82,8 @@ GET /api/v1/organizations/{org_id}/members auth=cookie|bearer req=- ok=MemberPag
 POST /api/v1/organizations/{org_id}/members auth=cookie+csrf|bearer req=AddMemberRequest ok=Member codes=201,400,401,403,404,409,413,415,422,500,503
 DELETE /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
 PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf|bearer req=ChangeRoleRequest ok=Member codes=200,400,401,403,404,409,413,415,422,500,503
-PUT /api/v1/organizations/{org_id}/members/{user_id}/apps auth=cookie|bearer req=MemberAppAssignmentsRequest ok=MemberAppAssignmentsResponse codes=200,400,401,403,404,422,500,503
+PATCH /api/v1/organizations/{org_id}/members/{user_id}/apps auth=cookie|bearer req=MemberAppChangeRequest ok=MemberAppAssignmentsResponse codes=200,400,401,403,404,409,422,500,503
+PUT /api/v1/organizations/{org_id}/members/{user_id}/apps auth=cookie|bearer req=MemberAppAssignmentsRequest ok=MemberAppAssignmentsResponse codes=200,400,401,403,404,409,422,500,503
 GET /api/v1/organizations/{org_id}/overview auth=cookie|bearer req=- ok=OrganizationOverview codes=200,401,403,404,500,503
 GET /api/v1/organizations/{org_id}/shared-with-me auth=cookie|bearer req=- ok=SharedWithMeResponse codes=200,400,401,404,422,500,503
 GET /api/v1/organizations/{org_id}/usage auth=cookie|bearer req=- ok=UsagePage codes=200,400,401,403,404,422,500,503
@@ -172,6 +173,7 @@ MaintenanceStatus
 Member
 MemberAppAssignmentsRequest
 MemberAppAssignmentsResponse
+MemberAppChangeRequest
 MemberPage
 MyOrganizationPage
 Organization

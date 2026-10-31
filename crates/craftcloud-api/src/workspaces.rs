@@ -113,7 +113,24 @@ pub(crate) async fn read_actor(
             workspace: ws_role.map(|role| WorkspaceMembership { workspace_id, role }),
         },
         app_access,
+        tool_access: None,
     })
+}
+
+/// Restriction of launcher and CLI device sessions in the organization:
+/// `Some(allowed)` for those sessions, `None` for browser and app sessions.
+pub(crate) async fn tool_access(
+    services: &crate::Services,
+    user_id: Uuid,
+    org_id: Uuid,
+    client_kind: &str,
+) -> Result<Option<bool>, DbError> {
+    if !matches!(client_kind, "launcher" | "cli") {
+        return Ok(None);
+    }
+    Ok(Some(
+        craftcloud_db::app_access::tool_allowed(&services.pool, org_id, user_id).await?,
+    ))
 }
 
 /// Opens a locked transaction for a workspace request and loads the actor
@@ -121,6 +138,21 @@ pub(crate) async fn read_actor(
 pub(crate) struct Locked {
     pub(crate) tx: OrgTx,
     pub(crate) actor: AppActor,
+}
+
+impl Locked {
+    /// Applies the launcher/CLI restriction of the session's client kind
+    /// under the same organization lock.
+    pub(crate) async fn restrict_tool_session(
+        &mut self,
+        user_id: Uuid,
+        client_kind: &str,
+    ) -> Result<(), DbError> {
+        if matches!(client_kind, "launcher" | "cli") {
+            self.actor.tool_access = Some(self.tx.tool_allowed(user_id).await?);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn lock(
@@ -191,6 +223,7 @@ pub(crate) async fn lock(
             workspace: ws_role.map(|role| WorkspaceMembership { workspace_id, role }),
         },
         app_access,
+        tool_access: None,
     };
     Ok(Locked { tx, actor })
 }

@@ -215,6 +215,12 @@ pub(crate) async fn acquire(
         Ok(v) => v,
         Err(r) => return *r,
     };
+    if let Err(e) = opened
+        .restrict_tool_session(session.user_id, &session.client_kind)
+        .await
+    {
+        return db_failure(&e, &headers, "device client lookup failed");
+    }
     let resource = match opened
         .tx
         .policy_resource(

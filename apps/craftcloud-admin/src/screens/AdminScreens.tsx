@@ -77,14 +77,12 @@ export function AdminPeopleScreen({ organization, onChanged }: { organization: O
     const next: Record<string, { name: string; result: string }> = {};
     for (const id of selected) {
       const person = members.items.find((item) => item.user_id === id);
-      if (!person || person.role === "guest" || person.status !== "active") continue;
+      // Owners and admins always have every app and guests need none: only plain members carry assignments.
+      if (!person || person.role !== "member" || person.status !== "active") continue;
       if (!scopeIsCurrent()) return;
-      const current = person.apps ?? [];
-      const apps = kind === "assign"
-        ? [...new Set([...current, selectedApp])]
-        : current.filter((app) => app !== selectedApp);
       try {
-        const updated = await api.updateMemberApps(orgId, id, apps);
+        // Add/remove one app instead of replacing the list from possibly stale data.
+        const updated = await api.changeMemberApps(orgId, id, kind === "assign" ? { add: [selectedApp] } : { remove: [selectedApp] });
         if (!scopeIsCurrent()) return;
         members.mutate((items) => items.map((item) => item.user_id === updated.user_id ? { ...item, apps: updated.apps } : item));
         next[id] = { name: person.display_name, result: t("Done") };
@@ -180,7 +178,7 @@ export function AdminPeopleScreen({ organization, onChanged }: { organization: O
               </td>
               <th>{person.display_name}<span className="cell__sub cell__sub--email">{person.email}</span></th>
               <td data-label={t("Role")}>{names.orgRole(person.role)}</td>
-              <td data-label={t("Apps")}>{person.role === "guest" ? t("Not required for guests") : (person.apps ?? []).map((appId) => appData?.apps.find((app) => app.id === appId)?.name ?? appId).join(", ") || t("None assigned")}</td>
+              <td data-label={t("Apps")}>{person.role === "guest" ? t("Not required for guests") : person.role === "owner" || person.role === "admin" ? t("Always all apps") : (person.apps ?? []).map((appId) => appData?.apps.find((app) => app.id === appId)?.name ?? appId).join(", ") || t("None assigned")}</td>
               <td data-label={t("Status")}>{person.status === "invited" ? t("Invited") : person.status === "disabled" ? t("Disabled") : t("Active")}</td>
               <td data-label={t("Two-factor authentication")}>{person.two_factor_enabled ? t("Enabled") : t("Not enabled")}</td>
               <td data-label={t("Actions")}><div className="row-actions">

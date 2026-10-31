@@ -906,7 +906,7 @@ pub(crate) async fn add_member(
         return internal(&headers);
     };
     // Existence of the user is only revealed after the permission check.
-    let outcome = match tx.add(&scope, user_id, role).await {
+    let outcome = match tx.add_at(&scope, user_id, role, services.clock.now()).await {
         Ok(outcome) => outcome,
         Err(error) => return db_failure(&error, &headers, "member add failed"),
     };
@@ -1019,7 +1019,10 @@ pub(crate) async fn change_role(
     let Some(scope) = OrgScope::from_permit(&permit) else {
         return internal(&headers);
     };
-    match tx.set_role(&scope, target_id, new_role).await {
+    match tx
+        .set_role_at(&scope, target_id, new_role, services.clock.now())
+        .await
+    {
         Ok(RoleOutcome::Changed(member)) => {
             if let Err(error) = commit_audited(
                 tx,

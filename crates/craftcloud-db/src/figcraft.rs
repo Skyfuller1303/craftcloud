@@ -252,8 +252,12 @@ pub async fn enqueue_user_revocations(
     Ok(())
 }
 
+/// App whose assignment governs links of unknown (`legacy`) origin.
+const LEGACY_LINK_APP: &str = "figcraft";
+
 /// Queue capabilities from one app for one user. Browser, launcher, and CLI
-/// links remain untouched; unknown-origin legacy links are queued separately.
+/// links remain untouched; unknown-origin legacy links are queued only when
+/// the removed app is FigCraft.
 pub async fn enqueue_user_app_revocations(
     conn: &mut PgConnection,
     org_id: Uuid,
@@ -269,17 +273,24 @@ pub async fn enqueue_user_app_revocations(
         WHERE lf.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL AND l.source_kind='app' AND l.source_app=$5 \
         ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(user_id).bind(&reason).bind(now).bind(app).execute(&mut *conn).await?;
-    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
-        SELECT DISTINCT l.file_id,l.user_id,$3,$4,$4 \
-        FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
-        WHERE lf.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL AND l.source_kind='legacy' \
-        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
-        .bind(org_id).bind(user_id).bind(legacy_reason).bind(now).execute(conn).await?;
+    // Links of unknown origin were issued by FigCraft, so they follow the
+    // figcraft assignment and no other app.
+    if app == LEGACY_LINK_APP {
+        sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+            SELECT DISTINCT l.file_id,l.user_id,$3,$4,$4 \
+            FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+            WHERE lf.org_id=$1 AND l.user_id=$2 AND l.revoked_at IS NULL AND l.source_kind='legacy' \
+            ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+            .bind(org_id).bind(user_id).bind(legacy_reason).bind(now).execute(conn).await?;
+    }
     Ok(())
 }
 
 /// Queue app-origin links denied when an organization switches from all apps
-/// to assigned apps; queue legacy links conservatively for regular members.
+/// to assigned apps. Unknown-origin legacy links are FigCraft links and are
+/// queued for regular members without a figcraft assignment. Launcher and CLI
+/// links of regular members lose the editing capability reserved for
+/// assigned apps.
 pub async fn enqueue_org_app_revocations(
     conn: &mut PgConnection,
     org_id: Uuid,
@@ -294,13 +305,21 @@ pub async fn enqueue_org_app_revocations(
           AND NOT EXISTS(SELECT 1 FROM member_app_access a WHERE a.org_id=lf.org_id AND a.user_id=l.user_id AND a.app=l.source_app) \
         ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(now).execute(&mut *conn).await?;
-    // Legacy provenance cannot identify which app issued these links; after
-    // narrowing the org to assigned mode, revoke them for regular members.
+    // Legacy provenance means FigCraft: keep them for members who have it.
     sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
         SELECT DISTINCT l.file_id,l.user_id,'app_access_revoked:legacy',$2,$2 \
         FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
         JOIN organization_members m ON m.org_id=lf.org_id AND m.user_id=l.user_id AND m.status='active' \
         WHERE lf.org_id=$1 AND l.source_kind='legacy' AND l.revoked_at IS NULL \
+          AND m.role NOT IN ('owner','admin','guest') \
+          AND NOT EXISTS(SELECT 1 FROM member_app_access a WHERE a.org_id=lf.org_id AND a.user_id=l.user_id AND a.app='figcraft') \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(org_id).bind(now).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,'app_access_revoked:tool:'||l.source_kind,$2,$2 \
+        FROM figcraft_links l JOIN figcraft_live_files lf ON lf.file_id=l.file_id \
+        JOIN organization_members m ON m.org_id=lf.org_id AND m.user_id=l.user_id AND m.status='active' \
+        WHERE lf.org_id=$1 AND l.source_kind IN ('launcher','cli') AND l.revoked_at IS NULL \
           AND m.role NOT IN ('owner','admin','guest') \
         ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(now).execute(conn).await?;
@@ -328,6 +347,26 @@ pub async fn enqueue_file_app_revocations_pool(
         ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
         .bind(org_id).bind(file_id).bind(user_id).bind(now).bind(reason).bind(source_app).execute(&mut *tx).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Queue the launcher or CLI links of one user on one file, e.g. when
+/// reconciliation finds that the organization no longer allows them.
+pub async fn enqueue_file_tool_revocations_pool(
+    pool: &PgPool,
+    file_id: Uuid,
+    user_id: Uuid,
+    source_kind: &str,
+    now: OffsetDateTime,
+) -> Result<(), DbError> {
+    if !matches!(source_kind, "launcher" | "cli") {
+        return Err(DbError::Internal);
+    }
+    sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) \
+        SELECT DISTINCT l.file_id,l.user_id,'app_access_revoked:tool:'||l.source_kind,$4,$4 FROM figcraft_links l \
+        WHERE l.file_id=$1 AND l.user_id=$2 AND l.source_kind=$3 AND l.revoked_at IS NULL \
+        ON CONFLICT(file_id,user_id,reason) DO UPDATE SET available_at=LEAST(figcraft_outbox.available_at,EXCLUDED.available_at)")
+        .bind(file_id).bind(user_id).bind(source_kind).bind(now).execute(pool).await?;
     Ok(())
 }
 
@@ -457,6 +496,8 @@ pub struct Revocation {
 pub enum AppRevocationSource {
     Legacy,
     App(String),
+    /// Launcher or CLI links (`launcher` or `cli`).
+    Tool(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +524,13 @@ pub fn parse_app_revocation_reason(
     };
     if source == "legacy" {
         return Ok(Some(AppRevocationSource::Legacy));
+    }
+    if let Some(kind) = source.strip_prefix("tool:") {
+        return if matches!(kind, "launcher" | "cli") {
+            Ok(Some(AppRevocationSource::Tool(kind.to_owned())))
+        } else {
+            Err(InvalidAppRevocationReason)
+        };
     }
     let Some(app) = source.strip_prefix("app:") else {
         return Err(InvalidAppRevocationReason);
@@ -522,6 +570,17 @@ pub async fn app_access_revocation_links(
         .bind(file_id).bind(user_id).bind(source_app).fetch_all(pool).await?)
 }
 
+pub async fn tool_revocation_links(
+    pool: &PgPool,
+    file_id: Uuid,
+    user_id: Uuid,
+    source_kind: &str,
+) -> Result<Vec<LiveLink>, DbError> {
+    Ok(sqlx::query_as("SELECT id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,revoked_at FROM figcraft_links \
+        WHERE file_id=$1 AND user_id=$2 AND revoked_at IS NULL AND source_kind=$3 AND source_kind IN ('launcher','cli') ORDER BY id")
+        .bind(file_id).bind(user_id).bind(source_kind).fetch_all(pool).await?)
+}
+
 pub async fn finish_revocation(
     pool: &PgPool,
     id: Uuid,
@@ -539,6 +598,8 @@ pub async fn finish_revocation(
             .bind(id).bind(now).fetch_all(&mut *tx).await?,
         Some(AppRevocationSource::Legacy) => sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND source_kind='legacy' AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
             .bind(id).bind(now).fetch_all(&mut *tx).await?,
+        Some(AppRevocationSource::Tool(kind)) => sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND source_kind=$3 AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
+            .bind(id).bind(now).bind(kind).fetch_all(&mut *tx).await?,
         Some(AppRevocationSource::App(app)) => sqlx::query_as("UPDATE figcraft_links SET revoked_at=$2 WHERE file_id=(SELECT file_id FROM figcraft_outbox WHERE id=$1) AND ((SELECT user_id FROM figcraft_outbox WHERE id=$1) IS NULL OR user_id=(SELECT user_id FROM figcraft_outbox WHERE id=$1)) AND source_kind='app' AND source_app=$3 AND revoked_at IS NULL RETURNING id,file_id,user_id,access")
             .bind(id).bind(now).bind(app).fetch_all(&mut *tx).await?,
     };
@@ -783,5 +844,41 @@ impl OrgTx {
         let changed = sqlx::query("UPDATE figcraft_live_files SET last_snapshot_version_id=$3,last_snapshot_at=$4,last_snapshot_attempt_at=$4,final_snapshot_done=final_snapshot_done OR $5,updated_at=$4 WHERE org_id=$1 AND file_id=$2 AND state IN ('live','unpublishing')")
             .bind(self.org_id).bind(file_id).bind(version_id).bind(now).bind(final_snapshot).execute(&mut *self.tx).await?.rows_affected() == 1;
         Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_revocation_reasons_parse_every_source_and_fail_closed() {
+        assert_eq!(parse_app_revocation_reason("grant_revoked"), Ok(None));
+        assert_eq!(
+            parse_app_revocation_reason("app_access_revoked:legacy"),
+            Ok(Some(AppRevocationSource::Legacy))
+        );
+        assert_eq!(
+            parse_app_revocation_reason("app_access_revoked:app:figcraft"),
+            Ok(Some(AppRevocationSource::App("figcraft".to_owned())))
+        );
+        for kind in ["launcher", "cli"] {
+            assert_eq!(
+                parse_app_revocation_reason(&format!("app_access_revoked:tool:{kind}")),
+                Ok(Some(AppRevocationSource::Tool(kind.to_owned())))
+            );
+        }
+        for bad in [
+            "app_access_revoked",
+            "app_access_revoked:tool:browser",
+            "app_access_revoked:tool:",
+            "app_access_revoked:app:",
+        ] {
+            assert_eq!(
+                parse_app_revocation_reason(bad),
+                Err(InvalidAppRevocationReason),
+                "{bad}"
+            );
+        }
     }
 }

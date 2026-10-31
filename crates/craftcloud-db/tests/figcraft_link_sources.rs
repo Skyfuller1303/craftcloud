@@ -388,6 +388,13 @@ async fn source_specific_app_revocation_preserves_other_links_and_generic_revoke
 
     sqlx::query("INSERT INTO member_app_access(org_id,user_id,app) VALUES($1,$2,'photocraft'),($1,$2,'vectorcraft'),($1,$2,'legacy')")
         .bind(org_id).bind(member.id).execute(pool).await.unwrap();
+    // Assignments are only enforced (and only revoke) in `assigned` mode.
+    sqlx::query("UPDATE organizations SET app_access_mode='assigned' WHERE id=$1")
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let catalog = ["figcraft", "photocraft", "vectorcraft"].map(str::to_owned);
     let assignment_scope = permitted_scope(
         org_id,
         owner.id,
@@ -406,6 +413,7 @@ async fn source_specific_app_revocation_preserves_other_links_and_generic_revoke
         &assignment_scope,
         member.id,
         &["vectorcraft".to_owned(), "legacy".to_owned()],
+        &catalog,
         &AuditCtx::system(),
     )
     .await
@@ -420,8 +428,8 @@ async fn source_specific_app_revocation_preserves_other_links_and_generic_revoke
         "{reasons:?}"
     );
     assert!(
-        reasons.contains(&"app_access_revoked:legacy".to_owned()),
-        "{reasons:?}"
+        !reasons.contains(&"app_access_revoked:legacy".to_owned()),
+        "removing a non-figcraft app must not revoke legacy (FigCraft) links: {reasons:?}"
     );
     for source in [Some("photocraft"), None, Some("legacy")] {
         let mut access: Vec<String> =
@@ -448,13 +456,79 @@ async fn source_specific_app_revocation_preserves_other_links_and_generic_revoke
             .unwrap();
     }
     let still_active = active_rows(pool, file_id, member.id).await;
-    assert_eq!(still_active.len(), 8);
+    assert_eq!(still_active.len(), 10);
     for (kind, app, access) in &still_active {
         assert!(
-            !(*kind == "app" && app.as_deref() == Some("photocraft")) && kind != "legacy",
-            "only photocraft and unknown-origin legacy links should be revoked; kept {kind}/{app:?}/{access}"
+            !(*kind == "app" && app.as_deref() == Some("photocraft")),
+            "only photocraft links should be revoked; kept {kind}/{app:?}/{access}"
         );
     }
+    assert_eq!(
+        still_active
+            .iter()
+            .filter(|(kind, _, _)| kind == "legacy")
+            .count(),
+        2,
+        "legacy links follow the figcraft assignment"
+    );
+
+    // Removing figcraft itself revokes legacy links; other origins stay.
+    sqlx::query("INSERT INTO member_app_access(org_id,user_id,app) VALUES($1,$2,'figcraft')")
+        .bind(org_id)
+        .bind(member.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    app_access::set_assignments(
+        pool,
+        &assignment_scope,
+        member.id,
+        &["vectorcraft".to_owned(), "legacy".to_owned()],
+        &catalog,
+        &AuditCtx::system(),
+    )
+    .await
+    .unwrap();
+    let reasons = finish_outbox(pool).await;
+    assert!(
+        reasons.contains(&"app_access_revoked:legacy".to_owned()),
+        "{reasons:?}"
+    );
+    let still_active = active_rows(pool, file_id, member.id).await;
+    assert!(still_active.iter().all(|(kind, _, _)| kind != "legacy"));
+    assert_eq!(still_active.len(), 8);
+
+    // Setting apps to an owner or admin is a no-op for access: no row is
+    // written for them (the API rejects the request earlier).
+    app_access::set_assignments(
+        pool,
+        &permitted_scope(
+            org_id,
+            owner.id,
+            Action::MemberAppsSet,
+            Resource::Member {
+                org_id,
+                target: Some(MemberTarget {
+                    user_id: owner.id,
+                    role: OrgRole::Owner,
+                }),
+                role: None,
+            },
+        ),
+        owner.id,
+        &["figcraft".to_owned()],
+        &catalog,
+        &AuditCtx::system(),
+    )
+    .await
+    .unwrap();
+    let owner_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM member_app_access WHERE user_id=$1")
+            .bind(owner.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(owner_rows, 0);
     for expected in [
         ("browser", None, "view"),
         ("browser", None, "edit"),

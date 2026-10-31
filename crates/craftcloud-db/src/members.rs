@@ -311,6 +311,21 @@ impl OrgTx {
         .await?)
     }
 
+    /// Whether launcher and CLI sessions of the user may use the editing
+    /// actions reserved for assigned apps in this organization; see
+    /// `app_access::tool_allowed`.
+    pub async fn tool_allowed(&mut self, user_id: Uuid) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM organization_members m JOIN organizations o ON o.id=m.org_id \
+             WHERE m.org_id=$1 AND m.user_id=$2 AND m.status='active' \
+               AND (o.app_access_mode='all' OR m.role IN ('owner','admin','guest')))",
+        )
+        .bind(self.org_id)
+        .bind(user_id)
+        .fetch_one(&mut *self.tx)
+        .await?)
+    }
+
     /// The stored role of a membership row of **any** status (used to decide
     /// who may clean up invited/disabled rows), read under the lock.
     ///
@@ -422,6 +437,23 @@ impl OrgTx {
         user_id: Uuid,
         role: OrgRole,
     ) -> Result<AddOutcome, DbError> {
+        self.add_at(scope, user_id, role, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::add`] with the caller's clock, used for invitation expiry in
+    /// the seat count.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn add_at(
+        &mut self,
+        scope: &OrgScope,
+        user_id: Uuid,
+        role: OrgRole,
+        now: OffsetDateTime,
+    ) -> Result<AddOutcome, DbError> {
         self.check(scope, Action::MemberAdd)?;
         let disabled: Option<bool> =
             sqlx::query_scalar("SELECT disabled_at IS NOT NULL FROM users WHERE id = $1 FOR SHARE")
@@ -450,11 +482,7 @@ impl OrgTx {
                         .bind(user_id)
                         .fetch_one(&mut *self.tx)
                         .await?;
-                if self
-                    .seat_occupancy(OffsetDateTime::now_utc(), Some(&email), None)
-                    .await?
-                    >= i64::from(limit)
-                {
+                if self.seat_occupancy(now, Some(&email), None).await? >= i64::from(limit) {
                     return Ok(AddOutcome::SeatLimitReached);
                 }
             }
@@ -494,6 +522,23 @@ impl OrgTx {
         user_id: Uuid,
         new_role: OrgRole,
     ) -> Result<RoleOutcome, DbError> {
+        self.set_role_at(scope, user_id, new_role, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::set_role`] with the caller's clock, used for invitation expiry
+    /// in the seat count.
+    ///
+    /// # Errors
+    ///
+    /// Database failures only.
+    pub async fn set_role_at(
+        &mut self,
+        scope: &OrgScope,
+        user_id: Uuid,
+        new_role: OrgRole,
+        now: OffsetDateTime,
+    ) -> Result<RoleOutcome, DbError> {
         self.check(scope, Action::MemberChangeRole)?;
         let Some(current) = self.member(user_id).await? else {
             return Ok(RoleOutcome::NotMember);
@@ -517,11 +562,7 @@ impl OrgTx {
                         .bind(user_id)
                         .fetch_one(&mut *self.tx)
                         .await?;
-                if self
-                    .seat_occupancy(OffsetDateTime::now_utc(), Some(&email), None)
-                    .await?
-                    >= i64::from(limit)
-                {
+                if self.seat_occupancy(now, Some(&email), None).await? >= i64::from(limit) {
                     return Ok(RoleOutcome::SeatLimitReached);
                 }
             }

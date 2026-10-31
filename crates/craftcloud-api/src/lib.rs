@@ -122,7 +122,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/organizations/{org_id}/app-access", &["PATCH"]),
     (
         "/api/v1/organizations/{org_id}/members/{user_id}/apps",
-        &["PUT"],
+        &["PUT", "PATCH"],
     ),
     ("/api/v1/organizations/{org_id}/grants", &["GET"]),
     ("/api/v1/organizations/{org_id}/locks", &["GET"]),
@@ -304,7 +304,7 @@ pub fn router_with_shared(
         )
         .route(
             "/api/v1/organizations/{org_id}/members/{user_id}/apps",
-            put(app_access::assign),
+            put(app_access::assign).patch(app_access::change),
         )
         .route(
             "/api/v1/organizations/{org_id}/grants",

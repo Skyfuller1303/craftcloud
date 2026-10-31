@@ -149,7 +149,21 @@ pub struct Actor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppActor {
     pub actor: Actor,
+    /// Catalog app of an `app` device session and whether it is assigned.
     pub app_access: Option<(String, bool)>,
+    /// `Some(allowed)` for launcher and CLI device sessions: `false` when the
+    /// organization restricts apps and the person is a plain member. Such a
+    /// session behaves like a browser session (view, download, upload and
+    /// share stay allowed) but may not use the editing actions reserved for
+    /// assigned apps. `None` for browser and app sessions.
+    pub tool_access: Option<bool>,
+}
+impl AppActor {
+    /// Whether this session may issue or keep FigCraft live links.
+    #[must_use]
+    pub fn may_use_live_links(&self) -> bool {
+        self.tool_access != Some(false)
+    }
 }
 impl std::ops::Deref for AppActor {
     type Target = Actor;
@@ -789,6 +803,12 @@ fn can_user(actor: &Actor, action: Action, resource: &Resource) -> Decision {
 fn can_app_user(actor: &AppActor, action: Action, resource: &Resource) -> Decision {
     let actor_base = &actor.actor;
     let decision = can_user_without_app(actor_base, action, resource);
+    if matches!(decision, Decision::Allow(_))
+        && action == Action::FileLockAcquire
+        && actor.tool_access == Some(false)
+    {
+        return Decision::AppNotAssigned;
+    }
     if !matches!(decision, Decision::Allow(_)) || !requires_app_assignment(action) {
         return decision;
     }
@@ -1628,6 +1648,7 @@ mod tests {
         let denied = AppActor {
             actor: denied,
             app_access: Some(("photocraft".into(), false)),
+            tool_access: None,
         };
         let resource = Resource::Workspace {
             org_id: ORG,
@@ -1637,14 +1658,92 @@ mod tests {
         let hidden = AppActor {
             actor: actor(Some(OrgRole::Member), false),
             app_access: Some(("photocraft".into(), false)),
+            tool_access: None,
         };
         assert_eq!(outcome(can(&hidden, Action::FileRead, &resource)), H);
         let assigned = AppActor {
             actor: denied.actor.clone(),
             app_access: Some(("photocraft".into(), true)),
+            tool_access: None,
         };
         assert_eq!(outcome(can(&assigned, Action::FileRead, &resource)), Y);
     }
+
+    /// Matrix of session kind x assignment/mode for the actions that differ.
+    /// `app_access`/`tool_access` carry what the API derived from the stored
+    /// mode and assignments: an app is allowed when the org is in `all` mode
+    /// or the app is assigned; launcher and CLI are allowed when the org is
+    /// in `all` mode (the only difference to a browser is lock acquisition).
+    #[test]
+    fn device_session_kinds_follow_the_assignment_rules() {
+        let editor = with_ws(actor(Some(OrgRole::Member), false), WorkspaceRole::Editor);
+        let resource = Resource::Workspace {
+            org_id: ORG,
+            workspace_id: WS,
+        };
+        let browser = AppActor {
+            actor: editor.clone(),
+            app_access: None,
+            tool_access: None,
+        };
+        let app = |allowed| AppActor {
+            actor: editor.clone(),
+            app_access: Some(("photocraft".into(), allowed)),
+            tool_access: None,
+        };
+        let tool = |allowed| AppActor {
+            actor: editor.clone(),
+            app_access: None,
+            tool_access: Some(allowed),
+        };
+        let browser_outcomes: Vec<_> = DEVICE_MATRIX_ACTIONS
+            .iter()
+            .map(|a| outcome(can(&browser, *a, &resource)))
+            .collect();
+        // Assigned app (or `all` mode) and an allowed launcher/CLI behave like
+        // the browser for everything.
+        for allowed in [&app(true), &tool(true)] {
+            let got: Vec<_> = DEVICE_MATRIX_ACTIONS
+                .iter()
+                .map(|a| outcome(can(allowed, *a, &resource)))
+                .collect();
+            assert_eq!(got, browser_outcomes);
+        }
+        // An unassigned app is denied every protected action.
+        for action in DEVICE_MATRIX_ACTIONS {
+            let expected = if requires_app_assignment(*action) {
+                F
+            } else {
+                Y
+            };
+            assert_eq!(outcome(can(&app(false), *action, &resource)), expected);
+        }
+        // A restricted launcher/CLI keeps view, download, upload, commit and
+        // sharing; only the lock acquisition reserved for assigned apps is denied.
+        for action in DEVICE_MATRIX_ACTIONS {
+            let expected = if *action == Action::FileLockAcquire {
+                F
+            } else {
+                outcome(can(&browser, *action, &resource))
+            };
+            assert_eq!(outcome(can(&tool(false), *action, &resource)), expected);
+        }
+        assert!(tool(true).may_use_live_links());
+        assert!(!tool(false).may_use_live_links());
+        assert!(app(false).may_use_live_links());
+        assert!(browser.may_use_live_links());
+    }
+
+    const DEVICE_MATRIX_ACTIONS: &[Action] = &[
+        Action::FileList,
+        Action::FileRead,
+        Action::FileDownload,
+        Action::UploadCreate,
+        Action::UploadWrite,
+        Action::VersionCommit,
+        Action::FileLockAcquire,
+        Action::FileLockRelease,
+    ];
 
     #[test]
     fn admin_console_read_actions_follow_role_boundaries() {

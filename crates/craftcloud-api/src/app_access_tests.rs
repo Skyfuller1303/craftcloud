@@ -60,7 +60,10 @@ mod tests {
     }
 
     async fn call_device(app: &Router, req: Req) -> Resp {
-        let mut request = req.build();
+        send(app, req.build()).await
+    }
+
+    async fn send(app: &Router, mut request: axum::http::Request<axum::body::Body>) -> Resp {
         request
             .extensions_mut()
             .insert(ConnectInfo("127.0.0.1:443".parse::<SocketAddr>().unwrap()));
@@ -506,5 +509,380 @@ mod tests {
             .find(|member| member["user_id"] == user.to_string())
             .unwrap();
         assert_eq!(member["apps"], json!(["figcraft"]));
+    }
+
+    async fn bearer_call(app: &Router, req: Req, token: &str) -> Resp {
+        let mut request = req.build();
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        request.headers_mut().remove(axum::http::header::ORIGIN);
+        send(app, request).await
+    }
+
+    /// Creates a workspace, project and `figcraft` file as `owner`.
+    async fn make_file(
+        env: &TestEnv,
+        owner: &Session,
+        org: Uuid,
+        slug: &str,
+        app: &str,
+    ) -> (String, Uuid) {
+        let workspace = call(
+            &env.app,
+            Req::new("POST", &format!("/api/v1/organizations/{org}/workspaces"))
+                .session(owner)
+                .json(json!({"name":slug,"slug":slug})),
+        )
+        .await;
+        assert_eq!(workspace.status, StatusCode::CREATED, "{}", workspace.text);
+        let workspace_id = workspace.body["id"].as_str().unwrap().to_owned();
+        let project = call(
+            &env.app,
+            Req::new(
+                "POST",
+                &format!("/api/v1/workspaces/{workspace_id}/projects"),
+            )
+            .session(owner)
+            .json(json!({"name":"AC11 project"})),
+        )
+        .await;
+        assert_eq!(project.status, StatusCode::CREATED, "{}", project.text);
+        let file = call(
+            &env.app,
+            Req::new(
+                "POST",
+                &format!(
+                    "/api/v1/projects/{}/files",
+                    project.body["id"].as_str().unwrap()
+                ),
+            )
+            .session(owner)
+            .json(json!({"name":"AC11 file","app":app,"format":"native"})),
+        )
+        .await;
+        assert_eq!(file.status, StatusCode::CREATED, "{}", file.text);
+        (
+            workspace_id,
+            Uuid::parse_str(file.body["id"].as_str().unwrap()).unwrap(),
+        )
+    }
+
+    async fn device_login(env: &TestEnv, email: &str, kind: &str, client: &str) -> Resp {
+        let login = call_device(
+            &env.app,
+            Req::new("POST", "/api/v1/auth/device/login").json(json!({
+                "email":email, "password":PASSWORD,
+                "client_kind":kind, "client_id":client, "device_name":"AC11 test"
+            })),
+        )
+        .await;
+        assert_eq!(login.status, StatusCode::OK, "{}", login.text);
+        login
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn launcher_and_cli_sessions_cannot_lock_in_assigned_mode_but_keep_browser_actions() {
+        let (env, owner, org, user, _member_session) = fixture().await;
+        let (workspace, file) = make_file(&env, &owner, org, "ac11-tool", "photocraft").await;
+        let added = call(
+            &env.app,
+            Req::new("POST", &format!("/api/v1/workspaces/{workspace}/members"))
+                .session(&owner)
+                .json(json!({"user_id":user.to_string(),"role":"editor"})),
+        )
+        .await;
+        assert_eq!(added.status, StatusCode::CREATED, "{}", added.text);
+        for (kind, client) in [("launcher", "launcher"), ("cli", "craftcloud")] {
+            let login = device_login(&env, "ac11-app-user@example.test", kind, client).await;
+            let token = login.body["access_token"].as_str().unwrap().to_owned();
+            let read = bearer_call(
+                &env.app,
+                Req::new("GET", &format!("/api/v1/files/{file}")),
+                &token,
+            )
+            .await;
+            assert_eq!(read.status, StatusCode::OK, "{kind}: {}", read.text);
+            let lock = bearer_call(
+                &env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/lock"))
+                    .json(json!({"client_id":client})),
+                &token,
+            )
+            .await;
+            assert_eq!(
+                (lock.status, lock.code()),
+                (StatusCode::FORBIDDEN, "APP_NOT_ASSIGNED"),
+                "{kind}: {}",
+                lock.text
+            );
+        }
+        // Owners keep every client; `all` mode lifts the restriction.
+        let owner_login = device_login(&env, "op@example.test", "launcher", "launcher").await;
+        let owner_lock = bearer_call(
+            &env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/lock"))
+                .json(json!({"client_id":"launcher"})),
+            owner_login.body["access_token"].as_str().unwrap(),
+        )
+        .await;
+        assert!(owner_lock.status.is_success(), "{}", owner_lock.text);
+        let released = bearer_call(
+            &env.app,
+            Req::new("DELETE", &format!("/api/v1/files/{file}/lock")),
+            owner_login.body["access_token"].as_str().unwrap(),
+        )
+        .await;
+        assert!(released.status.is_success(), "{}", released.text);
+        let all = call(
+            &env.app,
+            Req::new("PATCH", &format!("/api/v1/organizations/{org}/app-access"))
+                .session(&owner)
+                .json(json!({"mode":"all"})),
+        )
+        .await;
+        assert_eq!(all.status, StatusCode::OK, "{}", all.text);
+        let login = device_login(&env, "ac11-app-user@example.test", "launcher", "launcher").await;
+        let lock = bearer_call(
+            &env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/lock"))
+                .json(json!({"client_id":"launcher"})),
+            login.body["access_token"].as_str().unwrap(),
+        )
+        .await;
+        assert!(lock.status.is_success(), "{}", lock.text);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn assignments_for_owners_and_admins_are_rejected_and_patch_changes_single_apps() {
+        let (env, owner, org, user, _member_session) = fixture().await;
+        let admin = env.user("ac11-assign-admin").await;
+        let added = call(
+            &env.app,
+            Req::new("POST", &format!("/api/v1/organizations/{org}/members"))
+                .session(&owner)
+                .json(json!({"user_id":admin,"role":"admin"})),
+        )
+        .await;
+        assert_eq!(added.status, StatusCode::CREATED, "{}", added.text);
+        let put = assign(&env, &owner, org, admin, &["figcraft"]).await;
+        assert_eq!(
+            (put.status, put.code()),
+            (StatusCode::CONFLICT, "APP_ASSIGNMENT_NOT_APPLICABLE"),
+            "{}",
+            put.text
+        );
+        let patch = |uid: Uuid, body: serde_json::Value| {
+            call(
+                &env.app,
+                Req::new(
+                    "PATCH",
+                    &format!("/api/v1/organizations/{org}/members/{uid}/apps"),
+                )
+                .session(&owner)
+                .json(body),
+            )
+        };
+        let rejected = patch(admin, json!({"add":["figcraft"]})).await;
+        assert_eq!(
+            (rejected.status, rejected.code()),
+            (StatusCode::CONFLICT, "APP_ASSIGNMENT_NOT_APPLICABLE"),
+            "{}",
+            rejected.text
+        );
+        let cleared = assign(&env, &owner, org, admin, &[]).await;
+        assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.text);
+
+        let first = assign(&env, &owner, org, user, &["figcraft"]).await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+        let added = patch(user, json!({"add":["photocraft"]})).await;
+        assert_eq!(added.status, StatusCode::OK, "{}", added.text);
+        assert_eq!(added.body["apps"], json!(["figcraft", "photocraft"]));
+        let removed = patch(user, json!({"remove":["figcraft"],"add":["vectorcraft"]})).await;
+        assert_eq!(removed.status, StatusCode::OK, "{}", removed.text);
+        assert_eq!(removed.body["apps"], json!(["photocraft", "vectorcraft"]));
+        let overlap = patch(user, json!({"add":["figcraft"],"remove":["figcraft"]})).await;
+        assert_eq!(
+            overlap.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            overlap.text
+        );
+        let unknown = patch(user, json!({"add":["nope"]})).await;
+        assert_eq!(
+            unknown.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            unknown.text
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn removing_assignment_in_all_mode_keeps_the_device_session() {
+        let (env, owner, org, user, _member_session) = fixture().await;
+        let all = call(
+            &env.app,
+            Req::new("PATCH", &format!("/api/v1/organizations/{org}/app-access"))
+                .session(&owner)
+                .json(json!({"mode":"all"})),
+        )
+        .await;
+        assert_eq!(all.status, StatusCode::OK, "{}", all.text);
+        let assigned = assign(&env, &owner, org, user, &["figcraft"]).await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.text);
+        let login = device_login(&env, "ac11-app-user@example.test", "app", "figcraft").await;
+        let session_id =
+            Uuid::parse_str(login.body["device_session_id"].as_str().unwrap()).unwrap();
+        let removed = assign(&env, &owner, org, user, &[]).await;
+        assert_eq!(removed.status, StatusCode::OK, "{}", removed.text);
+        let revoked: bool =
+            sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM device_sessions WHERE id=$1")
+                .bind(session_id)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert!(!revoked, "an `all` organization enforces no assignment");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn revoking_an_app_only_ends_sessions_no_other_organization_allows() {
+        let (env, owner, org_a, user, _member_session) = fixture().await;
+        let (_, file_a) = make_file(&env, &owner, org_a, "ac11-multi-a", "figcraft").await;
+        let org_b_resp = call(
+            &env.app,
+            Req::new("POST", "/api/v1/organizations")
+                .session(&owner)
+                .json(json!({
+                    "name":"AC11 second org",
+                    "slug":format!("ac11-second-{}", Uuid::new_v4().simple()),
+                    "owner_user_id":user
+                })),
+        )
+        .await;
+        assert_eq!(
+            org_b_resp.status,
+            StatusCode::CREATED,
+            "{}",
+            org_b_resp.text
+        );
+        let org_b = Uuid::parse_str(org_b_resp.body["id"].as_str().unwrap()).unwrap();
+        let assigned = assign(&env, &owner, org_a, user, &["figcraft"]).await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.text);
+        let login = device_login(&env, "ac11-app-user@example.test", "app", "figcraft").await;
+        let session_id =
+            Uuid::parse_str(login.body["device_session_id"].as_str().unwrap()).unwrap();
+        let lock = |file: Uuid, org: Uuid| {
+            let pool = env.pool.clone();
+            async move {
+                sqlx::query("INSERT INTO file_locks(file_id,org_id,holder_user_id,holder_session_kind,holder_session_id,client_id,acquired_at,refreshed_at,expires_at) VALUES($1,$2,$3,'device',$4,'figcraft',now(),now(),now()+interval '5 minutes')")
+                    .bind(file).bind(org).bind(user).bind(session_id).execute(&pool).await.unwrap();
+            }
+        };
+        lock(file_a, org_a).await;
+        // A file of the second organization held by the same session.
+        let (_, file_b) = {
+            let owner_b = env.login_ok("ac11-app-user").await;
+            make_file(&env, &owner_b, org_b, "ac11-multi-b", "figcraft").await
+        };
+        lock(file_b, org_b).await;
+
+        // The account owns org B (mode `all`): the session stays, only the
+        // lock on org A's file is released.
+        let removed = assign(&env, &owner, org_a, user, &[]).await;
+        assert_eq!(removed.status, StatusCode::OK, "{}", removed.text);
+        let state: (bool, i64, i64) = sqlx::query_as("SELECT revoked_at IS NOT NULL,(SELECT count(*) FROM file_locks WHERE file_id=$2),(SELECT count(*) FROM file_locks WHERE file_id=$3) FROM device_sessions WHERE id=$1")
+            .bind(session_id).bind(file_a).bind(file_b).fetch_one(&env.pool).await.unwrap();
+        assert_eq!(state, (false, 0, 1));
+
+        // Once org B no longer allows the app either, the session ends and
+        // its remaining locks are released.
+        sqlx::query("UPDATE organizations SET app_access_mode='assigned' WHERE id=$1")
+            .bind(org_b)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE organization_members SET role='member' WHERE org_id=$1 AND user_id=$2")
+            .bind(org_b)
+            .bind(user)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let again = assign(&env, &owner, org_a, user, &["figcraft"]).await;
+        assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+        let removed = assign(&env, &owner, org_a, user, &[]).await;
+        assert_eq!(removed.status, StatusCode::OK, "{}", removed.text);
+        let state: (bool, i64) = sqlx::query_as("SELECT revoked_at IS NOT NULL,(SELECT count(*) FROM file_locks WHERE holder_session_id=$1) FROM device_sessions WHERE id=$1")
+            .bind(session_id).fetch_one(&env.pool).await.unwrap();
+        assert_eq!(state, (true, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn switching_to_assigned_mode_releases_tool_locks_of_members_only() {
+        let (env, owner, org, user, _member_session) = fixture().await;
+        let all = call(
+            &env.app,
+            Req::new("PATCH", &format!("/api/v1/organizations/{org}/app-access"))
+                .session(&owner)
+                .json(json!({"mode":"all"})),
+        )
+        .await;
+        assert_eq!(all.status, StatusCode::OK, "{}", all.text);
+        let (_, file_member) = make_file(&env, &owner, org, "ac11-mode-a", "figcraft").await;
+        let (_, file_owner) = make_file(&env, &owner, org, "ac11-mode-b", "figcraft").await;
+        let owner_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM users WHERE normalized_email='op@example.test'")
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        let mut sessions = Vec::new();
+        for (email, holder, file) in [
+            ("ac11-app-user@example.test", user, file_member),
+            ("op@example.test", owner_id, file_owner),
+        ] {
+            let login = device_login(&env, email, "launcher", "launcher").await;
+            let session_id =
+                Uuid::parse_str(login.body["device_session_id"].as_str().unwrap()).unwrap();
+            sqlx::query("INSERT INTO file_locks(file_id,org_id,holder_user_id,holder_session_kind,holder_session_id,client_id,acquired_at,refreshed_at,expires_at) VALUES($1,$2,$3,'device',$4,'launcher',now(),now(),now()+interval '5 minutes')")
+                .bind(file).bind(org).bind(holder).bind(session_id).execute(&env.pool).await.unwrap();
+            sessions.push((session_id, file));
+        }
+        let assigned = call(
+            &env.app,
+            Req::new("PATCH", &format!("/api/v1/organizations/{org}/app-access"))
+                .session(&owner)
+                .json(json!({"mode":"assigned"})),
+        )
+        .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.text);
+        let locks: Vec<i64> = {
+            let mut counts = Vec::new();
+            for (_, file) in &sessions {
+                counts.push(
+                    sqlx::query_scalar("SELECT count(*) FROM file_locks WHERE file_id=$1")
+                        .bind(file)
+                        .fetch_one(&env.pool)
+                        .await
+                        .unwrap(),
+                );
+            }
+            counts
+        };
+        assert_eq!(locks, [0, 1], "member lock released, owner lock kept");
+        for (session, _) in &sessions {
+            let revoked: bool = sqlx::query_scalar(
+                "SELECT revoked_at IS NOT NULL FROM device_sessions WHERE id=$1",
+            )
+            .bind(session)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+            assert!(!revoked, "launcher sessions stay usable like a browser");
+        }
     }
 }

@@ -1213,9 +1213,15 @@ paths:
         content:
           application/json:
             schema: {$ref: '#/components/schemas/MemberAppAssignmentsRequest'}
+      description: >-
+        Assignments only exist for the role `member`. Owners and admins always have every app, so a non-empty
+        list for them is refused with 409 APP_ASSIGNMENT_NOT_APPLICABLE (an empty list clears leftover rows).
+        Removing an app revokes its device sessions, locks and FigCraft links only when the organization
+        mode is `assigned` and the target is a member; a device session is ended only if no other active
+        membership of the person still allows the app.
       responses:
         '200':
-          description: Replaced app assignments for one active non-guest member
+          description: Replaced app assignments for one active member
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MemberAppAssignmentsResponse'}
@@ -1223,6 +1229,34 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Members]
+      summary: Add and remove single apps of one member
+      description: >-
+        Applies `add` and `remove` relative to the stored assignments, so concurrent changes to other apps are
+        not overwritten (used by bulk actions). The same rules as `PUT` apply: 409 APP_ASSIGNMENT_NOT_APPLICABLE
+        when adding apps for an owner or admin; revocation only in `assigned` mode for members. An app
+        in both lists is a 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MemberAppChangeRequest'}
+      responses:
+        '200':
+          description: Resulting app assignments of the member
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberAppAssignmentsResponse'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -3627,6 +3661,12 @@ components:
       required: [apps]
       properties:
         apps: {type: array, uniqueItems: true, maxItems: 64, items: {type: string}}
+    MemberAppChangeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        add: {type: array, uniqueItems: true, maxItems: 64, items: {type: string}}
+        remove: {type: array, uniqueItems: true, maxItems: 64, items: {type: string}}
     MemberAppAssignmentsResponse:
       type: object
       required: [user_id, apps]

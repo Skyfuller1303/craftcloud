@@ -209,7 +209,7 @@ async fn verify_existing_link(
     access: &str,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    let crate::workspaces::Locked { mut tx, actor } = lock(
+    let mut locked = lock(
         &resolved.services,
         session.user_id,
         resolved.org_id,
@@ -219,6 +219,19 @@ async fn verify_existing_link(
     )
     .await
     .map_err(|e| *e)?;
+    locked
+        .restrict_tool_session(session.user_id, &session.client_kind)
+        .await
+        .map_err(|e| db_failure(&e, headers, "device client lookup failed"))?;
+    let crate::workspaces::Locked { mut tx, actor } = locked;
+    if !actor.may_use_live_links() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "ACCESS_CHANGED",
+            "Access changed before issuing the link.",
+            headers,
+        ));
+    }
     let valid = tx
         .session_valid(
             session.session_id,
@@ -286,7 +299,7 @@ async fn persist_link_with_current_authority(
     link: PendingLink<'_>,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    let crate::workspaces::Locked { mut tx, actor } = lock(
+    let mut locked = lock(
         &resolved.services,
         session.user_id,
         resolved.org_id,
@@ -296,6 +309,19 @@ async fn persist_link_with_current_authority(
     )
     .await
     .map_err(|e| *e)?;
+    locked
+        .restrict_tool_session(session.user_id, &session.client_kind)
+        .await
+        .map_err(|e| db_failure(&e, headers, "device client lookup failed"))?;
+    let crate::workspaces::Locked { mut tx, actor } = locked;
+    if !actor.may_use_live_links() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "ACCESS_CHANGED",
+            "Access changed before issuing the link.",
+            headers,
+        ));
+    }
     let now = resolved.services.clock.now();
     let valid = tx
         .session_valid(
@@ -580,6 +606,26 @@ pub(crate) async fn open(
         Ok(v) => v,
         Err(e) => return db_failure(&e, &headers, "actor lookup failed"),
     };
+    let mut actor = actor;
+    actor.tool_access = match crate::workspaces::tool_access(
+        &resolved.services,
+        session.user_id,
+        resolved.org_id,
+        &session.client_kind,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return db_failure(&e, &headers, "device client lookup failed"),
+    };
+    if !actor.may_use_live_links() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "APP_NOT_ASSIGNED",
+            "This client may not use live links in this organization.",
+            &headers,
+        );
+    }
     let resource = match policy_resource(
         &resolved.services.pool,
         session.user_id,
@@ -2255,19 +2301,24 @@ async fn process_revocations(services: &Arc<Services>) {
         };
         let links = match match app_source.as_ref() {
             Some(source) => match row.user_id {
-                Some(user_id) => {
-                    let source_app = match source {
-                        db::AppRevocationSource::Legacy => None,
-                        db::AppRevocationSource::App(app) => Some(app.as_str()),
-                    };
-                    db::app_access_revocation_links(
-                        &services.pool,
-                        row.file_id,
-                        user_id,
-                        source_app,
-                    )
-                    .await
-                }
+                Some(user_id) => match source {
+                    db::AppRevocationSource::Legacy => {
+                        db::app_access_revocation_links(&services.pool, row.file_id, user_id, None)
+                            .await
+                    }
+                    db::AppRevocationSource::App(app) => {
+                        db::app_access_revocation_links(
+                            &services.pool,
+                            row.file_id,
+                            user_id,
+                            Some(app.as_str()),
+                        )
+                        .await
+                    }
+                    db::AppRevocationSource::Tool(kind) => {
+                        db::tool_revocation_links(&services.pool, row.file_id, user_id, kind).await
+                    }
+                },
                 None => Err(craftcloud_db::DbError::Internal),
             },
             None => db::links(&services.pool, row.file_id).await,
@@ -2338,8 +2389,27 @@ async fn reconcile_links(services: &Arc<Services>, after: &mut Option<Uuid>) -> 
             .bind(user_id).bind(org_id).fetch_one(&services.pool).await {Ok(v)=>v,Err(e)=>{tracing::warn!(%e,"FigCraft user reconciliation failed");continue}};
         let mut app_denied = false;
         let policy = if allowed {
-            match read_actor(services, user_id, org_id, workspace_id, policy_app).await {
-                Ok(actor) => match policy_resource(
+            let actor = match read_actor(services, user_id, org_id, workspace_id, policy_app).await
+            {
+                Ok(mut actor) => {
+                    match crate::workspaces::tool_access(services, user_id, org_id, &source_kind)
+                        .await
+                    {
+                        Ok(tool_access) => {
+                            actor.tool_access = tool_access;
+                            Some(actor)
+                        }
+                        Err(_) => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            match actor {
+                Some(actor) if !actor.may_use_live_links() => {
+                    app_denied = true;
+                    false
+                }
+                Some(actor) => match policy_resource(
                     &services.pool,
                     user_id,
                     org_id,
@@ -2368,13 +2438,22 @@ async fn reconcile_links(services: &Arc<Services>, after: &mut Option<Uuid>) -> 
                     }
                     Err(_) => false,
                 },
-                Err(_) => false,
+                None => false,
             }
         } else {
             false
         };
         if !policy {
-            let enqueue = if app_denied {
+            let enqueue = if app_denied && matches!(source_kind.as_str(), "launcher" | "cli") {
+                db::enqueue_file_tool_revocations_pool(
+                    &services.pool,
+                    file_id,
+                    user_id,
+                    &source_kind,
+                    services.clock.now(),
+                )
+                .await
+            } else if app_denied {
                 let source_app = (source_kind != "legacy").then_some(policy_app).flatten();
                 db::enqueue_file_app_revocations_pool(
                     &services.pool,

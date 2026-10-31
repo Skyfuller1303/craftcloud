@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use craftcloud_core::policy::{Action, Actor, MemberTarget, OrgMembership, Resource, can};
+use craftcloud_core::policy::{Action, Actor, MemberTarget, OrgMembership, OrgRole, Resource, can};
 use craftcloud_db::{OrgScope, app_access, members::OrgTx};
 use serde::Deserialize;
 use serde_json::json;
@@ -19,6 +19,15 @@ use uuid::Uuid;
 fn id(value: &str) -> Option<Uuid> {
     Uuid::parse_str(value).ok()
 }
+fn catalog_ids(services: &crate::Services) -> Vec<String> {
+    services
+        .settings
+        .app_catalog
+        .iter()
+        .map(|app| app.id.clone())
+        .collect()
+}
+
 fn valid_apps(apps: &[String], catalog: &[craftcloud_core::apps::AppDefinition]) -> bool {
     apps.len() <= 64
         && apps
@@ -150,6 +159,7 @@ pub(crate) async fn set_mode(
         &mut org_tx,
         &scope,
         &body.mode,
+        &catalog_ids(&s),
         s.clock.now(),
         &crate::audit::ctx(&headers, Some(session.user_id)),
     )
@@ -171,38 +181,47 @@ pub(crate) async fn set_mode(
 pub(crate) struct AssignBody {
     apps: Vec<String>,
 }
-pub(crate) async fn assign(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    session: AuthenticatedSession,
-    Path((org_raw, user_raw)): Path<(String, String)>,
-    body: Result<Json<AssignBody>, JsonRejection>,
-) -> Response {
-    let Some(s) = state.services.clone() else {
-        return unavailable(&headers, "AUTH_UNAVAILABLE");
-    };
-    let (Some(org), Some(user)) = (id(&org_raw), id(&user_raw)) else {
-        return orgs::not_found(&headers);
-    };
-    let Json(body) = match body {
-        Ok(v) => v,
-        Err(e) => return rejection_response(&e, &headers),
-    };
-    if !valid_apps(&body.apps, &s.settings.app_catalog) {
-        return validation_failed(&["apps"], &headers);
-    }
-    let mut org_tx =
-        match begin_org_tx(&s.pool, org, &headers, "member app transaction failed").await {
-            Ok(tx) => tx,
-            Err(response) => return *response,
-        };
+/// Assignments only exist for plain members: owners and admins always have
+/// every app. Granting apps to them is refused instead of being silently
+/// ignored, because a stored row would suggest a restriction that does not
+/// exist.
+fn assignment_not_applicable(headers: &HeaderMap) -> Response {
+    orgs::conflict(
+        "APP_ASSIGNMENT_NOT_APPLICABLE",
+        "Owners and admins always have access to all apps; apps cannot be assigned to them.",
+        headers,
+    )
+}
+
+/// Shared gate of the assignment routes. Returns the open transaction, the
+/// write scope and the target's role.
+async fn assignment_gate(
+    s: &crate::Services,
+    headers: &HeaderMap,
+    session: &AuthenticatedSession,
+    org: Uuid,
+    user: Uuid,
+) -> Result<(OrgTx, OrgScope, Option<OrgRole>), Box<Response>> {
+    let mut org_tx = begin_org_tx(&s.pool, org, headers, "member app transaction failed").await?;
     let actor_role = match org_tx.role_of(session.user_id).await {
         Ok(role) => role,
-        Err(error) => return orgs::db_failure(&error, &headers, "member app actor lookup failed"),
+        Err(error) => {
+            return Err(Box::new(orgs::db_failure(
+                &error,
+                headers,
+                "member app actor lookup failed",
+            )));
+        }
     };
     let target_role = match org_tx.role_of(user).await {
         Ok(role) => role,
-        Err(error) => return orgs::db_failure(&error, &headers, "member app lookup failed"),
+        Err(error) => {
+            return Err(Box::new(orgs::db_failure(
+                &error,
+                headers,
+                "member app lookup failed",
+            )));
+        }
     };
     let actor = Actor {
         user_id: session.user_id,
@@ -224,23 +243,59 @@ pub(crate) async fn assign(
                 role: None,
             },
         ),
-        &headers,
+        headers,
         session.user_id,
         "member.apps.set",
         Some(org),
         Some(user),
     ) {
         Gate::Open(p) => p,
-        Gate::Closed(r) => return r,
+        Gate::Closed(r) => return Err(Box::new(r)),
     };
     let Some(scope) = OrgScope::from_permit(&p) else {
+        return Err(Box::new(orgs::not_found(headers)));
+    };
+    Ok((org_tx, scope, target_role))
+}
+
+fn is_always_all_apps(role: Option<OrgRole>) -> bool {
+    matches!(role, Some(OrgRole::Owner | OrgRole::Admin))
+}
+
+pub(crate) async fn assign(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path((org_raw, user_raw)): Path<(String, String)>,
+    body: Result<Json<AssignBody>, JsonRejection>,
+) -> Response {
+    let Some(s) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    let (Some(org), Some(user)) = (id(&org_raw), id(&user_raw)) else {
         return orgs::not_found(&headers);
     };
+    let Json(body) = match body {
+        Ok(v) => v,
+        Err(e) => return rejection_response(&e, &headers),
+    };
+    if !valid_apps(&body.apps, &s.settings.app_catalog) {
+        return validation_failed(&["apps"], &headers);
+    }
+    let (mut org_tx, scope, target_role) =
+        match assignment_gate(&s, &headers, &session, org, user).await {
+            Ok(v) => v,
+            Err(response) => return *response,
+        };
+    if is_always_all_apps(target_role) && !body.apps.is_empty() {
+        return assignment_not_applicable(&headers);
+    }
     match app_access::set_assignments_tx(
         &mut org_tx,
         &scope,
         user,
         &body.apps,
+        &catalog_ids(&s),
         s.clock.now(),
         &crate::audit::ctx(&headers, Some(session.user_id)),
     )
@@ -258,6 +313,76 @@ pub(crate) async fn assign(
             Err(error) => orgs::db_failure(&error, &headers, "member app assignment commit failed"),
         },
         Err(e) => orgs::db_failure(&e, &headers, "member app assignment failed"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChangeBody {
+    #[serde(default)]
+    add: Vec<String>,
+    #[serde(default)]
+    remove: Vec<String>,
+}
+
+/// Adds and removes single apps without replacing the whole list, so bulk
+/// actions cannot drop concurrent changes made from another session.
+pub(crate) async fn change(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path((org_raw, user_raw)): Path<(String, String)>,
+    body: Result<Json<ChangeBody>, JsonRejection>,
+) -> Response {
+    let Some(s) = state.services.clone() else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    let (Some(org), Some(user)) = (id(&org_raw), id(&user_raw)) else {
+        return orgs::not_found(&headers);
+    };
+    let Json(body) = match body {
+        Ok(v) => v,
+        Err(e) => return rejection_response(&e, &headers),
+    };
+    let overlap = body.add.iter().any(|app| body.remove.contains(app));
+    if !valid_apps(&body.add, &s.settings.app_catalog)
+        || !valid_apps(&body.remove, &s.settings.app_catalog)
+        || overlap
+    {
+        return validation_failed(&["add", "remove"], &headers);
+    }
+    let (mut org_tx, scope, target_role) =
+        match assignment_gate(&s, &headers, &session, org, user).await {
+            Ok(v) => v,
+            Err(response) => return *response,
+        };
+    if is_always_all_apps(target_role) && !body.add.is_empty() {
+        return assignment_not_applicable(&headers);
+    }
+    match app_access::change_assignments_tx(
+        &mut org_tx,
+        &scope,
+        user,
+        &body.add,
+        &body.remove,
+        &catalog_ids(&s),
+        s.clock.now(),
+        &crate::audit::ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
+        Ok(apps) => match org_tx.commit().await {
+            Ok(()) => {
+                crate::figcraft::process_app_access_revocations(&s).await;
+                (
+                    StatusCode::OK,
+                    Json(json!({"user_id":user.to_string(),"apps":apps})),
+                )
+                    .into_response()
+            }
+            Err(error) => orgs::db_failure(&error, &headers, "member app change commit failed"),
+        },
+        Err(e) => orgs::db_failure(&e, &headers, "member app change failed"),
     }
 }
 

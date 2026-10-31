@@ -88,6 +88,7 @@ export const ENDPOINTS = {
   orgApps: { method: "GET", path: "/organizations/{org_id}/apps" },
   orgAppAccess: { method: "PATCH", path: "/organizations/{org_id}/app-access" },
   memberApps: { method: "PUT", path: "/organizations/{org_id}/members/{user_id}/apps" },
+  changeMemberApps: { method: "PATCH", path: "/organizations/{org_id}/members/{user_id}/apps" },
   updateAdminOrganizationSeats: { method: "PATCH", path: "/admin/organizations/{org_id}/seats" },
   listDevices: { method: "GET", path: "/auth/devices" },
   revokeDevice: { method: "DELETE", path: "/auth/devices/{id}" },
@@ -338,6 +339,7 @@ export interface ApiClient {
   getOrganizationApps(orgId: string): Promise<OrganizationApps>;
   updateOrganizationAppMode(orgId: string, mode: "all" | "assigned"): Promise<{ mode: "all" | "assigned" }>;
   updateMemberApps(orgId: string, userId: string, apps: string[]): Promise<{ user_id: string; apps: string[] }>;
+  changeMemberApps(orgId: string, userId: string, change: { add?: string[]; remove?: string[] }): Promise<{ user_id: string; apps: string[] }>;
   updateAdminOrganizationSeats(orgId: string, seatLimit: number | null): Promise<{ seat_limit: number | null }>;
   /**
    * Ends the session. The CSRF token is dropped only when the server confirmed
@@ -606,6 +608,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     getOrganizationApps: (orgId) => call(ENDPOINTS.orgApps, { params: { org_id: orgId } }),
     updateOrganizationAppMode: (orgId, mode) => call(ENDPOINTS.orgAppAccess, { params: { org_id: orgId }, body: { mode } }),
     updateMemberApps: (orgId, userId, apps) => call(ENDPOINTS.memberApps, { params: { org_id: orgId, user_id: userId }, body: { apps } }),
+    changeMemberApps: (orgId, userId, change) => call(ENDPOINTS.changeMemberApps, { params: { org_id: orgId, user_id: userId }, body: change }),
     updateAdminOrganizationSeats: (orgId, seatLimit) => call(ENDPOINTS.updateAdminOrganizationSeats, { params: { org_id: orgId }, body: { seat_limit: seatLimit } }),
     async logout() {
       try {

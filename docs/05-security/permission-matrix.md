@@ -158,12 +158,12 @@ Entscheidungen und Vertragspräzisierungen: [ADR-0024](../09-decisions/adr-0024-
 
 | Aktion | Owner | Admin | Member | Guest | Operator |
 |---|---:|---:|---:|---:|---:|
-| App-Modus lesen | Ja | Ja | Ja | Nein | Nein |
+| App-Modus lesen | Ja | Ja | Nein | Nein | Nein |
 | App-Modus ändern | Ja | Ja | Nein | Nein | Nein |
 | Mitglieds-App-Zuweisung ändern | Ja | Ja | Nein | Nein | Nein |
 | Seat-Limit setzen | Nein | Nein | Nein | Nein | Ja |
 | App-Zugriff | Alle | Alle | Modus/Zuweisung | Keine individuelle Zuweisung; Rollenpolicy gilt | Keine organisationsgebundene Mitgliedsrolle |
 
-App-Gerätelogin erfordert nach 2FA mindestens eine aktive Organisation, die die App zulässt; jede Tenant-Anfrage prüft separat gegen ihre Organisation. Launcher, CLI und Browserzugriff umgehen nur die App-Zuweisung, nicht die übrige Authentisierung oder Tenant-Policy. Gäste werden nicht individuell zugewiesen; ihre Aktionen bleiben durch Rollenpolicy begrenzt. Platzbelegung zählt aktive Nichtgäste; offene Nichtgast-Einladungen reservieren Plätze. Gäste und deaktivierte Mitglieder zählen nicht.
+App-Gerätelogin erfordert nach 2FA mindestens eine aktive Organisation, die die App zulässt; jede Tenant-Anfrage prüft separat gegen ihre Organisation. Zuweisungen gibt es nur für die Rolle `member`; für Owner und Admin (alle Apps) wird das Setzen von Apps mit 409 `APP_ASSIGNMENT_NOT_APPLICABLE` abgelehnt, und das Entziehen einer App widerruft nur im Modus `assigned` bei Mitgliedern. Eine Geräte-Sitzung endet erst, wenn keine andere aktive Mitgliedschaft der Person die App noch erlaubt; Sperren werden nur für die Organisation des Entzugs freigegeben. Browser-Sitzungen umgehen die App-Zuweisung für Ansehen, Herunterladen, Hochladen und Freigeben. Launcher- und CLI-Sitzungen verhalten sich im Modus `assigned` für Mitglieder wie der Browser, dürfen aber keine Dateisperren erwerben und keine FigCraft-Livelinks ausstellen; Owner, Admin und Gäste sind davon ausgenommen. Die übrige Authentisierung und Tenant-Policy bleibt unberührt. Gäste werden nicht individuell zugewiesen; ihre Aktionen bleiben durch Rollenpolicy begrenzt. Platzbelegung zählt aktive Nichtgäste; offene Nichtgast-Einladungen reservieren Plätze. Gäste und deaktivierte Mitglieder zählen nicht.
 
 Für **jeden** Endpunkt: anonymous, disabled user, member another org, viewer -> write, editor -> role change, stale role from cache, deleted project, revoked invite, expired session. Responses für fremde Daten sollen keine Existenzinformation preisgeben; je nach API-Konvention 404 statt 403 verwenden.
