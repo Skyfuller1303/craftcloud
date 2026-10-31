@@ -22,3 +22,7 @@ Vorgebaute Registry-Images würden die Installation beschleunigen, benötigen ab
 ## Nachweise
 
 [OPS-01-Briefing](../12-app-cloud/ops-01-install-and-releases.md), [Installationsanleitung](../06-operations/install.md) und der lokale OPS-01-Bericht dokumentieren Umsetzung, Prüfungen und verbleibende Einschränkungen.
+
+## Nachtrag 2026-10-31: FigCraft-Begleitdienst standardmäßig
+
+Der Installer richtet den FigCraft-Begleitdienst aus [ADR-0022](adr-0022-figcraft-live-hosting.md) standardmäßig ein (`CRAFTCLOUD_FIGCRAFT=enabled`, Opt-out mit `--no-figcraft` oder `craftcloud-ctl figcraft disable`). Eine einzige Hilfsfunktion legt die Compose-Dateiliste fest, damit `install.sh` und `craftcloud-ctl` nicht auseinanderlaufen. Der Verwaltungsschlüssel liegt als `/etc/craftcloud/figcraft.key` (0600) und ist nicht im Backup.

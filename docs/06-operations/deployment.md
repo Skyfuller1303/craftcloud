@@ -35,7 +35,9 @@ Die Datenbank-Sicherung enthält die verschlüsselten TOTP-Geheimnisse und die g
 
 Ein Downgrade auf eine Version ohne AC-02 ist kein unterstützter Rückweg: Alte Server verstehen weder die 2FA-Anmeldepflicht noch das neue Schema. Ein geplanter Rückweg erfordert eine isolierte Wiederherstellung eines passenden früheren Backups und eine ausdrückliche Sicherheitsentscheidung; entfernen Sie nicht bloß Tabellen oder Spalten aus der laufenden Instanz. Weitere Restore-Grenzen stehen im [Backup-Runbook](backup-upgrade-runbook.md).
 
-## Optionaler FigCraft-Begleitdienst (AC-06)
+## FigCraft-Begleitdienst (AC-06, seit 2026-10-31 standardmäßig aktiv)
+
+Der Installer ([install.md](install.md)) aktiviert den Begleitdienst standardmäßig (`CRAFTCLOUD_FIGCRAFT=enabled`), erzeugt den Schlüssel `/etc/craftcloud/figcraft.key` und übergibt `compose.figcraft.yaml` in jedem Compose-Aufruf. Opt-out: `install.sh --no-figcraft` oder später `craftcloud-ctl figcraft disable`. Wer `docker compose` ohne Installer verwendet, führt beide Dateien selbst auf. Der folgende Abschnitt beschreibt die Konfiguration dieses Begleitdienstes.
 
 Mit FigCraft muss `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` mindestens `6` betragen; der Standard `10` erfüllt dies. Vier gleichzeitig zugelassene Live-Anfragen und der serielle Worker können fünf Advisory-Lock-Verbindungen belegen, während eine weitere Verbindung den Fortschritt ihrer Datenbankoperationen ermöglicht. Eine kleinere Konfiguration wird beim Start abgelehnt. Ohne FigCraft sind weiterhin kleinere Pools erlaubt.
 
@@ -52,13 +54,13 @@ Nach Migration `0018_figcraft_live.sql` aktiviert CraftCloud die Funktion nur, w
 
 URLs dürfen weder Zugangsdaten noch Query oder Fragment enthalten. Legen Sie die Host-Schlüsseldatei außerhalb des Repositorys mit restriktiven Dateirechten an, etwa `umask 077; openssl rand -hex 32 > /geschuetzter/pfad/figcraft.key`, und tragen Sie ihren absoluten Pfad in `.env` ein. Die vorhandene Vorlage erzeugt diesen zusätzlichen Schlüssel nicht automatisch. Behandeln Sie ihn wie ein Administratorpasswort: Er verwaltet sämtliche Dokumente des Begleitdienstes.
 
-Start mit dem optionalen Overlay:
+Start mit dem Overlay (manuell; der Installer übergibt es selbst):
 
 ```sh
 docker compose -f compose.yaml -f compose.setup.yaml -f compose.figcraft.yaml up -d --build
 ```
 
-`figcraft-init` schreibt den Schlüssel mit Modus 0400 und Eigentümer 65532 in das eigene Datenvolume und ein separates, nur vom CraftCloud-Server gelesenen Schlüsselvolume. Der laufende FigCraft-Prozess ist nonroot, hat eine schreibgeschützte Root-Dateisystemschicht, kein veröffentlichtes Host-Port und ausschließlich ein internes Netz. Caddy reicht `/figcraft/` unverändert weiter. Open-Publish ist ausgeschaltet; der Begleitdienst importiert nur über den Verwaltungsschlüssel. Die Konfiguration begrenzt native Dokumente auf 64 MiB, Dateien auf 1000, Links je Datei auf 1000 und gleichzeitige Verbindungen auf 128. Größere Installationen benötigen bewusst angepasste Grenzen und Lasttests. Der Standardstack ohne Overlay erhält keine FigCraft-Route.
+`figcraft-init` schreibt den Schlüssel mit Modus 0400 und Eigentümer 65532 in das eigene Datenvolume und ein separates, nur vom CraftCloud-Server gelesenen Schlüsselvolume. Der laufende FigCraft-Prozess ist nonroot, hat eine schreibgeschützte Root-Dateisystemschicht, kein veröffentlichtes Host-Port und ausschließlich ein internes Netz. Caddy reicht `/figcraft/` unverändert weiter. Open-Publish ist ausgeschaltet; der Begleitdienst importiert nur über den Verwaltungsschlüssel. Die Konfiguration begrenzt native Dokumente auf 64 MiB, Dateien auf 1000, Links je Datei auf 1000 und gleichzeitige Verbindungen auf 128. Größere Installationen benötigen bewusst angepasste Grenzen und Lasttests. Ein Stack ohne Overlay (Opt-out) erhält keine FigCraft-Route.
 
 Nach einem Neustart desselben FigCraft-Datenvolumes funktionieren bestehende persönliche Links weiter. Nach einem **Restore** gilt dagegen das [Backup-Runbook](backup-upgrade-runbook.md): alte Instanz abtrennen, leeres FigCraft-Volume verwenden, Dateien erneut veröffentlichen. Das bloße Entfernen des Overlays widerruft keine bereits ausgegebenen Links; beenden Sie die Live-Dateien vorher und prüfen Sie deren letzte gesicherte Version.
 

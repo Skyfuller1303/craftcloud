@@ -1,4 +1,9 @@
-# Optional AC-06 companion. Apply together with compose.yaml, never on its own.
+# AC-06 FigCraft live companion, enabled by default by the installer
+# (deploy/install/install.sh, CRAFTCLOUD_FIGCRAFT=enabled). Apply together with
+# compose.yaml, never on its own:
+#   docker compose -f compose.yaml -f compose.figcraft.yaml [-f compose.setup.yaml] ...
+# The installer opts out with --no-figcraft; craftcloud-ctl figcraft disable|enable
+# changes it later. Plain `docker compose` users list both files themselves.
 # The unchanged FigCraft protocol accepts /figcraft/ (ADR-0022).
 services:
   figcraft-init:

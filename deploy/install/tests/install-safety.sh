@@ -25,6 +25,7 @@ DF
 chmod +x "$TMP/bin/docker" "$TMP/bin/df"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-0.1.0/deploy/compose/compose.yaml"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-0.1.0/deploy/compose/compose.install.yaml"
+printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-0.1.0/deploy/compose/compose.figcraft.yaml"
 printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy }' >"$TMP/source/craftcloud-0.1.0/deploy/compose/caddy/Caddyfile"
 printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key' >"$TMP/source/craftcloud-0.1.0/deploy/compose/caddy/tls-custom.caddy"
 printf '{"version":"0.1.0","commit":"0123456"}\n' >"$TMP/source/craftcloud-0.1.0/CRAFTCLOUD-RELEASE.json"
@@ -66,6 +67,32 @@ cmp "$TMP/bootstrap-before" "$TMP/etc/craftcloud/bootstrap-token"
 [ "$(sed -n 's/^CC_SECRET_TWO_FACTOR_KEY=//p' "$TMP/etc/craftcloud/craftcloud.env")" = "$two_factor_key" ]
 [ "$(grep -c '^CC_SECRET_TWO_FACTOR_KEY=' "$TMP/etc/craftcloud/craftcloud.env")" -eq 1 ]
 
+# FigCraft companion: enabled by default. Every Compose call of the installer
+# carries the overlay, the key file is private, and the key never reaches a log.
+figcraft_env="$TMP/etc/craftcloud/craftcloud.env"
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$figcraft_env")" = enabled ]
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT_SECRET_FILE=//p' "$figcraft_env")" = "$TMP/etc/craftcloud/figcraft.key" ]
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT_PUBLIC_URL=//p' "$figcraft_env")" = 'wss://localhost:28543/figcraft/' ]
+[ "$(stat -c '%a' "$TMP/etc/craftcloud/figcraft.key")" = 600 ]
+figcraft_key=$(cat "$TMP/etc/craftcloud/figcraft.key")
+[ "${#figcraft_key}" -eq 64 ]
+case $figcraft_key in *[!0-9a-f]*) echo 'FigCraft key is not hexadecimal' >&2; exit 1 ;; esac
+[ -f "$TMP/etc/craftcloud/caddy/optional/figcraft.caddy" ]
+compose_calls=$(grep -c -- '--project-name craftcloud-ops01 ' "$TMP/docker.log")
+[ "$compose_calls" -gt 0 ]
+# Every call that names compose.yaml also names the overlay (and the build includes the service).
+if grep -- '-f compose.yaml ' "$TMP/docker.log" | grep -v -- '-f compose.figcraft.yaml' >/dev/null; then
+    echo 'a Compose call of the default install omitted the FigCraft overlay' >&2
+    exit 1
+fi
+grep -F -- '-f compose.install.yaml -f compose.figcraft.yaml -f compose.setup.yaml up -d' "$TMP/docker.log" >/dev/null
+grep -E -- 'build .* migrate server backup restore figcraft$' "$TMP/docker.log" >/dev/null
+if grep -F -- "$figcraft_key" "$TMP/install.log" "$TMP/reinstall.log" "$TMP/docker.log" >/dev/null; then
+    echo 'the FigCraft key was printed' >&2
+    exit 1
+fi
+[ "$(grep -c '^CRAFTCLOUD_FIGCRAFT=' "$figcraft_env")" -eq 1 ]
+
 # Invalid ACME addresses are rejected (the character class once allowed a range
 # that included , / : ; < = > ?). A normal address passes a dry run.
 for bad_email in 'a,b@example.org' 'a/b@example.org' 'a:b@example.org' 'a?b@example.org' 'a<b@example.org'; do
@@ -87,6 +114,7 @@ make_release() {
     mkdir -p "$TMP/source/craftcloud-$1/deploy/compose/caddy"
     printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-$1/deploy/compose/compose.yaml"
     printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-$1/deploy/compose/compose.install.yaml"
+    printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-$1/deploy/compose/compose.figcraft.yaml"
     printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy }' >"$TMP/source/craftcloud-$1/deploy/compose/caddy/Caddyfile"
     printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key' >"$TMP/source/craftcloud-$1/deploy/compose/caddy/tls-custom.caddy"
     if [ "${3:-}" != no-metadata ]; then
@@ -159,6 +187,7 @@ fi
 mkdir -p "$TMP/source/craftcloud-0.1.1/deploy/compose/caddy"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-0.1.1/deploy/compose/compose.yaml"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-0.1.1/deploy/compose/compose.install.yaml"
+printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-0.1.1/deploy/compose/compose.figcraft.yaml"
 printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy }' >"$TMP/source/craftcloud-0.1.1/deploy/compose/caddy/Caddyfile"
 printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key' >"$TMP/source/craftcloud-0.1.1/deploy/compose/caddy/tls-custom.caddy"
 printf '{"version":"0.1.1","commit":"1234567"}\n' >"$TMP/source/craftcloud-0.1.1/CRAFTCLOUD-RELEASE.json"
@@ -179,6 +208,7 @@ fi
 mkdir -p "$TMP/source/craftcloud-1.2.3+build.7/deploy/compose/caddy"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.3+build.7/deploy/compose/compose.yaml"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.3+build.7/deploy/compose/compose.install.yaml"
+printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.3+build.7/deploy/compose/compose.figcraft.yaml"
 printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy }' >"$TMP/source/craftcloud-1.2.3+build.7/deploy/compose/caddy/Caddyfile"
 printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key' >"$TMP/source/craftcloud-1.2.3+build.7/deploy/compose/caddy/tls-custom.caddy"
 printf '{"version":"1.2.3+build.7","commit":"7654321"}\n' >"$TMP/source/craftcloud-1.2.3+build.7/CRAFTCLOUD-RELEASE.json"
@@ -193,6 +223,7 @@ sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost --http
 mkdir -p "$TMP/source/craftcloud-1.2.4/deploy/compose/caddy"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.4/deploy/compose/compose.yaml"
 printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.4/deploy/compose/compose.install.yaml"
+printf '%s\n' 'services: {}' >"$TMP/source/craftcloud-1.2.4/deploy/compose/compose.figcraft.yaml"
 printf '%s\n' 'localhost { import tls-{$CRAFTCLOUD_TLS_MODE}.caddy } # v2' >"$TMP/source/craftcloud-1.2.4/deploy/compose/caddy/Caddyfile"
 printf '%s\n' 'tls /etc/caddy/fullchain.pem /etc/caddy/private.key # v2' >"$TMP/source/craftcloud-1.2.4/deploy/compose/caddy/tls-custom.caddy"
 printf '{"version":"1.2.4","commit":"1234567"}\n' >"$TMP/source/craftcloud-1.2.4/CRAFTCLOUD-RELEASE.json"
@@ -288,6 +319,86 @@ grep -F 'Two-factor key: present' "$TMP/status.log" >/dev/null
 main_ctl backup >"$TMP/backup.log" 2>&1
 grep -F 'does not contain the two-factor encryption key' "$TMP/backup.log" >/dev/null
 grep -F "$TMP/etc/craftcloud/craftcloud.env" "$TMP/backup.log" >/dev/null
+
+grep -F 'FigCraft live companion: enabled' "$TMP/status.log" >/dev/null
+: >"$TMP/docker.log"
+main_ctl backup >"$TMP/backup-figcraft.log" 2>&1
+if grep -- '-f compose.yaml ' "$TMP/docker.log" | grep -v -- '-f compose.figcraft.yaml' >/dev/null; then
+    echo 'a craftcloud-ctl call omitted the FigCraft overlay' >&2
+    exit 1
+fi
+
+# Opt-out through craftcloud-ctl: no overlay anywhere afterwards, containers of the
+# companion are removed, the key file and data stay for a later enable.
+cp "$TMP/etc/craftcloud/figcraft.key" "$TMP/figcraft-key-before"
+: >"$TMP/docker.log"
+main_ctl figcraft disable >"$TMP/figcraft-disable.log" 2>&1
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$TMP/etc/craftcloud/craftcloud.env")" = disabled ]
+grep -F -- 'up -d --remove-orphans' "$TMP/docker.log" >/dev/null
+if grep -F -- 'compose.figcraft.yaml' "$TMP/docker.log" >/dev/null; then
+    echo 'disabled FigCraft still passed the overlay' >&2
+    exit 1
+fi
+cmp "$TMP/figcraft-key-before" "$TMP/etc/craftcloud/figcraft.key"
+: >"$TMP/docker.log"
+main_ctl status >"$TMP/status-disabled.log" 2>&1
+main_ctl backup >"$TMP/backup-disabled.log" 2>&1
+grep -F 'FigCraft live companion: disabled' "$TMP/status-disabled.log" >/dev/null
+if grep -F -- 'compose.figcraft.yaml' "$TMP/docker.log" >/dev/null; then
+    echo 'a craftcloud-ctl call passed the overlay while FigCraft is disabled' >&2
+    exit 1
+fi
+main_ctl figcraft enable >"$TMP/figcraft-enable.log" 2>&1
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$TMP/etc/craftcloud/craftcloud.env")" = enabled ]
+cmp "$TMP/figcraft-key-before" "$TMP/etc/craftcloud/figcraft.key"
+grep -F -- 'compose.figcraft.yaml' "$TMP/docker.log" >/dev/null
+if main_ctl figcraft bogus >"$TMP/figcraft-bogus.log" 2>&1; then
+    echo 'craftcloud-ctl accepted an unknown figcraft subcommand' >&2
+    exit 1
+fi
+
+# Opt-out at install time: no overlay in any Compose call, no key file, no mount point.
+make_release 0.2.3 0230000
+(cd "$TMP/output" && sha256sum craftcloud-0.2.3.tar.gz >SHA256SUMS)
+: >"$TMP/docker-optout.log"
+PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/optout/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/optout/etc" \
+CRAFTCLOUD_DATA_DIR="$TMP/optout/data" CRAFTCLOUD_PROJECT_NAME=craftcloud-optout DOCKER_LOG="$TMP/docker-optout.log" \
+sh -x "$ROOT/deploy/install/install.sh" --non-interactive --no-figcraft --domain localhost --http-port 28220 --https-port 28221 \
+  --data-dir "$TMP/optout/data" "$TMP/output/craftcloud-0.2.3.tar.gz" >"$TMP/optout-install.log" 2>&1
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$TMP/optout/etc/craftcloud.env")" = disabled ]
+[ ! -e "$TMP/optout/etc/figcraft.key" ]
+if grep -F 'FIGCRAFT_SECRET_FILE' "$TMP/optout/etc/craftcloud.env" >/dev/null; then
+    echo 'opt-out installation recorded a FigCraft key path' >&2
+    exit 1
+fi
+grep -F -- '-f compose.yaml -f compose.install.yaml' "$TMP/docker-optout.log" >/dev/null
+if grep -F -- 'figcraft' "$TMP/docker-optout.log" >/dev/null; then
+    echo 'opt-out installation mentioned FigCraft in a Compose call' >&2
+    exit 1
+fi
+# The setting is sticky: a rerun without the flag keeps it, a contradicting flag is refused.
+PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/optout/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/optout/etc" \
+CRAFTCLOUD_DATA_DIR="$TMP/optout/data" CRAFTCLOUD_PROJECT_NAME=craftcloud-optout DOCKER_LOG="$TMP/docker-optout.log" \
+sh "$ROOT/deploy/install/install.sh" --non-interactive --domain localhost --http-port 28220 --https-port 28221 \
+  --data-dir "$TMP/optout/data" "$TMP/output/craftcloud-0.2.3.tar.gz" >"$TMP/optout-rerun.log" 2>&1
+[ "$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$TMP/optout/etc/craftcloud.env")" = disabled ]
+if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_INSTALL_ROOT="$TMP/optout/opt" CRAFTCLOUD_CONFIG_DIR="$TMP/optout/etc" \
+   CRAFTCLOUD_DATA_DIR="$TMP/optout/data" CRAFTCLOUD_PROJECT_NAME=craftcloud-optout sh "$ROOT/deploy/install/install.sh" \
+   --non-interactive --figcraft --domain localhost --http-port 28220 --https-port 28221 --data-dir "$TMP/optout/data" \
+   "$TMP/output/craftcloud-0.2.3.tar.gz" >"$TMP/optout-conflict.log" 2>&1; then
+    echo 'installer accepted a FigCraft flag that contradicts the saved setting' >&2
+    exit 1
+fi
+grep -F 'FigCraft setting differs' "$TMP/optout-conflict.log" >/dev/null
+# CRAFTCLOUD_FIGCRAFT=disabled in the environment is the same opt-out; other values are rejected.
+if PATH="$TMP/bin:$PATH" CRAFTCLOUD_SKIP_SYSTEMD=1 CRAFTCLOUD_FIGCRAFT=maybe CRAFTCLOUD_INSTALL_ROOT="$TMP/badfig/opt" \
+   CRAFTCLOUD_CONFIG_DIR="$TMP/badfig/etc" CRAFTCLOUD_DATA_DIR="$TMP/badfig/data" sh "$ROOT/deploy/install/install.sh" \
+   --dry-run --domain localhost --data-dir "$TMP/badfig/data" "$TMP/output/craftcloud-0.2.3.tar.gz" >"$TMP/badfig.log" 2>&1; then
+    echo 'installer accepted an invalid CRAFTCLOUD_FIGCRAFT value' >&2
+    exit 1
+fi
+grep -F 'must be enabled or disabled' "$TMP/badfig.log" >/dev/null
+(cd "$TMP/output" && sha256sum craftcloud-0.1.0.tar.gz >SHA256SUMS)
 
 # Backup, upgrade and rollback exclude each other.
 if command -v flock >/dev/null 2>&1; then

@@ -19,7 +19,7 @@ Ein Betreiber installiert CraftCloud auf einem eigenen Linux-Server mit wenigen 
 
 ## Ist-Stand (verifiziert 2026-10-30, main 73a06bd)
 
-- `deploy/compose/compose.yaml`: Dienste `secrets-init`, `db` (postgres 18.6, per Digest gepinnt), `db-init`, `migrate`, `server`, `caddy` (2.11, per Digest gepinnt), `backup` und `restore` im Profil `tools`; Netze `frontend` und `backend`. Zusätzlich `compose.setup.yaml` und `compose.metrics.yaml`.
+- `deploy/compose/compose.yaml`: Dienste `secrets-init`, `db` (postgres 18.6, per Digest gepinnt), `db-init`, `migrate`, `server`, `caddy` (2.11, per Digest gepinnt), `backup` und `restore` im Profil `tools`; Netze `frontend` und `backend`. Zusätzlich `compose.setup.yaml` und `compose.metrics.yaml`. Seit 2026-10-31 gehört auch `compose.figcraft.yaml` (FigCraft-Begleitdienst, AC-06) standardmäßig zur Installation: `install.sh` und `craftcloud-ctl` übergeben es in jedem Compose-Aufruf, `--no-figcraft` beziehungsweise `craftcloud-ctl figcraft disable` schaltet es ab (siehe `docs/06-operations/install.md`).
 - `deploy/compose/Dockerfile`: mehrstufiger Build (rust 1.99-trixie, node 24-trixie-slim, distroless cc-debian13 nonroot), alle Basis-Images per Digest gepinnt. Image-Name `${CRAFTCLOUD_IMAGE:-craftcloud-server:local}`.
 - `deploy/compose/secrets-init.sh` erzeugt die Geheimnisdateien; `db-init.sh` legt die getrennten DB-Rollen an.
 - `deploy/caddy/` enthält die Caddy-Konfiguration (TLS über ACME).

@@ -1,1 +1,1 @@
-# Deliberately empty by default. compose.figcraft.yaml mounts the companion route here.
+# Empty placeholder and mount point. With the FigCraft companion enabled (default), compose.figcraft.yaml mounts the companion route over this file.

@@ -134,25 +134,47 @@ version_of() {
     name=$(basename -- "$1")
     printf '%s\n' "$name" | sed 's/^craftcloud-//'
 }
-compose_at() {
-    root=$1; shift
+# The FigCraft companion setting in the environment file. A configuration without
+# the line predates the setting and stays off until `upgrade` or `figcraft enable`
+# records it (and creates the key file).
+figcraft_setting() {
+    fig_value=$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$CONFIG_DIR/craftcloud.env" 2>/dev/null | tail -n 1)
+    case $fig_value in
+        enabled|disabled) printf '%s\n' "$fig_value" ;;
+        '') printf '%s\n' disabled ;;
+        *) printf '%s\n' 'craftcloud-ctl: CRAFTCLOUD_FIGCRAFT must be enabled or disabled' >&2; return 1 ;;
+    esac
+}
+# compose_run <release-root> <with-setup 0|1> <docker compose arguments...>
+# The single place that decides which Compose files every invocation uses.
+compose_run() {
+    root=$1; setup=$2; shift 2
     dir=$(release_compose_dir "$root")
     version=$(version_of "$root")
     tag=$(image_tag "$version")
     [ "${#tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
+    fig=$(figcraft_setting) || exit 1
+    files='-f compose.yaml -f compose.install.yaml'
+    if [ "$fig" = enabled ]; then
+        if [ -f "$dir/compose.figcraft.yaml" ]; then
+            files="$files -f compose.figcraft.yaml"
+        else
+            printf '%s\n' "craftcloud-ctl: warning: release $version has no compose.figcraft.yaml; running it without the FigCraft companion" >&2
+        fi
+    fi
+    [ "$setup" != 1 ] || files="$files -f compose.setup.yaml"
     export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$tag"
     export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
-    (cd "$dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" -f compose.yaml -f compose.install.yaml "$@")
+    # shellcheck disable=SC2086 # the file list is intentionally word-split
+    (cd "$dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" $files "$@")
+}
+compose_at() {
+    root=$1; shift
+    compose_run "$root" 0 "$@"
 }
 compose_at_setup() {
     root=$1; shift
-    dir=$(release_compose_dir "$root")
-    version=$(version_of "$root")
-    tag=$(image_tag "$version")
-    [ "${#tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
-    export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$tag"
-    export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
-    (cd "$dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" -f compose.yaml -f compose.install.yaml -f compose.setup.yaml "$@")
+    compose_run "$root" 1 "$@"
 }
 compose_for_setup_state() {
     if [ -f "$CONFIG_DIR/bootstrap-token" ]; then compose_at_setup "$@"
@@ -245,6 +267,57 @@ generate_two_factor_key() {
     [ "${#gen_key}" -eq 44 ] || fail 'cannot generate two-factor key'
     printf '%s' "$gen_key"
 }
+# env_set <name> <value>: replaces or appends one line of the environment file.
+env_set() {
+    set_env=$CONFIG_DIR/craftcloud.env
+    set_tmp=$set_env.tmp.$$
+    { awk -v prefix="$1=" 'index($0, prefix) != 1' "$set_env"; printf '%s=%s\n' "$1" "$2"; } >"$set_tmp"
+    chmod 0600 "$set_tmp"
+    mv -f "$set_tmp" "$set_env"
+}
+# Generates the FigCraft management key (64 random hex characters) and prints it.
+generate_figcraft_key() {
+    gen_fig=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    [ "${#gen_fig}" -eq 64 ] || fail 'cannot generate FigCraft key'
+    printf '%s' "$gen_fig"
+}
+# Prepares everything the FigCraft companion needs: the management key file
+# (created once, mode 0600, never printed and never replaced), its path and the
+# public wss URL in the environment file, and the Caddy mount point of the route.
+ensure_figcraft_files() {
+    fig_env=$CONFIG_DIR/craftcloud.env
+    fig_key=$CONFIG_DIR/figcraft.key
+    [ ! -L "$fig_key" ] || fail 'FigCraft key path must not be a symbolic link'
+    if [ ! -e "$fig_key" ]; then
+        command -v od >/dev/null 2>&1 || fail 'required command missing: od'
+        fig_tmp=$fig_key.tmp.$$
+        generate_figcraft_key >"$fig_tmp"
+        chmod 0600 "$fig_tmp"
+        mv -f "$fig_tmp" "$fig_key"
+    else
+        [ -f "$fig_key" ] || fail 'FigCraft key path is not a regular file'
+        grep -Eq '^[0-9A-Fa-f]{64}$' "$fig_key" || fail "existing $fig_key is not 64 hexadecimal characters; refusing to replace it"
+        chmod 0600 "$fig_key"
+    fi
+    env_set CRAFTCLOUD_FIGCRAFT_SECRET_FILE "$fig_key"
+    if ! grep -q '^CRAFTCLOUD_FIGCRAFT_PUBLIC_URL=.' "$fig_env"; then
+        fig_domain=$(sed -n 's/^CRAFTCLOUD_DOMAIN=//p' "$fig_env" | tail -n 1)
+        fig_port=$(sed -n 's/^CRAFTCLOUD_HTTPS_PORT=//p' "$fig_env" | tail -n 1)
+        [ -n "$fig_domain" ] || fail 'CRAFTCLOUD_DOMAIN missing in the environment file'
+        fig_url=wss://$fig_domain/figcraft/
+        [ -z "$fig_port" ] || [ "$fig_port" = 443 ] || fig_url=wss://$fig_domain:$fig_port/figcraft/
+        env_set CRAFTCLOUD_FIGCRAFT_PUBLIC_URL "$fig_url"
+    fi
+    mkdir -p "$CONFIG_DIR/caddy/optional"
+    chmod 0700 "$CONFIG_DIR/caddy/optional"
+    [ -e "$CONFIG_DIR/caddy/optional/figcraft.caddy" ] || : >"$CONFIG_DIR/caddy/optional/figcraft.caddy"
+}
+# Environment files from before the FigCraft setting existed get the default (enabled).
+ensure_figcraft_setting() {
+    if ! grep -q '^CRAFTCLOUD_FIGCRAFT=' "$CONFIG_DIR/craftcloud.env"; then env_set CRAFTCLOUD_FIGCRAFT enabled; fi
+    fig_now=$(figcraft_setting) || exit 1
+    if [ "$fig_now" = enabled ]; then ensure_figcraft_files; fi
+}
 # Adds CC_SECRET_TWO_FACTOR_KEY to an environment file written before the key
 # existed. An existing non-empty value is never changed.
 ensure_two_factor_key() {
@@ -296,6 +369,8 @@ case ${1:-} in
         else
             printf '%s\n' "Two-factor key: MISSING in $CONFIG_DIR/craftcloud.env (two-factor setup is unavailable until it exists)"
         fi
+        fig_status=$(figcraft_setting) || exit 1
+        printf '%s\n' "FigCraft live companion: $fig_status (change with: craftcloud-ctl figcraft enable|disable)"
         ;;
     logs) shift; compose_at "$active" logs --follow "$@" ;;
     backup)
@@ -384,6 +459,7 @@ case ${1:-} in
         [ ! -L "$new_root" ] || fail 'release destination is a symbolic link'
         # Environment files from before the two-factor key existed get one now.
         ensure_two_factor_key
+        ensure_figcraft_setting
         # A backup must finish before any release or database change.
         sh "$0" backup
         backup_path=$(cat "$CONFIG_DIR/last-backup")
@@ -405,7 +481,11 @@ case ${1:-} in
         metaver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$metadata")
         [ "$metaver" = "$new_version" ] && [ -n "$commit" ] || fail 'release metadata mismatch'
         export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$new_image_tag" CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
-        (cd "$new_dir" && docker compose --project-name "$PROJECT" --env-file "$CONFIG_DIR/craftcloud.env" -f compose.yaml -f compose.install.yaml build --build-arg "CRAFTCLOUD_VERSION=$new_version" --build-arg "CRAFTCLOUD_COMMIT=$commit" migrate server backup restore)
+        build_services='migrate server backup restore'
+        fig_now=$(figcraft_setting) || exit 1
+        if [ "$fig_now" = enabled ] && [ -f "$new_dir/compose.figcraft.yaml" ]; then build_services="$build_services figcraft"; fi
+        # shellcheck disable=SC2086 # the service list is intentionally word-split
+        compose_at "$new_root" build --build-arg "CRAFTCLOUD_VERSION=$new_version" --build-arg "CRAFTCLOUD_COMMIT=$commit" $build_services
         restore_warning=0
         trap 'upgrade_status=$?; if [ "$restore_warning" -eq 1 ] && [ "$upgrade_status" -ne 0 ]; then printf "%s\\n" "Upgrade failed after migration attempt. Pre-upgrade backup: $backup_path. Restore manually if needed; see docs/06-operations/backup-upgrade-runbook.md. No automatic restore performed." >&2; fi' 0
         restore_warning=1
@@ -458,6 +538,49 @@ case ${1:-} in
         recreate_caddy_if_changed "$old"
         printf '%s\n' 'Release rolled back. Database schema was not restored; restore the pre-upgrade backup if the prior release requires it.' >&2
         ;;
+    figcraft)
+        sub=${2:-status}
+        case $sub in
+            status)
+                fig_status=$(figcraft_setting) || exit 1
+                printf 'FigCraft live companion: %s\n' "$fig_status"
+                ;;
+            enable|disable)
+                acquire_lock
+                if [ "$sub" = enable ]; then new_setting=enabled; else new_setting=disabled; fi
+                old_setting=$(figcraft_setting) || exit 1
+                if [ "$sub" = enable ]; then
+                    [ -f "$(release_compose_dir "$active")/compose.figcraft.yaml" ] || fail 'the active release has no compose.figcraft.yaml'
+                    command -v od >/dev/null 2>&1 || fail 'required command missing: od'
+                fi
+                had_setting=0
+                grep -q '^CRAFTCLOUD_FIGCRAFT=' "$CONFIG_DIR/craftcloud.env" && had_setting=1
+                env_set CRAFTCLOUD_FIGCRAFT "$new_setting"
+                restore_figcraft_setting() {
+                    if [ "$had_setting" -eq 1 ]; then env_set CRAFTCLOUD_FIGCRAFT "$old_setting"
+                    else awk '!/^CRAFTCLOUD_FIGCRAFT=/' "$CONFIG_DIR/craftcloud.env" >"$CONFIG_DIR/.craftcloud.env.tmp.$$" && chmod 0600 "$CONFIG_DIR/.craftcloud.env.tmp.$$" && mv -f "$CONFIG_DIR/.craftcloud.env.tmp.$$" "$CONFIG_DIR/craftcloud.env"; fi
+                }
+                if [ "$sub" = enable ]; then
+                    ensure_figcraft_files
+                    compose_for_setup_state "$active" build figcraft || { restore_figcraft_setting; fail 'could not build the FigCraft image; setting restored'; }
+                else
+                    printf '%s\n' 'craftcloud-ctl: warning: disabling FigCraft live collaboration. Active live files become unavailable and their links stop working. End live files in the cloud first so the last state is saved as a version; the data stays in the figcraft-data volume and the key stays in the config directory for a later enable.' >&2
+                fi
+                # --remove-orphans removes the figcraft containers when the overlay is gone.
+                if ! compose_for_setup_state "$active" up -d --remove-orphans; then
+                    restore_figcraft_setting
+                    fail "could not apply the FigCraft setting; the previous value ($old_setting) was restored, run 'craftcloud-ctl start' to reapply it"
+                fi
+                tries=0
+                until compose_at "$active" exec -T server /usr/local/bin/craftcloud-server healthcheck >/dev/null 2>&1; do
+                    tries=$((tries + 1)); [ "$tries" -lt 60 ] || fail 'readiness check timed out after changing the FigCraft setting'
+                    sleep 2
+                done
+                printf 'FigCraft live companion: %s\n' "$new_setting"
+                ;;
+            *) fail 'usage: craftcloud-ctl figcraft [status|enable|disable]' ;;
+        esac
+        ;;
     uninstall)
         acquire_lock
         shift
@@ -490,5 +613,5 @@ case ${1:-} in
             rm -rf -- "$DATA_DIR" "$CONFIG_DIR"
         fi
         ;;
-    *) fail 'usage: craftcloud-ctl status|logs|backup|upgrade <archive>|rollback|setup-complete|uninstall [--purge --confirm-purge]' ;;
+    *) fail 'usage: craftcloud-ctl status|logs|backup|upgrade <archive>|rollback|setup-complete|figcraft [status|enable|disable]|uninstall [--purge --confirm-purge]' ;;
 esac

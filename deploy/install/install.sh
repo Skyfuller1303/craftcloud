@@ -16,6 +16,9 @@ DATA_DIR_ENV=${CRAFTCLOUD_DATA_DIR:-}
 CADDY_CONFIG_DIR=$CONFIG_DIR/caddy
 SKIP_SYSTEMD=${CRAFTCLOUD_SKIP_SYSTEMD:-0}
 IMAGE_PREFIX=${CRAFTCLOUD_IMAGE_PREFIX:-}
+FIGCRAFT=${CRAFTCLOUD_FIGCRAFT:-enabled}
+FIGCRAFT_SET=0
+[ -z "${CRAFTCLOUD_FIGCRAFT:-}" ] || FIGCRAFT_SET=1
 ARCHIVE=
 DOMAIN=
 ACME_EMAIL=
@@ -36,6 +39,9 @@ Usage: install.sh [options] <craftcloud-version.tar.gz>
   --data-dir PATH        Persistent data directory
   --http-port PORT       HTTP host port (default 80)
   --https-port PORT      HTTPS host port (default 443)
+  --no-figcraft          Do not run the FigCraft live collaboration companion
+                         (enabled by default; same as CRAFTCLOUD_FIGCRAFT=disabled;
+                         change later with: craftcloud-ctl figcraft enable|disable)
   --non-interactive      Do not prompt
   --dry-run              Check inputs and print planned actions
 USAGE
@@ -222,6 +228,53 @@ sync_caddy_config() {
     chmod 0600 "$sync_next"
     mv -f "$sync_next" "$sync_manifest"
 }
+# Generates the FigCraft management key (64 random hex characters) and prints it.
+generate_figcraft_key() {
+    gen_fig=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    [ "${#gen_fig}" -eq 64 ] || fail 'cannot generate FigCraft key'
+    printf '%s' "$gen_fig"
+}
+# env_set <name> <value>: replaces or appends one line of the environment file.
+env_set() {
+    set_tmp=$env_file.tmp.$$
+    { awk -v prefix="$1=" 'index($0, prefix) != 1' "$env_file"; printf '%s=%s\n' "$1" "$2"; } >"$set_tmp"
+    chmod 0600 "$set_tmp"
+    mv -f "$set_tmp" "$env_file"
+}
+# Prepares everything the FigCraft companion needs: the management key file
+# (created once, mode 0600, never printed and never replaced), its path and the
+# public wss URL in the environment file, and the Caddy mount point of the route.
+ensure_figcraft_files() {
+    fig_key=$CONFIG_DIR/figcraft.key
+    [ ! -L "$fig_key" ] || fail 'FigCraft key path must not be a symbolic link'
+    if [ ! -e "$fig_key" ]; then
+        fig_tmp=$fig_key.tmp.$$
+        generate_figcraft_key >"$fig_tmp"
+        chmod 0600 "$fig_tmp"
+        mv -f "$fig_tmp" "$fig_key"
+    else
+        [ -f "$fig_key" ] || fail 'FigCraft key path is not a regular file'
+        grep -Eq '^[0-9A-Fa-f]{64}$' "$fig_key" || fail "existing $fig_key is not 64 hexadecimal characters; refusing to replace it"
+        chmod 0600 "$fig_key"
+    fi
+    env_set CRAFTCLOUD_FIGCRAFT_SECRET_FILE "$fig_key"
+    if ! grep -q '^CRAFTCLOUD_FIGCRAFT_PUBLIC_URL=.' "$env_file"; then
+        fig_url=wss://$DOMAIN/figcraft/
+        [ "$HTTPS_PORT" = 443 ] || fig_url=wss://$DOMAIN:$HTTPS_PORT/figcraft/
+        env_set CRAFTCLOUD_FIGCRAFT_PUBLIC_URL "$fig_url"
+    fi
+    mkdir -p "$CADDY_CONFIG_DIR/optional"
+    chmod 0700 "$CADDY_CONFIG_DIR/optional"
+    [ -e "$CADDY_CONFIG_DIR/optional/figcraft.caddy" ] || : >"$CADDY_CONFIG_DIR/optional/figcraft.caddy"
+}
+# compose_files <with-setup 0|1>: the single place that decides which Compose
+# files every invocation uses, so they cannot diverge.
+compose_files() {
+    printf '%s' '-f compose.yaml -f compose.install.yaml'
+    [ "$FIGCRAFT" != enabled ] || printf '%s' ' -f compose.figcraft.yaml'
+    [ "$1" != 1 ] || printf '%s' ' -f compose.setup.yaml'
+}
+
 # Generates the Base64 two-factor key (32 random bytes) and prints it.
 generate_two_factor_key() {
     gen_key=$(head -c 32 /dev/urandom | base64 | tr -d '\n') || fail 'cannot generate two-factor key'
@@ -236,6 +289,8 @@ while [ "$#" -gt 0 ]; do
         --data-dir) [ "$#" -ge 2 ] || fail '--data-dir needs a value'; DATA_DIR=$2; DATA_DIR_SET=1; shift 2 ;;
         --http-port) [ "$#" -ge 2 ] || fail '--http-port needs a value'; HTTP_PORT=$2; HTTP_PORT_SET=1; shift 2 ;;
         --https-port) [ "$#" -ge 2 ] || fail '--https-port needs a value'; HTTPS_PORT=$2; HTTPS_PORT_SET=1; shift 2 ;;
+        --figcraft) FIGCRAFT=enabled; FIGCRAFT_SET=1; shift ;;
+        --no-figcraft) FIGCRAFT=disabled; FIGCRAFT_SET=1; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -259,6 +314,11 @@ if [ -f "$env_file" ]; then
     saved_caddy_dir=$(sed -n 's/^CRAFTCLOUD_CADDY_CONFIG_DIR=//p' "$env_file" | tail -n 1)
     saved_image_prefix=$(sed -n 's/^CRAFTCLOUD_IMAGE_PREFIX=//p' "$env_file" | tail -n 1)
     saved_project=$(sed -n 's/^CRAFTCLOUD_PROJECT_NAME=//p' "$env_file" | tail -n 1)
+    saved_figcraft=$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$env_file" | tail -n 1)
+    if [ -n "$saved_figcraft" ]; then
+        [ "$FIGCRAFT_SET" -eq 0 ] || [ "$FIGCRAFT" = "$saved_figcraft" ] || fail 'FigCraft setting differs from existing config; use craftcloud-ctl figcraft enable|disable'
+        FIGCRAFT=$saved_figcraft
+    fi
     if [ -n "$saved_domain" ]; then
         [ "$DOMAIN_SET" -eq 0 ] || [ "$DOMAIN" = "$saved_domain" ] || fail 'domain differs from existing config'
         DOMAIN=$saved_domain
@@ -286,6 +346,7 @@ if [ -f "$env_file" ]; then
         IMAGE_PREFIX=$saved_image_prefix
     fi
 fi
+case $FIGCRAFT in enabled|disabled) ;; *) fail 'CRAFTCLOUD_FIGCRAFT must be enabled or disabled' ;; esac
 [ -n "$IMAGE_PREFIX" ] || IMAGE_PREFIX=craftcloud-server:
 [ -n "$IMAGE_PREFIX" ] || fail 'image prefix is required'
 case $IMAGE_PREFIX in *[!A-Za-z0-9._:/-]*) fail 'invalid image prefix' ;; esac
@@ -479,6 +540,7 @@ if [ ! -e "$env_file" ]; then
         printf 'CRAFTCLOUD_HTTP_PORT=%s\nCRAFTCLOUD_HTTPS_PORT=%s\nCRAFTCLOUD_TLS_MODE=%s\nCRAFTCLOUD_ACME_EMAIL=%s\n' "$HTTP_PORT" "$HTTPS_PORT" "$tls_mode" "$ACME_EMAIL"
         printf 'CRAFTCLOUD_DATA_DIR=%s\nCRAFTCLOUD_CONFIG_DIR=%s\nCRAFTCLOUD_PROJECT_NAME=%s\nCRAFTCLOUD_BACKUP_KEEP=%s\n' "$DATA_DIR" "$CONFIG_DIR" "$PROJECT" "${CRAFTCLOUD_BACKUP_KEEP:-7}"
         printf 'CRAFTCLOUD_IMAGE_PREFIX=%s\nCRAFTCLOUD_IMAGE=%s\n' "$IMAGE_PREFIX" "$IMAGE_PREFIX$version_image_tag"
+        printf 'CRAFTCLOUD_FIGCRAFT=%s\n' "$FIGCRAFT"
         printf 'CC_SECRET_DB_SUPERUSER_PASSWORD=%s\n' "$secret_db_superuser"
         printf 'CC_SECRET_DB_OWNER_PASSWORD=%s\n' "$secret_db_owner"
         printf 'CC_SECRET_DB_RUNTIME_PASSWORD=%s\n' "$secret_db_runtime"
@@ -502,6 +564,8 @@ if ! grep -q '^CC_SECRET_TWO_FACTOR_KEY=.' "$env_file"; then
 fi
 chmod 0600 "$env_file"
 if ! grep -q '^CRAFTCLOUD_CADDY_CONFIG_DIR=' "$env_file"; then printf 'CRAFTCLOUD_CADDY_CONFIG_DIR=%s\n' "$CADDY_CONFIG_DIR" >>"$env_file"; fi
+# Configurations from before the FigCraft setting existed record the chosen value.
+if ! grep -q '^CRAFTCLOUD_FIGCRAFT=' "$env_file"; then env_set CRAFTCLOUD_FIGCRAFT "$FIGCRAFT"; fi
 mkdir -p "$CADDY_CONFIG_DIR"
 if [ ! -e "$CADDY_CONFIG_DIR/Caddyfile" ]; then
     caddy_empty=1
@@ -516,30 +580,43 @@ fi
 # (the new version is written as <name>.new).
 sync_caddy_config "$compose_dir/caddy" "$CADDY_CONFIG_DIR"
 chmod 0700 "$CADDY_CONFIG_DIR"
+if [ "$FIGCRAFT" = enabled ]; then
+    [ -f "$compose_dir/compose.figcraft.yaml" ] || fail 'release archive has no compose.figcraft.yaml; use --no-figcraft or a complete release'
+    ensure_figcraft_files
+fi
 if [ -f "$CADDY_CONFIG_DIR/private.key" ]; then chmod 0600 "$CADDY_CONFIG_DIR/private.key"; fi
 version_image_tag=$(image_tag "$version")
 [ "${#version_image_tag}" -le 128 ] || fail 'release version is too long for a Docker image tag'
 export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$version_image_tag"
 export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR" CRAFTCLOUD_CADDY_CONFIG_DIR="$CADDY_CONFIG_DIR"
-compose() { (cd "$compose_dir" && docker compose --project-name "$PROJECT" --env-file "$env_file" -f compose.yaml -f compose.install.yaml "$@"); }
-compose build --build-arg "CRAFTCLOUD_VERSION=$version" --build-arg "CRAFTCLOUD_COMMIT=$release_commit" migrate server backup restore
+# compose <with-setup 0|1> <docker compose arguments...>
+compose() {
+    compose_setup=$1; shift
+    compose_list=$(compose_files "$compose_setup")
+    # shellcheck disable=SC2086 # the file list is intentionally word-split
+    (cd "$compose_dir" && docker compose --project-name "$PROJECT" --env-file "$env_file" $compose_list "$@")
+}
+build_services='migrate server backup restore'
+[ "$FIGCRAFT" != enabled ] || build_services="$build_services figcraft"
+# shellcheck disable=SC2086 # the service list is intentionally word-split
+compose 0 build --build-arg "CRAFTCLOUD_VERSION=$version" --build-arg "CRAFTCLOUD_COMMIT=$release_commit" $build_services
 setup_pending=0
 [ ! -f "$CONFIG_DIR/bootstrap-token" ] || setup_pending=1
 if [ "$setup_pending" -eq 1 ]; then
-    (cd "$compose_dir" && docker compose --project-name "$PROJECT" --env-file "$env_file" -f compose.yaml -f compose.install.yaml -f compose.setup.yaml run --rm migrate)
+    compose 1 run --rm migrate
 else
-    compose run --rm migrate
+    compose 0 run --rm migrate
 fi
 rm -f -- "$INSTALL_ROOT/current.new"
 ln -s "$release" "$INSTALL_ROOT/current.new"
 mv -Tf "$INSTALL_ROOT/current.new" "$INSTALL_ROOT/current"
 if [ "$setup_pending" -eq 1 ]; then
-    (cd "$compose_dir" && docker compose --project-name "$PROJECT" --env-file "$env_file" -f compose.yaml -f compose.install.yaml -f compose.setup.yaml up -d)
+    compose 1 up -d
 else
-    compose up -d
+    compose 0 up -d
 fi
 tries=0
-until compose exec -T server /usr/local/bin/craftcloud-server healthcheck >/dev/null 2>&1; do
+until compose "$setup_pending" exec -T server /usr/local/bin/craftcloud-server healthcheck >/dev/null 2>&1; do
     tries=$((tries + 1)); [ "$tries" -lt 60 ] || fail 'readiness check timed out'
     sleep 2
 done
@@ -557,4 +634,9 @@ setup_url=https://$DOMAIN/admin
 [ "$HTTPS_PORT" = 443 ] || setup_url=https://$DOMAIN:$HTTPS_PORT/admin
 printf 'CraftCloud installed. Setup: %s\n' "$setup_url"
 if [ -f "$CONFIG_DIR/bootstrap-token" ]; then printf 'Bootstrap secret file: %s (keep private; do not share its contents in logs)\n' "$CONFIG_DIR/bootstrap-token"; fi
+if [ "$FIGCRAFT" = enabled ]; then
+    printf 'FigCraft live collaboration: enabled (endpoint under https://%s/figcraft/). Disable with: craftcloud-ctl figcraft disable\n' "$DOMAIN"
+else
+    printf 'FigCraft live collaboration: disabled. Enable with: craftcloud-ctl figcraft enable\n'
+fi
 printf 'After setup, run: %s setup-complete\n' "$INSTALL_ROOT/current/deploy/install/craftcloud-ctl"

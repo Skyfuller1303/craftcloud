@@ -34,6 +34,27 @@ Der Installer legt versionierte Quellen unter `/opt/craftcloud/releases/<version
 
 Neben den Datenbank- und Token-Geheimnissen erzeugt der Installer einmalig einen Schlüssel für die Zwei-Faktor-Anmeldung (`CC_SECRET_TWO_FACTOR_KEY` in `craftcloud.env`, Base64 von 32 Zufallsbytes). Ohne ihn antwortet die 2FA-Einrichtung mit `503`. Wiederholung und Upgrade ändern einen vorhandenen Schlüssel nie; fehlt er in einer älteren Konfiguration, wird er beim `upgrade` ergänzt. Der Schlüssel ist **nicht** im Backup: Bewahren Sie eine getrennte, geschützte Kopie auf, denn ein Restore der Datenbank braucht denselben Schlüssel, sonst müssen alle Personen 2FA neu einrichten. `craftcloud-ctl status` zeigt, ob er vorhanden ist; sein Wert wird nirgends ausgegeben. Eine Rotation mit altem Schlüssel (`CRAFTCLOUD_SECRET_KEY_OLD_FILE`) ist eine Betreiberaufgabe außerhalb des Installers, siehe [deployment.md](deployment.md).
 
+## FigCraft-Live (standardmäßig aktiv)
+
+Seit 2026-10-31 richtet der Installer den FigCraft-Begleitdienst (AC-06) standardmäßig mit ein, damit Personen rund um die Uhr live an gemeinsamen FigCraft-Dateien arbeiten können, ohne dass jemand einen eigenen FigCraft-Server startet. `craftcloud.env` enthält dafür `CRAFTCLOUD_FIGCRAFT=enabled`, den Pfad `CRAFTCLOUD_FIGCRAFT_SECRET_FILE` und die öffentliche Adresse `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` (`wss://<Domain>[:<HTTPS-Port>]/figcraft/`). Den Verwaltungsschlüssel (64 zufällige Hex-Zeichen) erzeugt der Installer einmalig als `/etc/craftcloud/figcraft.key` mit Modus 0600; er wird nie ausgegeben, nie überschrieben und ist **nicht** im Backup. Bewahren Sie wie beim 2FA-Schlüssel eine getrennte, geschützte Kopie auf. Der Begleitdienst wird beim Installieren lokal gebaut (Netzwerkzugriff auf `codeload.github.com`, zusätzliche Bauzeit und Speicher) und läuft nur im internen Compose-Netz; Caddy reicht `/figcraft/` weiter. Alle `docker compose`-Aufrufe von `install.sh` und `craftcloud-ctl` verwenden gemeinsam `compose.yaml`, `compose.install.yaml`, `compose.figcraft.yaml` (und während des Setups `compose.setup.yaml`).
+
+Ausschalten bei der Installation:
+
+```sh
+sudo sh craftcloud-0.1.0/deploy/install/install.sh --no-figcraft \
+  --domain cloud.example.org --non-interactive ./craftcloud-0.1.0.tar.gz
+```
+
+`CRAFTCLOUD_FIGCRAFT=disabled` in der Umgebung des Installers wirkt genauso. Der gewählte Wert steht danach in `craftcloud.env`; ein erneuter Installerlauf mit widersprechendem Schalter wird abgelehnt. Später wechseln Sie mit `craftcloud-ctl`:
+
+```sh
+sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl figcraft status
+sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl figcraft disable
+sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl figcraft enable
+```
+
+Beim **Ausschalten** werden Server und Proxy ohne FigCraft neu gestartet und die Begleitcontainer entfernt. Live-Dateien sind dann nicht verfügbar: `/api/v1/info` meldet `figcraft_live: false`, die Live-Routen antworten mit `FIGCRAFT_LIVE_UNAVAILABLE`, und die ausgegebenen persönlichen Links funktionieren nicht mehr. Beenden Sie aktive Live-Dateien vorher über „Livebetrieb beenden“, damit der letzte Stand als Version gesichert ist; Änderungen seit dem letzten Snapshot (alle 15 Minuten) bleiben nur im Volume `figcraft-data` erhalten. Dieses Volume und der Schlüssel `figcraft.key` bleiben bestehen, `craftcloud-ctl figcraft enable` startet den Begleitdienst wieder mit demselben Datenstand. Ausstehende Rechteentzüge werden erst nach dem erneuten Einschalten abgearbeitet; widerrufen Sie bei einem dauerhaften Abschalten Personen und Links vorher. Bestehende Installationen ohne die Einstellung bleiben bis zum nächsten `craftcloud-ctl upgrade` unverändert; das Upgrade trägt dann den Standard `enabled` ein, erzeugt den Schlüssel und baut den Begleitdienst (mit `figcraft disable` danach abschaltbar; wer ihn von Anfang an nicht möchte, führt vor dem Upgrade `figcraft disable` aus). Der Datenbankpool muss mit FigCraft mindestens 6 Verbindungen erlauben; der Standard 10 genügt.
+
 ## Erstes Konto und Betrieb
 
 Nach dem Image-Build, der Datenbankinitialisierung und den Migrationen wartet das Skript auf `/health/ready`. Es nennt anschließend die Setup-URL und den Pfad zur Bootstrap-Geheimnisdatei, niemals das Geheimnis. Öffnen Sie die ausgegebene URL im Browser, lesen Sie den Token nur in einer privaten lokalen Administratorsitzung und tragen Sie ihn in das Setup ein. Legen Sie Ihr Betreiberkonto, ein eigenes Passwort und die erste Organisation an. Speichern Sie den Token nicht in Tickets, Logs, Shell-Argumenten oder Bildschirmaufzeichnungen.

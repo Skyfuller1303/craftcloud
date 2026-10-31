@@ -2,6 +2,7 @@
 
 - **Status:** Lokal umgesetzt; das Machbarkeitsgate A1–A4 ist bestätigt. Veröffentlichung und Maintainer-Abstimmung stehen aus.
 - **Datum:** 2026-10-30
+- **Nachtrag 2026-10-31:** Der Begleitdienst ist seit 2026-10-31 im Installer standardmäßig aktiviert (Opt-out möglich), siehe [ADR-0023](adr-0023-install-and-releases.md) und das [Entscheidungslog](decision-log.md). Die Bezeichnung „optionaler Begleitdienst“ unten meint damit abschaltbar, nicht ausgeschaltet.
 - **Bezug:** AC-06, CC-F16; ersetzt die Zurückstellung der Begleitdienst-Integration in ADR-0007. Native Konten und Capabilities im FigCraft-Protokoll bleiben zurückgestellt.
 
 ## Kontext
