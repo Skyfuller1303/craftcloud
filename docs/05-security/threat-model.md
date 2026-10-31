@@ -1,5 +1,13 @@
 # Threat model (STRIDE / trust boundary review)
 
+## AC-09b: Application mail credentials
+
+Microsoft Graph and SMTP XOAUTH2 add trust in a configured identity provider and its mailbox permissions. Production token and Graph endpoints are fixed HTTPS endpoints, redirects are disabled, response sizes and deadlines are bounded, and alternate endpoints require an integration-only feature and verified loopback TLS. Client assertions use maintained JWT signing code, bind client, audience, expiry and a random identifier, and require a matching, currently valid RSA certificate. Google delegation binds the service account to the configured sender and mail scope.
+
+OAuth access tokens remain in a synchronized memory cache with a five-minute expiry margin. Delivery authentication failure triggers at most one renewal. Credential files are bounded regular files; Unix rejects symlinks and group/world permissions, and Windows rejects final reparse points. Windows ACL custody remains an operator responsibility. Operational errors expose only allowlisted provider codes; queue codes additionally fit the existing restricted schema. The operator-only status displays transport metadata without tokens or message contents.
+
+Unrestricted Entra application grants are additive to Exchange application RBAC and can bypass mailbox scoping. The installation guide uses a scoped Exchange application role without an additional global Graph grant and requires positive and negative mailbox authorization checks. SMTP OAuth credential overlays cannot fall back to unauthenticated delivery when an older release lacks the selected overlay. Relay compromise, excessive tenant permissions, mailbox compromise, and duplicate delivery after an uncertain remote acceptance remain operational risks. A live tenant authorization check is required before production use.
+
 ## AC-09: Transactional email and address ownership
 
 The email-delivery mode closes inviter account squatting by keeping invitation bearer links away from the inviter and requiring mailbox proof before account creation. Legacy installations without SMTP retain ADR-0017's residual risk. Verification never silently trusts pre-existing accounts. Address changes require current password and configured second factor, bind a single-use capability to current account state, and take effect only after confirmation at the new address.

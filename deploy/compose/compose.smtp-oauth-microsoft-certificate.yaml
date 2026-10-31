@@ -1,0 +1,20 @@
+services:
+  secrets-init:
+    environment:
+      COPY_SMTP_OAUTH_CERT: "1"
+      COPY_SMTP_OAUTH_KEY: "1"
+    secrets: [smtp_oauth_cert, smtp_oauth_key]
+  server:
+    environment:
+      CRAFTCLOUD_SMTP_AUTH: xoauth2
+      CRAFTCLOUD_SMTP_OAUTH_PROVIDER: microsoft
+      CRAFTCLOUD_SMTP_USERNAME: ${CRAFTCLOUD_SMTP_USERNAME:?set SMTP mailbox}
+      CRAFTCLOUD_SMTP_OAUTH_TENANT_ID: ${CRAFTCLOUD_SMTP_OAUTH_TENANT_ID:?set Microsoft tenant ID}
+      CRAFTCLOUD_SMTP_OAUTH_CLIENT_ID: ${CRAFTCLOUD_SMTP_OAUTH_CLIENT_ID:?set OAuth client ID}
+      CRAFTCLOUD_SMTP_OAUTH_CERT_FILE: /run/secrets/smtp_oauth_cert
+      CRAFTCLOUD_SMTP_OAUTH_KEY_FILE: /run/secrets/smtp_oauth_key
+secrets:
+  smtp_oauth_cert:
+    file: ${CRAFTCLOUD_SMTP_OAUTH_CERT_SOURCE:?set OAuth certificate source file}
+  smtp_oauth_key:
+    file: ${CRAFTCLOUD_SMTP_OAUTH_KEY_SOURCE:?set OAuth key source file}

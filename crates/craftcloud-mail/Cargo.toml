@@ -8,8 +8,19 @@ publish.workspace = true
 
 [dependencies]
 lettre.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 zeroize.workspace = true
+base64 = "=0.22.1"
+reqwest = { version = "=0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+url.workspace = true
+time.workspace = true
+uuid.workspace = true
+jsonwebtoken = "=9.3.1"
+sha2.workspace = true
+x509-parser = "=0.18.0"
+httpdate = "=1.0.3"
 
 [features]
 default = []
@@ -23,5 +34,13 @@ name = "smtp_container"
 path = "tests/smtp_container.rs"
 required-features = ["test-util"]
 
+[[test]]
+name = "smtp_oauth_https"
+path = "tests/smtp_oauth_https.rs"
+required-features = ["test-util"]
+
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

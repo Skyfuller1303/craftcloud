@@ -91,6 +91,31 @@ describe.each(["en", "de"])("email delivery (%s)", (language) => {
     await waitFor(() => expect(network.calls.find((call) => call.path === "/admin/email-delivery/test")?.body).toEqual({}));
     await expectNoAxeViolations();
   });
+
+  it("shows optional transport status", async () => {
+    mount(<EmailSystem revision={0} />, language, true, {
+      "GET /admin/email-delivery": { body: { configured: true, transport: "graph", sender: "mailer@example.test", certificate_expires_at: "2027-01-15T12:00:00Z", last_error_code: "provider_unavailable", last_success_at: null, failed_count: 2, suppressed_count: 3 } },
+    });
+    expect(await screen.findByText(de ? "Aktiver Transport" : "Active transport")).toBeTruthy();
+    expect(screen.getByText(de ? "Microsoft Graph" : "Microsoft Graph")).toBeTruthy();
+    expect(screen.getByText(de ? "Absender" : "Sender")).toBeTruthy();
+    expect(screen.getByText("mailer@example.test")).toBeTruthy();
+    expect(screen.getByText(de ? "Zertifikat läuft ab" : "Certificate expires")).toBeTruthy();
+    expect(screen.getByText(/2027/)).toBeTruthy();
+    expect(screen.getByText(de ? "Letzter Providerfehler" : "Last provider error")).toBeTruthy();
+    expect(screen.getByText("provider_unavailable")).toBeTruthy();
+    await expectNoAxeViolations();
+  });
+
+  it("remains compatible with older status responses", async () => {
+    mount(<EmailSystem revision={0} />, language, true, {
+      "GET /admin/email-delivery": { body: { configured: true, last_success_at: null, failed_count: 2, suppressed_count: 3 } },
+    });
+    await screen.findByText(de ? "Letzte erfolgreiche Zustellung" : "Last successful delivery");
+    expect(screen.queryByText(/undefined/)).toBeNull();
+    expect(screen.queryByText(de ? "Aktiver Transport" : "Active transport")).toBeNull();
+    await expectNoAxeViolations();
+  });
 });
 
 it.each(["verify", "change"] as const)("removes %s email capability before use and waits for explicit confirmation", async (kind) => {

@@ -12,6 +12,7 @@
 mod admin_ui;
 mod config;
 mod healthcheck;
+mod mail_setup;
 mod mail_worker;
 mod secret;
 mod server;
@@ -975,31 +976,15 @@ async fn run(config: Config) -> Result<(), Failure> {
     if two_factor_key.is_none() {
         tracing::warn!("two-factor setup is unavailable: current secret key is not usable");
     }
+    let mail_status = craftcloud_mail::TransportStatus::default();
     let mail_transport = if let Some(settings) = &config.mail {
         if two_factor_key.is_none() {
             return Err(Failure::config(
-                "CRAFTCLOUD_SECRET_KEY_FILE must contain a valid AC-02 key when SMTP mail delivery is enabled",
+                "CRAFTCLOUD_SECRET_KEY_FILE must contain a valid AC-02 key when mail delivery is enabled",
             ));
         }
-        let password = settings
-            .password_file
-            .as_deref()
-            .map(secret::load_secret_file)
-            .transpose()
-            .map_err(|_| {
-                Failure::config("CRAFTCLOUD_SMTP_PASSWORD_FILE is unavailable or invalid")
-            })?;
-        let smtp_config = craftcloud_mail::SmtpConfig::new(
-            settings.host.clone(),
-            settings.port,
-            settings.tls,
-            settings.username.clone(),
-            password.as_ref().map(|value| value.expose().to_owned()),
-            settings.from.clone(),
-        );
         Some(std::sync::Arc::new(
-            craftcloud_mail::SmtpTransport::new(&smtp_config)
-                .map_err(|_| Failure::config("SMTP configuration is invalid"))?,
+            mail_setup::build(settings, mail_status.clone()).map_err(Failure::config)?,
         ))
     } else {
         None
@@ -1154,6 +1139,25 @@ async fn run(config: Config) -> Result<(), Failure> {
         let services = Services::new(pool.clone(), bootstrap, auth_settings)
             .with_two_factor_keys(two_factor_key, two_factor_old_key)
             .with_email_delivery(config.mail.is_some())
+            .with_email_transport_status(std::sync::Arc::new({
+                let status = mail_status.clone();
+                move || {
+                    let snapshot = status.snapshot();
+                    craftcloud_api::EmailTransportStatus {
+                        transport: (!snapshot.active_transport.is_empty())
+                            .then_some(snapshot.active_transport),
+                        sender: (!snapshot.sender.is_empty()).then_some(snapshot.sender),
+                        certificate_expires_at: snapshot
+                            .certificate_expires_unix
+                            .and_then(|unix| time::OffsetDateTime::from_unix_timestamp(unix).ok())
+                            .and_then(|date| {
+                                date.format(&time::format_description::well_known::Rfc3339)
+                                    .ok()
+                            }),
+                        last_error_code: snapshot.last_safe_error,
+                    }
+                }
+            }))
             .with_metrics(std::sync::Arc::clone(&metrics));
         let services = match serving_store {
             Some(store) => services.with_storage(store),
@@ -1190,7 +1194,7 @@ async fn run(config: Config) -> Result<(), Failure> {
         (Some(pool), Some(transport), Some(key)) => {
             let public_url = config.public_url.as_deref().unwrap_or_default();
             let domain = mail_message_id_domain(public_url);
-            tracing::info!("SMTP mail delivery worker enabled");
+            tracing::info!("mail delivery worker enabled");
             let public_url = config.public_url.clone().unwrap_or_default();
             Some(tokio::spawn(mail_worker::run(
                 pool.clone(),

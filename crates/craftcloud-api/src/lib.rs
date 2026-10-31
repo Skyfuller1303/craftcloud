@@ -46,7 +46,7 @@ pub use device::SecondFactorLogin;
 pub use figcraft::{FigcraftWorkerState, figcraft_worker_tick, run_figcraft_worker};
 pub use health::metrics_router;
 pub use observe::Metrics;
-pub use services::{AuthSettings, Services};
+pub use services::{AuthSettings, EmailTransportStatus, Services};
 pub use session::{AuthRejection, AuthenticatedSession, CSRF_HEADER};
 
 use std::{sync::Arc, time::Duration};

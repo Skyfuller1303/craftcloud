@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use lettre::message::{Mailbox, MultiPart, SinglePart, header::ContentType};
-use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 #[cfg(feature = "test-util")]
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -57,6 +57,36 @@ impl SmtpConfig {
         self.test_root_certificate_pem = Some(pem);
         self
     }
+
+    pub fn with_xoauth2_token(
+        &self,
+        username: &str,
+        token: &str,
+    ) -> Result<AsyncSmtpTransport<Tokio1Executor>, TransportError> {
+        let mut builder = match self.tls {
+            SmtpTls::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.host),
+            SmtpTls::ImplicitTls => AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host),
+        }
+        .map_err(|_| TransportError::Permanent)?
+        .port(self.port)
+        .timeout(Some(self.timeout));
+        #[cfg(feature = "test-util")]
+        if let Some(pem) = &self.test_root_certificate_pem {
+            let certificate = Certificate::from_pem(pem).map_err(|_| TransportError::Permanent)?;
+            let tls = TlsParameters::builder(self.host.clone())
+                .add_root_certificate(certificate)
+                .build_rustls()
+                .map_err(|_| TransportError::Permanent)?;
+            builder = builder.tls(match self.tls {
+                SmtpTls::StartTls => Tls::Required(tls),
+                SmtpTls::ImplicitTls => Tls::Wrapper(tls),
+            });
+        }
+        builder = builder
+            .authentication(vec![Mechanism::Xoauth2])
+            .credentials(Credentials::new(username.to_owned(), token.to_owned()));
+        Ok(builder.build())
+    }
 }
 
 impl fmt::Debug for SmtpConfig {
@@ -79,6 +109,38 @@ pub struct Delivery;
 pub enum TransportError {
     Transient,
     Permanent,
+    Authentication,
+    Provider {
+        permanent: bool,
+        code: &'static str,
+        retry_after: Option<Duration>,
+    },
+}
+
+impl TransportError {
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::Permanent | Self::Authentication => true,
+            Self::Provider { permanent, .. } => *permanent,
+            Self::Transient => false,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Permanent => "permanent",
+            Self::Authentication => "smtp_authentication_failed",
+            Self::Provider { code, .. } => code,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Provider { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for TransportError {
@@ -86,11 +148,23 @@ impl fmt::Display for TransportError {
         f.write_str(match self {
             Self::Transient => "temporary mail delivery failure",
             Self::Permanent => "permanent mail delivery failure",
+            Self::Authentication => "SMTP authentication failure",
+            Self::Provider { .. } => "mail provider failure",
         })
     }
 }
 
 impl std::error::Error for TransportError {}
+
+pub(crate) fn smtp_error(error: &lettre::transport::smtp::Error) -> TransportError {
+    if error.status().is_some_and(|code| code.to_string() == "535") {
+        TransportError::Authentication
+    } else if error.is_permanent() {
+        TransportError::Permanent
+    } else {
+        TransportError::Transient
+    }
+}
 
 pub struct MailMessage {
     pub recipient: String,

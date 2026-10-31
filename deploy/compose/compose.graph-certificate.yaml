@@ -1,0 +1,15 @@
+services:
+  secrets-init:
+    environment:
+      COPY_GRAPH_CERT: "1"
+      COPY_GRAPH_KEY: "1"
+    secrets: [graph_cert, graph_key]
+  server:
+    environment:
+      CRAFTCLOUD_GRAPH_CERT_FILE: /run/secrets/graph_cert
+      CRAFTCLOUD_GRAPH_KEY_FILE: /run/secrets/graph_key
+secrets:
+  graph_cert:
+    file: ${CRAFTCLOUD_GRAPH_CERT_SOURCE:?set Graph certificate source file}
+  graph_key:
+    file: ${CRAFTCLOUD_GRAPH_KEY_SOURCE:?set Graph key source file}

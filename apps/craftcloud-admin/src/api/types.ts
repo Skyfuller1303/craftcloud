@@ -334,6 +334,10 @@ export interface EmailDeliveryStatus {
   last_success_at: string | null;
   failed_count: number;
   suppressed_count: number;
+  transport?: "smtp" | "graph" | null;
+  sender?: string | null;
+  certificate_expires_at?: string | null;
+  last_error_code?: string | null;
 }
 
 export interface FigcraftLiveStatus {

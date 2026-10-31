@@ -130,6 +130,118 @@ Windows Server ist kein Ziel dieser Installation. Eine spätere Unterstützung b
 
 ## E-Mail-Versand (AC-09)
 
+### AC-09b: Microsoft Graph und SMTP mit OAuth
+
+Die drei Versandarten verwenden dieselbe Warteschlange, Vorlagen und Limits. Graph benötigt ausgehendes HTTPS; SMTP mit OAuth zusätzlich den SMTP-Port. Zugriffs-Tokens bleiben nur im Arbeitsspeicher. Die produktiven Endpunkte sind fest vorgegeben; Weiterleitungen und unsichere Zertifikate sind nicht zugelassen. Nationale Microsoft-Clouds werden nicht unterstützt.
+
+#### Entra-App und Zertifikat vorbereiten
+
+1. Melden Sie sich als Administrator im Microsoft Entra Admin Center an. Öffnen Sie **App-Registrierungen > Neue Registrierung**, Name „CraftCloud Mail“, nur Konten dieses Verzeichnisses; eine Redirect-URI ist nicht erforderlich. Notieren Sie die **Verzeichnis-/Mandanten-ID** und **Anwendungs-/Client-ID**.
+2. Unter **Unternehmensanwendungen > CraftCloud Mail > Übersicht** notieren Sie zusätzlich die **Objekt-ID des Dienstprinzipals**. Die Objekt-ID der App-Registrierung ist hierfür falsch.
+3. Erzeugen Sie auf dem geschützten Server ein RSA-Zertifikat und einen unverschlüsselten PEM-Schlüssel. Der Schlüssel ist ausschließlich durch Dateirechte geschützt; CraftCloud unterstützt keine interaktive Passphrase:
+
+```sh
+sudo install -d -m 0700 /etc/craftcloud/mail
+sudo sh -c 'umask 077; openssl req -x509 -newkey rsa:3072 -noenc -sha256 -days 365 -subj /CN=CraftCloud-Mail -keyout /etc/craftcloud/mail/client.key -out /etc/craftcloud/mail/client.crt'
+```
+
+4. Laden Sie ausschließlich `client.crt` unter **App-Registrierungen > CraftCloud Mail > Zertifikate und Geheimnisse > Zertifikate** hoch. Kontrollieren Sie Ablaufdatum und Fingerabdruck. Der private Schlüssel bleibt auf dem Server. CraftCloud prüft Laufzeit und Übereinstimmung des Schlüssels und verwendet eine signierte Client-Assertion. Alternativ erstellen Sie dort ein Client-Geheimnis und speichern dessen **Wert**, nicht dessen ID, mit einem lokalen Editor in einer geschützten Datei. Zertifikat/Schlüssel und Client-Geheimnis dürfen nicht gleichzeitig konfiguriert sein. Keine Geheimnisse in Shellargumente, Umgebungswerte oder Tickets kopieren.
+
+Die konkrete Zertifikatsanmeldung beschreibt [Microsoft](https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials).
+
+#### Graph auf genau ein Absenderpostfach beschränken
+
+Ein global in Entra gewährtes `Mail.Send` darf grundsätzlich aus jedem Postfach des Tenants senden. Die folgende Variante verwendet deshalb ausschließlich **Application RBAC** mit der Rolle `Application Mail.Send`; gewähren Sie dieser App keine zusätzliche unbeschränkte Entra-Anwendungsberechtigung `Mail.Send`. Bereits bestehende globale Admin-Consents müssen in den Berechtigungen der Unternehmensanwendung widerrufen werden, nicht nur aus der konfigurierten Berechtigungsliste verschwinden. Globale Grants und RBAC gelten additiv.
+
+Installieren Sie auf einem Administratorrechner das Microsoft-Modul und verbinden Sie sich mit Exchange Online. Ersetzen Sie die drei Beispielwerte durch die zuvor notierten IDs und das vorhandene Absenderpostfach:
+
+```powershell
+Install-Module ExchangeOnlineManagement -Scope CurrentUser
+Connect-ExchangeOnline
+$appId = '11111111-1111-1111-1111-111111111111'
+$enterpriseObjectId = '22222222-2222-2222-2222-222222222222'
+$sender = 'craftcloud@example.org'
+New-ServicePrincipal -AppId $appId -ObjectId $enterpriseObjectId -DisplayName 'CraftCloud Mail'
+$principal = Get-ServicePrincipal -Identity $enterpriseObjectId
+New-ManagementScope -Name 'CraftCloudSender' -RecipientRestrictionFilter "PrimarySmtpAddress -eq '$sender'"
+New-ManagementRoleAssignment -Name 'CraftCloudGraphSend' -Role 'Application Mail.Send' -App $principal.Identity -CustomResourceScope 'CraftCloudSender'
+Test-ServicePrincipalAuthorization -Identity $principal.Identity -Resource $sender
+Test-ServicePrincipalAuthorization -Identity $principal.Identity -Resource 'anderes-postfach@example.org'
+```
+
+Die erste Prüfung muss `InScope=True`, die zweite für ein tatsächlich existierendes fremdes Postfach `False` ergeben. Änderungen können verzögert wirksam werden. Testen Sie danach die tatsächliche Zustellung und den verweigerten Zugriff mit einem frischen Token. Eine bestehende Application Access Policy ist eine alternative Beschränkung globaler Entra-Grants, wird hier aber nicht mit RBAC vermischt. Hintergrund und Grant-Grenzen: [Exchange Application RBAC](https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac).
+
+Für direkten Serverbetrieb setzen Sie diese nicht geheimen Werte und Pfade:
+
+```dotenv
+CRAFTCLOUD_MAIL_TRANSPORT=graph
+CRAFTCLOUD_GRAPH_TENANT_ID=11111111-1111-1111-1111-111111111111
+CRAFTCLOUD_GRAPH_CLIENT_ID=22222222-2222-2222-2222-222222222222
+CRAFTCLOUD_GRAPH_SENDER=craftcloud@example.org
+CRAFTCLOUD_GRAPH_CERT_FILE=/etc/craftcloud/mail/client.crt
+CRAFTCLOUD_GRAPH_KEY_FILE=/etc/craftcloud/mail/client.key
+CRAFTCLOUD_GRAPH_SAVE_TO_SENT=false
+```
+
+Bei Client-Geheimnis ersetzen Sie beide Zertifikatspfade durch `CRAFTCLOUD_GRAPH_CLIENT_SECRET_FILE`. `SAVE_TO_SENT` ist standardmäßig `false`; `true` legt gesendete Nachrichten im Absenderpostfach ab. Der Token-Scope lautet `https://graph.microsoft.com/.default`. Die bestehende Datenbankkonfiguration, öffentliche URL und der AC-02-Serverschlüssel bleiben erforderlich.
+
+#### Microsoft SMTP mit XOAUTH2
+
+Verwenden Sie eine getrennte App, wenn deren Berechtigungen unabhängig von Graph verwaltet werden sollen. Wählen Sie unter **API-Berechtigungen > Berechtigung hinzufügen > Von meiner Organisation verwendete APIs > Office 365 Exchange Online > Anwendungsberechtigungen** `SMTP.SendAsApp`, anschließend **Administratorzustimmung erteilen**. Registrieren Sie deren Dienstprinzipal wie oben in Exchange und geben Sie ausschließlich das Absenderpostfach frei:
+
+```powershell
+Add-MailboxPermission -Identity 'craftcloud@example.org' -User $principal.Identity -AccessRights FullAccess
+Add-RecipientPermission -Identity 'craftcloud@example.org' -Trustee $principal.Identity -AccessRights SendAs
+Set-CASMailbox -Identity 'craftcloud@example.org' -SmtpClientAuthenticationDisabled $false
+```
+
+Prüfen Sie die tenantweiten Sicherheits- und SMTP-AUTH-Richtlinien vor einer Änderung; die Postfachfreigabe allein kann eine tenantweite Sperre nicht aufheben. Verwenden Sie für `$principal` die SMTP-App, nicht versehentlich die Graph-App. [Microsofts SMTP-OAuth-Anleitung](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth) erläutert Dienstprinzipal und Postfachbindung.
+
+```dotenv
+CRAFTCLOUD_MAIL_TRANSPORT=smtp
+CRAFTCLOUD_SMTP_HOST=smtp.office365.com
+CRAFTCLOUD_SMTP_PORT=587
+CRAFTCLOUD_SMTP_TLS=starttls
+CRAFTCLOUD_SMTP_FROM=CraftCloud <craftcloud@example.org>
+CRAFTCLOUD_SMTP_USERNAME=craftcloud@example.org
+CRAFTCLOUD_SMTP_AUTH=xoauth2
+CRAFTCLOUD_SMTP_OAUTH_PROVIDER=microsoft
+CRAFTCLOUD_SMTP_OAUTH_TENANT_ID=11111111-1111-1111-1111-111111111111
+CRAFTCLOUD_SMTP_OAUTH_CLIENT_ID=22222222-2222-2222-2222-222222222222
+CRAFTCLOUD_SMTP_OAUTH_CERT_FILE=/etc/craftcloud/mail/client.crt
+CRAFTCLOUD_SMTP_OAUTH_KEY_FILE=/etc/craftcloud/mail/client.key
+```
+
+Alternativ verwenden Sie `CRAFTCLOUD_SMTP_OAUTH_CLIENT_SECRET_FILE` statt Zertifikat und Schlüssel. `SMTP_PASSWORD_FILE` bleibt entfernt. Benutzername und tatsächliche Adresse in `SMTP_FROM` müssen übereinstimmen. Der Scope ist `https://outlook.office365.com/.default`.
+
+#### Google Workspace SMTP mit domainweiter Delegierung
+
+1. Erstellen Sie in der Google Cloud Console ein Projekt und unter **IAM und Verwaltung > Dienstkonten** ein Dienstkonto für CraftCloud. Aktivieren Sie dessen domainweite Delegierung; notieren Sie die numerische OAuth-Client-ID. Erstellen Sie unter **Schlüssel > Schlüssel hinzufügen > Neuen Schlüssel erstellen > JSON** eine Schlüsseldatei, sofern die Organisationsrichtlinie dies erlaubt.
+2. Ein Workspace-Superadministrator öffnet **Admin-Konsole > Sicherheit > Zugriff und Datenkontrolle > API-Steuerung > Domainweite Delegierung verwalten**. Fügen Sie die numerische Client-ID und genau den Scope `https://mail.google.com/` hinzu. Diese Delegierung ist weitreichend; schützen Sie das Dienstkonto entsprechend und verwenden Sie es ausschließlich für den vorgesehenen Versand.
+3. Legen Sie die JSON-Datei mit Modus 0600 im geschützten Mailverzeichnis ab. Verwenden Sie ein vorhandenes Workspace-Postfach als `SMTP_USERNAME` und identische Absenderadresse. CraftCloud setzt dieses Postfach als JWT-`sub`; es meldet sich keine Person interaktiv an.
+
+```dotenv
+CRAFTCLOUD_MAIL_TRANSPORT=smtp
+CRAFTCLOUD_SMTP_HOST=smtp.gmail.com
+CRAFTCLOUD_SMTP_PORT=587
+CRAFTCLOUD_SMTP_TLS=starttls
+CRAFTCLOUD_SMTP_FROM=CraftCloud <craftcloud@example.org>
+CRAFTCLOUD_SMTP_USERNAME=craftcloud@example.org
+CRAFTCLOUD_SMTP_AUTH=xoauth2
+CRAFTCLOUD_SMTP_OAUTH_PROVIDER=google
+CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_FILE=/etc/craftcloud/mail/google-service-account.json
+```
+
+Microsoft-Credentialfelder und `SMTP_PASSWORD_FILE` bleiben entfernt. Siehe [Google-Dienstkonten und Delegierung](https://developers.google.com/identity/protocols/oauth2/service-account) sowie [Gmail XOAUTH2](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol).
+
+#### Betrieb und Prüfung
+
+Bei Compose/Installation verwenden Sie für die geheimen Hostdateien die entsprechenden `*_SOURCE`-Einstellungen statt `*_FILE`. Die gewählten Overlays binden diese ein; `secrets-init` verteilt sie ausschließlich in das servereigene Secret-Verzeichnis. Für direkten Betrieb müssen die Dateien dem Serverkonto gehören und nur für dieses lesbar sein. Die Zertifikatsdatei ist öffentlich; sie wird wegen konsistenter Verteilung ebenfalls als Datei geführt. Nach einem Konfigurationswechsel verwenden Sie `craftcloud-ctl stop` und `craftcloud-ctl start` im Wartungsfenster.
+
+Unter **System** sehen Sie Transport, Absender, Zertifikatsablauf, letzten erfolgreichen Versand und letzten kontrollierten Providerfehler. Senden Sie die Testmail an die eigene Adresse. Prüfen Sie außerdem Spamordner, Gesendet-Ordner gemäß Einstellung und den tatsächlichen Absender. `invalid_client` deutet auf App-/Credentialkonfiguration, `ErrorAccessDenied` beziehungsweise `provider_forbidden` auf Berechtigungen; bei `429` berücksichtigt die Queue `Retry-After`. Zertifikate und Secrets werden vor Ablauf ersetzt, neue öffentliche Zertifikate zuerst in Entra hochgeladen und erst danach die Dateien gewechselt. Behalten Sie das alte Zertifikat bis zur erfolgreichen Prüfung des neuen bei.
+
+Echte Microsoft-/Google-Tenants gehören zur Betreiberabnahme; lokale Tests beweisen keine Tenantberechtigung. Beim ersten Rollout muss auch der Zugriff auf ein unzulässiges Postfach tatsächlich verweigert werden. Tokens, Schlüssel, JSON-Dateien oder Mailinhalte dürfen nicht in Diagnosepakete aufgenommen werden.
+
 Ohne `CRAFTCLOUD_MAIL_TRANSPORT` bleibt der Versand abgeschaltet. Einladungs- und Resetlinks werden dann wie bisher einmalig zum Kopieren angezeigt; das Restrisiko aus ADR-0017 bleibt in diesem Modus bestehen. Mit SMTP liefert `/api/v1/info` das Merkmal `feature_flags.email_delivery=true`. Einladende erhalten keine geheimen Links mehr. Bereits vorhandene unbestätigte Konten werden nicht automatisch als bestätigt markiert.
 
 Die Installation verwendet optionale Compose-Dateien `compose.smtp.yaml` und bei Passwortanmeldung zusätzlich `compose.smtp-auth.yaml`. `install.sh` und `craftcloud-ctl` wählen diese anhand von `/etc/craftcloud/craftcloud.env` automatisch. Der SMTP-Testcontainer gehört ausschließlich zu Entwicklungstests und wird nie installiert. Fügen Sie beispielsweise diese nicht geheimen Einstellungen in die geschützte Konfigurationsdatei ein:
@@ -155,7 +267,7 @@ Legen Sie die Passwortdatei mit Eigentümer root und Modus 0600 an, ohne das Pas
 
 Für den eigenen Postfix oder ein anderes Relay können Benutzername und Passwort beide entfallen, wenn das Relay ausschließlich die freigegebene Ausgangs-IP akzeptiert. Kein offenes Relay betreiben. Auch dieser Weg benötigt ein gültiges Serverzertifikat und TLS.
 
-Für Microsoft 365 verwenden Sie einen für Ihre Ausgangs-IP freigegebenen Eingangsconnector, den MX-Endpunkt Ihrer akzeptierten Domain als SMTP-Host, Port 25 und `starttls`, ohne Benutzername oder Passwort. Die Absenderdomain muss im Tenant akzeptiert sein. Port 25 muss ausgehend erreichbar sein. Ein zertifikatsbasierter Connector benötigt einen vorgeschalteten Relay mit passendem Clientzertifikat. Microsoft Graph und OAuth werden erst in AC-09b behandelt. Siehe [Microsofts Connector-Anleitung](https://learn.microsoft.com/en-us/exchange/mail-flow-best-practices/how-to-set-up-a-multifunction-device-or-application-to-send-email-using-microsoft-365-or-office-365).
+Für Microsoft 365 verwenden Sie einen für Ihre Ausgangs-IP freigegebenen Eingangsconnector, den MX-Endpunkt Ihrer akzeptierten Domain als SMTP-Host, Port 25 und `starttls`, ohne Benutzername oder Passwort. Die Absenderdomain muss im Tenant akzeptiert sein. Port 25 muss ausgehend erreichbar sein. Ein zertifikatsbasierter Connector benötigt einen vorgeschalteten Relay mit passendem Clientzertifikat. Microsoft Graph und SMTP mit OAuth sind oben unter AC-09b beschrieben. Siehe [Microsofts Connector-Anleitung](https://learn.microsoft.com/en-us/exchange/mail-flow-best-practices/how-to-set-up-a-multifunction-device-or-application-to-send-email-using-microsoft-365-or-office-365).
 
 Für Google Workspace konfigurieren Sie den SMTP-Relay-Dienst mit Ihrer freigegebenen Ausgangs-IP und TLS-Pflicht. Verwenden Sie `smtp-relay.gmail.com`, Port 587, `starttls` und einen zulässigen Absender Ihrer Domain; bei IP-Freigabe entfallen beide Zugangsdaten. Beachten Sie die [Google-Relay-Konfiguration](https://knowledge.workspace.google.com/admin/gmail/advanced/route-outgoing-smtp-relay-messages-through-google).
 

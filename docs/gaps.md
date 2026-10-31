@@ -1,5 +1,9 @@
 # Ranked gaps — documentation-first RFC
 
+## AC-09b: Graph und SMTP mit OAuth
+
+Graph und XOAUTH2 für Microsoft sowie Google ergänzen die bestehende Mailwarteschlange ohne Migration. Die Operatoransicht erhält Transport, Absender, Zertifikatsablauf und kontrollierten Fehlercode. Produktions-Tenantberechtigungen und die tatsächliche Postfachzustellung bleiben Betreiberprüfungen; insbesondere darf kein globaler Entra-Grant die Exchange-Postfachbeschränkung umgehen. Nationale Clouds, interaktive delegierte Anmeldung und Gmail-API bleiben außerhalb des Umfangs. Prüfstatus und dokumentierte Abweichungen stehen im AC-09b-Bericht.
+
 ## AC-09: SMTP und Adressverifikation
 
 [ADR-0025](09-decisions/adr-0025-email-delivery.md) ersetzt die historische SMTP-Lücke für Instanzen mit eingerichtetem Versand. Ohne SMTP gilt das Account-Squatting-Risiko aus ADR-0017 weiterhin. SMTP-Zustellung ist mindestens einmal: Ein Absturz nach Relay-Annahme kann Duplikate verursachen; eine Relay-Annahme garantiert keinen Postfacheingang. Clientzertifikate für SMTP benötigen einen vorgeschalteten Relay, Graph und OAuth folgen in AC-09b. Externe Relay-Konfigurationen, SPF/DKIM/DMARC und reale Postfachzustellung müssen Betreiber prüfen. Lokale Test- und Reviewnachweise stehen im AC-09-Bericht; diese Dokumentation allein ist kein Nachweis einer Produktionsabnahme.

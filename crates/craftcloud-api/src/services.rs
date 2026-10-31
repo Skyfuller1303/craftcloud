@@ -172,6 +172,14 @@ impl AuthSettings {
 
 /// Database-backed services. Create one per server and pass it to
 /// [`crate::router_with_services`].
+#[derive(Default)]
+pub struct EmailTransportStatus {
+    pub transport: Option<String>,
+    pub sender: Option<String>,
+    pub certificate_expires_at: Option<String>,
+    pub last_error_code: Option<String>,
+}
+
 pub struct Services {
     pub(crate) pool: PgPool,
     pub(crate) bootstrap: Option<BootstrapToken>,
@@ -182,6 +190,7 @@ pub struct Services {
     pub(crate) figcraft: Option<Arc<dyn craftcloud_figcraft::Backend>>,
     pub(crate) figcraft_public_url: Option<String>,
     pub(crate) email_delivery_enabled: bool,
+    pub(crate) email_transport_status: Option<Arc<dyn Fn() -> EmailTransportStatus + Send + Sync>>,
     pub(crate) figcraft_permits: Arc<Semaphore>,
     pub(crate) figcraft_job_permits: Arc<Semaphore>,
     hash_permits: Arc<Semaphore>,
@@ -266,6 +275,7 @@ impl Services {
             figcraft: None,
             figcraft_public_url: None,
             email_delivery_enabled: false,
+            email_transport_status: None,
             figcraft_permits: Arc::new(Semaphore::new(4)),
             figcraft_job_permits: Arc::new(Semaphore::new(crate::figcraft_jobs::MAX_FIGCRAFT_JOBS)),
             hash_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HASHES)),
@@ -305,6 +315,15 @@ impl Services {
     #[must_use]
     pub fn with_email_delivery(mut self, enabled: bool) -> Self {
         self.email_delivery_enabled = enabled;
+        self
+    }
+
+    /// Supplies sanitized transport metadata for the operator-only status route.
+    pub fn with_email_transport_status(
+        mut self,
+        read: Arc<dyn Fn() -> EmailTransportStatus + Send + Sync>,
+    ) -> Self {
+        self.email_transport_status = Some(read);
         self
     }
 

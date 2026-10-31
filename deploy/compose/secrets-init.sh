@@ -131,6 +131,16 @@ if [ "${COPY_SMTP_PASSWORD:-0}" = 1 ]; then
     copy 65532 server smtp_password
     server_files="$server_files smtp_password"
 fi
+# Optional Microsoft Graph credential files. Copy only selected secrets.
+for item in GRAPH_CERT:graph_cert GRAPH_KEY:graph_key GRAPH_CLIENT_SECRET:graph_client_secret SMTP_OAUTH_CERT:smtp_oauth_cert SMTP_OAUTH_KEY:smtp_oauth_key SMTP_OAUTH_CLIENT_SECRET:smtp_oauth_client_secret SMTP_OAUTH_SERVICE_ACCOUNT:smtp_oauth_service_account; do
+    [ -n "$item" ] || continue
+    flag=${item%%:*}; name=${item#*:}
+    eval "enabled=\${COPY_${flag}:-0}"
+    if [ "$enabled" = 1 ]; then
+        copy 65532 server "$name"
+        server_files="$server_files $name"
+    fi
+done
 # shellcheck disable=SC2086 # intentional word splitting of fixed names
 prune server $server_files
 

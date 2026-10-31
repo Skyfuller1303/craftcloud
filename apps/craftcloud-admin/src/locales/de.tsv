@@ -687,6 +687,10 @@
 	Invitation sent to {email}.	Einladung an {email} gesendet.
 	E-mail delivery	E-Mail-Versand
 	Configured	Eingerichtet
+	Active transport	Aktiver Transport
+	Sender	Absender
+	Certificate expires	Zertifikat läuft ab
+	Last provider error	Letzter Providerfehler
 	Last successful delivery	Letzte erfolgreiche Zustellung
 	Failed messages	Fehlgeschlagene Nachrichten
 	Suppressed security notices	Unterdrückte Sicherheitshinweise
@@ -700,3 +704,7 @@
 	Send confirmation links	Bestätigungslinks senden
 	Password reset email sent.	E-Mail zum Zurücksetzen des Passworts gesendet.
 	This signs out the account on all devices and sends a password reset email.	Das Konto wird auf allen Geräten abgemeldet und erhält eine E-Mail zum Zurücksetzen des Passworts.
+
+	Microsoft Graph	Microsoft Graph
+
+	SMTP	SMTP

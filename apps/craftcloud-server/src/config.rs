@@ -66,7 +66,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 45] = [
+const SUPPORTED_KEYS: &[&str] = &[
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -112,17 +112,63 @@ const SUPPORTED_KEYS: [&str; 45] = [
     "SMTP_USERNAME",
     "SMTP_PASSWORD_FILE",
     "SMTP_FROM",
+    "SMTP_AUTH",
+    "SMTP_OAUTH_PROVIDER",
+    "SMTP_OAUTH_TENANT_ID",
+    "SMTP_OAUTH_CLIENT_ID",
+    "SMTP_OAUTH_CERT_FILE",
+    "SMTP_OAUTH_KEY_FILE",
+    "SMTP_OAUTH_CLIENT_SECRET_FILE",
+    "SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+    "GRAPH_TENANT_ID",
+    "GRAPH_CLIENT_ID",
+    "GRAPH_CERT_FILE",
+    "GRAPH_KEY_FILE",
+    "GRAPH_CLIENT_SECRET_FILE",
+    "GRAPH_SENDER",
+    "GRAPH_SAVE_TO_SENT",
 ];
 
-/// SMTP relay settings. The password itself is read only by the server startup.
+/// Mail delivery settings. Secrets are read only by server startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MailSettings {
-    pub host: String,
-    pub port: u16,
-    pub tls: craftcloud_mail::SmtpTls,
-    pub username: Option<String>,
-    pub password_file: Option<PathBuf>,
-    pub from: String,
+pub enum MailSettings {
+    Smtp {
+        host: String,
+        port: u16,
+        tls: craftcloud_mail::SmtpTls,
+        username: Option<String>,
+        password_file: Option<PathBuf>,
+        from: String,
+    },
+    Graph {
+        tenant_id: String,
+        client_id: String,
+        certificate_file: Option<PathBuf>,
+        key_file: Option<PathBuf>,
+        client_secret_file: Option<PathBuf>,
+        sender: String,
+        save_to_sent: bool,
+    },
+    SmtpOAuthMicrosoft {
+        host: String,
+        port: u16,
+        tls: craftcloud_mail::SmtpTls,
+        username: String,
+        from: String,
+        tenant_id: String,
+        client_id: String,
+        certificate_file: Option<PathBuf>,
+        key_file: Option<PathBuf>,
+        client_secret_file: Option<PathBuf>,
+    },
+    SmtpOAuthGoogle {
+        host: String,
+        port: u16,
+        tls: craftcloud_mail::SmtpTls,
+        username: String,
+        from: String,
+        service_account_file: PathBuf,
+    },
 }
 
 /// Optional FigCraft companion service. Secrets are loaded only at startup.
@@ -440,7 +486,7 @@ impl Config {
                 if !present {
                     errors.push(ConfigError::new(
                         &format!("{PREFIX}{key}"),
-                        "required when SMTP mail delivery is enabled",
+                        "required when mail delivery is enabled",
                     ));
                 }
             }
@@ -805,46 +851,200 @@ fn parse_mail(
     env: &BTreeMap<String, String>,
     errors: &mut Vec<ConfigError>,
 ) -> Option<MailSettings> {
-    let transport = env.get("CRAFTCLOUD_MAIL_TRANSPORT").map(String::as_str);
-    let smtp_keys = [
+    let start_errors = errors.len();
+    let get = |suffix: &str| env.get(&format!("{PREFIX}{suffix}")).map(|v| v.trim());
+    let mail_keys = [
         "SMTP_HOST",
         "SMTP_PORT",
         "SMTP_TLS",
         "SMTP_USERNAME",
         "SMTP_PASSWORD_FILE",
         "SMTP_FROM",
+        "SMTP_AUTH",
+        "SMTP_OAUTH_PROVIDER",
+        "SMTP_OAUTH_TENANT_ID",
+        "SMTP_OAUTH_CLIENT_ID",
+        "SMTP_OAUTH_CERT_FILE",
+        "SMTP_OAUTH_KEY_FILE",
+        "SMTP_OAUTH_CLIENT_SECRET_FILE",
+        "SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+        "GRAPH_TENANT_ID",
+        "GRAPH_CLIENT_ID",
+        "GRAPH_CERT_FILE",
+        "GRAPH_KEY_FILE",
+        "GRAPH_CLIENT_SECRET_FILE",
+        "GRAPH_SENDER",
+        "GRAPH_SAVE_TO_SENT",
     ];
+    let transport = get("MAIL_TRANSPORT");
     if transport.is_none() {
-        for suffix in smtp_keys {
-            if env.contains_key(&format!("CRAFTCLOUD_{suffix}")) {
+        for suffix in mail_keys {
+            if env.contains_key(&format!("{PREFIX}{suffix}")) {
                 errors.push(ConfigError::new(
-                    &format!("CRAFTCLOUD_{suffix}"),
-                    "requires CRAFTCLOUD_MAIL_TRANSPORT=smtp",
+                    &format!("{PREFIX}{suffix}"),
+                    "requires an enabled CRAFTCLOUD_MAIL_TRANSPORT",
                 ));
             }
         }
         return None;
     }
-    if transport != Some("smtp") {
+    let transport = transport.unwrap_or_default();
+    if !["smtp", "graph"].contains(&transport) {
         errors.push(ConfigError::new(
             "CRAFTCLOUD_MAIL_TRANSPORT",
-            "expected `smtp`",
+            "expected `smtp`, `graph`, or absent",
         ));
         return None;
     }
-    let get = |suffix: &str| env.get(&format!("CRAFTCLOUD_{suffix}")).map(|v| v.trim());
-    let host = get("SMTP_HOST")
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned);
-    if host.is_none() {
-        errors.push(ConfigError::new(
-            "CRAFTCLOUD_SMTP_HOST",
-            "required when SMTP transport is enabled",
-        ));
+    let guid = |s: &str| {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && [8, 4, 4, 4, 12]
+                .iter()
+                .zip(parts)
+                .all(|(n, p)| p.len() == *n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    let bare_address = |s: &str| {
+        let mut p = s.split('@');
+        match (p.next(), p.next(), p.next()) {
+            (Some(local), Some(domain), None) => {
+                !local.is_empty()
+                    && !domain.is_empty()
+                    && !s
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || ['<', '>'].contains(&c))
+            }
+            _ => false,
+        }
+    };
+    let required = |suffix: &str, errors: &mut Vec<ConfigError>| -> Option<String> {
+        match get(suffix).filter(|s| !s.is_empty()) {
+            Some(value) => Some(value.to_owned()),
+            None => {
+                errors.push(ConfigError::new(&format!("{PREFIX}{suffix}"), "required"));
+                None
+            }
+        }
+    };
+    let path = |suffix: &str, errors: &mut Vec<ConfigError>| -> Option<PathBuf> {
+        match get(suffix) {
+            Some(raw) => match parse_absolute_path(&format!("{PREFIX}{suffix}"), raw) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    let credential = |prefix: &str,
+                      errors: &mut Vec<ConfigError>|
+     -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+        let cert_suffix = format!("{prefix}_CERT_FILE");
+        let key_suffix = format!("{prefix}_KEY_FILE");
+        let secret_suffix = format!("{prefix}_CLIENT_SECRET_FILE");
+        let cert = path(&cert_suffix, errors);
+        let key = path(&key_suffix, errors);
+        let secret = path(&secret_suffix, errors);
+        let cert_present = get(&cert_suffix).is_some();
+        let key_present = get(&key_suffix).is_some();
+        let secret_present = get(&secret_suffix).is_some();
+        if cert_present != key_present || (cert_present == secret_present) {
+            errors.push(ConfigError::new(&format!("{PREFIX}{cert_suffix}"), "set certificate and key together, or set client secret file; choose exactly one credential"));
+        }
+        (cert, key, secret)
+    };
+    if transport == "graph" {
+        for suffix in [
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_TLS",
+            "SMTP_USERNAME",
+            "SMTP_PASSWORD_FILE",
+            "SMTP_FROM",
+            "SMTP_AUTH",
+            "SMTP_OAUTH_PROVIDER",
+            "SMTP_OAUTH_TENANT_ID",
+            "SMTP_OAUTH_CLIENT_ID",
+            "SMTP_OAUTH_CERT_FILE",
+            "SMTP_OAUTH_KEY_FILE",
+            "SMTP_OAUTH_CLIENT_SECRET_FILE",
+            "SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+        ] {
+            if get(suffix).is_some() {
+                errors.push(ConfigError::new(
+                    &format!("{PREFIX}{suffix}"),
+                    "not valid with graph transport",
+                ));
+            }
+        }
+        let tenant = required("GRAPH_TENANT_ID", errors);
+        let client = required("GRAPH_CLIENT_ID", errors);
+        for (suffix, value) in [
+            ("GRAPH_TENANT_ID", tenant.as_deref()),
+            ("GRAPH_CLIENT_ID", client.as_deref()),
+        ] {
+            if value.is_some_and(|v| !guid(v)) {
+                errors.push(ConfigError::new(
+                    &format!("{PREFIX}{suffix}"),
+                    "must be a GUID",
+                ));
+            }
+        }
+        let (certificate_file, key_file, client_secret_file) = credential("GRAPH", errors);
+        let sender = required("GRAPH_SENDER", errors);
+        if sender.as_deref().is_some_and(|v| !bare_address(v)) {
+            errors.push(ConfigError::new(
+                "CRAFTCLOUD_GRAPH_SENDER",
+                "must be a bare email address",
+            ));
+        }
+        let save_to_sent = match get("GRAPH_SAVE_TO_SENT") {
+            None => false,
+            Some("true") => true,
+            Some("false") => false,
+            Some(_) => {
+                errors.push(ConfigError::new(
+                    "CRAFTCLOUD_GRAPH_SAVE_TO_SENT",
+                    "must be `true` or `false`",
+                ));
+                false
+            }
+        };
+        if errors.len() != start_errors {
+            return None;
+        }
+        return Some(MailSettings::Graph {
+            tenant_id: tenant?,
+            client_id: client?,
+            certificate_file,
+            key_file,
+            client_secret_file,
+            sender: sender?,
+            save_to_sent,
+        });
     }
+    for suffix in [
+        "GRAPH_TENANT_ID",
+        "GRAPH_CLIENT_ID",
+        "GRAPH_CERT_FILE",
+        "GRAPH_KEY_FILE",
+        "GRAPH_CLIENT_SECRET_FILE",
+        "GRAPH_SENDER",
+        "GRAPH_SAVE_TO_SENT",
+    ] {
+        if get(suffix).is_some() {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}{suffix}"),
+                "not valid with smtp transport",
+            ));
+        }
+    }
+    let host = required("SMTP_HOST", errors);
     let port = get("SMTP_PORT")
-        .and_then(|v| v.parse::<u16>().ok())
-        .filter(|port| *port != 0);
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|p| *p != 0);
     if port.is_none() {
         errors.push(ConfigError::new(
             "CRAFTCLOUD_SMTP_PORT",
@@ -862,56 +1062,217 @@ fn parse_mail(
             None
         }
     };
+    let from = required("SMTP_FROM", errors);
+    let auth = get("SMTP_AUTH").unwrap_or("password");
+    let provider = get("SMTP_OAUTH_PROVIDER");
     let username = get("SMTP_USERNAME")
-        .filter(|v| !v.is_empty())
+        .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let password_file = get("SMTP_PASSWORD_FILE")
-        .map(|raw| parse_absolute_path("CRAFTCLOUD_SMTP_PASSWORD_FILE", raw))
-        .transpose();
-    let password_file = match password_file {
-        Ok(path) => path,
-        Err(error) => {
-            errors.push(error);
-            None
+    if let Some(value) = get("SMTP_FROM")
+        && !value.contains('<')
+        && !bare_address(value)
+    {
+        errors.push(ConfigError::new(
+            "CRAFTCLOUD_SMTP_FROM",
+            "must be an email address, optionally with display name",
+        ));
+    }
+    match auth {
+        "password" => {
+            for suffix in [
+                "SMTP_OAUTH_PROVIDER",
+                "SMTP_OAUTH_TENANT_ID",
+                "SMTP_OAUTH_CLIENT_ID",
+                "SMTP_OAUTH_CERT_FILE",
+                "SMTP_OAUTH_KEY_FILE",
+                "SMTP_OAUTH_CLIENT_SECRET_FILE",
+                "SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+            ] {
+                if get(suffix).is_some() {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{suffix}"),
+                        "requires SMTP_AUTH=xoauth2",
+                    ));
+                }
+            }
+            let password = path("SMTP_PASSWORD_FILE", errors);
+            if username.is_some() != password.is_some()
+                || (get("SMTP_AUTH") == Some("password") && username.is_none())
+            {
+                errors.push(ConfigError::new(
+                    "CRAFTCLOUD_SMTP_USERNAME",
+                    "SMTP_USERNAME and SMTP_PASSWORD_FILE must be set together",
+                ));
+            }
+            if errors.len() != start_errors {
+                return None;
+            }
+            return Some(MailSettings::Smtp {
+                host: host?,
+                port: port?,
+                tls: tls?,
+                username,
+                password_file: password,
+                from: from?,
+            });
         }
-    };
-    if username.is_some() != password_file.is_some() {
-        errors.push(ConfigError::new(
-            "CRAFTCLOUD_SMTP_USERNAME",
-            "SMTP_USERNAME and SMTP_PASSWORD_FILE must be set together",
-        ));
+        "none" => {
+            for suffix in [
+                "SMTP_PASSWORD_FILE",
+                "SMTP_OAUTH_PROVIDER",
+                "SMTP_OAUTH_TENANT_ID",
+                "SMTP_OAUTH_CLIENT_ID",
+                "SMTP_OAUTH_CERT_FILE",
+                "SMTP_OAUTH_KEY_FILE",
+                "SMTP_OAUTH_CLIENT_SECRET_FILE",
+                "SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+            ] {
+                if get(suffix).is_some() {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{suffix}"),
+                        "credentials are not valid with SMTP_AUTH=none",
+                    ));
+                }
+            }
+            if username.is_some() {
+                errors.push(ConfigError::new(
+                    "CRAFTCLOUD_SMTP_USERNAME",
+                    "requires SMTP_AUTH=password or xoauth2",
+                ));
+            }
+            if errors.len() != start_errors {
+                return None;
+            }
+            return Some(MailSettings::Smtp {
+                host: host?,
+                port: port?,
+                tls: tls?,
+                username: None,
+                password_file: None,
+                from: from?,
+            });
+        }
+        "xoauth2" => {
+            if get("SMTP_PASSWORD_FILE").is_some() {
+                errors.push(ConfigError::new(
+                    "CRAFTCLOUD_SMTP_PASSWORD_FILE",
+                    "not valid with SMTP_AUTH=xoauth2",
+                ));
+            }
+            let username = match username {
+                Some(v) => Some(v),
+                None => {
+                    errors.push(ConfigError::new(
+                        "CRAFTCLOUD_SMTP_USERNAME",
+                        "required for delegated sender",
+                    ));
+                    None
+                }
+            };
+            if let (Some(user), Some(sender)) = (username.as_deref(), from.as_deref()) {
+                let mailbox = sender
+                    .rsplit_once('<')
+                    .map(|(_, a)| a.trim_end_matches('>').trim())
+                    .unwrap_or(sender);
+                if !bare_address(user)
+                    || !bare_address(mailbox)
+                    || !user.eq_ignore_ascii_case(mailbox)
+                {
+                    errors.push(ConfigError::new(
+                        "CRAFTCLOUD_SMTP_USERNAME",
+                        "must match SMTP_FROM mailbox",
+                    ));
+                }
+            }
+            match provider {
+                Some("microsoft") => {
+                    if get("SMTP_OAUTH_SERVICE_ACCOUNT_FILE").is_some() {
+                        errors.push(ConfigError::new(
+                            "CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+                            "not valid with microsoft provider",
+                        ));
+                    }
+                    let tenant = required("SMTP_OAUTH_TENANT_ID", errors);
+                    let client = required("SMTP_OAUTH_CLIENT_ID", errors);
+                    for (suffix, value) in [
+                        ("SMTP_OAUTH_TENANT_ID", tenant.as_deref()),
+                        ("SMTP_OAUTH_CLIENT_ID", client.as_deref()),
+                    ] {
+                        if value.is_some_and(|v| !guid(v)) {
+                            errors.push(ConfigError::new(
+                                &format!("{PREFIX}{suffix}"),
+                                "must be a GUID",
+                            ));
+                        }
+                    }
+                    let (certificate_file, key_file, client_secret_file) =
+                        credential("SMTP_OAUTH", errors);
+                    if errors.len() != start_errors {
+                        return None;
+                    }
+                    return Some(MailSettings::SmtpOAuthMicrosoft {
+                        host: host?,
+                        port: port?,
+                        tls: tls?,
+                        username: username?,
+                        from: from?,
+                        tenant_id: tenant?,
+                        client_id: client?,
+                        certificate_file,
+                        key_file,
+                        client_secret_file,
+                    });
+                }
+                Some("google") => {
+                    for suffix in [
+                        "SMTP_OAUTH_TENANT_ID",
+                        "SMTP_OAUTH_CLIENT_ID",
+                        "SMTP_OAUTH_CERT_FILE",
+                        "SMTP_OAUTH_KEY_FILE",
+                        "SMTP_OAUTH_CLIENT_SECRET_FILE",
+                    ] {
+                        if get(suffix).is_some() {
+                            errors.push(ConfigError::new(
+                                &format!("{PREFIX}{suffix}"),
+                                "not valid with google provider",
+                            ));
+                        }
+                    }
+                    let service_account_file = path("SMTP_OAUTH_SERVICE_ACCOUNT_FILE", errors);
+                    if service_account_file.is_none()
+                        && !env.contains_key("CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_FILE")
+                    {
+                        errors.push(ConfigError::new(
+                            "CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_FILE",
+                            "required",
+                        ));
+                    }
+                    if errors.len() != start_errors {
+                        return None;
+                    }
+                    return Some(MailSettings::SmtpOAuthGoogle {
+                        host: host?,
+                        port: port?,
+                        tls: tls?,
+                        username: username?,
+                        from: from?,
+                        service_account_file: service_account_file?,
+                    });
+                }
+                _ => {
+                    errors.push(ConfigError::new(
+                        "CRAFTCLOUD_SMTP_OAUTH_PROVIDER",
+                        "required; expected `microsoft` or `google`",
+                    ));
+                }
+            }
+        }
+        _ => errors.push(ConfigError::new(
+            "CRAFTCLOUD_SMTP_AUTH",
+            "expected `password`, `none`, or `xoauth2`",
+        )),
     }
-    let from = get("SMTP_FROM")
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned);
-    if from.is_none() {
-        errors.push(ConfigError::new(
-            "CRAFTCLOUD_SMTP_FROM",
-            "required; expected an email address, optionally with display name",
-        ));
-    }
-    if errors.iter().any(|e| {
-        [
-            "CRAFTCLOUD_MAIL_TRANSPORT",
-            "CRAFTCLOUD_SMTP_HOST",
-            "CRAFTCLOUD_SMTP_PORT",
-            "CRAFTCLOUD_SMTP_TLS",
-            "CRAFTCLOUD_SMTP_USERNAME",
-            "CRAFTCLOUD_SMTP_PASSWORD_FILE",
-            "CRAFTCLOUD_SMTP_FROM",
-        ]
-        .contains(&e.key.as_str())
-    }) {
-        return None;
-    }
-    Some(MailSettings {
-        host: host?,
-        port: port?,
-        tls: tls?,
-        username,
-        password_file,
-        from: from?,
-    })
+    None
 }
 
 fn default_bind() -> SocketAddr {
@@ -1861,13 +2222,129 @@ mod tests {
                 ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org"),
             ]))
             .unwrap();
-            assert_eq!(config.mail.as_ref().map(|mail| mail.tls), Some(expected));
             assert!(
-                config
-                    .mail
-                    .as_ref()
-                    .is_some_and(|mail| mail.username.is_none())
+                matches!(config.mail, Some(MailSettings::Smtp { tls, username: None, .. }) if tls == expected)
             );
+        }
+    }
+
+    #[test]
+    fn mail_parser_selects_graph_and_oauth_variants_and_rejects_contradictions() {
+        let file = std::env::temp_dir().join("craftcloud-synthetic-credential");
+        let file = file.to_string_lossy();
+        let prerequisites = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", file.as_ref()),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", file.as_ref()),
+            ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.test"),
+        ];
+        let graph = [
+            ("CRAFTCLOUD_MAIL_TRANSPORT", "graph"),
+            (
+                "CRAFTCLOUD_GRAPH_TENANT_ID",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+            (
+                "CRAFTCLOUD_GRAPH_CLIENT_ID",
+                "00000000-0000-0000-0000-000000000002",
+            ),
+            ("CRAFTCLOUD_GRAPH_CLIENT_SECRET_FILE", file.as_ref()),
+            ("CRAFTCLOUD_GRAPH_SENDER", "mailer@example.org"),
+        ];
+        let relay = [
+            ("CRAFTCLOUD_MAIL_TRANSPORT", "smtp"),
+            ("CRAFTCLOUD_SMTP_HOST", "smtp.example.org"),
+            ("CRAFTCLOUD_SMTP_PORT", "587"),
+            ("CRAFTCLOUD_SMTP_TLS", "starttls"),
+            ("CRAFTCLOUD_SMTP_FROM", "mailer@example.org"),
+        ];
+        let google = [
+            ("CRAFTCLOUD_SMTP_AUTH", "xoauth2"),
+            ("CRAFTCLOUD_SMTP_OAUTH_PROVIDER", "google"),
+            ("CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_FILE", file.as_ref()),
+            ("CRAFTCLOUD_SMTP_USERNAME", "mailer@example.org"),
+        ];
+        let graph_config =
+            Config::from_env_map(&env(&[prerequisites.as_slice(), graph.as_slice()].concat()))
+                .unwrap();
+        assert!(matches!(
+            graph_config.mail,
+            Some(MailSettings::Graph {
+                save_to_sent: false,
+                ..
+            })
+        ));
+        let relay_config =
+            Config::from_env_map(&env(&[prerequisites.as_slice(), relay.as_slice()].concat()))
+                .unwrap();
+        assert!(matches!(
+            relay_config.mail,
+            Some(MailSettings::Smtp { username: None, .. })
+        ));
+        let google_config = Config::from_env_map(&env(&[
+            prerequisites.as_slice(),
+            relay.as_slice(),
+            google.as_slice(),
+        ]
+        .concat()))
+        .unwrap();
+        assert!(matches!(
+            google_config.mail,
+            Some(MailSettings::SmtpOAuthGoogle { .. })
+        ));
+        for (base, extra, rejected_key) in [
+            (
+                graph.as_slice(),
+                vec![("CRAFTCLOUD_SMTP_HOST", "smtp.example.org")],
+                "CRAFTCLOUD_SMTP_HOST",
+            ),
+            (
+                graph.as_slice(),
+                vec![("CRAFTCLOUD_GRAPH_CERT_FILE", file.as_ref())],
+                "CRAFTCLOUD_GRAPH_CERT_FILE",
+            ),
+            (
+                graph.as_slice(),
+                vec![("CRAFTCLOUD_GRAPH_SAVE_TO_SENT", "invalid")],
+                "CRAFTCLOUD_GRAPH_SAVE_TO_SENT",
+            ),
+            (
+                relay.as_slice(),
+                vec![("CRAFTCLOUD_SMTP_AUTH", "password")],
+                "CRAFTCLOUD_SMTP_USERNAME",
+            ),
+            (
+                relay.as_slice(),
+                vec![
+                    ("CRAFTCLOUD_SMTP_AUTH", "none"),
+                    ("CRAFTCLOUD_SMTP_USERNAME", "mailer@example.org"),
+                ],
+                "CRAFTCLOUD_SMTP_USERNAME",
+            ),
+        ] {
+            let values = [prerequisites.as_slice(), base, extra.as_slice()].concat();
+            let errors = Config::from_env_map(&env(&values)).unwrap_err();
+            assert!(
+                keys(&errors).contains(&rejected_key),
+                "missing expected configuration error"
+            );
+        }
+        for (key, value) in [
+            ("CRAFTCLOUD_SMTP_PASSWORD_FILE", file.as_ref()),
+            (
+                "CRAFTCLOUD_SMTP_OAUTH_CLIENT_ID",
+                "00000000-0000-0000-0000-000000000002",
+            ),
+        ] {
+            let extra = [(key, value)];
+            let values = [
+                prerequisites.as_slice(),
+                relay.as_slice(),
+                google.as_slice(),
+                extra.as_slice(),
+            ]
+            .concat();
+            let errors = Config::from_env_map(&env(&values)).unwrap_err();
+            assert!(keys(&errors).contains(&key));
         }
     }
 }

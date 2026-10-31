@@ -1,0 +1,13 @@
+# Microsoft Graph mail delivery. Server requires outbound HTTPS.
+services:
+  server:
+    environment:
+      CRAFTCLOUD_MAIL_TRANSPORT: graph
+      CRAFTCLOUD_GRAPH_TENANT_ID: ${CRAFTCLOUD_GRAPH_TENANT_ID:?set Graph tenant ID}
+      CRAFTCLOUD_GRAPH_CLIENT_ID: ${CRAFTCLOUD_GRAPH_CLIENT_ID:?set Graph client ID}
+      CRAFTCLOUD_GRAPH_SENDER: ${CRAFTCLOUD_GRAPH_SENDER:?set Graph sender}
+      CRAFTCLOUD_GRAPH_SAVE_TO_SENT: ${CRAFTCLOUD_GRAPH_SAVE_TO_SENT:-false}
+    networks: [smtp_egress]
+
+networks:
+  smtp_egress: {}

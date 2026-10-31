@@ -35,6 +35,10 @@ export function EmailSystem({ revision }: { revision: number }) {
     {status !== null && <>
       <dl className="facts">
         <dt>{t("Status")}</dt><dd>{status.configured ? t("Configured") : t("Not configured")}</dd>
+        {status.transport != null && <><dt>{t("Active transport")}</dt><dd>{status.transport === "graph" ? t("Microsoft Graph") : t("SMTP")}</dd></>}
+        {status.sender != null && <><dt>{t("Sender")}</dt><dd>{status.sender}</dd></>}
+        {status.certificate_expires_at != null && <><dt>{t("Certificate expires")}</dt><dd>{formatDateTime(language, status.certificate_expires_at)}</dd></>}
+        {status.last_error_code != null && <><dt>{t("Last provider error")}</dt><dd><code>{status.last_error_code}</code></dd></>}
         <dt>{t("Last successful delivery")}</dt><dd>{status.last_success_at === null ? t("None") : formatDateTime(language, status.last_success_at)}</dd>
         <dt>{t("Failed messages")}</dt><dd>{status.failed_count}</dd>
         <dt>{t("Suppressed security notices")}</dt><dd>{status.suppressed_count}</dd>

@@ -3989,6 +3989,10 @@ components:
       required: [configured, last_success_at, failed_count, suppressed_count]
       properties:
         configured: {type: boolean}
+        transport: {type: [string, 'null'], enum: [smtp, graph, null]}
+        sender: {type: [string, 'null']}
+        certificate_expires_at: {type: [string, 'null'], format: date-time}
+        last_error_code: {type: [string, 'null']}
         last_success_at: {type: [string, 'null'], format: date-time}
         failed_count: {type: integer, format: int64, minimum: 0}
         suppressed_count:

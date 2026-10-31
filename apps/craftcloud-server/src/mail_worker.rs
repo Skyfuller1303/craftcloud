@@ -204,19 +204,35 @@ async fn deliver_one(
             }
         }
         Ok(Err(err)) => {
-            fail(
+            fail_with_retry(
                 pool,
                 &claim,
-                matches!(err, craftcloud_mail::TransportError::Permanent),
-                if matches!(err, craftcloud_mail::TransportError::Permanent) {
-                    "smtp_permanent"
-                } else {
-                    "smtp_transient"
-                },
+                err.is_permanent(),
+                queue_failure_code(err.code()),
+                err.retry_after(),
             )
             .await
         }
         Err(_) => fail(pool, &claim, false, "smtp_timeout").await,
+    }
+}
+
+fn queue_failure_code(code: &'static str) -> &'static str {
+    match code {
+        "ErrorAccessDenied" => "provider_access_denied",
+        "ErrorInvalidUser" => "provider_invalid_user",
+        "ErrorMailboxNotEnabledForRESTAPI" => "provider_mailbox_unavailable",
+        "ErrorRecipientNotFound" => "provider_recipient_not_found",
+        value
+            if !value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                }) =>
+        {
+            value
+        }
+        _ => "provider_failure",
     }
 }
 
@@ -240,8 +256,23 @@ async fn fail(
     permanent: bool,
     code: &'static str,
 ) {
+    fail_with_retry(pool, claim, permanent, code, None).await;
+}
+
+async fn fail_with_retry(
+    pool: &PgPool,
+    claim: &craftcloud_db::email_outbox::EmailClaim,
+    permanent: bool,
+    code: &'static str,
+    provider_delay: Option<Duration>,
+) {
     let now = time::OffsetDateTime::now_utc();
-    let retry = now + retry_delay(claim.attempts);
+    let provider_delay = provider_delay
+        .map(|value| {
+            time::Duration::seconds(i64::try_from(value.as_secs().min(86_400)).unwrap_or(86_400))
+        })
+        .unwrap_or(time::Duration::ZERO);
+    let retry = now + retry_delay(claim.attempts).max(provider_delay);
     match craftcloud_db::email_outbox::mark_failed(
         pool,
         claim.id,
@@ -275,6 +306,30 @@ fn retry_delay(attempts: i32) -> time::Duration {
 #[cfg(test)]
 mod tests {
     use super::{action_url, retry_delay};
+
+    #[test]
+    fn provider_codes_fit_the_existing_queue_constraint() {
+        for input in [
+            "ErrorAccessDenied",
+            "ErrorInvalidUser",
+            "ErrorMailboxNotEnabledForRESTAPI",
+            "ErrorRecipientNotFound",
+            "invalid_client",
+            "provider_rate_limited",
+            "untrusted provider body",
+        ] {
+            let code = super::queue_failure_code(input);
+            assert!(!code.is_empty() && code.len() <= 64);
+            assert!(
+                code.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            );
+        }
+        assert_eq!(
+            super::queue_failure_code("invalid_client"),
+            "invalid_client"
+        );
+    }
 
     #[test]
     fn capability_urls_use_fixed_spa_routes_and_fragments() {

@@ -690,6 +690,10 @@
 	Invitation sent to {email}.	Invitation sent to {email}.
 	E-mail delivery	E-mail delivery
 	Configured	Configured
+	Active transport	Active transport
+	Sender	Sender
+	Certificate expires	Certificate expires
+	Last provider error	Last provider error
 	Last successful delivery	Last successful delivery
 	Failed messages	Failed messages
 	Suppressed security notices	Suppressed security notices
@@ -703,3 +707,7 @@
 	Send confirmation links	Send confirmation links
 	Password reset email sent.	Password reset email sent.
 	This signs out the account on all devices and sends a password reset email.	This signs out the account on all devices and sends a password reset email.
+
+	Microsoft Graph	Microsoft Graph
+
+	SMTP	SMTP

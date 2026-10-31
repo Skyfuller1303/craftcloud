@@ -1,0 +1,14 @@
+services:
+  secrets-init:
+    environment:
+      COPY_SMTP_OAUTH_SERVICE_ACCOUNT: "1"
+    secrets: [smtp_oauth_service_account]
+  server:
+    environment:
+      CRAFTCLOUD_SMTP_AUTH: xoauth2
+      CRAFTCLOUD_SMTP_OAUTH_PROVIDER: google
+      CRAFTCLOUD_SMTP_USERNAME: ${CRAFTCLOUD_SMTP_USERNAME:?set SMTP mailbox}
+      CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_FILE: /run/secrets/smtp_oauth_service_account
+secrets:
+  smtp_oauth_service_account:
+    file: ${CRAFTCLOUD_SMTP_OAUTH_SERVICE_ACCOUNT_SOURCE:?set Google service account JSON source file}

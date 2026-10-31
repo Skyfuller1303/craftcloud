@@ -637,8 +637,17 @@ pub(crate) async fn status(
             return crate::orgs::db_failure(&error, &headers, "email status lookup failed");
         }
     };
+    let transport = services
+        .email_transport_status
+        .as_ref()
+        .map(|read| read())
+        .unwrap_or_default();
     Json(json!({
         "configured": services.email_delivery_enabled(),
+        "transport": transport.transport,
+        "sender": transport.sender,
+        "certificate_expires_at": transport.certificate_expires_at,
+        "last_error_code": transport.last_error_code,
         "last_success_at": status.last_success_at.map(crate::orgs::rfc3339),
         "failed_count": status.failed_count,
         "suppressed_count": status.suppressed_count,
