@@ -172,10 +172,10 @@ async fn make_live_figcraft_file(
 ) -> Uuid {
     let now = OffsetDateTime::now_utc();
     let project_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO projects(id,org_id,workspace_id,name,name_key,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,'Source project','source-project',$4,$5,$4,$5)")
+    sqlx::query("INSERT INTO projects(id,org_id,workspace_id,name,name_key,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,'Source project','source-project-'||$1::text,$4,$5,$4,$5)")
         .bind(project_id).bind(org_id).bind(workspace_id).bind(owner_id).bind(now).execute(pool).await.unwrap();
     let file_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO files(id,org_id,workspace_id,project_id,name,name_key,app,format,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,$4,'Source file','source-file','figcraft','fig',$5,$6,$5,$6)")
+    sqlx::query("INSERT INTO files(id,org_id,workspace_id,project_id,name,name_key,app,format,created_by_user_id,created_at,updated_by_user_id,updated_at) VALUES($1,$2,$3,$4,'Source file','source-file-'||$1::text,'figcraft','fig',$5,$6,$5,$6)")
         .bind(file_id).bind(org_id).bind(workspace_id).bind(project_id).bind(owner_id).bind(now).execute(pool).await.unwrap();
     let blob_id = Uuid::new_v4();
     sqlx::query("INSERT INTO blobs(id,org_id,workspace_id,object_key,size_bytes,sha256,state,created_at) VALUES($1,$2,$3,$4,0,$5,'committed',$6)")
@@ -537,4 +537,103 @@ async fn source_specific_app_revocation_preserves_other_links_and_generic_revoke
         active_rows(pool, file_id, member.id).await.is_empty(),
         "generic membership revocation covers all origins"
     );
+}
+
+/// Adds a committed version of `size` bytes to a file created by
+/// `make_live_figcraft_file`.
+async fn add_version(pool: &PgPool, file_id: Uuid, number: i64, size: i64, user_id: Uuid) {
+    let (org_id, workspace_id, project_id): (Uuid, Uuid, Uuid) =
+        sqlx::query_as("SELECT org_id,workspace_id,project_id FROM files WHERE id=$1")
+            .bind(file_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let now = OffsetDateTime::now_utc();
+    let blob_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO blobs(id,org_id,workspace_id,object_key,size_bytes,sha256,state,created_at) VALUES($1,$2,$3,$4,$5,$6,'committed',$7)")
+        .bind(blob_id).bind(org_id).bind(workspace_id).bind(Uuid::new_v4().simple().to_string())
+        .bind(size).bind([number as u8; 32].as_slice()).bind(now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO file_versions(id,org_id,workspace_id,project_id,file_id,number,blob_id,size_bytes,sha256,created_by_user_id,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+        .bind(Uuid::new_v4()).bind(org_id).bind(workspace_id).bind(project_id).bind(file_id)
+        .bind(number).bind(blob_id).bind(size).bind([number as u8; 32].as_slice()).bind(user_id).bind(now)
+        .execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn app_storage_counts_all_retained_versions_including_trashed_files() {
+    let db = TestDb::new().await;
+    let pool = &db.pool;
+    let owner = create_user(pool, "storage-owner@example.test").await;
+    let org = organizations::create(
+        pool,
+        &NewOrganization {
+            slug: format!("storage-{}", Uuid::new_v4().simple()),
+            name: "App storage".to_owned(),
+            owner_user_id: owner.id,
+        },
+    )
+    .await
+    .unwrap();
+    let org_id = org.id;
+    let workspace = workspaces::create(
+        pool,
+        &permitted_scope(
+            org_id,
+            owner.id,
+            Action::WorkspaceCreate,
+            Resource::Organization { org_id },
+        ),
+        &NewWorkspace {
+            slug: "storage-ws".to_owned(),
+            name: "Storage workspace".to_owned(),
+            quota_bytes: None,
+        },
+    )
+    .await
+    .unwrap();
+    // A file with three versions (0 + 100 + 250 bytes; the head is the
+    // newest) and a second figcraft file in the trash with 1000 bytes.
+    let live = make_live_figcraft_file(pool, org_id, owner.id, workspace.id).await;
+    add_version(pool, live, 2, 100, owner.id).await;
+    add_version(pool, live, 3, 250, owner.id).await;
+    sqlx::query("UPDATE files SET size_bytes=250 WHERE id=$1")
+        .bind(live)
+        .execute(pool)
+        .await
+        .unwrap();
+    let trashed = make_live_figcraft_file(pool, org_id, owner.id, workspace.id).await;
+    add_version(pool, trashed, 2, 1000, owner.id).await;
+    sqlx::query(
+        "UPDATE files SET size_bytes=1000,deleted_at=now(),deleted_by_user_id=$2 WHERE id=$1",
+    )
+    .bind(trashed)
+    .bind(owner.id)
+    .execute(pool)
+    .await
+    .unwrap();
+    // Another app's file must not be counted.
+    let other = make_live_figcraft_file(pool, org_id, owner.id, workspace.id).await;
+    add_version(pool, other, 2, 7, owner.id).await;
+    sqlx::query("UPDATE files SET app='photocraft' WHERE id=$1")
+        .bind(other)
+        .execute(pool)
+        .await
+        .unwrap();
+    let scope = permitted_scope(
+        org_id,
+        owner.id,
+        Action::OrganizationAppsRead,
+        Resource::Organization { org_id },
+    );
+    let (_, _, _, usage) = app_access::usage(
+        pool,
+        &scope,
+        &["figcraft".to_owned(), "photocraft".to_owned()],
+    )
+    .await
+    .unwrap();
+    let bytes = |app: &str| usage.iter().find(|u| u.app == app).unwrap().storage_bytes;
+    assert_eq!(bytes("figcraft"), 100 + 250 + 1000);
+    assert_eq!(bytes("photocraft"), 7);
 }

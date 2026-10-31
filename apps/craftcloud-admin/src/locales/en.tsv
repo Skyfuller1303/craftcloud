@@ -722,6 +722,8 @@
 	Only assigned apps	Only assigned apps
 	Assigned people	Assigned people
 	Active devices	Active devices
+	Storage incl. all versions	Storage incl. all versions
+	Storage counts the logical size of all retained versions of the app's files, including files in the trash. It is the same basis as the storage quota.	Storage counts the logical size of all retained versions of the app's files, including files in the trash. It is the same basis as the storage quota.
 	Assign selected app	Assign selected app
 	Remove selected app	Remove selected app
 	Choose an app	Choose an app

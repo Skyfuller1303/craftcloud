@@ -719,6 +719,8 @@
 	Only assigned apps	Nur zugewiesene Apps
 	Assigned people	Zugewiesene Personen
 	Active devices	Aktive Geräte
+	Storage incl. all versions	Speicher inkl. aller Versionen
+	Storage counts the logical size of all retained versions of the app's files, including files in the trash. It is the same basis as the storage quota.	Der Speicher zählt die logische Größe aller aufbewahrten Versionen der Dateien der App, einschließlich Dateien im Papierkorb. Das ist dieselbe Grundlage wie beim Speicherkontingent.
 	Assign selected app	Ausgewählte App zuweisen
 	Remove selected app	Ausgewählte App entziehen
 	Choose an app	App auswählen

@@ -469,6 +469,29 @@ mod tests {
         let data2 = pattern(40_000, 9);
         let v2 = w.push(&bob.1, f2, &data2).await;
 
+        // AC-11: a seat limit, the assigned-apps mode and persistent app
+        // assignments. Alice (owner) keeps no assignment of her own.
+        sqlx::query(
+            "UPDATE organizations SET seat_limit = 7, app_access_mode = 'assigned' WHERE id = $1",
+        )
+        .bind(acme)
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        for (app, created_at) in [
+            ("photocraft", "2026-10-01T08:00:00Z"),
+            ("figcraft", "2026-10-02T09:30:00Z"),
+        ] {
+            sqlx::query("INSERT INTO member_app_access(org_id,user_id,app,created_at) VALUES($1,$2,$3,$4::timestamptz)")
+                .bind(acme)
+                .bind(carol.0)
+                .bind(app)
+                .bind(created_at)
+                .execute(&w.env.pool)
+                .await
+                .unwrap();
+        }
+
         // ---- backup ----
         let backups = TempDir::new("backup-drill");
         let out = backups.child("b1");
@@ -477,7 +500,17 @@ mod tests {
         let backup_time = started.elapsed();
         assert!(created.audit_recorded);
         assert_eq!(created.blobs, 5, "{:?}", created.manifest.blobs);
-        assert_eq!(created.manifest.migration_version, 19);
+        assert_eq!(
+            created.manifest.migration_version,
+            *craftcloud_db::migrate::embedded_versions().last().unwrap()
+        );
+        assert!(
+            created
+                .manifest
+                .tables
+                .iter()
+                .any(|t| t.name == "member_app_access" && t.rows == 2)
+        );
 
         let report = craftcloud_backup::verify(&out, Some(&created.manifest_sha256)).unwrap();
         assert_eq!(report.blobs, 5);
@@ -500,6 +533,33 @@ mod tests {
         );
         assert_eq!((restored.blobs, restored.aborted_uploads), (5, 0));
         assert!(!restored.needs_migration);
+
+        // AC-11: limits, mode and assignments survive and keep deciding access.
+        let org_row: (Option<i32>, String) =
+            sqlx::query_as("SELECT seat_limit, app_access_mode FROM organizations WHERE id = $1")
+                .bind(acme)
+                .fetch_one(&target.pool)
+                .await
+                .unwrap();
+        assert_eq!(org_row, (Some(7), "assigned".to_owned()));
+        assert_eq!(
+            target.count("SELECT count(*) FROM member_app_access").await,
+            2
+        );
+        for (app, expected) in [("photocraft", true), ("figcraft", true), ("other", false)] {
+            assert_eq!(
+                craftcloud_db::app_access::assigned(&target.pool, acme, carol.0, app)
+                    .await
+                    .unwrap(),
+                expected,
+                "carol / {app}"
+            );
+        }
+        assert!(
+            !craftcloud_db::app_access::assigned(&target.pool, acme, bob.0, "photocraft")
+                .await
+                .unwrap()
+        );
 
         // Row data: identical, table by table (the audit log gains one event).
         for spec in BACKUP_TABLES {
@@ -860,7 +920,12 @@ mod tests {
 
         // Forged manifests with a matching checksum file: unknown versions.
         rewrite_manifest(&out, |m| m["migration_version"] = json!(99));
-        expect(&out, ErrorKind::Format, "only knows up to 19");
+        let newest = *craftcloud_db::migrate::embedded_versions().last().unwrap();
+        expect(
+            &out,
+            ErrorKind::Format,
+            &format!("only knows up to {newest}"),
+        );
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
             m["format_version"] = json!(2);
@@ -872,7 +937,7 @@ mod tests {
         );
         rewrite_manifest(&out, |m| {
             m["format_version"] = json!(1);
-            m["migration_version"] = json!(19);
+            m["migration_version"] = json!(newest);
             m["tables"][0]["rows"] = json!(77);
         });
         expect(&out, ErrorKind::Integrity, "rows but the manifest says 77");
@@ -1042,6 +1107,9 @@ mod tests {
         for table in ["figcraft_live_files", "figcraft_links", "figcraft_outbox"] {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
+        // AC-11 adds app assignments and appends seat_limit and
+        // app_access_mode to organizations.
+        std::fs::remove_file(out.join("tables").join("member_app_access.copy")).unwrap();
         let versions_path = out.join("tables").join("file_versions.copy");
         let current_versions = std::fs::read_to_string(&versions_path).unwrap();
         let old_versions: String = current_versions
@@ -1058,7 +1126,11 @@ mod tests {
         let old_orgs: String = current_orgs
             .lines()
             .map(|line| {
-                let (old_columns, policy) = line.rsplit_once('\t').unwrap();
+                let (without_mode, mode) = line.rsplit_once('\t').unwrap();
+                assert_eq!(mode, "all");
+                let (without_limit, seat_limit) = without_mode.rsplit_once('\t').unwrap();
+                assert_eq!(seat_limit, r"\N");
+                let (old_columns, policy) = without_limit.rsplit_once('\t').unwrap();
                 assert_eq!(policy, "f");
                 format!("{old_columns}\n")
             })
@@ -1102,6 +1174,7 @@ mod tests {
                             | "figcraft_live_files"
                             | "figcraft_links"
                             | "figcraft_outbox"
+                            | "member_app_access"
                     )
                 )
             });
@@ -1158,12 +1231,155 @@ mod tests {
 
         // Restore, then migrate.
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 8);
+        let expected_later = craftcloud_db::migrate::embedded_versions()
+            .into_iter()
+            .filter(|version| *version > 11)
+            .count();
+        assert_eq!(applied.len(), expected_later);
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
+        // The AC-11 defaults apply to the migrated old organizations.
+        let defaults: Vec<(Option<i32>, String)> =
+            sqlx::query_as("SELECT seat_limit, app_access_mode FROM organizations")
+                .fetch_all(&target.pool)
+                .await
+                .unwrap();
+        assert!(!defaults.is_empty());
+        assert!(
+            defaults
+                .iter()
+                .all(|(limit, mode)| limit.is_none() && mode == "all")
+        );
+        assert_eq!(
+            target.count("SELECT count(*) FROM member_app_access").await,
+            0
+        );
         assert_eq!(
             dump(&w.env.pool, "users").await,
             dump(&target.pool, "users").await
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn a_schema_19_backup_with_a_figcraft_link_is_restored_and_gains_the_ac_11_defaults() {
+        let w = W::new().await;
+        let dir = TempDir::new("backup-schema-19");
+        let owner = w.user("owner").await;
+        let org = w.org("old", owner.0).await;
+        let ws = w.ws(&owner.1, org, "main").await;
+        let project = w.project(&owner.1, ws, "P").await;
+        let file = w.file(&owner.1, project, "a.fig").await;
+        w.push(&owner.1, file, &pattern(30_000, 4)).await;
+        let head: Uuid = sqlx::query_scalar("SELECT head_version_id FROM files WHERE id = $1")
+            .bind(file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO figcraft_live_files(file_id,org_id,workspace_id,published_from_version_id,state,published_by_user_id,created_at,updated_at) VALUES($1,$2,$3,$4,'live',$5,now(),now())")
+            .bind(file)
+            .bind(org)
+            .bind(ws)
+            .bind(head)
+            .bind(owner.0)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO figcraft_links(id,file_id,user_id,access,created_at,source_kind,source_app) VALUES(gen_random_uuid(),$1,$2,'edit',now(),'app','photocraft')")
+            .bind(file)
+            .bind(owner.0)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        // The production create refuses an outdated schema, so the schema 19
+        // export is modelled from a current one: no assignment table, no
+        // seat_limit or app_access_mode, and the eight original link columns.
+        let out = dir.child("backup");
+        w.create_backup(&out).await.unwrap();
+        std::fs::remove_file(out.join("tables").join("member_app_access.copy")).unwrap();
+        let org_path = out.join("tables").join("organizations.copy");
+        let old_orgs: String = std::fs::read_to_string(&org_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (without_mode, mode) = line.rsplit_once('\t').unwrap();
+                assert_eq!(mode, "all");
+                let (old_columns, seat_limit) = without_mode.rsplit_once('\t').unwrap();
+                assert_eq!(seat_limit, r"\N");
+                format!("{old_columns}\n")
+            })
+            .collect();
+        std::fs::write(&org_path, &old_orgs).unwrap();
+        let links_path = out.join("tables").join("figcraft_links.copy");
+        let current_links = std::fs::read_to_string(&links_path).unwrap();
+        assert_eq!(current_links.lines().count(), 1);
+        let old_links: String = current_links
+            .lines()
+            .map(|line| {
+                let (without_app, source_app) = line.rsplit_once('\t').unwrap();
+                assert_eq!(source_app, "photocraft");
+                let (old_columns, source_kind) = without_app.rsplit_once('\t').unwrap();
+                assert_eq!(source_kind, "app");
+                format!("{old_columns}\n")
+            })
+            .collect();
+        assert_eq!(old_links.lines().next().unwrap().split('\t').count(), 8);
+        std::fs::write(&links_path, &old_links).unwrap();
+        rewrite_manifest(&out, |m| {
+            m["migration_version"] = json!(19);
+            let tables = m["tables"].as_array_mut().unwrap();
+            tables.retain(|t| t["name"] != "member_app_access");
+            for (name, text) in [("organizations", &old_orgs), ("figcraft_links", &old_links)] {
+                let entry = tables.iter_mut().find(|t| t["name"] == name).unwrap();
+                entry["bytes"] = json!(text.len());
+                entry["sha256"] = json!(sha_hex(text.as_bytes()));
+            }
+        });
+        craftcloud_backup::verify(&out, None).unwrap();
+
+        // Dropping the assignment table from a schema 20 manifest is still
+        // refused: it would silently lose the stored access decisions.
+        let forged = dir.child("forged");
+        w.create_backup(&forged).await.unwrap();
+        rewrite_manifest(&forged, |m| {
+            m["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|t| t["name"] != "member_app_access");
+        });
+        expect(&forged, ErrorKind::Format, "table list");
+
+        let target = Target::new().await;
+        let restored = target.restore(&out).await.unwrap();
+        assert!(restored.needs_migration);
+        let newest: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&target.pool)
+            .await
+            .unwrap();
+        assert_eq!(newest, 19, "restored at the schema of the backup");
+        assert!(craftcloud_db::migrate::verify(&target.pool).await.is_err());
+
+        let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
+        assert_eq!(applied.len(), 1, "only migration 20 is applied");
+        craftcloud_db::migrate::verify(&target.pool).await.unwrap();
+        let defaults: (Option<i32>, String) =
+            sqlx::query_as("SELECT seat_limit, app_access_mode FROM organizations WHERE id = $1")
+                .bind(org)
+                .fetch_one(&target.pool)
+                .await
+                .unwrap();
+        assert_eq!(defaults, (None, "all".to_owned()));
+        assert_eq!(
+            target.count("SELECT count(*) FROM member_app_access").await,
+            0
+        );
+        let link: (String, Option<String>, bool) = sqlx::query_as(
+            "SELECT source_kind, source_app, revoked_at IS NOT NULL FROM figcraft_links WHERE file_id = $1",
+        )
+        .bind(file)
+        .fetch_one(&target.pool)
+        .await
+        .unwrap();
+        assert_eq!(link, ("legacy".to_owned(), None, true));
     }
 
     // ---- no garbage collection during a backup ---------------------------------------
@@ -1570,7 +1786,10 @@ mod tests {
         .unwrap();
         assert_eq!((row.0, row.1, row.2.as_str()), (None, None, "success"));
         assert_eq!(row.3["blobs"], 1);
-        assert_eq!(row.3["migration"], 19);
+        assert_eq!(
+            row.3["migration"],
+            *craftcloud_db::migrate::embedded_versions().last().unwrap()
+        );
 
         // The manifest holds no secrets: neither a connection string nor the
         // password of the database URL, and no names.

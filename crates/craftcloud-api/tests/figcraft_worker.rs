@@ -1166,6 +1166,34 @@ mod tests {
             .execute(&fixture.env.pool)
             .await
             .unwrap();
+        // AC-11: links keep their origin through a backup. Add one link issued
+        // for an app and one for the launcher next to the original one.
+        for (source_kind, source_app) in [("app", Some("photocraft")), ("launcher", None)] {
+            sqlx::query("INSERT INTO figcraft_links(id,file_id,user_id,access,figcraft_link_id,token_ciphertext,created_at,source_kind,source_app) SELECT gen_random_uuid(),file_id,user_id,access,'old-remote-link',$2,created_at,$3,$4 FROM figcraft_links WHERE file_id=$1 AND revoked_at IS NULL ORDER BY created_at LIMIT 1")
+                .bind(fixture.file)
+                .bind(&[0x5a_u8; 48][..])
+                .bind(source_kind)
+                .bind(source_app)
+                .execute(&fixture.env.pool)
+                .await
+                .unwrap();
+        }
+        let sources_before: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT source_kind,source_app FROM figcraft_links WHERE file_id=$1 ORDER BY source_kind,source_app",
+        )
+        .bind(fixture.file)
+        .fetch_all(&fixture.env.pool)
+        .await
+        .unwrap();
+        assert!(sources_before.len() >= 3, "{sources_before:?}");
+        assert!(
+            sources_before.contains(&("app".to_owned(), Some("photocraft".to_owned()))),
+            "{sources_before:?}"
+        );
+        assert!(
+            sources_before.contains(&("launcher".to_owned(), None)),
+            "{sources_before:?}"
+        );
         sqlx::query("INSERT INTO figcraft_outbox(file_id,user_id,reason,available_at,created_at) VALUES($1,$2,'security_changed',$3,$3)")
             .bind(fixture.file)
             .bind(fixture.env.operator_id)
@@ -1201,16 +1229,30 @@ mod tests {
         assert_eq!(restored.1, "republish");
         assert_eq!(restored.2, None);
         assert!(!restored.3);
-        let link: (Option<String>, Option<Vec<u8>>, bool) = sqlx::query_as(
-            "SELECT figcraft_link_id,token_ciphertext,revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1",
-        )
-        .bind(fixture.file)
-        .fetch_one(&target.pool)
-        .await
-        .unwrap();
-        assert_eq!(link.0, None);
-        assert_eq!(link.1, None);
-        assert!(link.2);
+        type RestoredLink = (
+            Option<String>,
+            Option<Vec<u8>>,
+            bool,
+            String,
+            Option<String>,
+        );
+        let links: Vec<RestoredLink> =
+            sqlx::query_as(
+                "SELECT figcraft_link_id,token_ciphertext,revoked_at IS NOT NULL,source_kind,source_app FROM figcraft_links WHERE file_id=$1 ORDER BY source_kind,source_app",
+            )
+            .bind(fixture.file)
+            .fetch_all(&target.pool)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), sources_before.len());
+        for link in &links {
+            assert_eq!(link.0, None);
+            assert_eq!(link.1, None);
+            assert!(link.2);
+        }
+        let sources_after: Vec<(String, Option<String>)> =
+            links.into_iter().map(|link| (link.3, link.4)).collect();
+        assert_eq!(sources_after, sources_before);
         let outbox: i64 = sqlx::query_scalar("SELECT count(*) FROM figcraft_outbox")
             .fetch_one(&target.pool)
             .await

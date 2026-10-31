@@ -508,6 +508,9 @@ async fn snapshot(pool: &PgPool, out: &Path) -> Result<Snapshot, BackupError> {
             // FigCraft server. A restored file must be republished, with no
             // prior remote id or automatic-snapshot completion state.
             "figcraft_live_files" => "COPY (SELECT file_id,org_id,workspace_id,NULL::text,published_from_version_id,last_snapshot_version_id,last_snapshot_at,NULL::timestamptz,false,'republish',published_by_user_id,created_at,now() FROM figcraft_live_files) TO STDOUT".to_owned(),
+            // From schema 20 the link also carries its origin (source_kind,
+            // source_app); the restore loads without a column list.
+            "figcraft_links" if migration_version >= 20 => "COPY (SELECT id,file_id,user_id,access,NULL::text,NULL::bytea,created_at,COALESCE(revoked_at,now()),source_kind,source_app FROM figcraft_links) TO STDOUT".to_owned(),
             "figcraft_links" => "COPY (SELECT id,file_id,user_id,access,NULL::text,NULL::bytea,created_at,COALESCE(revoked_at,now()) FROM figcraft_links) TO STDOUT".to_owned(),
             // Remote revocation jobs cannot target the restored server's new
             // FigCraft file ids. Restored personal links are already revoked.

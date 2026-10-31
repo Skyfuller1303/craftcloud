@@ -44,9 +44,10 @@ export function AppsScreen({ organization }: { organization: Organization | null
     <section className="section" aria-labelledby="apps-usage-title">
       <h2 id="apps-usage-title" className="section__title">{t("Apps usage")}</h2>
       <div className="table-wrap"><table className="table"><caption className="visually-hidden">{t("Apps usage")}</caption>
-        <thead><tr><th scope="col">{t("App")}</th><th scope="col" className="numeric">{t("Assigned people")}</th><th scope="col" className="numeric">{t("Active devices")}</th><th scope="col" className="numeric">{t("Storage used")}</th></tr></thead>
-        <tbody>{data.apps.map((app) => <tr key={app.id}><th scope="row">{app.name}</th><td className="numeric" data-label={t("Assigned people")}>{number(app.assigned_members)}</td><td className="numeric" data-label={t("Active devices")}>{number(app.active_devices)}</td><td className="numeric" data-label={t("Storage used")}>{formatBytes(language, app.storage_bytes)}</td></tr>)}</tbody>
+        <thead><tr><th scope="col">{t("App")}</th><th scope="col" className="numeric">{t("Assigned people")}</th><th scope="col" className="numeric">{t("Active devices")}</th><th scope="col" className="numeric">{t("Storage incl. all versions")}</th></tr></thead>
+        <tbody>{data.apps.map((app) => <tr key={app.id}><th scope="row">{app.name}</th><td className="numeric" data-label={t("Assigned people")}>{number(app.assigned_members)}</td><td className="numeric" data-label={t("Active devices")}>{number(app.active_devices)}</td><td className="numeric" data-label={t("Storage incl. all versions")}>{formatBytes(language, app.storage_bytes)}</td></tr>)}</tbody>
       </table></div>
+      <p className="muted">{t("Storage counts the logical size of all retained versions of the app's files, including files in the trash. It is the same basis as the storage quota.")}</p>
     </section>
   </div>;
 }

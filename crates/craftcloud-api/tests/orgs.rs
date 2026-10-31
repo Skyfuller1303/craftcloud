@@ -443,6 +443,7 @@ mod tests {
                     "name",
                     "quota_bytes",
                     "reserved_bytes",
+                    "seat_limit",
                     "slug"
                 ]
             );

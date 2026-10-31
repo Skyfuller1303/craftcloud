@@ -49,6 +49,7 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("workspaces", 2),
     table("invitations", 6),
     table("organization_members", 1),
+    table("member_app_access", 20),
     table("workspace_members", 2),
     table("instance_setup", 3),
     table("projects", 7),
@@ -185,11 +186,11 @@ mod tests {
         // AC-06 adds FigCraft state at 18; AC-09 adds one-use email state at 19.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len() - 6
+            BACKUP_TABLES.len() - 7
         );
         assert_eq!(
             backup_tables_for(14).unwrap().len(),
-            BACKUP_TABLES.len() - 6
+            BACKUP_TABLES.len() - 7
         );
         assert_eq!(
             excluded_tables_for(14),
@@ -216,7 +217,7 @@ mod tests {
         assert!(!excluded_tables_for(15).contains(&"file_locks"));
         assert_eq!(
             backup_tables_for(16).unwrap().len(),
-            BACKUP_TABLES.len() - 5
+            BACKUP_TABLES.len() - 6
         );
         assert_eq!(
             excluded_tables_for(16),
@@ -263,6 +264,24 @@ mod tests {
                 "pending_email_changes"
             ]
         );
+        // AC-11 adds the app assignments at 20, after the memberships they
+        // reference.
+        let position =
+            |tables: &[&TableSpec], name: &str| tables.iter().position(|t| t.name == name);
+        assert!(position(&backup_tables_for(19).unwrap(), "member_app_access").is_none());
+        let backup_20 = backup_tables_for(20).unwrap();
+        assert_eq!(
+            backup_20
+                .iter()
+                .filter(|t| t.name == "member_app_access" && t.since == 20)
+                .count(),
+            1
+        );
+        assert!(
+            position(&backup_20, "organization_members")
+                < position(&backup_20, "member_app_access")
+        );
+        assert!(!excluded_tables_for(20).contains(&"member_app_access"));
         assert!(!is_backup_table("outbound_emails"));
         assert!(!is_backup_table("email_verification_tokens"));
         assert!(!is_backup_table("pending_email_changes"));

@@ -36,7 +36,7 @@ pub async fn usage(
              WHERE ma.org_id=$1 AND ma.app=a.app AND m.status='active' \
                AND m.role NOT IN ('owner','admin','guest')), \
            count(DISTINCT d.id), \
-           COALESCE((SELECT sum(f.size_bytes)::bigint FROM files f WHERE f.org_id=$1 AND f.app=a.app AND f.deleted_at IS NULL),0::bigint) \
+           COALESCE((SELECT sum(v.size_bytes)::bigint FROM file_versions v JOIN files f ON f.org_id=v.org_id AND f.id=v.file_id WHERE v.org_id=$1 AND f.app=a.app),0::bigint) \
          FROM (SELECT unnest($2::text[]) app) a \
          LEFT JOIN device_sessions d ON d.client_kind='app' AND d.client_id=a.app \
            AND d.revoked_at IS NULL AND d.idle_expires_at>now() AND d.absolute_expires_at>now() \
