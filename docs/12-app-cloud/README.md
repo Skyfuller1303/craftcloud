@@ -27,8 +27,9 @@ Stand 2026-10-30. Dieser Ordner beschreibt den nächsten Ausbau von CraftCloud a
 | AC-09b | [E-Mail über Microsoft Graph und SMTP mit OAuth](ac-09b-microsoft-graph-mail.md) | CraftCloud | AC-09 | Opus-Review (Sicherheit) |
 | AC-10 | [Unternehmens-Anmeldung (OIDC) und Provisionierung (SCIM)](ac-10-sso-and-scim.md) | CraftCloud | AC-01, AC-09 | Opus-Review (Sicherheit) |
 | AC-11 | [Plätze und App-Zuweisung](ac-11-seats-and-app-access.md) | CraftCloud | AC-01, AC-08 | Opus-Review (Sicherheit) |
+| AC-12 | [Speicherstufen: neueste Version lokal, Archiv extern](ac-12-storage-tiers.md) | CraftCloud | AC-02 (Serverschlüssel), AC-06 | Opus-Review (Sicherheit) |
 
-Empfohlene Reihenfolge: AC-01 und AC-03 parallel (verschiedene Dateien, siehe jeweilige Zuständigkeit), danach AC-02 und AC-04, dann AC-05, AC-06 und AC-07. AC-05 und AC-07 arbeiten in fremden Repositories nur lokal. Stand 2026-10-30: AC-01 und AC-03 sind gemerged (main 73a06bd), AC-02 und AC-04 laufen. OPS-01 kann jederzeit parallel laufen, weil es kaum Dateien der anderen Briefings berührt; AC-08 folgt nach AC-02. Danach AC-09 (SMTP), dann AC-09b (Microsoft Graph, SMTP mit OAuth) und AC-10 (braucht verifizierte Adressen); AC-11 ist davon unabhängig. Die Migrationsnummer vergibt der Koordinator beim Start, weil mehrere Briefings parallel Migrationen anlegen.
+Empfohlene Reihenfolge: AC-01 und AC-03 parallel (verschiedene Dateien, siehe jeweilige Zuständigkeit), danach AC-02 und AC-04, dann AC-05, AC-06 und AC-07. AC-05 und AC-07 arbeiten in fremden Repositories nur lokal. Stand 2026-10-30: AC-01 und AC-03 sind gemerged (main 73a06bd), AC-02 und AC-04 laufen. OPS-01 kann jederzeit parallel laufen, weil es kaum Dateien der anderen Briefings berührt; AC-08 folgt nach AC-02. Danach AC-09 (SMTP), dann AC-09b (Microsoft Graph, SMTP mit OAuth) und AC-10 (braucht verifizierte Adressen); AC-11 ist davon unabhängig. AC-12 (Speicherstufen) folgt nach AC-11, weil es Wartung, Aufbewahrung und Backup berührt. Die Migrationsnummer vergibt der Koordinator beim Start, weil mehrere Briefings parallel Migrationen anlegen.
 
 ## Feste Entscheidungen
 
