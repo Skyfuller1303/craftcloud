@@ -125,19 +125,14 @@ async fn create_inner(
             .execute(&mut *tx)
             .await?
             .rows_affected();
-        if factor_removed > 0
-            && email.is_some()
-            && crate::mail_security::enqueue_in(
+        if factor_removed > 0 && email.is_some() {
+            crate::mail_security::enqueue_in(
                 &mut tx,
                 new.user_id,
                 new.now,
                 crate::mail_security::SecurityEvent::TwoFactorReset,
             )
-            .await?
-                != crate::email_outbox::EnqueueOutcome::Queued
-        {
-            tx.rollback().await?;
-            return Ok(IssueOutcome::EmailRateLimited);
+            .await?;
         }
     }
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
@@ -376,14 +371,13 @@ pub async fn consume_audited_with_email(
 pub enum ConsumeOutcome {
     Consumed(Uuid),
     InvalidToken,
-    EmailRateLimited,
 }
 
 impl ConsumeOutcome {
     fn user_id(self) -> Option<Uuid> {
         match self {
             Self::Consumed(user_id) => Some(user_id),
-            Self::InvalidToken | Self::EmailRateLimited => None,
+            Self::InvalidToken => None,
         }
     }
 }
@@ -476,12 +470,8 @@ async fn consume_inner(
         )
         .await?;
     }
-    if let Some(event) = email_event
-        && crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(ConsumeOutcome::EmailRateLimited);
+    if let Some(event) = email_event {
+        crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?;
     }
     tx.commit().await?;
     Ok(ConsumeOutcome::Consumed(user_id))

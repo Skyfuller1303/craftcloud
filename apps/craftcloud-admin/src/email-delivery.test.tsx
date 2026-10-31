@@ -83,7 +83,7 @@ describe.each(["en", "de"])("email delivery (%s)", (language) => {
 
   it("shows mail status and sends a test without a recipient parameter", async () => {
     const network = mount(<EmailSystem revision={0} />, language, true, {
-      "GET /admin/email-delivery": { body: { configured: true, last_success_at: null, failed_count: 2 } },
+      "GET /admin/email-delivery": { body: { configured: true, last_success_at: null, failed_count: 2, suppressed_count: 3 } },
       "POST /admin/email-delivery/test": { status: 202, body: {} },
     });
     const user = userEvent.setup();
@@ -108,7 +108,7 @@ it.each(["verify", "change"] as const)("removes %s email capability before use a
 
 it("continues operator verification from the server cursor and respects its cooldown", async () => {
   const network = mount(<EmailSystem revision={0} />, "en", true, {
-    "GET /admin/email-delivery": { body: { configured: true, last_success_at: null, failed_count: 0 } },
+    "GET /admin/email-delivery": { body: { configured: true, last_success_at: null, failed_count: 0, suppressed_count: 0 } },
     "POST /admin/users/email-verification": (call) => ({ status: 202, body: call.query.has("after")
       ? { queued: 0, next_cursor: "last-user", limited: true, retry_after_seconds: 3600 }
       : { queued: 30, next_cursor: "last-user", limited: false, retry_after_seconds: null } }),

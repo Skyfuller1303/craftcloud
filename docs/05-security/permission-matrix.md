@@ -150,7 +150,7 @@ Entscheidungen und Vertragspräzisierungen: [ADR-0024](../09-decisions/adr-0024-
 
 `POST /auth/email-verification` und `POST /auth/email-change` sind Selbstbedienungsaktionen ausschließlich für das authentifizierte Konto. Die Adressänderung verlangt zusätzlich aktuelles Passwort und eingerichteten zweiten Faktor. Die Bestätigungsrouten verwenden einen kurzlebigen Einmaltoken, Origin-Prüfung und bei Cookie-Sitzungen den bestehenden CSRF-Schutz. Einladungs-Resends behalten die Rechteprüfung der ursprünglichen Einladung und geben bei aktivem Versand niemals Links zurück.
 
-`GET /admin/email-delivery`, `POST /admin/email-delivery/test` und `POST /admin/users/email-verification` sind operatorgeschützt. Die Testmail hat keinen frei wählbaren Empfänger; sie geht ausschließlich an das eigene Konto. Statusantworten enthalten nur Konfiguration, letzten Erfolg und Fehleranzahl. Organisationsrollen verleihen keine Rechte auf diese Instanzfunktionen.
+`GET /admin/email-delivery`, `POST /admin/email-delivery/test` und `POST /admin/users/email-verification` sind operatorgeschützt. Die Testmail hat keinen frei wählbaren Empfänger; sie geht ausschließlich an das eigene Konto. Statusantworten enthalten nur Konfiguration, letzten Erfolg, Fehleranzahl und die Zahl unterdrückter Sicherheitshinweise. Organisationsrollen verleihen keine Rechte auf diese Instanzfunktionen.
 
 ## Allgemeine Negativtests (weiterhin verbindlich)
 

@@ -164,8 +164,10 @@ compose_run() {
             printf '%s\n' "craftcloud-ctl: warning: release $version has no compose.figcraft.yaml; running it without the FigCraft companion" >&2
         fi
     fi
-    # smtp_files contains only fixed -f filenames emitted by smtp_overrides.
-    [ -z "$smtp_files" ] || files="$files $smtp_files"
+    # smtp_files contains only fixed -f filenames emitted by smtp_overrides;
+    # overlays missing from an older release are dropped with a warning.
+    release_smtp_files=$(smtp_release_files "$dir" "$smtp_files" "$version")
+    [ -z "$release_smtp_files" ] || files="$files $release_smtp_files"
     [ "$setup" != 1 ] || files="$files -f compose.setup.yaml"
     export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$tag"
     export CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"

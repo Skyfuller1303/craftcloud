@@ -333,6 +333,7 @@ export interface EmailDeliveryStatus {
   configured: boolean;
   last_success_at: string | null;
   failed_count: number;
+  suppressed_count: number;
 }
 
 export interface FigcraftLiveStatus {

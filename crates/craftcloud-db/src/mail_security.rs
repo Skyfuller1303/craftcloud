@@ -5,7 +5,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::DbError;
-use crate::email_outbox::{self, EmailDraft, EnqueueOutcome};
+use crate::email_outbox::{self, EmailDraft};
 
 #[derive(Clone, Copy)]
 pub enum SecurityEvent {
@@ -31,14 +31,16 @@ impl SecurityEvent {
 }
 
 /// Adds a no-link security email to the caller's account transaction.
-/// The caller already holds the user row lock. A rate-limit outcome must roll
-/// back the security change to keep the action and its notification atomic.
+/// The caller already holds the user row lock. A notice never blocks the
+/// security action: when the per-recipient limit is reached the action still
+/// commits and the notice is stored as `suppressed` for the operator status.
+/// Returns whether the notice was queued for delivery.
 pub async fn enqueue_in(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
     now: OffsetDateTime,
     event: SecurityEvent,
-) -> Result<EnqueueOutcome, DbError> {
+) -> Result<bool, DbError> {
     let account: Option<(String, String)> = sqlx::query_as(
         "SELECT normalized_email,display_name FROM users WHERE id=$1 AND disabled_at IS NULL",
     )
@@ -63,5 +65,5 @@ pub async fn enqueue_in(
         is_resend: false,
         now,
     };
-    email_outbox::enqueue_in(tx, &draft).await
+    email_outbox::enqueue_notice_in(tx, &draft).await
 }

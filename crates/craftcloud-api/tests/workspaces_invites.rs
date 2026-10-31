@@ -341,6 +341,46 @@ mod tests {
             (occupied.status, occupied.body),
             (available.status, available.body)
         );
+
+        // A taken address does the same observable work: the old address
+        // gets the same notice and the target is accounted in the same window.
+        let counts = || async {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT count(*) FILTER (WHERE template='security_notice'                    AND params->>'security_event'='email address change requested'),                  count(*) FILTER (WHERE template='email_change') FROM outbound_emails",
+            )
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(counts().await, (2, 2));
+        let available_again = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/auth/email-change")
+                .session(&owner_session)
+                .json(json!({"email":"change-a@example.test", "password":crate::common::PASSWORD})),
+        )
+        .await;
+        let occupied_again = call(
+            &w.env.app,
+            Req::new("POST", "/api/v1/auth/email-change")
+                .session(&owner_session)
+                .json(
+                    json!({"email":"new-person@example.test", "password":crate::common::PASSWORD}),
+                ),
+        )
+        .await;
+        assert_eq!(
+            (occupied_again.status, occupied_again.body),
+            (available_again.status, available_again.body)
+        );
+        assert_eq!(counts().await, (2, 2));
+        let delivered_to_taken: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbound_emails WHERE recipient='new-person@example.test'              AND template='email_change' AND status='queued'",
+        )
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(delivered_to_taken, 0);
     }
 
     fn assert_status(resp: &Resp, status: StatusCode, code: &str) {

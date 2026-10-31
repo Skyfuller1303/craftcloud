@@ -57,7 +57,6 @@ pub async fn complete_browser_login(
 pub enum LoginOutcome {
     Created(Uuid),
     Rejected,
-    EmailRateLimited,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,18 +132,14 @@ pub async fn complete_browser_login_with_email(
         )
         .await?;
     }
-    if mail_enabled
-        && crate::mail_security::enqueue_in(
+    if mail_enabled {
+        crate::mail_security::enqueue_in(
             &mut tx,
             user_id,
             new.now,
             crate::mail_security::SecurityEvent::NewLogin,
         )
-        .await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(LoginOutcome::EmailRateLimited);
+        .await?;
     }
     tx.commit().await?;
     Ok(LoginOutcome::Created(id))
@@ -253,18 +248,14 @@ pub async fn complete_device_login_with_email(
         )
         .await?;
     }
-    if mail_enabled
-        && crate::mail_security::enqueue_in(
+    if mail_enabled {
+        crate::mail_security::enqueue_in(
             &mut tx,
             user_id,
             new.now,
             crate::mail_security::SecurityEvent::NewLogin,
         )
-        .await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(LoginOutcome::EmailRateLimited);
+        .await?;
     }
     tx.commit().await?;
     Ok(LoginOutcome::Created(id))
@@ -425,7 +416,7 @@ pub async fn confirm_setup(
     .await?
     {
         FactorChangeOutcome::Changed => Ok(true),
-        FactorChangeOutcome::Unchanged | FactorChangeOutcome::EmailRateLimited => Ok(false),
+        FactorChangeOutcome::Unchanged => Ok(false),
     }
 }
 
@@ -433,7 +424,6 @@ pub async fn confirm_setup(
 pub enum FactorChangeOutcome {
     Changed,
     Unchanged,
-    EmailRateLimited,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,19 +533,14 @@ pub async fn confirm_setup_with_email(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
-    if changed
-        && mail_enabled
-        && crate::mail_security::enqueue_in(
+    if changed && mail_enabled {
+        crate::mail_security::enqueue_in(
             &mut tx,
             user_id,
             now,
             crate::mail_security::SecurityEvent::TwoFactorEnabled,
         )
-        .await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(FactorChangeOutcome::EmailRateLimited);
+        .await?;
     }
     tx.commit().await?;
     Ok(if changed {
@@ -676,7 +661,7 @@ pub async fn reset_for_user(
     .await?
     {
         FactorChangeOutcome::Changed => Ok(true),
-        FactorChangeOutcome::Unchanged | FactorChangeOutcome::EmailRateLimited => Ok(false),
+        FactorChangeOutcome::Unchanged => Ok(false),
     }
 }
 
@@ -847,12 +832,7 @@ pub async fn reset_for_user_with_email(
         } else {
             crate::mail_security::SecurityEvent::TwoFactorReset
         };
-        if crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-        {
-            tx.rollback().await?;
-            return Ok(FactorChangeOutcome::EmailRateLimited);
-        }
+        crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?;
     }
     tx.commit().await?;
     Ok(if changed {

@@ -504,17 +504,17 @@ pub(crate) async fn change_email(
             session_proof,
         )
         .await?;
-        match staged {
+        // An unavailable address does the same observable work as a free one:
+        // the same rate-window accounting for the target and the same notice
+        // to the old address. Only the delivery of the link is skipped.
+        let deliverable = match staged {
             email_verification::StageEmailChangeOutcome::ProofInvalid => {
                 tx.rollback().await?;
                 return Ok::<_, DbError>(None);
             }
-            email_verification::StageEmailChangeOutcome::AddressUnavailable => {
-                tx.commit().await?;
-                return Ok(Some(email_outbox::EnqueueOutcome::Queued));
-            }
-            email_verification::StageEmailChangeOutcome::Staged => {}
-        }
+            email_verification::StageEmailChangeOutcome::AddressUnavailable => false,
+            email_verification::StageEmailChangeOutcome::Staged => true,
+        };
         let mut mail = draft(
             &services,
             target.clone(),
@@ -531,16 +531,17 @@ pub(crate) async fn change_email(
             "recipient_name": account.display_name,
             "new_email": target
         });
-        let queued = email_outbox::enqueue_in(&mut tx, &mail).await?;
+        let queued = if deliverable {
+            email_outbox::enqueue_in(&mut tx, &mail).await?
+        } else {
+            email_outbox::enqueue_discarded_in(&mut tx, &mail).await?
+        };
         if queued != email_outbox::EnqueueOutcome::Queued {
             tx.rollback().await?;
             return Ok(Some(queued));
         }
-        let queued = email_outbox::enqueue_in(&mut tx, &old_notice).await?;
-        if queued != email_outbox::EnqueueOutcome::Queued {
-            tx.rollback().await?;
-            return Ok(Some(queued));
-        }
+        // The notice to the old address never blocks the request.
+        email_outbox::enqueue_notice_in(&mut tx, &old_notice).await?;
         tx.commit().await?;
         Ok(Some(email_outbox::EnqueueOutcome::Queued))
     }
@@ -606,12 +607,6 @@ pub(crate) async fn confirm_change(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(email_verification::ConfirmEmailChangeOutcome::Invalid) => invalid_email_token(&headers),
-        Ok(email_verification::ConfirmEmailChangeOutcome::RateLimited) => error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Too many email messages were requested. Try again later.",
-            &headers,
-        ),
         Err(error) => crate::orgs::db_failure(&error, &headers, "email change confirmation failed"),
     }
 }
@@ -646,6 +641,7 @@ pub(crate) async fn status(
         "configured": services.email_delivery_enabled(),
         "last_success_at": status.last_success_at.map(crate::orgs::rfc3339),
         "failed_count": status.failed_count,
+        "suppressed_count": status.suppressed_count,
     }))
     .into_response()
 }

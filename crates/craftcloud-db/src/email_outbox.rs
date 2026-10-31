@@ -46,7 +46,8 @@ pub enum EnqueueOutcome {
     Queued,
     /// Recipient exceeded five messages per template in one hour.
     RecipientLimit,
-    /// Actor exceeded thirty messages in one hour.
+    /// Actor exceeded thirty messages in one hour (verification links are
+    /// counted separately from all other templates).
     ActorLimit,
     /// This recipient/template was resent less than one minute ago.
     ResendTooSoon,
@@ -82,6 +83,9 @@ pub struct EmailStatus {
     pub last_success_at: Option<OffsetDateTime>,
     /// Number of terminal failures retained in the queue.
     pub failed_count: i64,
+    /// Number of security notices dropped by the per-recipient limit and still
+    /// retained (rows are purged after seven days). The security action itself succeeded.
+    pub suppressed_count: i64,
 }
 
 /// Checks durable limits and inserts the draft inside the caller's transaction.
@@ -89,6 +93,26 @@ pub struct EmailStatus {
 pub async fn enqueue_in(
     tx: &mut Transaction<'_, Postgres>,
     draft: &EmailDraft,
+) -> Result<EnqueueOutcome, DbError> {
+    enqueue_with_status(tx, draft, "queued").await
+}
+
+/// Applies the same durable limits as [`enqueue_in`] and records the attempt
+/// in the rate windows, but stores a terminal `expired` row without the token
+/// so the message is never delivered. Used where the caller must stay
+/// indistinguishable from a real send (for example an address that cannot be
+/// claimed).
+pub async fn enqueue_discarded_in(
+    tx: &mut Transaction<'_, Postgres>,
+    draft: &EmailDraft,
+) -> Result<EnqueueOutcome, DbError> {
+    enqueue_with_status(tx, draft, "expired").await
+}
+
+async fn enqueue_with_status(
+    tx: &mut Transaction<'_, Postgres>,
+    draft: &EmailDraft,
+    status: &'static str,
 ) -> Result<EnqueueOutcome, DbError> {
     // Serialize durable-rate checks across concurrent transactions. Sending
     // is low volume and this fixed key avoids cross-bucket lock-order cycles.
@@ -99,7 +123,7 @@ pub async fn enqueue_in(
     if draft.is_resend {
         let recent: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM outbound_emails WHERE recipient=$1 AND template=$2 \
-             AND created_at > $3 - interval '1 minute')",
+             AND status<>'suppressed' AND created_at > $3 - interval '1 minute')",
         )
         .bind(&draft.recipient)
         .bind(&draft.template)
@@ -112,7 +136,7 @@ pub async fn enqueue_in(
     }
     let recipient_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM outbound_emails WHERE recipient=$1 AND template=$2 \
-         AND created_at > $3 - interval '1 hour'",
+         AND status<>'suppressed' AND created_at > $3 - interval '1 hour'",
     )
     .bind(&draft.recipient)
     .bind(&draft.template)
@@ -123,11 +147,16 @@ pub async fn enqueue_in(
         return Ok(EnqueueOutcome::RecipientLimit);
     }
     if let Some(actor_id) = draft.actor_id {
+        // Verification links (including operator bulk issuance) have their own
+        // budget so they cannot exhaust the actor's notices and test mails.
         let actor_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM outbound_emails WHERE actor_id=$1 AND created_at > $2 - interval '1 hour'",
+            "SELECT count(*) FROM outbound_emails WHERE actor_id=$1 \
+             AND status<>'suppressed' AND created_at > $2 - interval '1 hour' \
+             AND (template='email_verification') = ($3='email_verification')",
         )
         .bind(actor_id)
         .bind(draft.now)
+        .bind(&draft.template)
         .fetch_one(&mut **tx)
         .await?;
         if actor_count >= 30 {
@@ -135,22 +164,55 @@ pub async fn enqueue_in(
         }
     }
     sqlx::query(
-        "INSERT INTO outbound_emails(id,recipient,template,language,params,encrypted_token,expires_at,actor_id,is_resend,created_at,available_at) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)",
+        "INSERT INTO outbound_emails(id,recipient,template,language,params,encrypted_token,expires_at,actor_id,is_resend,created_at,available_at,status) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11)",
     )
     .bind(draft.id)
     .bind(&draft.recipient)
     .bind(&draft.template)
     .bind(&draft.language)
     .bind(&draft.params)
-    .bind(&draft.encrypted_token)
+    .bind(if status == "queued" {
+        draft.encrypted_token.as_deref()
+    } else {
+        None
+    })
     .bind(draft.expires_at)
     .bind(draft.actor_id)
     .bind(draft.is_resend)
     .bind(draft.now)
+    .bind(status)
     .execute(&mut **tx)
     .await?;
     Ok(EnqueueOutcome::Queued)
+}
+
+/// Enqueues a no-link security notice without ever failing the caller's
+/// security action. When a durable limit refuses the notice, a terminal
+/// `suppressed` row is stored instead so the operator status can count it.
+/// The row holds no token and no rendered content and is never delivered.
+/// Returns whether the notice was queued for delivery.
+pub async fn enqueue_notice_in(
+    tx: &mut Transaction<'_, Postgres>,
+    draft: &EmailDraft,
+) -> Result<bool, DbError> {
+    if enqueue_in(tx, draft).await? == EnqueueOutcome::Queued {
+        return Ok(true);
+    }
+    sqlx::query(
+        "INSERT INTO outbound_emails(id,recipient,template,language,params,expires_at,actor_id,is_resend,status,created_at,available_at) \
+         VALUES($1,$2,$3,$4,'{}'::jsonb,$5,$6,false,'suppressed',$7,$7)",
+    )
+    .bind(draft.id)
+    .bind(&draft.recipient)
+    .bind(&draft.template)
+    .bind(&draft.language)
+    .bind(draft.expires_at)
+    .bind(draft.actor_id)
+    .bind(draft.now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(false)
 }
 
 impl OrgTx {
@@ -365,13 +427,32 @@ pub async fn expire_pending(pool: &PgPool, now: OffsetDateTime) -> Result<u64, D
 
 /// Returns counts and timestamp for the operator status panel.
 pub async fn status(pool: &PgPool) -> Result<EmailStatus, DbError> {
-    let (last_success_at, failed_count): (Option<OffsetDateTime>, i64) = sqlx::query_as(
-        "SELECT max(sent_at) FILTER (WHERE status='sent'), count(*) FILTER (WHERE status='failed') FROM outbound_emails",
-    )
-    .fetch_one(pool)
-    .await?;
+    let (last_success_at, failed_count, suppressed_count): (Option<OffsetDateTime>, i64, i64) =
+        sqlx::query_as(
+            "SELECT max(sent_at) FILTER (WHERE status='sent'), count(*) FILTER (WHERE status='failed'), \
+             count(*) FILTER (WHERE status='suppressed') FROM outbound_emails",
+        )
+        .fetch_one(pool)
+        .await?;
     Ok(EmailStatus {
         last_success_at,
         failed_count,
+        suppressed_count,
     })
+}
+
+/// Deletes terminal rows (`sent`, `failed`, `expired`, `suppressed`) created
+/// more than seven days ago by the database clock. This keeps the one-hour
+/// rate windows and a week of failed and suppressed counts. The newest `sent`
+/// row is kept so the operator status can still show the last success.
+pub async fn purge_terminal(pool: &PgPool) -> Result<u64, DbError> {
+    let result = sqlx::query(
+        "DELETE FROM outbound_emails WHERE status IN ('sent','failed','expired','suppressed') \
+         AND created_at < now() - interval '7 days' \
+         AND id IS DISTINCT FROM (SELECT id FROM outbound_emails WHERE status='sent' \
+                                  ORDER BY sent_at DESC, id LIMIT 1)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }

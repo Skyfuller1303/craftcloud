@@ -689,6 +689,7 @@
 	Configured	Eingerichtet
 	Last successful delivery	Letzte erfolgreiche Zustellung
 	Failed messages	Fehlgeschlagene Nachrichten
+	Suppressed security notices	Unterdrückte Sicherheitshinweise
 	Test messages are sent only to your own address.	Testnachrichten werden nur an deine eigene Adresse gesendet.
 	Send test email	Testmail senden
 	Verify all unverified accounts…	Alle unbestätigten Konten bestätigen…

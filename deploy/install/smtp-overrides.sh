@@ -23,3 +23,24 @@ smtp_overrides() {
         *) printf '%s\n' 'Unsupported mail transport in craftcloud.env' >&2; return 1 ;;
     esac
 }
+# smtp_release_files <release-compose-dir> <overrides from smtp_overrides> <version>
+# Keeps only overlays that the release actually ships, so a rollback to a
+# release from before SMTP support runs without mail instead of failing.
+smtp_release_files() {
+    rel_dir=$1; rel_list=$2; rel_version=$3
+    [ -n "$rel_list" ] || return 0
+    if [ ! -f "$rel_dir/compose.smtp.yaml" ]; then
+        printf '%s\n' "craftcloud-ctl: warning: release $rel_version has no compose.smtp.yaml; running it without SMTP delivery" >&2
+        return 0
+    fi
+    case $rel_list in
+        *compose.smtp-auth.yaml*)
+            if [ ! -f "$rel_dir/compose.smtp-auth.yaml" ]; then
+                printf '%s\n' "craftcloud-ctl: warning: release $rel_version has no compose.smtp-auth.yaml; running it without SMTP authentication" >&2
+                printf '%s' '-f compose.smtp.yaml'
+                return 0
+            fi
+            ;;
+    esac
+    printf '%s' "$rel_list"
+}

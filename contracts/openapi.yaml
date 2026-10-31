@@ -3986,11 +3986,16 @@ components:
         recovery_code: {type: string, minLength: 10, maxLength: 10, writeOnly: true}
     EmailDeliveryStatus:
       type: object
-      required: [configured, last_success_at, failed_count]
+      required: [configured, last_success_at, failed_count, suppressed_count]
       properties:
         configured: {type: boolean}
         last_success_at: {type: [string, 'null'], format: date-time}
         failed_count: {type: integer, format: int64, minimum: 0}
+        suppressed_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Security notices dropped by the per-recipient limit in the last seven days. The security action itself was not blocked.
     EmailVerificationBatchResponse:
       type: object
       required: [queued, next_cursor, limited, retry_after_seconds]

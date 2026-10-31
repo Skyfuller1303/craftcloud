@@ -1,5 +1,7 @@
 -- 0019: durable outbound email queue. Capabilities stay encrypted and are
 -- excluded from backups; the queue is operational state, not user data.
+-- 'suppressed' marks a security notice that the per-recipient limit dropped;
+-- it is never delivered and only counted for the operator status.
 CREATE TABLE outbound_emails (
     id uuid PRIMARY KEY,
     recipient text NOT NULL CHECK (char_length(recipient) BETWEEN 3 AND 320),
@@ -13,7 +15,7 @@ CREATE TABLE outbound_emails (
     actor_id uuid NULL,
     is_resend boolean NOT NULL DEFAULT false,
     status text NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('queued', 'sending', 'sent', 'failed', 'expired')),
+        CHECK (status IN ('queued', 'sending', 'sent', 'failed', 'expired', 'suppressed')),
     attempts integer NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 8),
     created_at timestamptz NOT NULL,
     available_at timestamptz NOT NULL,
@@ -25,7 +27,7 @@ CREATE TABLE outbound_emails (
         (status = 'sending' AND claimed_until IS NOT NULL AND lease_token IS NOT NULL)
         OR (status <> 'sending' AND claimed_until IS NULL AND lease_token IS NULL)
     ),
-    CHECK (status NOT IN ('sent', 'failed', 'expired') OR encrypted_token IS NULL)
+    CHECK (status NOT IN ('sent', 'failed', 'expired', 'suppressed') OR encrypted_token IS NULL)
 );
 CREATE INDEX outbound_emails_ready_idx ON outbound_emails(available_at, created_at, id)
     WHERE status IN ('queued', 'sending');

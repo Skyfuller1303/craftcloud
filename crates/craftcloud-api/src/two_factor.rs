@@ -385,12 +385,6 @@ pub(crate) async fn confirm(
             reservation.record_success();
             Json(json!({"recovery_codes": codes})).into_response()
         }
-        Ok(two_factor::FactorChangeOutcome::EmailRateLimited) => crate::error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Try again later.",
-            &headers,
-        ),
         Ok(two_factor::FactorChangeOutcome::Unchanged) => {
             management_failure(&services, reservation, &session, &headers)
         }
@@ -529,12 +523,6 @@ pub(crate) async fn disable(
             reservation.record_success();
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(two_factor::FactorChangeOutcome::EmailRateLimited) => crate::error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Try again later.",
-            &headers,
-        ),
         Ok(two_factor::FactorChangeOutcome::Unchanged) => {
             management_failure(&services, reservation, &session, &headers)
         }
@@ -875,14 +863,6 @@ pub(crate) async fn browser_login(
     .await
     {
         Ok(two_factor::LoginOutcome::Created(_)) => reservation.record_success(),
-        Ok(two_factor::LoginOutcome::EmailRateLimited) => {
-            return crate::error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "RATE_LIMITED",
-                "Try again later.",
-                &headers,
-            );
-        }
         Ok(two_factor::LoginOutcome::Rejected) => {
             reservation.record_failure(services.now_secs());
             return invalid(&headers);
@@ -1017,14 +997,6 @@ pub(crate) async fn device_login(
         Ok(two_factor::LoginOutcome::Created(id)) => {
             reservation.record_success();
             id
-        }
-        Ok(two_factor::LoginOutcome::EmailRateLimited) => {
-            return crate::error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "RATE_LIMITED",
-                "Try again later.",
-                &headers,
-            );
         }
         Ok(two_factor::LoginOutcome::Rejected) => {
             reservation.record_failure(services.now_secs());

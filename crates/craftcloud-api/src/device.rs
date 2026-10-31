@@ -356,14 +356,6 @@ pub(crate) async fn login(
     .await;
     let id = match created {
         Ok(device_sessions::LoginOutcome::Created(id)) => id,
-        Ok(device_sessions::LoginOutcome::EmailRateLimited) => {
-            return crate::error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "RATE_LIMITED",
-                "Try again later.",
-                &headers,
-            );
-        }
         Ok(device_sessions::LoginOutcome::Rejected) => {
             match second_factor_decision(
                 &services,

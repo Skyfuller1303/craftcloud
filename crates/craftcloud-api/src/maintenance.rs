@@ -1518,6 +1518,16 @@ impl Maintenance {
                 break;
             }
         }
+        if ctx.go() {
+            report.add(
+                "purged_emails",
+                craftcloud_db::email_outbox::purge_terminal(&self.pool).await?,
+            );
+            report.add(
+                "purged_email_tokens",
+                craftcloud_db::email_verification::delete_expired(&self.pool).await?,
+            );
+        }
         Ok(())
     }
 

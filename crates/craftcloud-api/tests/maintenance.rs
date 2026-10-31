@@ -2074,6 +2074,9 @@ mod tests {
             .bind(expired_id).bind([4_u8;32].as_slice()).bind(now - time::Duration::days(40))
             .execute(&w.env.pool).await.unwrap();
 
+        sqlx::query("INSERT INTO outbound_emails(id,recipient,template,language,expires_at,status,created_at,available_at) VALUES($1,'old@example.test','test','en',now(),'failed',now()-interval '8 days',now()-interval '8 days')")
+            .bind(Uuid::new_v4()).execute(&w.env.pool).await.unwrap();
+
         w.age(180).await;
         let mut checked = settings(1024);
         checked.max_clock_drift = Some(Duration::from_secs(300));
@@ -2081,6 +2084,7 @@ mod tests {
         let job = w.job_with(checked).await;
         let report = run(&job).await;
         assert_eq!(report.count("purge_audit", "purged_device_sessions"), 2);
+        assert_eq!(report.count("purge_audit", "purged_emails"), 1);
         assert_eq!(
             w.count(&format!(
                 "SELECT count(*) FROM device_sessions WHERE id='{fresh_id}' AND revoked_at IS NULL"

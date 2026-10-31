@@ -343,14 +343,6 @@ pub(crate) async fn login(
     .await;
     match created {
         Ok(sessions::LoginOutcome::Created(_)) => {}
-        Ok(sessions::LoginOutcome::EmailRateLimited) => {
-            return crate::error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "RATE_LIMITED",
-                "Try again later.",
-                &headers,
-            );
-        }
         Ok(sessions::LoginOutcome::Rejected) => {
             match crate::two_factor::issue_login_challenge(
                 &services,
@@ -773,12 +765,6 @@ pub(crate) async fn change_password(
         }
         // The password was changed or reset, or this session was revoked,
         // while the request was being processed: the session is gone (401).
-        Ok(accounts::PasswordChangeResult::EmailRateLimited) => crate::error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Try again later.",
-            &headers,
-        ),
         Ok(accounts::PasswordChangeResult::NotChanged) => {
             let response = error_response(
                 StatusCode::UNAUTHORIZED,
@@ -1064,12 +1050,6 @@ pub(crate) async fn reset_password(
             StatusCode::NO_CONTENT.into_response()
         }
         // Consumed, expired or the account got disabled in the meantime.
-        Ok(password_reset::ConsumeOutcome::EmailRateLimited) => crate::error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Try again later.",
-            &headers,
-        ),
         Ok(password_reset::ConsumeOutcome::InvalidToken) => invalid_token(),
         Err(error) => db_failure(&error, &headers, "password reset failed"),
     }

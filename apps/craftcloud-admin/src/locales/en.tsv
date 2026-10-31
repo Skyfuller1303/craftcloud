@@ -692,6 +692,7 @@
 	Configured	Configured
 	Last successful delivery	Last successful delivery
 	Failed messages	Failed messages
+	Suppressed security notices	Suppressed security notices
 	Test messages are sent only to your own address.	Test messages are sent only to your own address.
 	Send test email	Send test email
 	Verify all unverified accounts…	Verify all unverified accounts…

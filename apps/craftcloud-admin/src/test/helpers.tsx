@@ -108,7 +108,7 @@ export function loggedInRoutes(overrides: Record<string, Handler> = {}): Record<
     "GET /setup/status": { body: { setup_required: false } },
     "GET /auth/session": { body: SESSION },
     "GET /auth/2fa": { body: { enabled: false, available: true, recovery_codes_remaining: 0 } },
-    "GET /admin/email-delivery": { body: { configured: false, last_success_at: null, failed_count: 0 } },
+    "GET /admin/email-delivery": { body: { configured: false, last_success_at: null, failed_count: 0, suppressed_count: 0 } },
     "GET /organizations": { body: { items: [ORG_A, ORG_B], next_cursor: null } },
     [`GET /organizations/${ORG_A.id}/workspaces`]: { body: { items: [WS_1, WS_2], next_cursor: null } },
     [`GET /organizations/${ORG_B.id}/workspaces`]: { body: { items: [], next_cursor: null } },

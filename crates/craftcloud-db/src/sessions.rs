@@ -90,7 +90,6 @@ pub async fn create_for_verified_login_audited(
 pub enum LoginOutcome {
     Created(Uuid),
     Rejected,
-    EmailRateLimited,
 }
 
 pub async fn create_for_verified_login_with_email(
@@ -160,18 +159,14 @@ async fn create_for_verified_login_inner(
         )
         .await?;
     }
-    if mail_enabled
-        && crate::mail_security::enqueue_in(
+    if mail_enabled {
+        crate::mail_security::enqueue_in(
             &mut tx,
             new.user_id,
             new.now,
             crate::mail_security::SecurityEvent::NewLogin,
         )
-        .await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(LoginOutcome::EmailRateLimited);
+        .await?;
     }
     tx.commit().await?;
     Ok(LoginOutcome::Created(id))

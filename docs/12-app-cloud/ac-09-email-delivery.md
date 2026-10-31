@@ -49,7 +49,7 @@ CraftCloud verschickt E-Mails über einen vom Betreiber konfigurierten SMTP-Serv
 ## Tests (Pflicht)
 
 - Unit: Vorlagen-Escaping (HTML-Injection im Anzeigenamen), Platzhalter, Sprachwahl, Backoff.
-- DB/HTTP: Warteschlange in derselben Transaktion (Rollback ohne Mail), Verifikationsablauf für neue und bestehende Konten, E-Mail-Änderung mit Bestätigung, keine Kontoexistenz-Leaks, Ratenbegrenzung, Token nach Versand gelöscht.
+- DB/HTTP: Warteschlange in derselben Transaktion (Rollback ohne Mail; Sicherheitshinweise blockieren die Aktion nie, ein Limit führt zu einem gezählten unterdrückten Hinweis), Verifikationsablauf für neue und bestehende Konten, E-Mail-Änderung mit Bestätigung, keine Kontoexistenz-Leaks, Ratenbegrenzung, Token nach Versand gelöscht.
 - Integration gegen einen SMTP-Testcontainer: echter Versand, TLS-Pflicht, Fehlerfall mit Wiederholung.
 - Web: Einladungs- und Profilbildschirme mit und ohne Versand, EN/DE, axe.
 

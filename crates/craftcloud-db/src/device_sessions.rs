@@ -64,7 +64,7 @@ pub async fn create_for_verified_login(
 ) -> Result<Option<Uuid>, DbError> {
     match create_for_verified_login_with_email(pool, new, verified_hash, audit, false).await? {
         LoginOutcome::Created(id) => Ok(Some(id)),
-        LoginOutcome::Rejected | LoginOutcome::EmailRateLimited => Ok(None),
+        LoginOutcome::Rejected => Ok(None),
     }
 }
 
@@ -72,7 +72,6 @@ pub async fn create_for_verified_login(
 pub enum LoginOutcome {
     Created(Uuid),
     Rejected,
-    EmailRateLimited,
 }
 
 pub async fn create_for_verified_login_with_email(
@@ -126,18 +125,14 @@ pub async fn create_for_verified_login_with_email(
         &NewEvent::new("auth.device_login").target("device_session", id),
     )
     .await?;
-    if mail_enabled
-        && crate::mail_security::enqueue_in(
+    if mail_enabled {
+        crate::mail_security::enqueue_in(
             &mut tx,
             new.user_id,
             new.now,
             crate::mail_security::SecurityEvent::NewLogin,
         )
-        .await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(LoginOutcome::EmailRateLimited);
+        .await?;
     }
     tx.commit().await?;
     Ok(LoginOutcome::Created(id))

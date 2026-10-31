@@ -715,6 +715,54 @@ mod tests {
             1,
             "reset use"
         );
+
+        // Confirming an e-mail change ends every session and must revoke links too.
+        let session = Uuid::new_v4();
+        let expires_at = now + time::Duration::hours(2);
+        sqlx::query("INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at) VALUES($1,$2,$3,$4,$4,$5)")
+            .bind(session)
+            .bind(user)
+            .bind([0x61_u8; 32].as_slice())
+            .bind(now)
+            .bind(expires_at)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let change_token = [0x62_u8; 32];
+        let mut tx = env.pool.begin().await.unwrap();
+        let staged = craftcloud_db::email_verification::stage_email_change_verified_in(
+            &mut tx,
+            user,
+            "reset-hash",
+            "changed-address@example.test",
+            &change_token,
+            now,
+            now + time::Duration::hours(1),
+            None,
+            craftcloud_db::email_verification::EmailChangeSession {
+                id: session,
+                device: false,
+                expires_at,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            staged,
+            craftcloud_db::email_verification::StageEmailChangeOutcome::Staged
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            craftcloud_db::email_verification::confirm_email_change(&env.pool, &change_token, now)
+                .await
+                .unwrap(),
+            craftcloud_db::email_verification::ConfirmEmailChangeOutcome::Confirmed
+        );
+        assert_eq!(
+            take_security_rows(env, fixture.file, user).await,
+            1,
+            "email change confirm"
+        );
     }
 
     #[tokio::test]

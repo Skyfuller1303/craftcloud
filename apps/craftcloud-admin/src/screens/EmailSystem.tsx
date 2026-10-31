@@ -37,6 +37,7 @@ export function EmailSystem({ revision }: { revision: number }) {
         <dt>{t("Status")}</dt><dd>{status.configured ? t("Configured") : t("Not configured")}</dd>
         <dt>{t("Last successful delivery")}</dt><dd>{status.last_success_at === null ? t("None") : formatDateTime(language, status.last_success_at)}</dd>
         <dt>{t("Failed messages")}</dt><dd>{status.failed_count}</dd>
+        <dt>{t("Suppressed security notices")}</dt><dd>{status.suppressed_count}</dd>
       </dl>
       {status.configured && <div className="stack">
         <p className="muted">{t("Test messages are sent only to your own address.")}</p>

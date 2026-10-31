@@ -36,10 +36,8 @@ pub enum StageEmailChangeOutcome {
 pub enum ConfirmEmailChangeOutcome {
     /// Invalid, expired, consumed or stale capability.
     Invalid,
-    /// Changed successfully and notified the old address.
+    /// Changed successfully; the old address notice was queued or suppressed.
     Confirmed,
-    /// Durable mail limits prevented the notice; change was rolled back.
-    RateLimited,
 }
 
 /// Authenticated session evidence that must remain valid through password work.
@@ -349,6 +347,20 @@ async fn stage_address_change(
     Ok(true)
 }
 
+/// Deletes expired verification tokens and expired pending address changes.
+/// Returns the number of removed rows.
+pub async fn delete_expired(pool: &PgPool) -> Result<u64, DbError> {
+    let tokens = sqlx::query("DELETE FROM email_verification_tokens WHERE expires_at < now()")
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let pending = sqlx::query("DELETE FROM pending_email_changes WHERE expires_at < now()")
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(tokens.saturating_add(pending))
+}
+
 /// Applies a pending address only after a valid, unexpired, single-use proof.
 pub async fn confirm_email_change(
     pool: &PgPool,
@@ -467,6 +479,9 @@ pub async fn confirm_email_change(
         actor_id: Some(user_id),
         request_id: None,
     };
+    // The users row is locked above; FigCraft capabilities do not survive the change.
+    crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
+        .await?;
     crate::device_sessions::revoke_all_for_user_tx(&mut tx, user_id, now, &audit).await?;
     let notice = crate::email_outbox::EmailDraft {
         id: Uuid::new_v4(),
@@ -483,12 +498,8 @@ pub async fn confirm_email_change(
         is_resend: false,
         now,
     };
-    if crate::email_outbox::enqueue_in(&mut tx, &notice).await?
-        != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(ConfirmEmailChangeOutcome::RateLimited);
-    }
+    // The notice never blocks the change; a limit hit is counted as suppressed.
+    crate::email_outbox::enqueue_notice_in(&mut tx, &notice).await?;
     record_in(
         &mut tx,
         &AuditCtx::default(),

@@ -354,14 +354,13 @@ pub async fn change_password_device_audited_with_email(
 pub enum PasswordChangeResult {
     Changed(u64),
     NotChanged,
-    EmailRateLimited,
 }
 
 impl PasswordChangeResult {
     fn changed(self) -> Option<u64> {
         match self {
             Self::Changed(revoked) => Some(revoked),
-            Self::NotChanged | Self::EmailRateLimited => None,
+            Self::NotChanged => None,
         }
     }
 }
@@ -478,12 +477,8 @@ async fn change_password_inner(
         )
         .await?;
     }
-    if let Some(event) = email_event
-        && crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?
-            != crate::email_outbox::EnqueueOutcome::Queued
-    {
-        tx.rollback().await?;
-        return Ok(PasswordChangeResult::EmailRateLimited);
+    if let Some(event) = email_event {
+        crate::mail_security::enqueue_in(&mut tx, user_id, now, event).await?;
     }
     tx.commit().await?;
     Ok(PasswordChangeResult::Changed(revoked))
