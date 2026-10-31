@@ -20,7 +20,6 @@ use craftcloud_db::files::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::ApiState;
 use crate::audit::{Change, commit_audited};
 use crate::orgs::{conflict, db_failure, not_found, page_error, parse_id, rfc3339};
 use crate::pagination::{TrashListQuery, decode_time_cursor, encode_time_cursor};
@@ -30,6 +29,7 @@ use crate::projects::{
 };
 use crate::responses::{internal, rejection_response, unavailable, validation_failed};
 use crate::session::AuthenticatedSession;
+use crate::{ApiState, error_response};
 
 const ETAG: &str = "file";
 
@@ -90,7 +90,7 @@ fn project_deleted(headers: &HeaderMap) -> Response {
 }
 
 /// A file resolved from the path: `resolved.id` is the file id.
-async fn resolve_file(
+pub(crate) async fn resolve_file(
     state: &ApiState,
     headers: &HeaderMap,
     raw: &str,
@@ -612,6 +612,12 @@ pub(crate) async fn delete_file(
         }
         Ok(FileDeleteOutcome::Unchanged(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(FileDeleteOutcome::ProjectDeleted) => project_deleted(&headers),
+        Ok(FileDeleteOutcome::FigcraftLive) => error_response(
+            StatusCode::CONFLICT,
+            "FILE_IS_LIVE",
+            "Stop FigCraft Live before moving this file to the trash.",
+            &headers,
+        ),
         Ok(FileDeleteOutcome::Gone) => not_found(&headers),
         Err(error) => db_failure(&error, &headers, "file deletion failed"),
     }

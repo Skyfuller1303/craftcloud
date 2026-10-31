@@ -59,7 +59,7 @@ fn version_tag(id: Uuid) -> String {
     format!("\"version:{id}\"")
 }
 
-fn version_json(v: &FileVersion) -> Value {
+pub(crate) fn version_json(v: &FileVersion) -> Value {
     json!({
         "id": v.id.to_string(),
         "file_id": v.file_id.to_string(),
@@ -70,6 +70,7 @@ fn version_json(v: &FileVersion) -> Value {
         "restored_from_version_id": v.restored_from_version_id.map(|id| id.to_string()),
         "upload_id": v.upload_session_id.map(|id| id.to_string()),
         "created_by": v.created_by_user_id.to_string(),
+        "actor_kind": v.actor_kind,
         "created_at": rfc3339(v.created_at),
     })
 }

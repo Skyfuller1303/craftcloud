@@ -98,6 +98,14 @@ function codeMessage(t: Translate, error: ApiError): string | undefined {
       return t("The project is in the trash. Restore it first.");
     case "FILE_DELETED":
       return t("The file is in the trash. Restore it first.");
+    case "FILE_IS_LIVE":
+      return t("This file is being edited live in FigCraft. Save changes there or ask a workspace administrator to end live collaboration before uploading a version.");
+    case "FIGCRAFT_LIVE_UNAVAILABLE":
+      return t("FigCraft live collaboration is unavailable. Try again later.");
+    case "FIGCRAFT_BUSY":
+      return t("Another live operation is in progress. Reload and try again shortly.");
+    case "INVALID_FIGCRAFT_FILE":
+      return t("Live collaboration requires an intact native .figcraft file.");
     case "RETENTION_EXPIRED":
       return t("The retention period has passed; this item can no longer be restored.");
     case "LAST_OWNER":

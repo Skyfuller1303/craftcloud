@@ -821,23 +821,24 @@ mod tests {
             let (app, session, file) = (w.env.app.clone(), c.editor.1.clone(), c.file);
             handles.push(tokio::spawn(async move {
                 let data = pattern(100, i as u8);
-                call(
+                let response = call(
                     &app,
                     Req::new("POST", &format!("/api/v1/files/{file}/uploads"))
                         .session(&session)
                         .json(json!({"size_bytes": 100, "sha256": sha_hex(&data)})),
                 )
-                .await
-                .status
+                .await;
+                (response.status, response.text)
             }));
         }
         let mut created = 0;
         let mut refused = 0;
         for h in handles {
-            match h.await.unwrap() {
+            let (status, body) = h.await.unwrap();
+            match status {
                 StatusCode::CREATED => created += 1,
                 StatusCode::PAYLOAD_TOO_LARGE => refused += 1,
-                other => panic!("unexpected {other}"),
+                other => panic!("unexpected {other}: {body}"),
             }
         }
         assert_eq!((created, refused), (10, 20));

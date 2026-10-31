@@ -50,7 +50,21 @@ Restrisiken: Ein gestohlenes noch gültiges Token bleibt bis zu Ablauf oder Wide
 
 Restrisiken: TOTP schützt nicht gegen Phishing mit sofortiger Weiterleitung oder einen kompromittierten Client. Ein Angreifer mit Zugriff auf Datenbank und Schlüsseldatei kann Geheimnisse entschlüsseln. Die bestehende Ratenbegrenzung ist pro Serverprozess; eine horizontale Verteilung benötigt eine gemeinsame Begrenzung (der Fehlerzähler je Konto ist dagegen in der Datenbank und gilt prozessübergreifend). Organisationsrouten werden anhand des Pfads erkannt: nicht decodierbare Segmente gelten als ohne Organisation (der Router lehnt sie ab), Instanz-Admin-Pfade unter `/api/v1/admin/` unterliegen der Organisationspflicht nicht. Ein legitimer Wechsel der Client-Adresse während des Anmeldeschritts kann einen Neustart der Anmeldung erfordern. Passkeys sind nicht Bestandteil von AC-02.
 
-## Allgemeine STRIDE-Matrix
+## FigCraft-Live (AC-06)
+
+Der optionale Begleitdienst bildet eine zusätzliche Vertrauensgrenze. Sein Verwaltungsschlüssel kann alle gehosteten Dateien verändern; nur der CraftCloud-Prozess und FigCraft erhalten die geschützte Schlüsseldatei. Das interne Netz hat keinen veröffentlichten FigCraft-Port. Der öffentliche Caddy-Pfad verwendet WSS; Open-Publish ist ausgeschaltet. Ein kompromittierter Host oder ein kompromittierter FigCraft-Dienst liegt weiterhin innerhalb dieser Vertrauensgrenze und kann Dokumente lesen oder verändern. Native Dokumente sind auf dem Begleitdienst nicht Ende-zu-Ende-verschlüsselt.
+
+Ein persönlicher Link ist ein Bearer-Geheimnis: Die Datenbank ordnet ihn einer Person zu, FigCraft prüft beim Join aber nur Token und Zugriffsart. Weitergabe überträgt Zugriff bis zum Widerruf. Tokens werden mit dem AC-02-Schlüssel verschlüsselt gespeichert, an Datei, Person und Zugriffsart gebunden und weder in Audit noch in Logs aufgenommen. Der Webdialog hält sie ausschließlich im Arbeitsspeicher und öffnet nur das erwartete `figcraft://join`-Schema. Browser-Erweiterungen, Bildschirmaufnahmen, Zwischenablage und ein bewusst weitergereichter Link bleiben außerhalb dieses Schutzes.
+
+Jede API-Aktion prüft die zentrale Policy; Ausgabe oder Persistierung nach einem externen Aufruf prüft erneut die aktuellen Rechte. Organisationstransaktionen und eine Sperre je Datei schützen gegen Veröffentlichung, Linkerneuerung und Rechteentzug im Rennen. Rechteänderungen schreiben einen dauerhaften Widerrufsauftrag atomar mit der Änderung. Worker und zusätzlicher Abgleich widerrufen überschüssige Links. Bei Netzpartition oder ausgefallenem FigCraft ist sofortiger Widerruf nicht garantierbar; ein bereits verbundener Client kann bis zur Wiederherstellung weiterarbeiten. Diese Grenze muss bei besonders sensiblen Dateien in die Betriebsentscheidung eingehen.
+
+Automatische Sicherungen verwenden einen eigenen, an die konkrete aktive Live-Datei gebundenen Policy-Akteur. Er kann ausschließlich die benötigten Lese-, Upload- und Versionsaktionen ausführen; er besitzt keine Sitzung und keine allgemeinen Administratorrechte. Publisher-Identität im Versionsdatensatz ist Herkunft, keine behauptete interaktive Handlung. Audit und `actor_kind = figcraft_live` kennzeichnen den Systemvorgang. Normale Uploads und Versions-Restore dürfen den Live-Stand nicht nebenläufig überschreiben. Beenden widerruft zuerst die persönlichen Verbindungen, sichert danach den endgültigen Stand und löscht die entfernte Datei erst nach bestätigter Sicherung.
+
+Der Adapter nimmt höchstens 64 MiB an, begrenzt Nachrichten und Verbindungen und bricht Netzwerkoperationen nach einer absoluten Frist ab. Er lehnt Archive mit Reparaturbedarf ab und erhält nicht synchronisierte Archivteile aus der ursprünglichen Version. Temporäre Exportlinks sind nach einem fehlgeschlagenen Widerruf wiederauffindbar. Unbekannte zukünftige FigCraft-Archivbestandteile sind kein zugesicherter kompatibler Import; der Commit ist deshalb exakt gepinnt.
+
+Ein Restore widerruft Datenbank-Links und verlangt eine neue Veröffentlichung. Er kann keine alte externe FigCraft-Instanz abschalten. Das Runbook verlangt daher einen isolierten alten Dienst und ein frisches Datenvolume; andernfalls bleiben alte Links außerhalb der wiederhergestellten Berechtigungsautorität verwendbar. Native Capability-Prüfung, gemeinsame Konten und CraftHub-Protokoll v3 sind nicht Bestandteil von AC-06.
+
+## Allgemeine STRIDE-Matrix (bestehende Funktionen)
 
 | Risiko | Beispiel | Gegenmaßnahmen | Test |
 |---|---|---|---|

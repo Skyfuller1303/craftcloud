@@ -1,5 +1,15 @@
 # FigCraft-Integration: Abhängigkeiten und Machbarkeitsgate
 
+## AC-06: lokaler Begleitdienst
+
+[ADR-0022](../09-decisions/adr-0022-figcraft-live-hosting.md) konkretisiert die bisher zurückgestellte Integration: Der unveränderte FigCraft-Commit `ddda495a6ff40c326a117fbc393a8cfaa319f529` wird mit Protokoll 2 und Wire-Version 1 betrieben. CraftCloud verwaltet Datei und persönliche Edit-/View-Links per Serverschlüssel. Es gibt weiterhin keine CraftCloud-Konten im FigCraft-Protokoll und keinen Ersatz der Live-Engine.
+
+Die vier Routen `GET/POST/DELETE /api/v1/files/{id}/live` und `POST /api/v1/files/{id}/live/snapshot` sind im OpenAPI-Vertrag beschrieben. Veröffentlichung benötigt Leserecht, ein Edit-Link und eine manuelle Sicherung benötigen Bearbeitungsrecht, Beenden benötigt Workspace-Admin-Recht. Die Oberfläche zeigt die Funktion nur bei `info.feature_flags.figcraft_live`; Autorisierung erfolgt trotzdem für jede Anfrage auf dem Server. Erneuern eines persönlichen Links widerruft den bisherigen. Ein Link bleibt ein übertragbares Bearer-Geheimnis, kein Nachweis der Identität seiner tatsächlich verbundenen Person.
+
+Der Spike bestätigt Veröffentlichung eines nativen Dokuments, Editor-/Viewer-Trennung, Widerruf, Online-Export, Neustartpersistenz und `/figcraft/` als Pfad. Der Adapter erhält nicht synchronisierte Archivteile aus der ursprünglichen Cloud-Version. Die Grenze von 64 MiB und das Ablehnen reparaturbedürftiger Dokumente verhindern einen stillen verlustbehafteten Import. Laufende Änderungen werden als unveränderliche Versionen mit `actor_kind = figcraft_live` gesichert; gewöhnliche Uploads und Restore auf dieselbe Datei liefern währenddessen `409 FILE_IS_LIVE`.
+
+Die transaktionale Outbox trägt Rechteentzug über Prozessabstürze hinweg. Wiederholungen und der fünfminütige Rechteabgleich beheben vorübergehende Ausfälle; während eines FigCraft-Ausfalls ist keine feste maximale Widerrufslatenz garantiert. Betrieb, Schlüssel und Restore sind in [Deployment](../06-operations/deployment.md) und im [Backup-Runbook](../06-operations/backup-upgrade-runbook.md) beschrieben. Native Capability-Prüfung sowie die Abstimmung mit FigCraft und CraftHub bleiben offen. Die folgenden Varianten und Fragen dokumentieren den früheren Planungsstand; für den lokal implementierten Umfang gilt ADR-0022.
+
 ## Verifizierter Stand
 
 Die [FigCraft Server-Dokumentation](https://github.com/storytold/figcraft/blob/main/docs/server.md) beschreibt persistente Dokumente, Snapshots + Operationslog, WebSocket, Owner-Token/Server-Key, Bearbeiten/Lesen-Freigaben, Revocation, TLS-Reverse-Proxy, Team Libraries und Plugin Directory. **Es gibt aktuell keine Benutzeraccounts oder per-user Permissions**. Die [Roadmap](https://github.com/storytold/figcraft/blob/main/docs/roadmap.md) nennt Accounts/Teams ausdrücklich als ausstehende M9-Arbeit. `figcraft-server` speichert Dateien auf dem Server derzeit unverschlüsselt und ist nicht E2EE.

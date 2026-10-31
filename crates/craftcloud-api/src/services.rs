@@ -175,6 +175,10 @@ pub struct Services {
     pub(crate) settings: AuthSettings,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) storage: Option<craftcloud_storage::LocalStore>,
+    pub(crate) figcraft: Option<Arc<dyn craftcloud_figcraft::Backend>>,
+    pub(crate) figcraft_public_url: Option<String>,
+    pub(crate) figcraft_permits: Arc<Semaphore>,
+    pub(crate) figcraft_job_permits: Arc<Semaphore>,
     hash_permits: Arc<Semaphore>,
     // Separate tables per class: flooding one cannot evict another.
     login_ip: WindowLimiter,
@@ -218,6 +222,12 @@ impl Drop for TwoFactorKeys {
 }
 
 impl Services {
+    /// Waits until every HTTP-owned FigCraft operation releases its permit.
+    /// Call after HTTP admission has stopped and bound the wait at shutdown.
+    pub async fn drain_figcraft_jobs(&self) {
+        wait_for_figcraft_jobs(Arc::clone(&self.figcraft_job_permits)).await;
+    }
+
     /// Creates the services. `bootstrap` is `None` when no bootstrap secret
     /// file is configured; setup then answers 403 `INVALID_BOOTSTRAP_TOKEN`
     /// exactly like a wrong token (the reason is only logged).
@@ -247,6 +257,10 @@ impl Services {
             settings,
             clock: Arc::new(SystemClock),
             storage: None,
+            figcraft: None,
+            figcraft_public_url: None,
+            figcraft_permits: Arc::new(Semaphore::new(4)),
+            figcraft_job_permits: Arc::new(Semaphore::new(crate::figcraft_jobs::MAX_FIGCRAFT_JOBS)),
             hash_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HASHES)),
             login_ip: WindowLimiter::new(cap),
             setup_ip: WindowLimiter::new(cap),
@@ -291,6 +305,36 @@ impl Services {
     pub fn with_storage(mut self, store: craftcloud_storage::LocalStore) -> Self {
         self.storage = Some(store);
         self
+    }
+
+    /// Configures the FigCraft backend and the operator supplied public URL.
+    #[must_use]
+    pub fn with_figcraft(
+        mut self,
+        backend: Arc<dyn craftcloud_figcraft::Backend>,
+        public_url: String,
+    ) -> Self {
+        self.figcraft = Some(backend);
+        self.figcraft_public_url = Some(public_url);
+        self
+    }
+
+    /// FigCraft live is available only when every required local dependency exists.
+    #[must_use]
+    pub fn figcraft_available(&self) -> bool {
+        self.figcraft.is_some()
+            && self.figcraft_public_url.is_some()
+            && self.two_factor_keys.current.is_some()
+            && self.storage.is_some()
+    }
+
+    /// Runs blocking FigCraft network work on the blocking pool with bounded concurrency.
+    pub(crate) async fn run_figcraft<T, F>(&self, job: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        run_blocking(Arc::clone(&self.figcraft_permits), job).await
     }
 
     /// Records that an object store is configured but refused (binding
@@ -489,6 +533,15 @@ impl Services {
         F: FnOnce() -> T + Send + 'static,
     {
         run_blocking(self.hash_permits.clone(), job).await
+    }
+}
+
+pub(crate) async fn wait_for_figcraft_jobs(permits: Arc<Semaphore>) {
+    if let Ok(permit) = permits
+        .acquire_many_owned(crate::figcraft_jobs::MAX_FIGCRAFT_JOBS as u32)
+        .await
+    {
+        drop(permit);
     }
 }
 

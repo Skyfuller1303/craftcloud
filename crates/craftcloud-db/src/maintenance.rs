@@ -258,6 +258,11 @@ impl OrgTx {
         file_id: Uuid,
         now: OffsetDateTime,
     ) -> Result<PurgeCounts, DbError> {
+        let live_busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM figcraft_live_files l WHERE l.file_id=$1 AND (l.state<>'republish' OR l.figcraft_file_id IS NOT NULL OR EXISTS(SELECT 1 FROM figcraft_links k WHERE k.file_id=l.file_id AND k.revoked_at IS NULL) OR EXISTS(SELECT 1 FROM figcraft_outbox o WHERE o.file_id=l.file_id)))")
+            .bind(file_id).fetch_one(&mut *self.tx).await?;
+        if live_busy {
+            return Ok(PurgeCounts::default());
+        }
         sqlx::query("DELETE FROM file_locks WHERE file_id = $1 AND org_id = $2")
             .bind(file_id)
             .bind(self.org_id)
@@ -294,6 +299,12 @@ impl OrgTx {
         .bind(self.org_id)
         .execute(&mut *self.tx)
         .await?;
+        sqlx::query("DELETE FROM figcraft_links WHERE file_id=$1")
+            .bind(file_id)
+            .execute(&mut *self.tx)
+            .await?;
+        sqlx::query("DELETE FROM figcraft_live_files WHERE file_id=$1 AND state='republish' AND figcraft_file_id IS NULL")
+            .bind(file_id).execute(&mut *self.tx).await?;
         let versions = sqlx::query("DELETE FROM file_versions WHERE file_id = $1 AND org_id = $2")
             .bind(file_id)
             .bind(self.org_id)
@@ -489,7 +500,9 @@ impl OrgTx {
                            WHERE n.file_id = v.file_id AND n.number > v.number \
                            ORDER BY n.number LIMIT 1) nx ON true \
              WHERE v.file_id = $1 AND v.org_id = $2 AND v.id IS DISTINCT FROM $3 \
-               AND nx.created_at < $4",
+               AND nx.created_at < $4 \
+               AND NOT EXISTS (SELECT 1 FROM figcraft_live_files l WHERE l.file_id=v.file_id \
+                               AND (l.published_from_version_id=v.id OR l.last_snapshot_version_id=v.id))",
         )
         .bind(file_id)
         .bind(self.org_id)

@@ -36,6 +36,9 @@ http://{$CRAFTCLOUD_DOMAIN} {
 	@metrics path /metrics /metrics/*
 	respond @metrics 404
 
+	# Optional companion routes, mounted only by compose.figcraft.yaml.
+	import optional/*.caddy
+
 	# No `request_body { max_size ... }` here on purpose: uploads
 	# (PUT /api/v1/uploads/{id}/content) are streamed and the server enforces the
 	# declared size, the quota and a stall timeout. Caddy does not buffer request

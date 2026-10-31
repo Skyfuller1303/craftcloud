@@ -340,6 +340,27 @@ fn fingerprint(file_id: Uuid, size: i64, sha256: &[u8; 32]) -> String {
 }
 
 impl OrgTx {
+    /// Checks the live-write barrier on the already-held organization connection.
+    pub async fn figcraft_blocks_write(&mut self, file_id: Uuid) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM figcraft_live_files WHERE org_id=$1 AND file_id=$2 AND state IN ('publishing','live','unpublishing'))")
+            .bind(self.org_id)
+            .bind(file_id)
+            .fetch_one(&mut *self.tx)
+            .await?)
+    }
+
+    /// Checks whether any project file is in a live transition on this transaction.
+    pub async fn figcraft_blocks_project_write(
+        &mut self,
+        project_id: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM figcraft_live_files l JOIN files f ON f.id=l.file_id WHERE l.org_id=$1 AND f.project_id=$2 AND l.state IN ('publishing','live','unpublishing'))")
+            .bind(self.org_id)
+            .bind(project_id)
+            .fetch_one(&mut *self.tx)
+            .await?)
+    }
+
     pub async fn upload_get(
         &mut self,
         scope: &OrgScope,

@@ -441,6 +441,14 @@ impl OrgTx {
         .bind(new_role.as_str())
         .execute(&mut *self.tx)
         .await?;
+        crate::figcraft::enqueue_user_revocations(
+            &mut self.tx,
+            self.org_id,
+            user_id,
+            "role_changed",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
         match self.member(user_id).await? {
             Some(member) => Ok(RoleOutcome::Changed(member)),
             None => Err(DbError::Internal),
@@ -500,6 +508,14 @@ impl OrgTx {
             .bind(user_id)
             .execute(&mut *self.tx)
             .await?;
+        crate::figcraft::enqueue_user_revocations(
+            &mut self.tx,
+            self.org_id,
+            user_id,
+            "membership_removed",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
         sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2")
             .bind(self.org_id)
             .bind(user_id)
@@ -547,6 +563,11 @@ impl OrgTx {
         expected_version: i64,
     ) -> Result<UpdateOutcome, DbError> {
         self.check(scope, Action::OrganizationUpdate)?;
+        let current_two_factor: bool =
+            sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
+                .bind(self.org_id)
+                .fetch_one(&mut *self.tx)
+                .await?;
         let updated = sqlx::query_as::<_, Organization>(
             "UPDATE organizations SET name = COALESCE($2, name), \
                     workspace_admin_invites_enabled = COALESCE($3, workspace_admin_invites_enabled), \
@@ -563,6 +584,15 @@ impl OrgTx {
         .fetch_optional(&mut *self.tx)
         .await?;
         if let Some(org) = updated {
+            if require_two_factor.is_some_and(|value| value != current_two_factor) {
+                crate::figcraft::enqueue_org_revocations(
+                    &mut self.tx,
+                    self.org_id,
+                    "security_changed",
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await?;
+            }
             return Ok(UpdateOutcome::Updated(org));
         }
         let current: Option<i64> =

@@ -9,13 +9,262 @@ mod common;
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use axum::http::StatusCode;
+    use craftcloud_api::Clock;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
     use crate::common::{Req, Resp, Session, TestEnv, call, capture_logs};
+
+    struct FakeFigcraft;
+    impl craftcloud_figcraft::Backend for FakeFigcraft {
+        fn publish(
+            &self,
+            _original: &[u8],
+            _name: &str,
+        ) -> Result<String, craftcloud_figcraft::Error> {
+            Ok("remote-file-id".into())
+        }
+        fn create_link(
+            &self,
+            _file: &str,
+            _access: craftcloud_figcraft::Access,
+        ) -> Result<craftcloud_figcraft::Link, craftcloud_figcraft::Error> {
+            Ok(craftcloud_figcraft::Link {
+                id: "remote-link-id".into(),
+                token: "opaque-secret".into(),
+            })
+        }
+        fn revoke_link(&self, _file: &str, _link: &str) -> Result<(), craftcloud_figcraft::Error> {
+            Ok(())
+        }
+        fn export(
+            &self,
+            _file: &str,
+            original: &[u8],
+        ) -> Result<craftcloud_figcraft::Export, craftcloud_figcraft::Error> {
+            Ok(craftcloud_figcraft::Export {
+                bytes: original.to_vec(),
+            })
+        }
+        fn remove(&self, _file: &str) -> Result<(), craftcloud_figcraft::Error> {
+            Ok(())
+        }
+    }
+
+    struct GatedBackend {
+        creates: std::sync::atomic::AtomicUsize,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+        revokes: std::sync::atomic::AtomicUsize,
+    }
+    impl craftcloud_figcraft::Backend for GatedBackend {
+        fn publish(&self, _: &[u8], _: &str) -> Result<String, craftcloud_figcraft::Error> {
+            Ok("race-file".into())
+        }
+        fn create_link(
+            &self,
+            _: &str,
+            _: craftcloud_figcraft::Access,
+        ) -> Result<craftcloud_figcraft::Link, craftcloud_figcraft::Error> {
+            let n = self
+                .creates
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if n == 2 {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(craftcloud_figcraft::Link {
+                id: format!("race-link-{n}"),
+                token: format!("race-token-{n}"),
+            })
+        }
+        fn revoke_link(&self, _: &str, _: &str) -> Result<(), craftcloud_figcraft::Error> {
+            self.revokes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn export(
+            &self,
+            _: &str,
+            original: &[u8],
+        ) -> Result<craftcloud_figcraft::Export, craftcloud_figcraft::Error> {
+            Ok(craftcloud_figcraft::Export {
+                bytes: original.to_vec(),
+            })
+        }
+        fn remove(&self, _: &str) -> Result<(), craftcloud_figcraft::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct OrderedState {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        fail_publish: std::sync::atomic::AtomicBool,
+        fail_export: std::sync::atomic::AtomicBool,
+        fail_remove: std::sync::atomic::AtomicBool,
+        remote_present: std::sync::atomic::AtomicBool,
+        next_link: std::sync::atomic::AtomicUsize,
+    }
+
+    struct OrderedBackend(Arc<OrderedState>);
+
+    impl craftcloud_figcraft::Backend for OrderedBackend {
+        fn publish(&self, _: &[u8], _: &str) -> Result<String, craftcloud_figcraft::Error> {
+            if self
+                .0
+                .fail_publish
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(craftcloud_figcraft::Error::RemoteUnavailable);
+            }
+            self.0
+                .remote_present
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("ordered-file".into())
+        }
+        fn create_link(
+            &self,
+            _: &str,
+            _: craftcloud_figcraft::Access,
+        ) -> Result<craftcloud_figcraft::Link, craftcloud_figcraft::Error> {
+            let n = self
+                .0
+                .next_link
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(craftcloud_figcraft::Link {
+                id: format!("ordered-link-{n}"),
+                token: "ordered-token".into(),
+            })
+        }
+        fn revoke_link(&self, _: &str, _: &str) -> Result<(), craftcloud_figcraft::Error> {
+            self.0.calls.lock().unwrap().push("revoke");
+            Ok(())
+        }
+        fn export(
+            &self,
+            _: &str,
+            original: &[u8],
+        ) -> Result<craftcloud_figcraft::Export, craftcloud_figcraft::Error> {
+            self.0.calls.lock().unwrap().push("export");
+            if self.0.fail_export.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(craftcloud_figcraft::Error::RemoteUnavailable);
+            }
+            Ok(craftcloud_figcraft::Export {
+                bytes: original.to_vec(),
+            })
+        }
+        fn remove(&self, _: &str) -> Result<(), craftcloud_figcraft::Error> {
+            self.0.calls.lock().unwrap().push("remove");
+            if self.0.fail_remove.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(craftcloud_figcraft::Error::RemoteUnavailable);
+            }
+            self.0
+                .remote_present
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    type NativeSocket =
+        tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
+
+    fn native_join(join_url: &str, name: &str) -> (NativeSocket, figcraft_collab::Client) {
+        use figcraft_collab::{
+            Client,
+            message::{self, ServerMsg},
+        };
+        use tungstenite::Message;
+        let invite = url::Url::parse(join_url).unwrap();
+        let query = invite
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let (mut socket, _) = tungstenite::connect(query.get("server").unwrap().as_str()).unwrap();
+        if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+        }
+        let hello = message::encode(&Client::hello(
+            query.get("file").unwrap(),
+            query.get("token").unwrap(),
+            name,
+            "#336699",
+        ))
+        .unwrap();
+        socket.send(Message::Binary(hello.into())).unwrap();
+        let welcome = loop {
+            match socket.read().unwrap() {
+                Message::Binary(bytes) => {
+                    let msg: ServerMsg = message::decode(&bytes, 64 * 1024 * 1024).unwrap();
+                    match &msg {
+                        ServerMsg::Welcome { .. } => break msg,
+                        ServerMsg::Refused { .. } => panic!("native server refused issued link"),
+                        _ => (),
+                    }
+                }
+                Message::Ping(value) => socket.send(Message::Pong(value)).unwrap(),
+                Message::Close(_) => panic!("native server closed join"),
+                _ => (),
+            }
+        };
+        (socket, Client::join(welcome).unwrap())
+    }
+
+    fn native_message(socket: &mut NativeSocket) -> figcraft_collab::message::ServerMsg {
+        use figcraft_collab::message::{self, ServerMsg};
+        use tungstenite::Message;
+        loop {
+            match socket.read().unwrap() {
+                Message::Binary(bytes) => {
+                    return message::decode::<ServerMsg>(&bytes, 64 * 1024 * 1024).unwrap();
+                }
+                Message::Ping(value) => socket.send(Message::Pong(value)).unwrap(),
+                Message::Close(_) => panic!("native connection closed"),
+                _ => (),
+            }
+        }
+    }
+
+    fn native_link_refused(join_url: &str) -> bool {
+        use figcraft_collab::{
+            Client,
+            message::{self, ServerMsg},
+        };
+        use tungstenite::Message;
+        let invite = url::Url::parse(join_url).unwrap();
+        let query = invite
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let (mut socket, _) = tungstenite::connect(query.get("server").unwrap().as_str()).unwrap();
+        let hello = message::encode(&Client::hello(
+            query.get("file").unwrap(),
+            query.get("token").unwrap(),
+            "Revoked capability",
+            "#336699",
+        ))
+        .unwrap();
+        socket.send(Message::Binary(hello.into())).unwrap();
+        loop {
+            match socket.read().unwrap() {
+                Message::Binary(bytes) => {
+                    let response: ServerMsg = message::decode(&bytes, 64 * 1024 * 1024).unwrap();
+                    return matches!(response, ServerMsg::Refused { .. });
+                }
+                Message::Ping(value) => socket.send(Message::Pong(value)).unwrap(),
+                Message::Close(_) => return true,
+                _ => {}
+            }
+        }
+    }
 
     struct W {
         env: TestEnv,
@@ -159,6 +408,39 @@ mod tests {
 
     fn assert_status(resp: &Resp, status: StatusCode, code: &str) {
         assert_eq!((resp.status, resp.code()), (status, code), "{}", resp.text);
+    }
+
+    async fn upload_bytes(w: &W, actor: &Session, file: Uuid, bytes: &[u8]) {
+        let sha256 = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let created = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/uploads"))
+                .session(actor)
+                .json(json!({"size_bytes":bytes.len(),"sha256":sha256})),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let upload = created.body["upload_id"].as_str().unwrap().to_owned();
+        let stored = call(
+            &w.env.app,
+            Req::new("PUT", &format!("/api/v1/uploads/{upload}/content"))
+                .session(actor)
+                .body(axum::body::Body::from(bytes.to_vec())),
+        )
+        .await;
+        assert_eq!(stored.status, StatusCode::OK, "{}", stored.text);
+        let committed = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/versions"))
+                .session(actor)
+                .header("If-None-Match", "*")
+                .json(json!({"upload_id":upload})),
+        )
+        .await;
+        assert_eq!(committed.status, StatusCode::CREATED, "{}", committed.text);
     }
 
     fn hidden(resp: &Resp) {
@@ -1426,5 +1708,962 @@ mod tests {
                 "UNAUTHENTICATED",
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_open_reuses_join_url_with_remote_file_id() {
+        let mut w = W::new().await;
+        let backend_state = Arc::new(OrderedState::default());
+        w.env
+            .configure_figcraft(
+                Arc::new(OrderedBackend(Arc::clone(&backend_state))),
+                "ws://figcraft.test/figcraft",
+            )
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Live").await;
+        let file = w.file_id(&c.owner.1, project, "design.figcraft").await;
+        let source = b"figcraft-native-test";
+        upload_bytes(&w, &c.owner.1, file, source).await;
+        let path = format!("/api/v1/files/{file}/live");
+        let first = call(&w.env.app, Req::new("POST", &path).session(&c.owner.1)).await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+        assert!(
+            first.body["join_url"]
+                .as_str()
+                .unwrap()
+                .contains("ordered-file")
+        );
+        let second = call(&w.env.app, Req::new("POST", &path).session(&c.owner.1)).await;
+        assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+        assert_eq!(first.body["join_url"], second.body["join_url"]);
+        let stopped = call(&w.env.app, Req::new("DELETE", &path).session(&c.owner.1)).await;
+        assert_eq!(stopped.status, StatusCode::NO_CONTENT, "{}", stopped.text);
+        let actor_kind:String=sqlx::query_scalar("SELECT v.actor_kind FROM files f JOIN file_versions v ON v.id=f.head_version_id WHERE f.id=$1").bind(file).fetch_one(&w.env.pool).await.unwrap();
+        assert_eq!(actor_kind, "figcraft_live");
+
+        sqlx::query("UPDATE figcraft_live_files SET state='publishing',figcraft_file_id=NULL,updated_at=$2 WHERE file_id=$1")
+            .bind(file).bind(w.env.clock.now() - time::Duration::minutes(2)).execute(&w.env.pool).await.unwrap();
+        let mut worker = craftcloud_api::FigcraftWorkerState::default();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        let after_stale_cleanup: String =
+            sqlx::query_scalar("SELECT state FROM figcraft_live_files WHERE file_id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_stale_cleanup, "republish",
+            "stale intent recovery must preserve historic link references"
+        );
+
+        backend_state
+            .fail_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed_retry = call(&w.env.app, Req::new("POST", &path).session(&c.owner.1)).await;
+        assert_eq!(
+            failed_retry.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            failed_retry.text
+        );
+        let after_failure: String =
+            sqlx::query_scalar("SELECT state FROM figcraft_live_files WHERE file_id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_failure, "republish",
+            "failed retry must preserve the publishable row with historical links"
+        );
+        backend_state
+            .fail_publish
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retried = call(&w.env.app, Req::new("POST", &path).session(&c.owner.1)).await;
+        assert_eq!(retried.status, StatusCode::OK, "{}", retried.text);
+        let final_state: String =
+            sqlx::query_scalar("SELECT state FROM figcraft_live_files WHERE file_id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(final_state, "live");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_live_blocks_file_and_project_trash() {
+        let mut w = W::new().await;
+        w.env
+            .configure_figcraft(Arc::new(FakeFigcraft), "ws://figcraft.test")
+            .await;
+        let c = cast(&w).await;
+        let project = w
+            .project_id(&c.owner.1, c.ws, "Protected live project")
+            .await;
+        let file = w.file_id(&c.owner.1, project, "protected.figcraft").await;
+        upload_bytes(&w, &c.owner.1, file, b"native fixture").await;
+        let live = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(live.status, StatusCode::OK, "{}", live.text);
+
+        let file_trash = call(
+            &w.env.app,
+            Req::new("DELETE", &format!("/api/v1/files/{file}")).session(&c.owner.1),
+        )
+        .await;
+        assert_status(&file_trash, StatusCode::CONFLICT, "FILE_IS_LIVE");
+        let project_trash = call(
+            &w.env.app,
+            Req::new("DELETE", &format!("/api/v1/projects/{project}")).session(&c.owner.1),
+        )
+        .await;
+        assert_status(&project_trash, StatusCode::CONFLICT, "FILE_IS_LIVE");
+        let state: (String, bool, bool) = sqlx::query_as("SELECT l.state,f.deleted_at IS NULL,p.deleted_at IS NULL FROM figcraft_live_files l JOIN files f ON f.id=l.file_id JOIN projects p ON p.id=f.project_id WHERE l.file_id=$1")
+            .bind(file).fetch_one(&w.env.pool).await.unwrap();
+        assert_eq!(state, ("live".into(), true, true));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_file_grant_revoke_keeps_other_file_capability_active() {
+        let mut w = W::new().await;
+        w.env
+            .configure_figcraft(Arc::new(FakeFigcraft), "ws://figcraft.test")
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Scoped revoke").await;
+        let file_a = w.file_id(&c.owner.1, project, "a.figcraft").await;
+        let file_b = w.file_id(&c.owner.1, project, "b.figcraft").await;
+        for file in [file_a, file_b] {
+            upload_bytes(&w, &c.owner.1, file, b"native source").await;
+            let opened = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+            )
+            .await;
+            assert_eq!(opened.status, StatusCode::OK, "{}", opened.text);
+            let granted = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/grants"))
+                    .session(&c.owner.1)
+                    .json(json!({"user_id":c.plain.0.to_string(),"role":"editor"})),
+            )
+            .await;
+            assert_eq!(granted.status, StatusCode::CREATED, "{}", granted.text);
+            let joined = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.plain.1),
+            )
+            .await;
+            assert_eq!(joined.status, StatusCode::OK, "{}", joined.text);
+        }
+        let grant_a: Uuid = sqlx::query_scalar("SELECT id FROM grants WHERE org_id=$1 AND file_id=$2 AND grantee_user_id=$3 AND revoked_at IS NULL")
+            .bind(c.org).bind(file_a).bind(c.plain.0).fetch_one(&w.env.pool).await.unwrap();
+        let revoked = call(
+            &w.env.app,
+            Req::new("DELETE", &format!("/api/v1/grants/{grant_a}")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.text);
+        let mut worker = craftcloud_api::FigcraftWorkerState::default();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        let revoked_a: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access='edit'")
+            .bind(file_a).bind(c.plain.0).fetch_one(&w.env.pool).await.unwrap();
+        let revoked_b: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access='edit'")
+            .bind(file_b).bind(c.plain.0).fetch_one(&w.env.pool).await.unwrap();
+        assert!(revoked_a, "revoked file grant left its capability active");
+        assert!(
+            !revoked_b,
+            "revoking one file grant must preserve the same user's other-file capability"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_project_and_workspace_revokes_stay_in_scope() {
+        let mut w = W::new().await;
+        w.env
+            .configure_figcraft(Arc::new(FakeFigcraft), "ws://figcraft.test")
+            .await;
+        let c = cast(&w).await;
+        let project_a = w.project_id(&c.owner.1, c.ws, "Project A").await;
+        let project_b = w.project_id(&c.owner.1, c.ws, "Project B").await;
+        let file_a = w.file_id(&c.owner.1, project_a, "a.figcraft").await;
+        let file_b = w.file_id(&c.owner.1, project_b, "b.figcraft").await;
+        for file in [file_a, file_b] {
+            upload_bytes(&w, &c.owner.1, file, b"native source").await;
+            let opened = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+            )
+            .await;
+            assert_eq!(opened.status, StatusCode::OK, "{}", opened.text);
+        }
+        let project_grant = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/projects/{project_a}/grants"))
+                .session(&c.owner.1)
+                .json(json!({"user_id":c.plain.0.to_string(),"role":"editor"})),
+        )
+        .await;
+        assert_eq!(
+            project_grant.status,
+            StatusCode::CREATED,
+            "{}",
+            project_grant.text
+        );
+        let file_grant = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file_b}/grants"))
+                .session(&c.owner.1)
+                .json(json!({"user_id":c.plain.0.to_string(),"role":"editor"})),
+        )
+        .await;
+        assert_eq!(
+            file_grant.status,
+            StatusCode::CREATED,
+            "{}",
+            file_grant.text
+        );
+        for file in [file_a, file_b] {
+            let opened = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.plain.1),
+            )
+            .await;
+            assert_eq!(opened.status, StatusCode::OK, "{}", opened.text);
+        }
+        let project_grant_id = id_of(&project_grant);
+        let revoked = call(
+            &w.env.app,
+            Req::new("DELETE", &format!("/api/v1/grants/{project_grant_id}")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.text);
+        let mut worker = craftcloud_api::FigcraftWorkerState::default();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        let a_revoked: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access='edit'").bind(file_a).bind(c.plain.0).fetch_one(&w.env.pool).await.unwrap();
+        let b_revoked: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access='edit'").bind(file_b).bind(c.plain.0).fetch_one(&w.env.pool).await.unwrap();
+        assert!(a_revoked);
+        assert!(
+            !b_revoked,
+            "project grant revoke must not affect another project in the organization"
+        );
+
+        let workspace_b = w.ws(&c.owner.1, c.org, "secondary").await;
+        w.ws_add(&c.owner.1, workspace_b, c.editor.0, "editor")
+            .await;
+        let project_c = w.project_id(&c.owner.1, workspace_b, "Project C").await;
+        let file_c = w.file_id(&c.owner.1, project_c, "c.figcraft").await;
+        upload_bytes(&w, &c.owner.1, file_c, b"native source").await;
+        for file in [file_a, file_c] {
+            let opened = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+            )
+            .await;
+            assert_eq!(opened.status, StatusCode::OK, "{}", opened.text);
+            let joined = call(
+                &w.env.app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.editor.1),
+            )
+            .await;
+            assert_eq!(joined.status, StatusCode::OK, "{}", joined.text);
+        }
+        let role = call(
+            &w.env.app,
+            Req::new(
+                "PATCH",
+                &format!("/api/v1/workspaces/{}/members/{}", c.ws, c.editor.0),
+            )
+            .session(&c.owner.1)
+            .json(json!({"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(role.status, StatusCode::OK, "{}", role.text);
+        worker.reconcile_now();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        let main_revoked: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access='edit'").bind(file_a).bind(c.editor.0).fetch_one(&w.env.pool).await.unwrap();
+        let other_workspace_revoked: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND access='edit'").bind(file_c).bind(c.editor.0).fetch_one(&w.env.pool).await.unwrap();
+        assert!(
+            main_revoked,
+            "workspace role change must revoke links in its workspace"
+        );
+        assert!(
+            !other_workspace_revoked,
+            "workspace role change must preserve link in another workspace"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_stop_orders_revoke_snapshot_remove_and_recovers_failures() {
+        let mut w = W::new().await;
+        let state = Arc::new(OrderedState::default());
+        w.env
+            .configure_figcraft(
+                Arc::new(OrderedBackend(Arc::clone(&state))),
+                "ws://figcraft.test",
+            )
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Stop ordering").await;
+        let file = w.file_id(&c.owner.1, project, "stop.figcraft").await;
+        upload_bytes(&w, &c.owner.1, file, b"native source").await;
+        let opened = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(opened.status, StatusCode::OK, "{}", opened.text);
+        state.calls.lock().unwrap().clear();
+
+        state
+            .fail_export
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let stopped = call(
+            &w.env.app,
+            Req::new("DELETE", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(
+            stopped.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            stopped.text
+        );
+        assert_eq!(*state.calls.lock().unwrap(), ["revoke", "export"]);
+        let after_export_failure: (String, bool) = sqlx::query_as(
+            "SELECT state,final_snapshot_done FROM figcraft_live_files WHERE file_id=$1",
+        )
+        .bind(file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(after_export_failure, ("unpublishing".into(), false));
+        assert!(
+            state
+                .remote_present
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "failed final export must keep remote file"
+        );
+
+        state
+            .fail_export
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        state
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.calls.lock().unwrap().clear();
+        let mut worker = craftcloud_api::FigcraftWorkerState::default();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        assert_eq!(
+            *state.calls.lock().unwrap(),
+            ["export"],
+            "recovery must save final snapshot before removing"
+        );
+        let after_snapshot: (String, bool) = sqlx::query_as(
+            "SELECT state,final_snapshot_done FROM figcraft_live_files WHERE file_id=$1",
+        )
+        .bind(file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(after_snapshot, ("unpublishing".into(), true));
+        assert!(
+            state
+                .remote_present
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        state.calls.lock().unwrap().clear();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        assert_eq!(*state.calls.lock().unwrap(), ["remove"]);
+        let after_remove_failure: (String, bool) = sqlx::query_as(
+            "SELECT state,final_snapshot_done FROM figcraft_live_files WHERE file_id=$1",
+        )
+        .bind(file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(after_remove_failure, ("unpublishing".into(), true));
+        assert!(
+            state
+                .remote_present
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        state
+            .fail_remove
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        state.calls.lock().unwrap().clear();
+        craftcloud_api::figcraft_worker_tick(Arc::clone(&w.env.services), &mut worker).await;
+        assert_eq!(*state.calls.lock().unwrap(), ["remove"]);
+        assert!(
+            !state
+                .remote_present
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let final_state: String =
+            sqlx::query_scalar("SELECT state FROM figcraft_live_files WHERE file_id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(final_state, "republish");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_snapshot_quota_and_revoked_session_preserve_stored_blob() {
+        let mut w = W::new().await;
+        w.env
+            .configure_figcraft(Arc::new(FakeFigcraft), "ws://figcraft.test")
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Snapshot quota").await;
+        let file = w.file_id(&c.owner.1, project, "quota.figcraft").await;
+        let source = b"native source that fits quota";
+        upload_bytes(&w, &c.owner.1, file, source).await;
+        let opened = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(opened.status, StatusCode::OK, "{}", opened.text);
+        sqlx::query("UPDATE workspaces SET quota_bytes=committed_bytes WHERE id=$1")
+            .bind(c.ws)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM file_versions WHERE file_id=$1")
+            .bind(file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let exhausted = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live/snapshot")).session(&c.owner.1),
+        )
+        .await;
+        assert_status(&exhausted, StatusCode::PAYLOAD_TOO_LARGE, "QUOTA_EXCEEDED");
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM file_versions WHERE file_id=$1")
+            .bind(file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "quota rejection must not create a version");
+        let live_state: String =
+            sqlx::query_scalar("SELECT state FROM figcraft_live_files WHERE file_id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            live_state, "live",
+            "quota rejection must leave remote collaboration active"
+        );
+
+        sqlx::query("UPDATE workspaces SET quota_bytes=NULL WHERE id=$1")
+            .bind(c.ws)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE FUNCTION ac06_revoke_session_after_upload_store() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='stored' AND OLD.state IS DISTINCT FROM NEW.state THEN UPDATE sessions SET revoked_at=NEW.updated_at WHERE user_id=NEW.created_by_user_id AND revoked_at IS NULL; END IF; RETURN NEW; END $$")
+            .execute(&w.env.pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER ac06_revoke_session_after_upload_store AFTER UPDATE OF state ON upload_sessions FOR EACH ROW EXECUTE FUNCTION ac06_revoke_session_after_upload_store()")
+            .execute(&w.env.pool).await.unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM file_versions WHERE file_id=$1")
+            .bind(file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let revoked = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live/snapshot")).session(&c.owner.1),
+        )
+        .await;
+        assert_status(&revoked, StatusCode::FORBIDDEN, "ACCESS_CHANGED");
+        sqlx::query("DROP TRIGGER ac06_revoke_session_after_upload_store ON upload_sessions")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION ac06_revoke_session_after_upload_store()")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM file_versions WHERE file_id=$1")
+            .bind(file)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "revoked session must not commit a snapshot version"
+        );
+        let staged: (String, String) = sqlx::query_as("SELECT b.object_key,b.state FROM upload_sessions u JOIN blobs b ON b.id=u.blob_id WHERE u.file_id=$1 AND u.state='stored' ORDER BY u.created_at DESC LIMIT 1")
+            .bind(file).fetch_one(&w.env.pool).await.unwrap();
+        assert_eq!(staged.1, "staged");
+        let object_path = w
+            .env
+            .storage_dir
+            .join("objects")
+            .join(&staged.0[..2])
+            .join(&staged.0[2..4])
+            .join(&staged.0);
+        assert!(
+            object_path.exists(),
+            "DB-referenced staged blob was deleted after session revocation"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_link_creation_rechecks_demotion_after_remote_call() {
+        let mut w = W::new().await;
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let backend = Arc::new(GatedBackend {
+            creates: std::sync::atomic::AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            revokes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        w.env
+            .configure_figcraft(backend.clone(), "ws://figcraft.test/figcraft")
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Live race").await;
+        let file = w.file_id(&c.owner.1, project, "race.figcraft").await;
+        let source = b"native source";
+        upload_bytes(&w, &c.owner.1, file, source).await;
+        let owner_link = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(owner_link.status, StatusCode::OK, "{}", owner_link.text);
+        let grant = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/grants"))
+                .session(&c.owner.1)
+                .json(json!({"user_id":c.plain.0.to_string(),"role":"editor"})),
+        )
+        .await;
+        assert_eq!(grant.status, StatusCode::CREATED, "{}", grant.text);
+        let grant_id = grant.body["id"].as_str().unwrap().to_owned();
+        let app = w.env.app.clone();
+        let editor = c.plain.1.clone();
+        let open = tokio::spawn(async move {
+            call(
+                &app,
+                Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&editor),
+            )
+            .await
+        });
+        let entered_wait = Arc::clone(&entered);
+        tokio::task::spawn_blocking(move || entered_wait.wait())
+            .await
+            .unwrap();
+        let changed = call(
+            &w.env.app,
+            Req::new("PATCH", &format!("/api/v1/grants/{grant_id}"))
+                .session(&c.owner.1)
+                .if_match("\"grant-v1\"")
+                .json(json!({"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(changed.status, StatusCode::OK, "{}", changed.text);
+        let release_wait = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_wait.wait())
+            .await
+            .unwrap();
+        let result = open.await.unwrap();
+        assert_eq!(
+            (result.status, result.code()),
+            (StatusCode::FORBIDDEN, "ACCESS_CHANGED"),
+            "{}",
+            result.text
+        );
+        assert_eq!(
+            backend.revokes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unpersisted remote capability must be revoked"
+        );
+        let active:i64=sqlx::query_scalar("SELECT count(*) FROM figcraft_links WHERE file_id=$1 AND user_id=$2 AND revoked_at IS NULL").bind(file).bind(c.plain.0).fetch_one(&w.env.pool).await.unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL and CC_TEST_FIGCRAFT_SERVER"]
+    async fn figcraft_grant_revoke_disconnects_native_websocket() {
+        use craftcloud_figcraft::Client;
+        use std::{
+            net::{TcpListener, TcpStream},
+            process::{Child, Command, Stdio},
+            time::Duration,
+        };
+        use tokio::time::timeout;
+
+        let Ok(server_exe) = std::env::var("CC_TEST_FIGCRAFT_SERVER") else {
+            return;
+        };
+        struct ChildGuard(Child);
+        impl ChildGuard {
+            fn stop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                self.stop();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let data = std::env::temp_dir().join(format!("craftcloud-figcraft-api-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let child = Command::new(&server_exe)
+            .args(["--listen", &host, "--public-url"])
+            .arg(format!("ws://{host}/figcraft/"))
+            .arg("--data")
+            .arg(&data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut _child = ChildGuard(child);
+        let mut ready = false;
+        for _ in 0..100 {
+            if TcpStream::connect(&host).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready, "FigCraft server did not start");
+        let key = std::fs::read_to_string(data.join("server.key"))
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let mut w = W::new().await;
+        let internal = format!("ws://{host}/figcraft/");
+        w.env
+            .configure_figcraft(Arc::new(Client::new(&internal, key).unwrap()), &internal)
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Native live").await;
+        let file = w.file_id(&c.owner.1, project, "native.figcraft").await;
+        let mut document = figcraft_doc::Document::new("Native API E2E");
+        let page = document.first_page().unwrap();
+        let shape = document
+            .create(
+                page,
+                figcraft_doc::NodeKind::Rectangle,
+                "Initial live shape",
+                12.0,
+                18.0,
+                120.0,
+                80.0,
+            )
+            .unwrap();
+        let png = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,
+            192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+            96, 130,
+        ];
+        let image_hash = figcraft_format::image_hash(&png);
+        document.images.insert(
+            image_hash.clone(),
+            figcraft_doc::ImageData {
+                bytes: Arc::new(png.clone()),
+                width: 1,
+                height: 1,
+            },
+        );
+        document
+            .node_mut(shape)
+            .unwrap()
+            .fills
+            .push(figcraft_doc::color::Paint::image(
+                image_hash.clone(),
+                figcraft_doc::color::ImageScaleMode::Fit,
+            ));
+        let original_version = figcraft_format::Version::new(
+            "source-1",
+            "Original checkpoint",
+            "AC-06 archive fixture",
+            1,
+            Arc::new(document.clone()),
+        );
+        let source = figcraft_format::save_bytes_with_history(
+            &document,
+            Some(&png),
+            &[original_version],
+            &[],
+        )
+        .unwrap();
+        upload_bytes(&w, &c.owner.1, file, &source).await;
+
+        let added = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/grants"))
+                .session(&c.owner.1)
+                .json(json!({"user_id":c.plain.0.to_string(),"role":"editor"})),
+        )
+        .await;
+        assert_eq!(added.status, StatusCode::CREATED, "{}", added.text);
+        let editor_grant = added.body["id"].as_str().unwrap().to_owned();
+        let viewer_added = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/grants"))
+                .session(&c.owner.1)
+                .json(json!({"user_id":c.viewer.0.to_string(),"role":"viewer"})),
+        )
+        .await;
+        assert_eq!(
+            viewer_added.status,
+            StatusCode::CREATED,
+            "{}",
+            viewer_added.text
+        );
+        let joined = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.plain.1),
+        )
+        .await;
+        assert_eq!(joined.status, StatusCode::OK, "{}", joined.text);
+        let issued_url = url::Url::parse(joined.body["join_url"].as_str().unwrap()).unwrap();
+        let issued_server = issued_url
+            .query_pairs()
+            .find(|(name, _)| name == "server")
+            .map(|(_, value)| value.into_owned());
+        assert_eq!(issued_server.as_deref(), Some(internal.as_str()));
+        let (mut editor_socket, mut editor) = native_join(
+            joined.body["join_url"].as_str().unwrap(),
+            "Native API editor",
+        );
+        let viewer_join = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.viewer.1),
+        )
+        .await;
+        assert_eq!(viewer_join.status, StatusCode::OK, "{}", viewer_join.text);
+        let (mut viewer_socket, mut viewer) = native_join(
+            viewer_join.body["join_url"].as_str().unwrap(),
+            "Native API viewer",
+        );
+        let shape = editor
+            .document()
+            .nodes()
+            .find(|n| n.name == "Initial live shape")
+            .unwrap()
+            .id;
+        let mut changed = editor.document().clone();
+        changed.node_mut(shape).unwrap().name = "Edited by native editor".into();
+        let batch = editor.edit(&changed).unwrap().unwrap();
+        editor_socket
+            .send(tungstenite::Message::Binary(
+                figcraft_collab::message::encode(&batch).unwrap().into(),
+            ))
+            .unwrap();
+        loop {
+            if let msg @ figcraft_collab::message::ServerMsg::Changes(_) =
+                native_message(&mut editor_socket)
+            {
+                editor.receive(msg, &figcraft_collab::NoRecompute).unwrap();
+                break;
+            }
+        }
+        let mut forbidden = viewer.document().clone();
+        forbidden.node_mut(shape).unwrap().name = "Viewer forbidden edit".into();
+        let batch = viewer.edit(&forbidden).unwrap().unwrap();
+        viewer_socket
+            .send(tungstenite::Message::Binary(
+                figcraft_collab::message::encode(&batch).unwrap().into(),
+            ))
+            .unwrap();
+        loop {
+            let message = native_message(&mut viewer_socket);
+            match message {
+                msg @ figcraft_collab::message::ServerMsg::Changes(_) => {
+                    viewer.receive(msg, &figcraft_collab::NoRecompute).unwrap();
+                }
+                figcraft_collab::message::ServerMsg::Reject { .. } => break,
+                _ => {}
+            }
+        }
+
+        let snapshot = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live/snapshot")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(snapshot.status, StatusCode::CREATED, "{}", snapshot.text);
+        assert_eq!(snapshot.body["actor_kind"], "figcraft_live");
+        let version = snapshot.body["id"]
+            .as_str()
+            .or_else(|| snapshot.body["version_id"].as_str())
+            .expect("snapshot version id");
+        let content = call(
+            &w.env.app,
+            Req::new(
+                "GET",
+                &format!("/api/v1/files/{file}/versions/{version}/content"),
+            )
+            .session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(content.status, StatusCode::OK, "{}", content.text);
+        let native_bytes = content.bytes;
+        assert_eq!(
+            snapshot.body["size_bytes"].as_u64(),
+            Some(native_bytes.len() as u64)
+        );
+        let native_sha = Sha256::digest(&native_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            snapshot.body["sha256"].as_str(),
+            Some(native_sha.as_str()),
+            "download bytes must match the committed version digest"
+        );
+        let loaded = figcraft_format::load_bytes_with_versions(&native_bytes).unwrap();
+        assert!(
+            loaded.issues.is_empty(),
+            "snapshot archive has load issues: {:?}",
+            loaded.issues
+        );
+        assert!(
+            loaded
+                .versions
+                .iter()
+                .any(|v| v.name == "Original checkpoint"),
+            "snapshot lost source history"
+        );
+        assert_eq!(
+            loaded.doc.node(shape).unwrap().name,
+            "Edited by native editor"
+        );
+        assert_eq!(
+            loaded.doc.images.get(&image_hash).unwrap().bytes.as_slice(),
+            png.as_slice()
+        );
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&native_bytes)).unwrap();
+        let mut thumbnail = Vec::new();
+        std::io::Read::read_to_end(
+            &mut archive.by_name("thumbnail.png").unwrap(),
+            &mut thumbnail,
+        )
+        .unwrap();
+        assert_eq!(thumbnail, png, "snapshot lost original thumbnail");
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(craftcloud_api::run_figcraft_worker(
+            Arc::clone(&w.env.services),
+            stop_rx,
+        ));
+        let revoke_started = std::time::Instant::now();
+        let revoked = call(
+            &w.env.app,
+            Req::new("DELETE", &format!("/api/v1/grants/{editor_grant}")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.text);
+        let elapsed = timeout(
+            Duration::from_secs(8),
+            tokio::task::spawn_blocking(move || {
+                loop {
+                    match editor_socket.read() {
+                        Err(tungstenite::Error::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            panic!("native socket timed out instead of being disconnected");
+                        }
+                        Err(_) | Ok(tungstenite::Message::Close(_)) => {
+                            return revoke_started.elapsed();
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("grant revoke did not close native WebSocket")
+        .unwrap();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "disconnect latency exceeded bound: {elapsed:?}"
+        );
+        println!(
+            "AC-06 native grant revoke to WebSocket disconnect: {} ms",
+            elapsed.as_millis()
+        );
+        assert!(
+            native_link_refused(joined.body["join_url"].as_str().unwrap()),
+            "revoked native capability still joined"
+        );
+        let denied = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.plain.1),
+        )
+        .await;
+        assert!(
+            matches!(denied.status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN),
+            "revoked grant still authorizes API link: {} {}",
+            denied.status,
+            denied.text
+        );
+        drop(viewer_socket);
+        let _ = stop_tx.send(true);
+        let _ = worker.await;
+        _child.stop();
+        let restarted = Command::new(&server_exe)
+            .args(["--listen", &host, "--public-url"])
+            .arg(format!("ws://{host}/figcraft/"))
+            .arg("--data")
+            .arg(&data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut _restarted = ChildGuard(restarted);
+        let mut ready = false;
+        for _ in 0..100 {
+            if TcpStream::connect(&host).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready, "FigCraft server did not restart");
+        let (persisted_socket, persisted_client) = native_join(
+            viewer_join.body["join_url"].as_str().unwrap(),
+            "After restart",
+        );
+        assert_eq!(
+            persisted_client.document().node(shape).unwrap().name,
+            "Edited by native editor"
+        );
+        drop(persisted_socket);
+        drop(_restarted);
+        drop(_child);
+        let _ = std::fs::remove_dir_all(data);
     }
 }

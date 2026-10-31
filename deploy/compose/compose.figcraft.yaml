@@ -1,0 +1,75 @@
+# Optional AC-06 companion. Apply together with compose.yaml, never on its own.
+# The unchanged FigCraft protocol accepts /figcraft/ (ADR-0022).
+services:
+  figcraft-init:
+    image: postgres:18.6@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/figcraft-init.sh"]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    environment:
+      FIGCRAFT_PUBLIC_URL: ${CRAFTCLOUD_FIGCRAFT_PUBLIC_URL:-wss://${CRAFTCLOUD_DOMAIN}/figcraft/}
+    secrets: [figcraft_key]
+    volumes:
+      - ./figcraft/init.sh:/figcraft-init.sh:ro
+      - figcraft-data:/data
+      - figcraft-secrets:/shared-secret
+      - figcraft-config:/config
+    mem_limit: 64m
+    pids_limit: 32
+
+  figcraft:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/figcraft/Dockerfile
+    image: ${CRAFTCLOUD_FIGCRAFT_IMAGE:-craftcloud-figcraft:ddda495a6ff4}
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    depends_on:
+      figcraft-init: {condition: service_completed_successfully}
+    volumes:
+      - figcraft-data:/data
+      - figcraft-config:/etc/figcraft-server:ro
+    networks: [figcraft]
+    mem_limit: 1g
+    pids_limit: 256
+    stop_grace_period: 30s
+
+  server:
+    environment:
+      CRAFTCLOUD_FIGCRAFT_URL: ws://figcraft:47900/
+      CRAFTCLOUD_FIGCRAFT_PUBLIC_URL: ${CRAFTCLOUD_FIGCRAFT_PUBLIC_URL:-wss://${CRAFTCLOUD_DOMAIN}/figcraft/}
+      CRAFTCLOUD_FIGCRAFT_KEY_FILE: /run/figcraft-secrets/server.key
+    volumes:
+      - figcraft-secrets:/run/figcraft-secrets:ro
+    depends_on:
+      figcraft-init: {condition: service_completed_successfully}
+      figcraft: {condition: service_started}
+    networks: [frontend, backend, figcraft]
+
+  caddy:
+    volumes:
+      - ./figcraft/proxy.caddy:/etc/caddy/optional/figcraft.caddy:ro
+    depends_on:
+      figcraft: {condition: service_started}
+    networks: [edge, frontend, figcraft]
+
+networks:
+  figcraft:
+    internal: true
+
+volumes:
+  figcraft-data: {}
+  figcraft-secrets: {}
+  figcraft-config: {}
+
+secrets:
+  figcraft_key:
+    file: ${CRAFTCLOUD_FIGCRAFT_SECRET_FILE:?set a private file containing 64 random hex characters}

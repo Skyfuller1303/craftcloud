@@ -322,7 +322,22 @@ export interface SharedItem {
 
 export interface ServerInfo {
   features: string[];
-  feature_flags?: { two_factor?: boolean; grants?: boolean; locks?: boolean };
+  feature_flags?: { two_factor?: boolean; grants?: boolean; locks?: boolean; figcraft_live?: boolean };
+}
+
+export interface FigcraftLiveStatus {
+  state: "inactive" | "publishing" | "active" | "stopping" | "republish";
+  access: "edit" | "view";
+  can_snapshot: boolean;
+  can_stop: boolean;
+  last_snapshot_at: string | null;
+  participants: number | null;
+}
+
+export interface FigcraftLiveLink {
+  join_url: string;
+  web_url?: string;
+  access: "edit" | "view";
 }
 
 export interface CreateFileRequest {
@@ -364,6 +379,7 @@ export interface FileVersion {
   restored_from_version_id: Uuid | null;
   upload_id: Uuid | null;
   created_by: Uuid;
+  actor_kind?: "user" | "figcraft_live";
   created_at: string;
 }
 

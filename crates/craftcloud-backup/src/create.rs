@@ -503,9 +503,18 @@ async fn snapshot(pool: &PgPool, out: &Path) -> Result<Snapshot, BackupError> {
     for spec in specs {
         let relative = table_file(spec.name);
         let mut file = Out::create(&out.join(&relative), &relative)?;
-        let mut stream = tx
-            .copy_out_raw(&format!("COPY \"{}\" TO STDOUT", spec.name))
-            .await?;
+        let copy = match spec.name {
+            // Remote identities and snapshot attempts belong to the old
+            // FigCraft server. A restored file must be republished, with no
+            // prior remote id or automatic-snapshot completion state.
+            "figcraft_live_files" => "COPY (SELECT file_id,org_id,workspace_id,NULL::text,published_from_version_id,last_snapshot_version_id,last_snapshot_at,NULL::timestamptz,false,'republish',published_by_user_id,created_at,now() FROM figcraft_live_files) TO STDOUT".to_owned(),
+            "figcraft_links" => "COPY (SELECT id,file_id,user_id,access,NULL::text,NULL::bytea,created_at,COALESCE(revoked_at,now()) FROM figcraft_links) TO STDOUT".to_owned(),
+            // Remote revocation jobs cannot target the restored server's new
+            // FigCraft file ids. Restored personal links are already revoked.
+            "figcraft_outbox" => "COPY (SELECT id,file_id,user_id,reason,attempts,available_at,NULL::timestamptz,created_at FROM figcraft_outbox WHERE false) TO STDOUT".to_owned(),
+            _ => format!("COPY \"{}\" TO STDOUT", spec.name),
+        };
+        let mut stream = tx.copy_out_raw(&copy).await?;
         while let Some(chunk) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
             file.write(&chunk?).await?;
         }

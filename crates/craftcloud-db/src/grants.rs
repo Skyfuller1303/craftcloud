@@ -432,6 +432,30 @@ impl OrgTx {
                 }
                 _ => return Err(DbError::Internal),
             }
+            match current.target_kind.as_str() {
+                "file" => {
+                    crate::figcraft::enqueue_file_user_revocations(
+                        &mut self.tx,
+                        current.target_id,
+                        current.grantee_user_id,
+                        "role_changed",
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await?
+                }
+                "project" => {
+                    crate::figcraft::enqueue_project_user_revocations(
+                        &mut self.tx,
+                        self.org_id,
+                        current.target_id,
+                        current.grantee_user_id,
+                        "role_changed",
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await?
+                }
+                _ => return Err(DbError::Internal),
+            }
         }
         Ok(ChangeOutcome::Changed(Box::new(
             self.grant(id).await?.ok_or(DbError::Internal)?,
@@ -460,6 +484,32 @@ impl OrgTx {
                     sqlx::query("DELETE FROM file_locks l USING files f WHERE l.file_id=f.id AND l.org_id=$1 AND f.project_id=$2 AND l.holder_user_id=$3").bind(self.org_id).bind(current.target_id).bind(current.grantee_user_id).execute(&mut *self.tx).await?;
                 }
                 _ => return Err(DbError::Internal),
+            }
+            if changed {
+                match current.target_kind.as_str() {
+                    "file" => {
+                        crate::figcraft::enqueue_file_user_revocations(
+                            &mut self.tx,
+                            current.target_id,
+                            current.grantee_user_id,
+                            "grant_revoked",
+                            now,
+                        )
+                        .await?
+                    }
+                    "project" => {
+                        crate::figcraft::enqueue_project_user_revocations(
+                            &mut self.tx,
+                            self.org_id,
+                            current.target_id,
+                            current.grantee_user_id,
+                            "grant_revoked",
+                            now,
+                        )
+                        .await?
+                    }
+                    _ => return Err(DbError::Internal),
+                }
             }
         }
         Ok(self.grant(id).await?.map(|grant| (grant, changed)))

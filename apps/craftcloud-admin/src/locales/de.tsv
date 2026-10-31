@@ -632,3 +632,35 @@
 	Changing the password signs out your other browser sessions and all registered devices.	Beim Ändern des Passworts werden deine anderen Browser-Sitzungen und alle registrierten Geräte abgemeldet.
 	Change password	Passwort ändern
 	Old password	Altes Passwort
+
+
+# FigCraft Live (AC-06)
+	Open live	Live öffnen
+	Open {name} live	{name} live öffnen
+	Live in FigCraft: {name}	Live in FigCraft: {name}
+	Your personal link follows your CraftCloud permissions. Anyone you give this link to can use your access. Renew it to invalidate the old link.	Dein persönlicher Link folgt deinen CraftCloud-Berechtigungen. Wer diesen Link von dir erhält, kann deinen Zugriff nutzen. Erneuere ihn, um den alten Link ungültig zu machen.
+	While this file is live, save changes in FigCraft. Regular cloud uploads are unavailable until live collaboration ends.	Speichere Änderungen während der Live-Zusammenarbeit in FigCraft. Reguläre Cloud-Uploads sind erst nach dem Beenden wieder möglich.
+	Loading live status…	Live-Status wird geladen…
+	Live collaboration is active.	Die Live-Zusammenarbeit ist aktiv.
+	Live collaboration is changing. Refresh the status shortly.	Die Live-Zusammenarbeit wird umgestellt. Aktualisiere den Status gleich erneut.
+	Creating a link starts live collaboration from the current version.	Das Erstellen eines Links startet die Live-Zusammenarbeit mit der aktuellen Version.
+	Your access: edit	Dein Zugriff: Bearbeiten
+	Your access: view	Dein Zugriff: Lesen
+	Last cloud snapshot: {time}	Letzte Cloud-Sicherung: {time}
+	Connected participants: {count}	Verbundene Personen: {count}
+	Personal FigCraft link	Persönlicher FigCraft-Link
+	Open in FigCraft	In FigCraft öffnen
+	Show personal link	Persönlichen Link anzeigen
+	Renew link	Link erneuern
+	Save cloud snapshot	Cloud-Sicherung erstellen
+	Cloud snapshot saved.	Cloud-Sicherung gespeichert.
+	End live collaboration	Live-Zusammenarbeit beenden
+	Disconnect everyone and save the final live state as a cloud version?	Alle Verbindungen trennen und den letzten Live-Stand als Cloud-Version sichern?
+	The server returned an invalid FigCraft link.	Der Server hat einen ungültigen FigCraft-Link zurückgegeben.
+	FigCraft Live	FigCraft Live
+
+# FigCraft Live (AC-06)
+	This file is being edited live in FigCraft. Save changes there or ask a workspace administrator to end live collaboration before uploading a version.	Diese Datei wird live in FigCraft bearbeitet. Speichere Änderungen dort oder bitte einen Workspace-Administrator, die Live-Zusammenarbeit vor dem Hochladen einer Version zu beenden.
+	FigCraft live collaboration is unavailable. Try again later.	Die Live-Zusammenarbeit mit FigCraft ist nicht verfügbar. Versuche es später erneut.
+	Another live operation is in progress. Reload and try again shortly.	Eine andere Live-Aktion läuft gerade. Lade neu und versuche es gleich erneut.
+	Live collaboration requires an intact native .figcraft file.	Die Live-Zusammenarbeit benötigt eine intakte native .figcraft-Datei.

@@ -385,6 +385,43 @@ pub(crate) async fn write_gate(
         Some(target),
     ) {
         Gate::Open(permit) => {
+            let live_write = matches!(
+                action,
+                Action::FileRename
+                    | Action::FileDelete
+                    | Action::FileRestore
+                    | Action::UploadCreate
+                    | Action::UploadWrite
+                    | Action::VersionCommit
+                    | Action::VersionRestore
+                    | Action::ProjectDelete
+                    | Action::ProjectRestore
+            );
+            if live_write {
+                let is_live = if matches!(action, Action::ProjectDelete | Action::ProjectRestore) {
+                    tx.figcraft_blocks_project_write(resolved.id).await
+                } else {
+                    tx.figcraft_blocks_write(resolved.id).await
+                };
+                match is_live {
+                    Ok(true) => {
+                        return Err(Box::new(error_response(
+                            StatusCode::CONFLICT,
+                            "FILE_IS_LIVE",
+                            "Stop FigCraft Live before changing this file or project.",
+                            headers,
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(Box::new(db_failure(
+                            &error,
+                            headers,
+                            "FigCraft live state lookup failed",
+                        )));
+                    }
+                }
+            }
             if matches!(action, Action::ProjectDelete | Action::ProjectRestore) {
                 match tx
                     .active_project_lock(resolved.id, session.session_id)
@@ -868,6 +905,12 @@ pub(crate) async fn delete_project(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(ProjectDeleteOutcome::Unchanged(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(ProjectDeleteOutcome::FigcraftLive) => error_response(
+            StatusCode::CONFLICT,
+            "FILE_IS_LIVE",
+            "Stop FigCraft Live before moving this project to the trash.",
+            &headers,
+        ),
         Ok(ProjectDeleteOutcome::Gone) => not_found(&headers),
         Err(error) => db_failure(&error, &headers, "project deletion failed"),
     }

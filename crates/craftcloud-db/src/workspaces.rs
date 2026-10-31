@@ -545,6 +545,15 @@ impl OrgTx {
         .bind(role.as_str())
         .execute(&mut *self.tx)
         .await?;
+        crate::figcraft::enqueue_workspace_user_revocations(
+            &mut self.tx,
+            self.org_id,
+            workspace_id,
+            user_id,
+            "role_changed",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
         match self.workspace_member(workspace_id, user_id).await? {
             Some(member) => Ok(WorkspaceRoleOutcome::Changed(member)),
             None => Err(DbError::Internal),
@@ -578,6 +587,17 @@ impl OrgTx {
         .execute(&mut *self.tx)
         .await?
         .rows_affected();
+        if removed == 1 {
+            crate::figcraft::enqueue_workspace_user_revocations(
+                &mut self.tx,
+                self.org_id,
+                workspace_id,
+                user_id,
+                "membership_removed",
+                time::OffsetDateTime::now_utc(),
+            )
+            .await?;
+        }
         Ok(removed == 1)
     }
 }

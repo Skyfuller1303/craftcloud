@@ -31,7 +31,15 @@ Die TOTP-Geheimnisse stehen verschlüsselt im Backup; der Schlüssel dazu nicht.
 
 Ein Restore benötigt **denselben** Schlüssel: Tragen Sie ihn vor dem ersten Start der wiederhergestellten Instanz als `CC_SECRET_TWO_FACTOR_KEY` in deren Umgebungsdatei ein (beim Installer vor dem ersten `install.sh`-Lauf in einer vorbereiteten `craftcloud.env`, sonst durch Ersetzen des Werts in der bereits erzeugten Konfiguration). Ein neu erzeugter Schlüssel öffnet die gesicherten Geheimnisse nicht; die betroffenen Personen müssten 2FA neu einrichten. Die Rotation mit altem Schlüssel (`CRAFTCLOUD_SECRET_KEY_OLD_FILE`, siehe [deployment.md](deployment.md)) ist in diesem Prototyp nicht durch den Installer automatisiert; sie erfordert eine eigene Compose-Ergänzung des Betreibers und ist eine offene Lücke.
 
-## Backup erstellen
+## FigCraft-Live: Sicherungsgrenze und Wiederanlauf
+
+CraftCloud sichert die bereits gespeicherten unveränderlichen Dateiversionen. Das zusätzliche Volume `figcraft-data` mit Snapshot und Operationslog gehört nicht zum CraftCloud-Backup. Live-Änderungen seit der letzten erfolgreichen Sicherung fehlen deshalb im Backup. Für eine geplante vollständige Sicherung beenden Sie die Live-Dateien über die API beziehungsweise den Webdialog und prüfen die letzte Version; ein ungeprüfter Prozessstopp genügt nicht. Quota- oder Speicherfehler können die automatische Sicherung verzögern.
+
+Restore setzt Live-Dateien auf `republish` und widerruft die gespeicherten persönlichen Links. Es übernimmt keine gültigen Link-Tokens in den neuen Betrieb. **Trennen Sie die alte FigCraft-Instanz vom öffentlichen Endpunkt und verwenden Sie beim Restore ein leeres FigCraft-Datenvolume mit neuem Verwaltungsschlüssel.** Alte, noch laufende Instanzen würden alte Bearer-Links weiterhin akzeptieren; der Datenbank-Restore allein kann diese Verbindungen nicht beenden. Bewahren Sie das alte Volume bei Bedarf isoliert für eine manuelle Datenrettung auf, verbinden Sie es aber nicht mit der wiederhergestellten Instanz.
+
+Nach dem Start veröffentlicht „Live öffnen“ die gesicherte Cloud-Version neu und erzeugt neue persönliche Links. Prüfen Sie auf der isolierten Restore-Instanz: alter Link abgelehnt, neue Veröffentlichung möglich, View-Link nicht schreibfähig und Snapshot als native `.figcraft` ladbar. Eine Rückkehr zu einem Schema vor `0018_figcraft_live.sql` benötigt ein passendes früheres Backup; löschen Sie die neuen Tabellen oder Spalten nicht im laufenden System.
+
+## Backup erstellen (Befehle)
 
 Bei aktivem 2FA ist die Wiederherstellbarkeit von [Schlüsseldateien und Rotation](deployment.md#backup-und-restore-mit-2fa) Teil jeder Restore-Probe. Nach einem produktiven Restore sind auch Wiederherstellungscodes wieder im Zustand des Backupzeitpunkts; lassen Sie sie neu erzeugen. Ein verlorener Entschlüsselungsschlüssel darf nicht durch Abschalten der Login-Prüfung umgangen werden; der gezielte Operator-Reset verlangt eine erneute Einrichtung.
 

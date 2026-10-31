@@ -531,6 +531,13 @@ async fn set_disabled_inner(
         .execute(&mut *tx)
         .await?;
         if disabled {
+            crate::figcraft::enqueue_all_user_revocations(
+                &mut tx,
+                user_id,
+                "account_disabled",
+                now,
+            )
+            .await?;
             sqlx::query(
                 "UPDATE sessions SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL",
             )

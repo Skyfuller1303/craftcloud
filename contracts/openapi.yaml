@@ -2083,6 +2083,78 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/live:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    get:
+      tags: [Files]
+      summary: Read FigCraft Live status and the current actor's access
+      responses:
+        '200': {description: Live status, content: {application/json: {schema: {$ref: '#/components/schemas/FigCraftLiveStatus'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Publish a native FigCraft file and issue or reuse a personal live link
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FigCraftLiveRequest'}
+      responses:
+        '200': {description: Personal FigCraft deep link, content: {application/json: {schema: {$ref: '#/components/schemas/FigCraftLiveLink'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: FILE_IS_LIVE conflict or unsupported document, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Stop FigCraft Live (workspace administrator or higher)
+      responses:
+        '204': {description: Live collaboration stopped and links revoked}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: FILE_IS_LIVE while stop recovery is pending, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /files/{file_id}/live/snapshot:
+    parameters:
+      - {$ref: '#/components/parameters/FileId'}
+    post:
+      tags: [Files]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Export the current live FigCraft state as a native file version
+      responses:
+        '201': {description: New native file version, content: {application/json: {schema: {$ref: '#/components/schemas/Version'}}}}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: FIGCRAFT_NOT_LIVE, FIGCRAFT_BUSY, FILE_IS_LIVE or VERSION_CONFLICT, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /files/{file_id}/uploads:
     parameters:
       - {$ref: '#/components/parameters/FileId'}
@@ -4002,7 +4074,7 @@ components:
         upload_id: {type: string, format: uuid}
     Version:
       type: object
-      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, created_at]
+      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, actor_kind, created_at]
       properties:
         id: {type: string, format: uuid}
         file_id: {type: string, format: uuid}
@@ -4013,7 +4085,30 @@ components:
         restored_from_version_id: {type: [string, 'null'], format: uuid}
         upload_id: {type: [string, 'null'], format: uuid}
         created_by: {type: string, format: uuid}
+        actor_kind: {type: string, enum: [user, figcraft_live]}
         created_at: {type: string, format: date-time}
+    FigCraftLiveRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        renew: {type: boolean, default: false}
+    FigCraftLiveLink:
+      type: object
+      required: [join_url, access]
+      properties:
+        join_url: {type: string, format: uri}
+        web_url: {type: [string, 'null'], format: uri}
+        access: {type: string, enum: [edit, view]}
+    FigCraftLiveStatus:
+      type: object
+      required: [state, access, can_snapshot, can_stop, last_snapshot_at, participants]
+      properties:
+        state: {type: string, enum: [inactive, publishing, active, stopping, republish]}
+        access: {type: string, enum: [edit, view]}
+        can_snapshot: {type: boolean}
+        can_stop: {type: boolean}
+        last_snapshot_at: {type: [string, 'null'], format: date-time}
+        participants: {type: [integer, 'null'], minimum: 0}
     VersionPage:
       type: object
       required: [items, next_cursor]

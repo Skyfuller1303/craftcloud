@@ -477,7 +477,7 @@ mod tests {
         let backup_time = started.elapsed();
         assert!(created.audit_recorded);
         assert_eq!(created.blobs, 5, "{:?}", created.manifest.blobs);
-        assert_eq!(created.manifest.migration_version, 17);
+        assert_eq!(created.manifest.migration_version, 18);
 
         let report = craftcloud_backup::verify(&out, Some(&created.manifest_sha256)).unwrap();
         assert_eq!(report.blobs, 5);
@@ -860,7 +860,7 @@ mod tests {
 
         // Forged manifests with a matching checksum file: unknown versions.
         rewrite_manifest(&out, |m| m["migration_version"] = json!(99));
-        expect(&out, ErrorKind::Format, "only knows up to 17");
+        expect(&out, ErrorKind::Format, "only knows up to 18");
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
             m["format_version"] = json!(2);
@@ -872,7 +872,7 @@ mod tests {
         );
         rewrite_manifest(&out, |m| {
             m["format_version"] = json!(1);
-            m["migration_version"] = json!(17);
+            m["migration_version"] = json!(18);
             m["tables"][0]["rows"] = json!(77);
         });
         expect(&out, ErrorKind::Integrity, "rows but the manifest says 77");
@@ -1037,6 +1037,22 @@ mod tests {
         for table in ["user_two_factor", "user_two_factor_recovery_codes"] {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
+        // AC-06 adds live state tables and an actor label on versions. The
+        // older-schema fixture must model both changes in its COPY files.
+        for table in ["figcraft_live_files", "figcraft_links", "figcraft_outbox"] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+        let versions_path = out.join("tables").join("file_versions.copy");
+        let current_versions = std::fs::read_to_string(&versions_path).unwrap();
+        let old_versions: String = current_versions
+            .lines()
+            .map(|line| {
+                let (columns, actor_kind) = line.rsplit_once('\t').unwrap();
+                assert_eq!(actor_kind, "user");
+                format!("{columns}\n")
+            })
+            .collect();
+        std::fs::write(&versions_path, &old_versions).unwrap();
         let org_path = out.join("tables").join("organizations.copy");
         let current_orgs = std::fs::read_to_string(&org_path).unwrap();
         let old_orgs: String = current_orgs
@@ -1053,7 +1069,14 @@ mod tests {
             m["tables"].as_array_mut().unwrap().retain(|t| {
                 !matches!(
                     t["name"].as_str(),
-                    Some("grants" | "user_two_factor" | "user_two_factor_recovery_codes")
+                    Some(
+                        "grants"
+                            | "user_two_factor"
+                            | "user_two_factor_recovery_codes"
+                            | "figcraft_live_files"
+                            | "figcraft_links"
+                            | "figcraft_outbox"
+                    )
                 )
             });
             let org = m["tables"]
@@ -1064,6 +1087,14 @@ mod tests {
                 .unwrap();
             org["bytes"] = json!(old_orgs.len());
             org["sha256"] = json!(sha_hex(old_orgs.as_bytes()));
+            let versions = m["tables"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|t| t["name"] == "file_versions")
+                .unwrap();
+            versions["bytes"] = json!(old_versions.len());
+            versions["sha256"] = json!(sha_hex(old_versions.as_bytes()));
             m["excluded_tables"] = json!([
                 "sessions",
                 "password_reset_tokens",
@@ -1085,7 +1116,7 @@ mod tests {
 
         // Restore, then migrate.
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 6);
+        assert_eq!(applied.len(), 7);
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         assert_eq!(
             dump(&w.env.pool, "users").await,
@@ -1497,7 +1528,7 @@ mod tests {
         .unwrap();
         assert_eq!((row.0, row.1, row.2.as_str()), (None, None, "success"));
         assert_eq!(row.3["blobs"], 1);
-        assert_eq!(row.3["migration"], 17);
+        assert_eq!(row.3["migration"], 18);
 
         // The manifest holds no secrets: neither a connection string nor the
         // password of the database URL, and no names.

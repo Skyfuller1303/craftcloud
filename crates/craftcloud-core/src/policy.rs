@@ -145,6 +145,39 @@ pub struct Actor {
     pub workspace: Option<WorkspaceMembership>,
 }
 
+/// Trusted service identity bound to one FigCraft live file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FigcraftService {
+    pub org_id: Uuid,
+    pub workspace_id: Uuid,
+    pub file_id: Uuid,
+    pub state: FigcraftFileState,
+}
+
+/// Persisted lifecycle state accepted for internal FigCraft snapshot work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FigcraftFileState {
+    Live,
+    Unpublishing,
+}
+
+/// Principal accepted by the central authorization decision.
+pub enum Principal<'a> {
+    User(&'a Actor),
+    FigcraftLive(&'a FigcraftService),
+}
+
+impl<'a> From<&'a Actor> for Principal<'a> {
+    fn from(actor: &'a Actor) -> Self {
+        Self::User(actor)
+    }
+}
+impl<'a> From<&'a FigcraftService> for Principal<'a> {
+    fn from(service: &'a FigcraftService) -> Self {
+        Self::FigcraftLive(service)
+    }
+}
+
 /// What the actor wants to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -561,6 +594,13 @@ pub enum Resource {
         /// Grant on the source file, if any.
         target: ObjectTarget,
     },
+    /// A live FigCraft document, scoped to its persisted lifecycle state.
+    FigcraftLiveFile {
+        org_id: Uuid,
+        workspace_id: Uuid,
+        file_id: Uuid,
+        state: FigcraftFileState,
+    },
     /// Invitations of an organization. `spec` is `None` for listing.
     Invitation {
         /// The organization.
@@ -664,7 +704,48 @@ enum Manager {
 /// Deny by default: a combination of action and resource kind that is not
 /// listed is `Forbidden`.
 #[must_use]
-pub fn can(actor: &Actor, action: Action, resource: &Resource) -> Decision {
+pub fn can<'a>(
+    principal: impl Into<Principal<'a>>,
+    action: Action,
+    resource: &Resource,
+) -> Decision {
+    match principal.into() {
+        Principal::User(actor) => can_user(actor, action, resource),
+        Principal::FigcraftLive(service) => can_figcraft_service(service, action, resource),
+    }
+}
+
+fn can_figcraft_service(
+    service: &FigcraftService,
+    action: Action,
+    resource: &Resource,
+) -> Decision {
+    use Action as A;
+    match (action, resource) {
+        (
+            A::FileRead | A::UploadCreate | A::UploadWrite | A::VersionCommit,
+            Resource::FigcraftLiveFile {
+                org_id,
+                workspace_id,
+                file_id,
+                state,
+            },
+        ) if service.org_id == *org_id
+            && service.workspace_id == *workspace_id
+            && service.file_id == *file_id
+            && service.state == *state
+            && matches!(
+                state,
+                FigcraftFileState::Live | FigcraftFileState::Unpublishing
+            ) =>
+        {
+            allow(action, Some(*org_id))
+        }
+        _ => Decision::Forbidden,
+    }
+}
+
+fn can_user(actor: &Actor, action: Action, resource: &Resource) -> Decision {
     use Action as A;
     match (action, resource) {
         // ---- instance level ----
@@ -3126,5 +3207,91 @@ mod tests {
         ] {
             assert_eq!(can(&a, action, &resource), Decision::Hidden, "{action:?}");
         }
+    }
+
+    #[test]
+    fn figcraft_service_authority_is_file_org_state_and_action_bound() {
+        let org = Uuid::new_v4();
+        let workspace = Uuid::new_v4();
+        let file = Uuid::new_v4();
+        let live = FigcraftService {
+            org_id: org,
+            workspace_id: workspace,
+            file_id: file,
+            state: FigcraftFileState::Live,
+        };
+        let resource = Resource::FigcraftLiveFile {
+            org_id: org,
+            workspace_id: workspace,
+            file_id: file,
+            state: FigcraftFileState::Live,
+        };
+        for action in [
+            Action::FileRead,
+            Action::UploadCreate,
+            Action::UploadWrite,
+            Action::VersionCommit,
+        ] {
+            assert!(can(&live, action, &resource).is_allow(), "{action:?}");
+        }
+        assert_eq!(
+            can(&live, Action::MemberRemove, &resource),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(&live, Action::FileRead, &Resource::Instance),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &live,
+                Action::FileRead,
+                &Resource::FigcraftLiveFile {
+                    org_id: org,
+                    workspace_id: workspace,
+                    file_id: Uuid::new_v4(),
+                    state: FigcraftFileState::Live
+                }
+            ),
+            Decision::Forbidden
+        );
+        assert_eq!(
+            can(
+                &live,
+                Action::FileRead,
+                &Resource::FigcraftLiveFile {
+                    org_id: Uuid::new_v4(),
+                    workspace_id: workspace,
+                    file_id: file,
+                    state: FigcraftFileState::Live
+                }
+            ),
+            Decision::Forbidden
+        );
+        let unpublishing = FigcraftService {
+            state: FigcraftFileState::Unpublishing,
+            ..live
+        };
+        let unpublishing_resource = Resource::FigcraftLiveFile {
+            org_id: org,
+            workspace_id: workspace,
+            file_id: file,
+            state: FigcraftFileState::Unpublishing,
+        };
+        assert!(can(&unpublishing, Action::VersionCommit, &unpublishing_resource).is_allow());
+        assert_eq!(
+            can(&live, Action::VersionCommit, &unpublishing_resource),
+            Decision::Forbidden
+        );
+        let actor = Actor {
+            user_id: Uuid::new_v4(),
+            instance_operator: true,
+            membership: None,
+            workspace: None,
+        };
+        assert_eq!(
+            can(&actor, Action::VersionCommit, &resource),
+            Decision::Forbidden
+        );
     }
 }

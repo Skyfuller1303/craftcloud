@@ -11,11 +11,13 @@ import { useAction, useLeaseRefresh } from "../hooks.ts";
 import { useI18n } from "../i18n/index.tsx";
 import { usePagedList } from "../usePagedList.ts";
 import { VersionsDialog } from "./VersionsDialog.tsx";
+import { FigcraftLiveDialog, useFigcraftAvailable } from "./FigcraftLiveDialog.tsx";
 
 /** The server sends no workspace name to guests (`name: null`); the group then has no heading. */
 export function SharedWithMeScreen({ organizationId }: { organizationId: string | null }) {
   const { t } = useI18n();
   const { api } = useAuth();
+  const liveAvailable = useFigcraftAvailable();
   const load = useMemo(
     () => organizationId === null ? null : (cursor?: string) => api.listSharedWithMe(organizationId, cursor),
     [api, organizationId],
@@ -33,17 +35,17 @@ export function SharedWithMeScreen({ organizationId }: { organizationId: string 
     {[...groups.entries()].map(([workspaceId, items]) => <section className="section" key={workspaceId}>
       {items[0]?.workspace.name != null && <h2 className="section__title">{items[0].workspace.name}</h2>}
       {items.filter((item) => item.target_kind === "project" && item.project !== null).map((item) =>
-        item.project === null ? null : <SharedProject key={item.target_id} item={item} />,
+        item.project === null ? null : <SharedProject key={`${organizationId}:${item.target_id}`} item={item} liveAvailable={liveAvailable} />,
       )}
       {items.filter((item) => item.target_kind === "file" && item.file !== null).map((item) =>
-        item.file === null ? null : <SharedFile key={item.target_id} fileId={item.target_id} name={item.file.name} role={item.role} />,
+        item.file === null ? null : <SharedFile key={`${organizationId}:${item.target_id}`} fileId={item.target_id} name={item.file.name} role={item.role} liveAvailable={liveAvailable} />,
       )}
     </section>)}
     <LoadMoreButton list={shares} />
   </>;
 }
 
-function SharedProject({ item }: { item: SharedItem }) {
+function SharedProject({ item, liveAvailable }: { item: SharedItem; liveAvailable: boolean }) {
   const { t } = useI18n();
   const { api } = useAuth();
   const projectId = item.project?.id ?? item.target_id;
@@ -62,22 +64,24 @@ function SharedProject({ item }: { item: SharedItem }) {
     <h3 className="section__subtitle">{item.project?.name}</h3>
     {lease.error !== null && <ErrorNotice error={lease.error} onRetry={() => void lease.retry()} onReload={() => void lease.retry()} />}
     <ListStatus list={files} empty={t("This project has no files yet.")} loadingLabel={t("Loading files…")} />
-    {files.items.map((file) => <SharedFile key={file.id} fileId={file.id} name={file.name} role={item.role} record={file} />)}
+    {files.items.map((file) => <SharedFile key={file.id} fileId={file.id} name={file.name} role={item.role} record={file} liveAvailable={liveAvailable} />)}
     <LoadMoreButton list={files} />
   </section>;
 }
 
-function SharedFile({ fileId, name, role, record }: {
+function SharedFile({ fileId, name, role, record, liveAvailable }: {
   fileId: string;
   name: string;
   role: "viewer" | "editor";
   record?: FileRecord;
+  liveAvailable: boolean;
 }) {
   const { t, language } = useI18n();
   const { api } = useAuth();
   const [file, setFile] = useState<FileRecord | null>(record ?? null);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [versionsOpen, setVersionsOpen] = useState(false);
+  const [liveOpen, setLiveOpen] = useState(false);
   const [forceOpen, setForceOpen] = useState(false);
   const force = useAction();
   const reloadFile = useCallback(async () => {
@@ -114,6 +118,7 @@ function SharedFile({ fileId, name, role, record }: {
         <Badge>{role === "editor" ? t("Editor") : t("Viewer")}</Badge>
         {file?.head_version_id !== null && file !== null && <a className="button button--sm" href={api.downloadUrl(fileId)} download aria-label={t("Download {name}", { name })}>{t("Download")}</a>}
         {file !== null && <Button className="button button--sm" onPress={() => setVersionsOpen(true)}>{t("Versions")}</Button>}
+        {liveAvailable && file?.app === "figcraft" && file.head_version_id !== null && <Button className="button button--sm" onPress={() => setLiveOpen(true)}>{t("Open live")}</Button>}
       </div>
     </div>
     {file !== null && <p className="muted">{[
@@ -130,6 +135,7 @@ function SharedFile({ fileId, name, role, record }: {
       {lockedElsewhere && file?.can_force_lock === true && <Button className="button button--danger-quiet button--sm" onPress={() => setForceOpen(true)}>{t("Release lock")}</Button>}
     </p>}
     {versionsOpen && file !== null && <VersionsDialog file={file} canRestore={role === "editor"} onChanged={() => undefined} onClose={() => setVersionsOpen(false)} />}
+    {liveOpen && <FigcraftLiveDialog key={fileId} fileId={fileId} name={name} onClose={() => setLiveOpen(false)} onChanged={() => void reloadFile().catch(setLoadError)} />}
     {forceOpen && lock !== null && <ConfirmDialog
       title={t("Release edit lock")}
       message={t("Release the edit lock held by {name}?", { name: lock.holder_display_name })}

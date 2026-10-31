@@ -39,6 +39,10 @@ PATCH /api/v1/files/{file_id} auth=cookie+csrf|bearer req=UpdateFileRequest ok=F
 GET /api/v1/files/{file_id}/content auth=cookie|bearer req=- ok=- codes=200,206,400,401,404,409,416,500,503
 GET /api/v1/files/{file_id}/grants auth=cookie|bearer req=- ok=- codes=200,400,401,403,404,500,503
 POST /api/v1/files/{file_id}/grants auth=cookie+csrf|bearer req=GrantCreateRequest ok=Grant codes=201,400,401,403,404,409,422,500,503
+DELETE /api/v1/files/{file_id}/live auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
+GET /api/v1/files/{file_id}/live auth=cookie|bearer req=- ok=FigCraftLiveStatus codes=200,401,403,404,500,503
+POST /api/v1/files/{file_id}/live auth=cookie+csrf|bearer req=FigCraftLiveRequest ok=FigCraftLiveLink codes=200,400,401,403,404,409,413,422,500,503
+POST /api/v1/files/{file_id}/live/snapshot auth=cookie+csrf|bearer req=- ok=Version codes=201,400,401,403,404,409,413,500,503
 DELETE /api/v1/files/{file_id}/lock auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
 POST /api/v1/files/{file_id}/lock auth=cookie+csrf|bearer req=LockAcquireRequest ok=FileLock codes=200,400,401,403,404,409,422,423,500,503
 POST /api/v1/files/{file_id}/restore auth=cookie+csrf|bearer req=- ok=File codes=200,400,401,403,404,409,410,423,500,503
@@ -125,6 +129,9 @@ DeviceLoginRequest
 DeviceLoginResponse
 DeviceTokenResponse
 Error
+FigCraftLiveLink
+FigCraftLiveRequest
+FigCraftLiveStatus
 File
 FileLock
 FilePage

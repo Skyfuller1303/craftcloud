@@ -311,6 +311,31 @@ impl TestEnv {
         Self::build(settings(), ApiConfig::default(), false, true).await
     }
 
+    pub async fn configure_figcraft(
+        &mut self,
+        backend: Arc<dyn craftcloud_figcraft::Backend>,
+        public_url: &str,
+    ) {
+        let store = LocalStore::open_with_faults(&self.storage_dir, Arc::clone(&self.faults))
+            .await
+            .unwrap();
+        let clock: Arc<dyn Clock> = self.clock.clone();
+        let services = Arc::new(
+            Services::new(self.pool.clone(), None, settings())
+                .with_clock(clock)
+                .with_metrics(Arc::clone(&self.metrics))
+                .with_two_factor_keys(Some([0x42; 32]), None)
+                .with_storage(store)
+                .with_figcraft(backend, public_url.to_owned()),
+        );
+        self.app = router_with_shared(
+            Capabilities::development_defaults(),
+            &ApiConfig::default(),
+            Some(Arc::clone(&services)),
+        );
+        self.services = services;
+    }
+
     async fn build(
         settings: AuthSettings,
         config: ApiConfig,

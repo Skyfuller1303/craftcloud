@@ -17,6 +17,7 @@ pub mod accounts;
 pub mod audit;
 pub mod device_sessions;
 mod error;
+pub mod figcraft;
 pub mod files;
 pub mod grants;
 pub mod invitations;

@@ -558,6 +558,8 @@ pub async fn reset_for_user(
         .execute(&mut *tx)
         .await?;
     if changed {
+        crate::figcraft::enqueue_all_user_revocations(&mut tx, user_id, "security_changed", now)
+            .await?;
         if let Some(session_id) = keep_session {
             if keep_session_kind == Some("device") {
                 sqlx::query(

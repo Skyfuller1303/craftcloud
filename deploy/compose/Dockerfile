@@ -37,6 +37,9 @@ ENV CARGO_BUILD_JOBS=2 \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY apps/craftcloud-server apps/craftcloud-server
+# Cargo resolves every workspace member, including the SDK demo, even when
+# only the server package is built. No demo binary enters the runtime image.
+COPY apps/craftcloud-egui-demo apps/craftcloud-egui-demo
 COPY crates crates
 # The workspace lists xtask as a member, so its manifest must exist.
 COPY xtask xtask

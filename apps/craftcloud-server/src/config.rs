@@ -66,7 +66,7 @@ const RESERVED_KEYS: [&str; 4] = [
     "SESSION_SECRET_FILE",
 ];
 
-const SUPPORTED_KEYS: [&str; 34] = [
+const SUPPORTED_KEYS: [&str; 37] = [
     "BIND",
     "PUBLIC_URL",
     "TRUSTED_PROXIES",
@@ -101,7 +101,18 @@ const SUPPORTED_KEYS: [&str; 34] = [
     "DEVICE_ABSOLUTE_DAYS",
     "SECRET_KEY_FILE",
     "SECRET_KEY_OLD_FILE",
+    "FIGCRAFT_URL",
+    "FIGCRAFT_PUBLIC_URL",
+    "FIGCRAFT_KEY_FILE",
 ];
+
+/// Optional FigCraft companion service. Secrets are loaded only at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FigcraftSettings {
+    pub internal_url: String,
+    pub public_url: String,
+    pub key_file: PathBuf,
+}
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +194,8 @@ pub struct Config {
     pub secret_key_file: Option<PathBuf>,
     /// Previous key used only to decrypt secrets during rotation.
     pub secret_key_old_file: Option<PathBuf>,
+    /// All three FigCraft settings are required together; absent means disabled.
+    pub figcraft: Option<FigcraftSettings>,
     /// Origin (`scheme://host[:port]`) of the public URL, used for the CSRF
     /// Origin check.
     pub public_origin: Option<String>,
@@ -564,6 +577,30 @@ impl Config {
                 )
             });
 
+        let figcraft = parse_figcraft(env, &mut errors);
+        if figcraft.is_some() {
+            // Four HTTP jobs and the serial worker may each hold a FileGuard
+            // connection. Leave one more connection for their database work.
+            if db_max_connections < 6 {
+                errors.push(ConfigError::new(
+                    "CRAFTCLOUD_DATABASE_MAX_CONNECTIONS",
+                    "must be at least 6 when the FigCraft companion is configured",
+                ));
+            }
+            for (key, present) in [
+                ("SECRET_KEY_FILE", secret_key_file.is_some()),
+                ("DATABASE_URL_FILE", db_url_file.is_some()),
+                ("STORAGE_DIR", storage_dir.is_some()),
+            ] {
+                if !present {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{key}"),
+                        "required when the FigCraft companion is configured",
+                    ));
+                }
+            }
+        }
+
         // Range-checked above, so the conversion cannot fail; the fallback
         // keeps the code free of panics regardless.
         let max_body_bytes = usize::try_from(max_body_bytes).unwrap_or(usize::MAX);
@@ -587,6 +624,7 @@ impl Config {
                 bootstrap_secret_file,
                 secret_key_file,
                 secret_key_old_file,
+                figcraft,
                 public_origin,
                 cookie_secure,
                 session_idle_timeout: Duration::from_secs(session_idle_minutes * 60),
@@ -613,6 +651,63 @@ impl Config {
             Err(errors)
         }
     }
+}
+
+fn parse_figcraft(
+    env: &BTreeMap<String, String>,
+    errors: &mut Vec<ConfigError>,
+) -> Option<FigcraftSettings> {
+    let names = ["FIGCRAFT_URL", "FIGCRAFT_PUBLIC_URL", "FIGCRAFT_KEY_FILE"];
+    if !names
+        .iter()
+        .any(|name| env.contains_key(&format!("{PREFIX}{name}")))
+    {
+        return None;
+    }
+    for name in names {
+        if !env.contains_key(&format!("{PREFIX}{name}")) {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}{name}"),
+                "all three FigCraft settings must be configured together",
+            ));
+        }
+    }
+    let internal_url = field(errors, env, "FIGCRAFT_URL", |key, value| {
+        parse_figcraft_url(key, value, false)
+    });
+    let public_url = field(errors, env, "FIGCRAFT_PUBLIC_URL", |key, value| {
+        parse_figcraft_url(key, value, true)
+    });
+    let key_file = field(errors, env, "FIGCRAFT_KEY_FILE", parse_absolute_path);
+    Some(FigcraftSettings {
+        internal_url: internal_url?,
+        public_url: public_url?,
+        key_file: key_file?,
+    })
+}
+
+fn parse_figcraft_url(key: &str, raw: &str, public: bool) -> Result<String, ConfigError> {
+    let invalid = || {
+        ConfigError::new(
+            key,
+            "must be an absolute ws/wss URL without credentials, query, fragment or whitespace; public ws is allowed only on loopback (value not shown)",
+        )
+    };
+    if raw.len() > 2048 || raw.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let url = Url::parse(raw).map_err(|_| invalid())?;
+    let host = url.host().ok_or_else(invalid)?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.scheme(), "ws" | "wss")
+        || (public && url.scheme() == "ws" && !is_loopback_host(&host))
+    {
+        return Err(invalid());
+    }
+    Ok(url.to_string())
 }
 
 /// Whether two listen addresses would compete for the same socket: the same
@@ -1455,5 +1550,71 @@ mod tests {
         // Without the UI a path in the public URL stays allowed.
         let without = env(&[("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.org/craft")]);
         assert!(Config::from_env_map(&without).is_ok());
+    }
+
+    #[test]
+    fn figcraft_is_optional_but_incomplete_configuration_is_rejected() {
+        assert!(Config::from_env_map(&env(&[])).unwrap().figcraft.is_none());
+        let errors = errors_of(&[("CRAFTCLOUD_FIGCRAFT_URL", "ws://figcraft:47900/")]);
+        assert!(keys(&errors).contains(&"CRAFTCLOUD_FIGCRAFT_PUBLIC_URL"));
+        assert!(keys(&errors).contains(&"CRAFTCLOUD_FIGCRAFT_KEY_FILE"));
+        let path = std::env::temp_dir().join("synthetic-key");
+        let path = path.to_string_lossy();
+        let configured = env(&[
+            ("CRAFTCLOUD_FIGCRAFT_URL", "ws://figcraft:47900/"),
+            (
+                "CRAFTCLOUD_FIGCRAFT_PUBLIC_URL",
+                "wss://cloud.example/figcraft/",
+            ),
+            ("CRAFTCLOUD_FIGCRAFT_KEY_FILE", &path),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", &path),
+            ("CRAFTCLOUD_DATABASE_URL_FILE", &path),
+            ("CRAFTCLOUD_STORAGE_DIR", &path),
+        ]);
+        let config = Config::from_env_map(&configured).unwrap();
+        assert_eq!(
+            config.figcraft.unwrap().public_url,
+            "wss://cloud.example/figcraft/"
+        );
+        for required in ["SECRET_KEY_FILE", "DATABASE_URL_FILE", "STORAGE_DIR"] {
+            let mut incomplete = configured.clone();
+            incomplete.remove(&format!("CRAFTCLOUD_{required}"));
+            assert!(Config::from_env_map(&incomplete).is_err());
+        }
+        for limit in 1..=6 {
+            let mut limited = configured.clone();
+            limited.insert(
+                "CRAFTCLOUD_DATABASE_MAX_CONNECTIONS".into(),
+                limit.to_string(),
+            );
+            assert_eq!(Config::from_env_map(&limited).is_ok(), limit == 6);
+        }
+        assert!(
+            Config::from_env_map(&env(&[("CRAFTCLOUD_DATABASE_MAX_CONNECTIONS", "1")])).is_ok()
+        );
+    }
+
+    #[test]
+    fn figcraft_urls_preserve_prefix_and_reject_credential_or_transport_leaks() {
+        for valid in [
+            "wss://cloud.example/figcraft/",
+            "ws://localhost:47900/",
+            "ws://[::1]:47900/",
+        ] {
+            assert!(parse_figcraft_url("FIGCRAFT_PUBLIC_URL", valid, true).is_ok());
+        }
+        assert!(parse_figcraft_url("FIGCRAFT_URL", "ws://figcraft:47900/", false).is_ok());
+        for bad in [
+            "ws://cloud.example/",
+            "https://cloud.example/",
+            "wss://user:private@cloud.example/",
+            "wss://cloud.example/?key=private",
+            "wss://cloud.example/#private",
+            "wss://cloud.example/with space",
+        ] {
+            let error = parse_figcraft_url("FIGCRAFT_PUBLIC_URL", bad, true).unwrap_err();
+            assert!(!error.message.contains("private"));
+            assert!(!error.message.contains(bad));
+        }
     }
 }

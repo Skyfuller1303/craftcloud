@@ -90,6 +90,7 @@ export function VersionsDialog({
                     {version.number}
                     {version.id === head ? ` · ${t("Current")}` : ""}
                     {version.restored_from_version_id !== null ? ` · ${t("Restored")}` : ""}
+                    {version.actor_kind === "figcraft_live" ? ` · ${t("FigCraft Live")}` : ""}
                   </th>
                   <td className="numeric" data-label={t("Size")}>{formatBytes(language, version.size_bytes)}</td>
                   <td className="numeric" data-label={t("Saved")}>{formatDateTime(language, version.created_at)}</td>

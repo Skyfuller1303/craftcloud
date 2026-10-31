@@ -1,0 +1,53 @@
+# ADR-0022: FigCraft-Live als Begleitdienst
+
+- **Status:** Lokal umgesetzt; das Machbarkeitsgate A1–A4 ist bestätigt. Veröffentlichung und Maintainer-Abstimmung stehen aus.
+- **Datum:** 2026-10-30
+- **Bezug:** AC-06, CC-F16; ersetzt die Zurückstellung der Begleitdienst-Integration in ADR-0007. Native Konten und Capabilities im FigCraft-Protokoll bleiben zurückgestellt.
+
+## Kontext
+
+CraftCloud soll den unveränderten FigCraft-Server betreiben und dessen bestehendes Verwaltungsprotokoll verwenden. Der lokale Spike untersucht den gepinnten FigCraft-Commit `ddda495a6ff40c326a117fbc393a8cfaa319f529`. FigCraft-Quelltext und Protokoll bleiben unverändert.
+
+## Machbarkeitsgate
+
+Vor der fachlichen Integration müssen Veröffentlichung eines nativen Dokuments, persönliche Edit-/View-Links samt Widerruf und der Online-Export eines ladbaren nativen Dokuments praktisch nachgewiesen sein. Der Spike untersucht außerdem das Verhalten hinter einem Pfadpräfix. Ohne bestätigte A1 bis A3 beschränkt sich die Umsetzung auf Begleitdienst und Konfiguration; sie darf keine funktionierende Live-Integration vortäuschen.
+
+## Vorgesehene Sicherheitsgrenzen
+
+CraftCloud bleibt die Berechtigungsautorität. Ein FigCraft-Link ist technisch ein übertragbares Bearer-Geheimnis, auch wenn CraftCloud ihn einer Person zuordnet. Tokens dürfen weder in Logs noch in Audit-Ereignisse gelangen. Rechteentzug benötigt eine transaktionale Outbox und wiederholbaren Widerruf außerhalb der Datenbanktransaktion. Ein periodischer Abgleich allein genügt nicht.
+
+## Entscheidung und nachgewiesene Grenzen
+
+Der unveränderte FigCraft-Commit `ddda495a6ff40c326a117fbc393a8cfaa319f529` wird als optionaler Begleitdienst betrieben. `Manage` und `Admin::Publish`, `CreateLink`, `Revoke` sowie ein authentifizierter Welcome-Snapshot tragen die Integration ohne Protokolländerung. Der native Spike belegt Editor-/Viewer-Trennung, das Trennen einer aktiven Verbindung beim Widerruf, Neustartpersistenz und den Pfad `/figcraft/`. Die gemessenen Läufe und ihre Grenzen stehen im AC-06-Abnahmebericht; die native Widerrufsmessung von 1 ms ist ausdrücklich keine zugesicherte Ende-zu-Ende-Latenz eines CraftCloud-Rechteentzugs.
+
+Der Export erhält den aktuellen synchronisierten Dokumentzustand. Historie, Branches, Vorschaubild und veröffentlichte Library sind teilweise nicht Bestandteil dieses Zustands und werden deshalb aus der unveränderlichen `published_from_version_id` ergänzt. Ein bloßer Export der Replica würde diese Archivteile verlieren und ist verworfen. Der Adapter lädt das Ergebnis erneut; reparierte, abgeschnittene oder übergroße Eingaben werden abgelehnt. Der unterstützte Umfang ist auf 64 MiB je nativem Dokument begrenzt.
+
+CraftCloud speichert persönliche Links verschlüsselt mit dem Schlüsselbund aus AC-02 und bindet die Verschlüsselung an Datei, Person und Zugriffsart. Erneuern widerruft den bisherigen Link. Der Dialog hält den Link nur im Arbeitsspeicher und erklärt seine Übertragbarkeit. Automatisch bei Veröffentlichung erzeugte FigCraft-Links werden widerrufen. Temporäre Exportlinks haben einen wiedererkennbaren Marker; der nächste Export bereinigt nach einem Transportfehler zurückgebliebene Links, bevor er einen neuen anlegt.
+
+Rechteänderung und Widerrufsauftrag werden in derselben Organisationstransaktion gespeichert. Der Worker verarbeitet die dauerhafte Outbox außerhalb der Transaktion und wiederholt Fehler. Ein zusätzlicher vollständiger, paginierter Rechteabgleich läuft alle fünf Minuten. Bei nicht erreichbarem FigCraft-Server ist sofortiger Widerruf nicht garantierbar: bereits verbundene Personen können bis zur Wiederherstellung weiterarbeiten. Ein Intervall allein wäre gegenüber einem Absturz nach dem Commit zu schwach; ein ausgehender Aufruf unter der Organisationstransaktion würde fremde Schreiboperationen blockieren.
+
+Snapshots verwenden denselben Quota-, Blob- und Versionspfad wie normale Uploads. Der interne Akteur `FigcraftLive` wird in der zentralen Policy ausschließlich für die konkrete Organisation, den Workspace und die aktive oder gerade beendete Live-Datei freigeschaltet. Er besitzt weder Benutzerkonto noch Sitzung und erhält keine sonstigen Benutzerrechte. `created_by` bewahrt die veröffentlichende Person als Herkunft; `actor_kind = figcraft_live` und der System-Audit unterscheiden die automatische Sicherung von einer Handlung dieser Person. Ein erfundener Admin-Akteur oder eine privilegierte Login-Sitzung sind verworfen.
+
+Externes Speichern und Wiederherstellen einer Version sind während des Livebetriebs mit `409 FILE_IS_LIVE` gesperrt. Das Beenden speichert zuerst den dauerhaften Beendigungszustand, widerruft die Links, sichert den danach eingefrorenen Stand und entfernt erst anschließend die entfernte Datei. Wiederholung und Worker-Recovery dürfen keinen ungesicherten entfernten Stand löschen. Automatische Sicherungen erfolgen nach 15 Minuten nur bei geändertem Inhalt.
+
+Compose verwendet ein internes Netz, eine nicht beschreibbare Root-Dateisystemschicht, einen unprivilegierten FigCraft-Prozess und eigene Volumes. Caddy reicht den bestätigten Pfad unverändert über WSS weiter. Open-Publish bleibt aus. Der Verwaltungszugriff ist ein getrenntes Secret; nur CraftCloud und der FigCraft-Dienst erhalten es. Der Browser erhält diesen Schlüssel niemals. Der synchrone Adapter begrenzt jeden Aufruf absolut auf 30 Sekunden und schließt den Socket bei Fristablauf; ein bloßer Inaktivitätstimeout schützt nicht gegen langsam fortschreitende Frames.
+
+Ein CraftCloud-Backup umfasst die letzten gesicherten Dateiversionen, nicht den laufenden FigCraft-Operationslog. Restore markiert Live-Dateien zum erneuten Veröffentlichen und widerruft ihre alten Linkdatensätze. Der Betreiber muss eine alte FigCraft-Instanz abtrennen und einen leeren Datenbestand verwenden; eine Datenbankwiederherstellung kann extern noch laufende Bearer-Links nicht rückwirkend entwerten. Ein Downgrade erfordert eine isolierte Wiederherstellung eines passenden älteren Backups, kein Entfernen der Migration aus dem laufenden Schema.
+
+### Abbruch und Wiederholung
+
+Bei aktivierter FigCraft-Integration muss der Datenbankpool mindestens sechs Verbindungen erlauben. Vier HTTP-Aufgaben und der serielle Worker können jeweils eine Verbindung für eine dateibezogene Advisory-Sperre halten; eine weitere Verbindung muss für ihre Datenbankarbeit verfügbar bleiben. Kleinere Pools werden beim Serverstart ausdrücklich abgelehnt, statt Live-Aufgaben erst durch Pooltimeouts scheitern zu lassen. Ohne FigCraft bleibt die bisherige Untergrenze von einer Verbindung gültig. Prüfungen innerhalb einer bereits geöffneten Organisationstransaktion verwenden deren Verbindung und fordern keine zusätzliche Poolverbindung an.
+
+Die drei schreibenden Live-Routen laufen nach erfolgreicher Zulassung in höchstens vier eigenen Aufgaben weiter. Ein HTTP-Timeout oder ein abgebrochener Client darf eine bereits ausgeführte entfernte Aktion nicht von ihrer Datenbankpersistierung oder Kompensation trennen. Ein erneuter Aufruf liest den abgeschlossenen Zustand oder erhält vorübergehend `FIGCRAFT_BUSY`. Neue Aufgaben werden beim Herunterfahren abgewiesen. HTTP-Verbindungen, Live-Aufgaben, Wartungsaufgaben und Datenbankpool erhalten jeweils eine begrenzte Drainphase; anschließend beendet ein separates Runtime-Zeitlimit das Warten auf blockierende Threads. Diese Phasen sind zusammen länger als ein einzelnes `shutdown_grace`-Intervall.
+
+Das ist keine Exactly-once-Garantie über einen Prozess- oder Hostabsturz hinweg. Ein harter Abbruch zwischen entferntem Erfolg und Speicherung seiner ID kann eine entfernte Datei oder einen nicht ausgegebenen Link hinterlassen. Solche Einträge gewähren ohne ihr unbekanntes Token keinen neuen Benutzerzugriff, belegen aber Kapazität im Begleitdienst. Eine automatische Inventarbereinigung über beide Systeme ist Folgearbeit; nach erzwungenem Abbruch muss der Betreiber den Begleitdienst prüfen. Normale HTTP-Abbrüche werden durch die weiterlaufende Aufgabe behandelt. Bei DNS-Störungen bleibt höchstens ein nicht abbrechbarer OS-Resolver zurück; weitere Anfragen warten nur bis zu ihrer eigenen Frist. IP-Adressen benötigen keinen Resolver.
+
+Dateien und Projekte mit aktiven Live-Dateien können erst nach bestätigtem Ende in den Papierkorb verschoben werden (`409 FILE_IS_LIVE`). Ein unmittelbares Löschen des Begleitdienststands oder ein vorgetäuschtes `final_snapshot_done` würde ungesicherte Änderungen verlieren und ist ausgeschlossen.
+
+### Gemessener Widerruf
+
+Die lokale PostgreSQL-Abnahme mit echtem FigCraft-Server maß am 30.10.2026 vom CraftCloud-Grantentzug bis zum Ende der aktiven WebSocket-Verbindung zuletzt 1.027 ms; das Maximum aller protokollierten nativen API-Läufe betrug 1.047 ms. Der abschließende Compose-Lauf über verifiziertes HTTPS/WSS maß bei persönlicher Linkerneuerung 2.063 ms; ein früherer erfolgreicher Compose-Lauf hatte 2.083 ms gemessen. Das sind unterschiedliche Messpfade und beobachtete lokale Werte, keine zugesicherte Obergrenze unter beliebiger Last oder bei Ausfall des Begleitdiensts. Der Outbox-Worker prüft neue Arbeit im Sekundentakt; der zusätzliche Rechteabgleich erfolgt alle fünf Minuten. Die vollständigen Laufbelege und der endgültige Compose-Nachweis stehen im AC-06-Bericht.
+
+## Alternativen und Abstimmung
+
+Eine eigene Live-Engine und Änderungen am FigCraft-Protokoll sind ausgeschlossen. Native CraftCloud-Capabilities im FigCraft-Protokoll bleiben eine spätere gemeinsame Entscheidung mit FigCraft-Maintainern und CraftHub. Es erfolgen keine Veröffentlichungen oder Kontaktaufnahmen im Rahmen dieses lokalen Auftrags.

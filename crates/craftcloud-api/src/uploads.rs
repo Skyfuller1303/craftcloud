@@ -361,6 +361,20 @@ pub(crate) async fn upload_write_gate(
         Some(resolved.id),
     ) {
         Gate::Open(permit) => {
+            if matches!(action, Action::UploadWrite | Action::VersionCommit) {
+                let live = tx.figcraft_blocks_write(file_id).await;
+                match live {
+                    Ok(true) => {
+                        return Err(Box::new(conflict(
+                            "FILE_IS_LIVE",
+                            "Stop FigCraft Live before committing another version.",
+                            headers,
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(_) => return Err(Box::new(internal(headers))),
+                }
+            }
             if action == Action::VersionCommit {
                 match tx.file_lock(file_id).await {
                     Ok(Some(lock)) if lock.holder_session_id != session.session_id => {

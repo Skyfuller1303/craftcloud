@@ -35,7 +35,39 @@ Die Datenbank-Sicherung enthält die verschlüsselten TOTP-Geheimnisse und die g
 
 Ein Downgrade auf eine Version ohne AC-02 ist kein unterstützter Rückweg: Alte Server verstehen weder die 2FA-Anmeldepflicht noch das neue Schema. Ein geplanter Rückweg erfordert eine isolierte Wiederherstellung eines passenden früheren Backups und eine ausdrückliche Sicherheitsentscheidung; entfernen Sie nicht bloß Tabellen oder Spalten aus der laufenden Instanz. Weitere Restore-Grenzen stehen im [Backup-Runbook](backup-upgrade-runbook.md).
 
-## Minimaler MVP-Stack
+## Optionaler FigCraft-Begleitdienst (AC-06)
+
+Mit FigCraft muss `CRAFTCLOUD_DATABASE_MAX_CONNECTIONS` mindestens `6` betragen; der Standard `10` erfüllt dies. Vier gleichzeitig zugelassene Live-Anfragen und der serielle Worker können fünf Advisory-Lock-Verbindungen belegen, während eine weitere Verbindung den Fortschritt ihrer Datenbankoperationen ermöglicht. Eine kleinere Konfiguration wird beim Start abgelehnt. Ohne FigCraft sind weiterhin kleinere Pools erlaubt.
+
+Nach Migration `0018_figcraft_live.sql` aktiviert CraftCloud die Funktion nur, wenn alle drei Variablen `CRAFTCLOUD_FIGCRAFT_URL`, `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` und `CRAFTCLOUD_FIGCRAFT_KEY_FILE` gesetzt sind. Zusätzlich werden Datenbank, Dateispeicher und der aktuelle Verschlüsselungsschlüssel `CRAFTCLOUD_SECRET_KEY_FILE` benötigt. Eine unvollständige oder ungültige Konfiguration bricht den Start ab. Ohne die drei Variablen bleibt die Funktion ausgeschaltet; `/api/v1/info` meldet `figcraft_live: false`.
+
+| Variable | Bedeutung |
+|---|---|
+| `CRAFTCLOUD_FIGCRAFT_URL` | Interner Verwaltungsendpunkt, in Compose `ws://figcraft:47900/`; `ws` ist nur im vertrauenswürdigen internen Netz vorgesehen. |
+| `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` | Öffentlich erreichbarer Endpunkt in persönlichen Links, normalerweise `wss://<Cloud-Domain>/figcraft/`. Unverschlüsseltes `ws` wird nur für Loopback akzeptiert. |
+| `CRAFTCLOUD_FIGCRAFT_KEY_FILE` | Absolute geschützte Datei mit dem FigCraft-Verwaltungsschlüssel; nicht der AC-02-Verschlüsselungsschlüssel. |
+| `CRAFTCLOUD_FIGCRAFT_SECRET_FILE` | Nur Compose: Hostdatei mit 64 zufälligen Hex-Zeichen, aus der `figcraft-init` den Verwaltungsschlüssel bereitstellt. |
+| `CRAFTCLOUD_FIGCRAFT_IMAGE` | Nur Compose: optionaler Name für das lokal gebaute, auf Commit und Archivprüfsumme gepinnte Begleitdienst-Image. |
+
+URLs dürfen weder Zugangsdaten noch Query oder Fragment enthalten. Legen Sie die Host-Schlüsseldatei außerhalb des Repositorys mit restriktiven Dateirechten an, etwa `umask 077; openssl rand -hex 32 > /geschuetzter/pfad/figcraft.key`, und tragen Sie ihren absoluten Pfad in `.env` ein. Die vorhandene Vorlage erzeugt diesen zusätzlichen Schlüssel nicht automatisch. Behandeln Sie ihn wie ein Administratorpasswort: Er verwaltet sämtliche Dokumente des Begleitdienstes.
+
+Start mit dem optionalen Overlay:
+
+```sh
+docker compose -f compose.yaml -f compose.setup.yaml -f compose.figcraft.yaml up -d --build
+```
+
+`figcraft-init` schreibt den Schlüssel mit Modus 0400 und Eigentümer 65532 in das eigene Datenvolume und ein separates, nur vom CraftCloud-Server gelesenen Schlüsselvolume. Der laufende FigCraft-Prozess ist nonroot, hat eine schreibgeschützte Root-Dateisystemschicht, kein veröffentlichtes Host-Port und ausschließlich ein internes Netz. Caddy reicht `/figcraft/` unverändert weiter. Open-Publish ist ausgeschaltet; der Begleitdienst importiert nur über den Verwaltungsschlüssel. Die Konfiguration begrenzt native Dokumente auf 64 MiB, Dateien auf 1000, Links je Datei auf 1000 und gleichzeitige Verbindungen auf 128. Größere Installationen benötigen bewusst angepasste Grenzen und Lasttests. Der Standardstack ohne Overlay erhält keine FigCraft-Route.
+
+Nach einem Neustart desselben FigCraft-Datenvolumes funktionieren bestehende persönliche Links weiter. Nach einem **Restore** gilt dagegen das [Backup-Runbook](backup-upgrade-runbook.md): alte Instanz abtrennen, leeres FigCraft-Volume verwenden, Dateien erneut veröffentlichen. Das bloße Entfernen des Overlays widerruft keine bereits ausgegebenen Links; beenden Sie die Live-Dateien vorher und prüfen Sie deren letzte gesicherte Version.
+
+Snapshots werden bei Änderungen alle 15 Minuten erstellt. Bei Quota-, Speicher- oder Verbindungsfehlern bleibt der entfernte Stand erhalten und die Sicherung wird wiederholt; erfolgreiche Sicherungen erscheinen im Versionsdialog als „FigCraft Live“. Zum geplanten Abschalten eines Live-Dokuments verwenden Sie „Livebetrieb beenden“ und warten auf den bestätigten Abschluss. Ein Prozessstopp oder Backup allein garantiert keine Abschlusssicherung. Rechteentzug wird über eine dauerhafte Outbox wiederholt; ein Ausfall des Begleitdienstes kann den Widerruf verzögern. Beobachten Sie ausstehende Zustände und Serverfehler, bevor Sie von einer abgeschlossenen Sperrung ausgehen.
+
+Der Begleitdienst speichert Dokumente unverschlüsselt auf seinem Datenvolume. Host- und Docker-Zugriff bleiben privilegiert. Die öffentliche TLS-Verbindung schützt den Transport, ersetzt aber weder Volume-Verschlüsselung noch verschlüsselte, getrennt aufbewahrte Backups. Details und Alternativen stehen in [ADR-0022](../09-decisions/adr-0022-figcraft-live-hosting.md).
+
+Eine schreibende Live-Aktion kann nach einem HTTP-Timeout noch fertig werden. Laden Sie ihren Status neu, bevor Sie erneut veröffentlichen oder beenden. Höchstens vier solche Aktionen laufen gleichzeitig. Beim Herunterfahren gibt es mehrere begrenzte Drainphasen; `CRAFTCLOUD_SHUTDOWN_GRACE_SECS` ist deshalb keine Obergrenze für die gesamte Prozesslaufzeit nach SIGTERM. Ein erzwungener Prozess- oder Hostabbruch kann zwischen FigCraft-Erfolg und Datenbankpersistierung entfernte Einträge ohne bekannte Cloud-ID hinterlassen. Prüfen Sie danach die Dateiliste des Begleitdienstes und seine Kapazität; eine automatische Bereinigung solcher Einträge ist noch nicht implementiert.
+
+## Minimaler MVP-Stack (ohne Begleitdienst)
 
 - `craftcloud-server`: Rust service (axum, siehe ADR-0010), listens only in private network/loopback; runs as non-root.
 - `postgres`: single supported primary production database; persistent volume, backups.

@@ -20,6 +20,7 @@ import type { UploadTarget } from "./UploadDialog.tsx";
 import { VersionsDialog } from "./VersionsDialog.tsx";
 import { SharingDialog } from "./SharingDialog.tsx";
 import type { ShareTarget } from "./SharingDialog.tsx";
+import { FigcraftLiveDialog, useFigcraftAvailable } from "./FigcraftLiveDialog.tsx";
 
 export function FilesScreen({
   scope,
@@ -39,6 +40,9 @@ export function FilesScreen({
   const [trashing, setTrashing] = useState<FileRecord | null>(null);
   const [unlocking, setUnlocking] = useState<FileRecord | null>(null);
   const [sharing, setSharing] = useState<ShareTarget | null>(null);
+  const [liveFile, setLiveFile] = useState<FileRecord | null>(null);
+  const liveAvailable = useFigcraftAvailable();
+  useEffect(() => { setLiveFile(null); }, [projectId, scope.organization?.id]);
   const trashAction = useAction();
   const restoreAction = useAction();
   const unlockAction = useAction();
@@ -241,6 +245,9 @@ export function FilesScreen({
                               {t("Share")}
                             </Button>
                           )}
+                          {!showTrash && liveAvailable && file.app === "figcraft" && file.head_version_id !== null && (
+                            <Button className="button button--sm" aria-label={t("Open {name} live", { name: file.name })} onPress={() => setLiveFile(file)}>{t("Open live")}</Button>
+                          )}
                           {!showTrash && mayWrite && (
                             <Button
                               className="button button--sm"
@@ -304,6 +311,7 @@ export function FilesScreen({
         <UploadDialog target={uploading} onChanged={files.refresh} onClose={() => setUploading(null)} />
       )}
 
+      {liveFile !== null && <FigcraftLiveDialog key={liveFile.id} fileId={liveFile.id} name={liveFile.name} onClose={() => setLiveFile(null)} onChanged={() => files.refresh()} />}
       {versionsOf !== null && (
         <VersionsDialog
           file={versionsOf}

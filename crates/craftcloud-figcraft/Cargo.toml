@@ -1,0 +1,22 @@
+[package]
+name = "craftcloud-figcraft"
+description = "CraftCloud adapter for managing persistent FigCraft live sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+figcraft-collab.workspace = true
+figcraft-doc.workspace = true
+figcraft-format.workspace = true
+tungstenite.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+zip.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -636,3 +636,34 @@
 	Changing the password signs out your other browser sessions and all registered devices.	Changing the password signs out your other browser sessions and all registered devices.
 	Change password	Change password
 	Old password	Old password
+
+# FigCraft Live (AC-06)
+	Open live	Open live
+	Open {name} live	Open {name} live
+	Live in FigCraft: {name}	Live in FigCraft: {name}
+	Your personal link follows your CraftCloud permissions. Anyone you give this link to can use your access. Renew it to invalidate the old link.	Your personal link follows your CraftCloud permissions. Anyone you give this link to can use your access. Renew it to invalidate the old link.
+	While this file is live, save changes in FigCraft. Regular cloud uploads are unavailable until live collaboration ends.	While this file is live, save changes in FigCraft. Regular cloud uploads are unavailable until live collaboration ends.
+	Loading live status…	Loading live status…
+	Live collaboration is active.	Live collaboration is active.
+	Live collaboration is changing. Refresh the status shortly.	Live collaboration is changing. Refresh the status shortly.
+	Creating a link starts live collaboration from the current version.	Creating a link starts live collaboration from the current version.
+	Your access: edit	Your access: edit
+	Your access: view	Your access: view
+	Last cloud snapshot: {time}	Last cloud snapshot: {time}
+	Connected participants: {count}	Connected participants: {count}
+	Personal FigCraft link	Personal FigCraft link
+	Open in FigCraft	Open in FigCraft
+	Show personal link	Show personal link
+	Renew link	Renew link
+	Save cloud snapshot	Save cloud snapshot
+	Cloud snapshot saved.	Cloud snapshot saved.
+	End live collaboration	End live collaboration
+	Disconnect everyone and save the final live state as a cloud version?	Disconnect everyone and save the final live state as a cloud version?
+	The server returned an invalid FigCraft link.	The server returned an invalid FigCraft link.
+	FigCraft Live	FigCraft Live
+
+# FigCraft Live (AC-06)
+	This file is being edited live in FigCraft. Save changes there or ask a workspace administrator to end live collaboration before uploading a version.	This file is being edited live in FigCraft. Save changes there or ask a workspace administrator to end live collaboration before uploading a version.
+	FigCraft live collaboration is unavailable. Try again later.	FigCraft live collaboration is unavailable. Try again later.
+	Another live operation is in progress. Reload and try again shortly.	Another live operation is in progress. Reload and try again shortly.
+	Live collaboration requires an intact native .figcraft file.	Live collaboration requires an intact native .figcraft file.

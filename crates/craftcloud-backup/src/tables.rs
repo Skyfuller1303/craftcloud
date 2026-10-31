@@ -63,6 +63,9 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("grants", 16),
     table("user_two_factor", 17),
     table("user_two_factor_recovery_codes", 17),
+    table("figcraft_live_files", 18),
+    table("figcraft_links", 18),
+    table("figcraft_outbox", 18),
     table("audit_events", 11),
 ];
 
@@ -173,13 +176,14 @@ mod tests {
     fn the_table_set_follows_the_migration_version() {
         // AC-03 adds grants at 16; AC-02 adds factor state and ephemeral
         // challenges at 17.
+        // AC-06 adds the three FigCraft state tables at 18.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len() - 3
+            BACKUP_TABLES.len() - 6
         );
         assert_eq!(
             backup_tables_for(14).unwrap().len(),
-            BACKUP_TABLES.len() - 3
+            BACKUP_TABLES.len() - 6
         );
         assert_eq!(
             excluded_tables_for(14),
@@ -206,7 +210,7 @@ mod tests {
         assert!(!excluded_tables_for(15).contains(&"file_locks"));
         assert_eq!(
             backup_tables_for(16).unwrap().len(),
-            BACKUP_TABLES.len() - 2
+            BACKUP_TABLES.len() - 5
         );
         assert_eq!(
             excluded_tables_for(16),

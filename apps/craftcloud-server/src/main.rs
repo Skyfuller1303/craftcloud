@@ -206,8 +206,23 @@ fn init_tracing(format: LogFormat) {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("craftcloud-server: cannot initialize async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+async fn async_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = match parse_args(&args) {
         Ok(Command::Help) => {
@@ -434,6 +449,37 @@ fn load_two_factor_key(path: Option<&std::path::PathBuf>) -> Option<[u8; 32]> {
         tracing::warn!("two-factor secret key must decode to exactly 32 bytes");
     }
     key
+}
+
+struct LoadedFigcraft {
+    client: std::sync::Arc<dyn craftcloud_figcraft::Backend>,
+    public_url: String,
+}
+
+fn load_figcraft(
+    config: &Config,
+    encryption_available: bool,
+) -> Result<Option<LoadedFigcraft>, Failure> {
+    let Some(settings) = &config.figcraft else {
+        return Ok(None);
+    };
+    if !encryption_available {
+        return Err(Failure::config(
+            "FigCraft requires a usable CRAFTCLOUD_SECRET_KEY_FILE; refusing to start without token encryption",
+        ));
+    }
+    let key = secret::load_secret_file(&settings.key_file).map_err(|_| {
+        Failure::config("CRAFTCLOUD_FIGCRAFT_KEY_FILE is unavailable or has unsafe permissions")
+    })?;
+    let client =
+        craftcloud_figcraft::Client::new(&settings.internal_url, key.expose().trim().to_owned())
+            .map_err(|_| {
+                Failure::config("FigCraft endpoint or server key is invalid (value not shown)")
+            })?;
+    Ok(Some(LoadedFigcraft {
+        client: std::sync::Arc::new(client),
+        public_url: settings.public_url.clone(),
+    }))
 }
 
 /// Offline recovery: prints a single-use reset link to stdout. The token is
@@ -921,6 +967,7 @@ async fn run(config: Config) -> Result<(), Failure> {
     let metrics_token = load_metrics_token(&config)?;
     let two_factor_key = load_two_factor_key(config.secret_key_file.as_ref());
     let two_factor_old_key = load_two_factor_key(config.secret_key_old_file.as_ref());
+    let figcraft = load_figcraft(&config, two_factor_key.is_some())?;
     if two_factor_key.is_none() {
         tracing::warn!("two-factor setup is unavailable: current secret key is not usable");
     }
@@ -1078,6 +1125,10 @@ async fn run(config: Config) -> Result<(), Failure> {
             Some(store) => services.with_storage(store),
             None => services,
         };
+        let services = match figcraft {
+            Some(loaded) => services.with_figcraft(loaded.client, loaded.public_url),
+            None => services,
+        };
         std::sync::Arc::new(if store_refused {
             services.with_storage_refused()
         } else {
@@ -1095,6 +1146,12 @@ async fn run(config: Config) -> Result<(), Failure> {
         &api_config,
         services.clone(),
     );
+    let figcraft_task = services.as_ref().map(|services| {
+        tokio::spawn(craftcloud_api::run_figcraft_worker(
+            std::sync::Arc::clone(services),
+            stop_maintenance.subscribe(),
+        ))
+    });
     let router = match admin_ui {
         Some(assets) => {
             tracing::info!("serving the admin UI under /admin");
@@ -1146,8 +1203,24 @@ async fn run(config: Config) -> Result<(), Failure> {
     let outcome = server::serve(listener, router, shutdown, config.shutdown_grace)
         .await
         .map_err(Failure::runtime);
+    if let Some(services) = &services
+        && tokio::time::timeout(config.shutdown_grace, services.drain_figcraft_jobs())
+            .await
+            .is_err()
+    {
+        tracing::warn!("FigCraft HTTP operations did not drain before the shutdown deadline");
+    }
     // Stop the maintenance loop between items; a run in progress finishes its item.
     let _ = stop_maintenance.send(true);
+    if let Some(mut task) = figcraft_task
+        && tokio::time::timeout(config.shutdown_grace, &mut task)
+            .await
+            .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+        tracing::warn!("FigCraft worker stopped at shutdown deadline; durable work remains queued");
+    }
     if let Some(task) = metrics_task
         && tokio::time::timeout(config.shutdown_grace, task)
             .await
@@ -1169,8 +1242,12 @@ async fn run(config: Config) -> Result<(), Failure> {
             tracing::warn!("shut down after grace period; some connections were cut");
         }
     }
-    if let Some(pool) = pool {
-        pool.close().await;
+    if let Some(pool) = pool
+        && tokio::time::timeout(config.shutdown_grace, pool.close())
+            .await
+            .is_err()
+    {
+        tracing::warn!("database pool did not close before the shutdown deadline");
     }
     Ok(())
 }

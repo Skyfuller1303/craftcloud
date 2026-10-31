@@ -12,6 +12,7 @@ members = [
     "crates/craftcloud-auth",
     "crates/craftcloud-db",
     "crates/craftcloud-storage",
+    "crates/craftcloud-figcraft",
     "xtask",
 ]
 
@@ -29,6 +30,7 @@ craftcloud-backup = { path = "crates/craftcloud-backup" }
 craftcloud-db = { path = "crates/craftcloud-db" }
 craftcloud-auth = { path = "crates/craftcloud-auth" }
 craftcloud-storage = { path = "crates/craftcloud-storage" }
+craftcloud-figcraft = { path = "crates/craftcloud-figcraft" }
 argon2 = { version = "0.5", features = ["std"] }
 aes-gcm = "0.10"
 hmac = "0.12"
@@ -48,6 +50,11 @@ tower-http = { version = "0.6", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "json"] }
 url = { version = "2", default-features = false, features = ["std"] }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+zip = { version = "=2.6.1", default-features = false, features = ["deflate"] }
+figcraft-collab = { git = "https://github.com/storytold/figcraft", rev = "ddda495a6ff40c326a117fbc393a8cfaa319f529" }
+figcraft-doc = { git = "https://github.com/storytold/figcraft", rev = "ddda495a6ff40c326a117fbc393a8cfaa319f529" }
+figcraft-format = { git = "https://github.com/storytold/figcraft", rev = "ddda495a6ff40c326a117fbc393a8cfaa319f529" }
 ipnet = "2"
 zeroize = "1"
 unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }

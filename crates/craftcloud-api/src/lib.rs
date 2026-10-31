@@ -15,6 +15,8 @@ mod auth;
 mod client_ip;
 mod clock;
 mod device;
+mod figcraft;
+mod figcraft_jobs;
 mod files;
 mod grants;
 mod health;
@@ -40,6 +42,7 @@ mod workspaces;
 pub use client_ip::ClientIp;
 pub use clock::{Clock, SystemClock};
 pub use device::SecondFactorLogin;
+pub use figcraft::{FigcraftWorkerState, figcraft_worker_tick, run_figcraft_worker};
 pub use health::metrics_router;
 pub use observe::Metrics;
 pub use services::{AuthSettings, Services};
@@ -149,6 +152,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/files/{file_id}", &["GET", "PATCH", "DELETE"]),
     ("/api/v1/files/{file_id}/restore", &["POST"]),
     ("/api/v1/files/{file_id}/lock", &["POST", "DELETE"]),
+    ("/api/v1/files/{file_id}/live", &["GET", "POST", "DELETE"]),
+    ("/api/v1/files/{file_id}/live/snapshot", &["POST"]),
     ("/api/v1/projects/{project_id}/grants", &["GET", "POST"]),
     ("/api/v1/files/{file_id}/grants", &["GET", "POST"]),
     ("/api/v1/grants/{grant_id}", &["PATCH", "DELETE"]),
@@ -338,6 +343,16 @@ pub fn router_with_shared(
         .route(
             "/api/v1/files/{file_id}/lock",
             post(locks::acquire).delete(locks::release),
+        )
+        .route(
+            "/api/v1/files/{file_id}/live",
+            get(figcraft::status)
+                .post(figcraft_jobs::open)
+                .delete(figcraft_jobs::stop),
+        )
+        .route(
+            "/api/v1/files/{file_id}/live/snapshot",
+            post(figcraft_jobs::snapshot),
         )
         .route(
             "/api/v1/projects/{project_id}/grants",

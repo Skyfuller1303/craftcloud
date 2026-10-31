@@ -54,13 +54,15 @@ pub struct FileVersion {
     pub upload_session_id: Option<Uuid>,
     /// Who committed it.
     pub created_by_user_id: Uuid,
+    /// User action or automated FigCraft Live snapshot.
+    pub actor_kind: String,
     /// When.
     pub created_at: OffsetDateTime,
 }
 
 const COLUMNS: &str = "id, org_id, workspace_id, project_id, file_id, number, blob_id, size_bytes, \
      sha256, base_version_id, restored_from_version_id, upload_session_id, created_by_user_id, \
-     created_at";
+     created_at, actor_kind";
 
 /// What a new version is made of.
 struct NewVersion<'a> {
@@ -317,6 +319,18 @@ pub async fn mark_blob_corrupt(pool: &PgPool, blob_id: Uuid) -> Result<(), DbErr
 }
 
 impl OrgTx {
+    /// Marks a version produced by a FigCraft Live export while retaining the authenticated uploader as creator provenance.
+    pub async fn mark_figcraft_live_snapshot(&mut self, version_id: Uuid) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE file_versions SET actor_kind='figcraft_live' WHERE id=$1 AND org_id=$2",
+        )
+        .bind(version_id)
+        .bind(self.org_id)
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(())
+    }
+
     /// Locks the file and returns `(head, file_deleted, project_deleted,
     /// workspace_id, project_id)`.
     async fn file_head_locked(

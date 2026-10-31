@@ -1,9 +1,11 @@
-# CC-F16 — FigCraft Collaboration Adapter (spätere Integration)
+# CC-F16 — FigCraft Collaboration Adapter
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P5 (Collaboration / Launcher). **Priorität:** später / nur nach Gate.  
+> **Status:** AC-06 implementiert die lokale Begleitdienst-Integration nach bestandenem Spike-Gate; native Konten/Capabilities und Maintainer-Abstimmung bleiben offen. **Zielphase:** P5 (Collaboration / Launcher).
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 > **Neuplanung 2026-10-30:** Konkrete Umsetzung in [docs/12-app-cloud](../12-app-cloud/README.md) (AC-06).
+
+Der aktuelle Umfang ist in [ADR-0022](../09-decisions/adr-0022-figcraft-live-hosting.md) und [FigCraft-Adapter](../04-integrations/figcraft-adapter.md) beschrieben: persönlicher Link, Edit-/View-Rechte, dauerhafter Widerrufsauftrag, native Versionssicherung und optionales Compose-Hosting. Die folgenden Capability-/RFC-Ziele bleiben der spätere gemeinsame Entwurf; sie sind keine bereits vorhandene Authentifizierung im FigCraft-Protokoll.
 
 ## Problem und Nutzen
 

@@ -16,6 +16,8 @@ import type {
   FileRecord,
   FileLock,
   FileVersion,
+  FigcraftLiveStatus,
+  FigcraftLiveLink,
   Invitation,
   IssuePasswordResetRequest,
   IssuedPasswordReset,
@@ -143,6 +145,10 @@ export const ENDPOINTS = {
   downloadVersion: { method: "GET", path: "/files/{file_id}/versions/{version_id}/content" },
   acquireFileLock: { method: "POST", path: "/files/{file_id}/lock" },
   releaseFileLock: { method: "DELETE", path: "/files/{file_id}/lock" },
+  figcraftLiveStatus: { method: "GET", path: "/files/{file_id}/live" },
+  figcraftLiveLink: { method: "POST", path: "/files/{file_id}/live" },
+  figcraftLiveSnapshot: { method: "POST", path: "/files/{file_id}/live/snapshot" },
+  figcraftLiveStop: { method: "DELETE", path: "/files/{file_id}/live" },
 } as const satisfies Record<string, Endpoint>;
 
 export const API_BASE = "/api/v1";
@@ -365,6 +371,10 @@ export interface ApiClient {
   listProjects(workspaceId: string, deleted: boolean, cursor?: string): Promise<Page<Project>>;
   getProject(projectId: string): Promise<Project>;
   getFile(fileId: string): Promise<FileRecord>;
+  getFigcraftLiveStatus(fileId: string): Promise<FigcraftLiveStatus>;
+  getFigcraftLiveLink(fileId: string, renew?: boolean): Promise<FigcraftLiveLink>;
+  snapshotFigcraftLive(fileId: string): Promise<FileVersion>;
+  stopFigcraftLive(fileId: string): Promise<void>;
   createProject(workspaceId: string, name: string): Promise<Project>;
   renameProject(project: Pick<Project, "id" | "version">, name: string): Promise<Project>;
   trashProject(projectId: string): Promise<void>;
@@ -541,6 +551,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       return result;
     },
     getTwoFactorStatus: () => call(ENDPOINTS.twoFactorStatus),
+    getFigcraftLiveStatus: (fileId) => call(ENDPOINTS.figcraftLiveStatus, { params: { file_id: fileId } }),
+    getFigcraftLiveLink: (fileId, renew = false) => call(ENDPOINTS.figcraftLiveLink, { params: { file_id: fileId }, body: { renew } }),
+    snapshotFigcraftLive: (fileId) => call(ENDPOINTS.figcraftLiveSnapshot, { params: { file_id: fileId } }),
+    stopFigcraftLive: (fileId) => call(ENDPOINTS.figcraftLiveStop, { params: { file_id: fileId } }),
     setupTwoFactor: (password) => call(ENDPOINTS.twoFactorSetup, { body: { password } }),
     confirmTwoFactor: (code) => call(ENDPOINTS.twoFactorConfirm, { body: { code } }),
     disableTwoFactor: (body) => call(ENDPOINTS.twoFactorDisable, { body }),

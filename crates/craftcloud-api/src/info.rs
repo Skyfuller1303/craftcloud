@@ -51,7 +51,10 @@ pub(crate) async fn discover(State(state): State<ApiState>) -> Json<Discovery> {
                 .is_some_and(|services| services.two_factor_available()),
             grants: true,
             locks: true,
-            figcraft_live: false,
+            figcraft_live: state
+                .services
+                .as_ref()
+                .is_some_and(|services| services.figcraft_available()),
         },
         limits: Limits {
             max_file_size,

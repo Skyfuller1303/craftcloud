@@ -224,6 +224,8 @@ pub enum FileDeleteOutcome {
     Unchanged(Box<File>),
     /// The project is in the trash.
     ProjectDeleted,
+    /// FigCraft Live must be stopped before trashing this file.
+    FigcraftLive,
     /// No such file in this organization.
     Gone,
 }
@@ -421,6 +423,11 @@ impl OrgTx {
         if file.deleted_at.is_some() {
             return Ok(FileDeleteOutcome::Unchanged(Box::new(file)));
         }
+        let live:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM figcraft_live_files WHERE org_id=$1 AND file_id=$2 AND state IN ('publishing','live','unpublishing'))")
+            .bind(self.org_id).bind(file_id).fetch_one(&mut *self.tx).await?;
+        if live {
+            return Ok(FileDeleteOutcome::FigcraftLive);
+        }
         let updated = sqlx::query_as::<_, File>(&format!(
             "UPDATE files SET deleted_at = $3, deleted_by_user_id = $4, version = version + 1, \
                  updated_by_user_id = $4, updated_at = $3 \
@@ -432,6 +439,8 @@ impl OrgTx {
         .bind(user_id)
         .fetch_one(&mut *self.tx)
         .await?;
+        crate::figcraft::enqueue_file_revocation(&mut self.tx, file_id, "file_deleted", now)
+            .await?;
         Ok(FileDeleteOutcome::Deleted(Box::new(updated)))
     }
 
