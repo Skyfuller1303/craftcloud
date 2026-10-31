@@ -78,8 +78,8 @@ async fn smtp_oauth_tls_protocol_cases() {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             assert!(transport.send(message()).await.is_ok());
         }
-        "535_refresh" => assert!(transport.send(message()).await.is_ok()),
-        "permanent_535" => assert_eq!(
+        "535_refresh" | "334_refresh" => assert!(transport.send(message()).await.is_ok()),
+        "permanent_535" | "334_permanent" => assert_eq!(
             transport.send(message()).await,
             Err(TransportError::Authentication)
         ),

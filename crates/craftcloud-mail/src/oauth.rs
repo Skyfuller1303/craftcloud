@@ -149,21 +149,40 @@ impl MailTransport for ConfiguredTransport {
         }
         result
     }
+
+    fn uses_smtp(&self) -> bool {
+        !matches!(self, Self::Graph(_))
+    }
 }
 
 #[derive(Clone)]
 struct CachedToken {
     value: Zeroizing<String>,
     refresh_at: i64,
+    generation: u64,
+}
+
+/// Token cache guarded by one lock; `generation` counts successful fetches so
+/// concurrent senders that were rejected with the same token share one refresh.
+#[derive(Default)]
+struct TokenState {
+    cached: Option<CachedToken>,
+    generation: u64,
+}
+
+struct IssuedToken {
+    value: Zeroizing<String>,
+    generation: u64,
 }
 
 struct TokenProvider {
     client: reqwest::Client,
     kind: TokenKind,
-    token: Mutex<Option<CachedToken>>,
+    token: Mutex<TokenState>,
     status: TransportStatus,
     token_endpoint: Option<String>,
 }
+#[derive(Clone)]
 enum TokenKind {
     Microsoft {
         config: OAuthConfig,
@@ -171,6 +190,7 @@ enum TokenKind {
     },
     Google(GoogleConfig),
 }
+#[derive(Clone)]
 struct GoogleConfig {
     service_account_file: String,
     sender: String,
@@ -187,8 +207,9 @@ fn preflight_oauth(config: &OAuthConfig, status: &TransportStatus) -> Result<(),
     match &config.credential {
         OAuthCredential::ClientSecretFile(path) => {
             let secret = read_secret(path)?;
-            if secret.is_empty() || std::str::from_utf8(&secret).is_err() {
-                return Err(TransportError::Permanent);
+            match std::str::from_utf8(&secret) {
+                Ok(text) if !text.trim().is_empty() => {}
+                _ => return Err(TransportError::Permanent),
             }
         }
         OAuthCredential::CertificateAndKeyFiles {
@@ -207,8 +228,13 @@ fn preflight_oauth(config: &OAuthConfig, status: &TransportStatus) -> Result<(),
                 return Err(TransportError::Permanent);
             }
             let endpoint = format!("{GRAPH_TOKEN}/{}/oauth2/v2.0/token", config.tenant_id);
-            let _ = microsoft_certificate_assertion(config, certificate_file, key_file, &endpoint)?;
-            status.set_certificate_expiry(Some(expiry));
+            let _ = microsoft_certificate_assertion(
+                config,
+                certificate_file,
+                key_file,
+                &endpoint,
+                status,
+            )?;
         }
     }
     Ok(())
@@ -245,7 +271,7 @@ impl TokenProvider {
         Ok(Self {
             client: http_client(None)?,
             kind: TokenKind::Microsoft { config, scope },
-            token: Mutex::new(None),
+            token: Mutex::new(TokenState::default()),
             status,
             token_endpoint: None,
         })
@@ -254,24 +280,36 @@ impl TokenProvider {
         Ok(Self {
             client: http_client(None)?,
             kind: TokenKind::Google(config),
-            token: Mutex::new(None),
+            token: Mutex::new(TokenState::default()),
             status,
             token_endpoint: None,
         })
     }
-    async fn token(&self, force: bool) -> Result<Zeroizing<String>, TransportError> {
+    /// Returns a cached token while it is fresh. With `rejected` set to the
+    /// generation of a token the provider refused, the token is refreshed
+    /// only if no other caller has already replaced that generation.
+    async fn token(&self, rejected: Option<u64>) -> Result<IssuedToken, TransportError> {
         let mut guard = self.token.lock().await;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if !force
-            && let Some(t) = guard.as_ref()
+        if let Some(t) = guard.cached.as_ref()
             && t.refresh_at > now
+            && rejected != Some(t.generation)
         {
-            return Ok(Zeroizing::new(t.value.to_string()));
+            return Ok(IssuedToken {
+                value: Zeroizing::new(t.value.to_string()),
+                generation: t.generation,
+            });
         }
-        let (url, mut form) = match &self.kind {
-            TokenKind::Microsoft { config, scope } => microsoft_form(config, scope)?,
-            TokenKind::Google(c) => google_form(c).await?,
-        };
+        // Credential files and JWT signing are blocking work; keep them off
+        // the async worker threads while the lock keeps refreshes single-flight.
+        let status = self.status.clone();
+        let kind = self.kind.clone();
+        let (url, mut form) = tokio::task::spawn_blocking(move || match &kind {
+            TokenKind::Microsoft { config, scope } => microsoft_form(config, scope, &status),
+            TokenKind::Google(c) => google_form(c),
+        })
+        .await
+        .map_err(|_| TransportError::Transient)??;
         let url = self.token_endpoint.as_deref().unwrap_or(&url);
         let sent = self.client.post(url).form(&form).send().await;
         for (_, value) in &mut form {
@@ -348,15 +386,18 @@ impl TokenProvider {
         if let Some(Value::String(secret)) = value.get_mut("access_token") {
             zeroize::Zeroize::zeroize(secret);
         }
-        *guard = Some(CachedToken {
+        guard.generation = guard.generation.wrapping_add(1);
+        let generation = guard.generation;
+        guard.cached = Some(CachedToken {
             value: Zeroizing::new(access.to_string()),
             refresh_at,
+            generation,
         });
         self.status.clear_error();
-        Ok(access)
-    }
-    async fn invalidate(&self) {
-        *self.token.lock().await = None;
+        Ok(IssuedToken {
+            value: access,
+            generation,
+        })
     }
 }
 
@@ -486,6 +527,7 @@ fn read_secret(path: &str) -> Result<Zeroizing<Vec<u8>>, TransportError> {
 fn microsoft_form(
     c: &OAuthConfig,
     scope: &str,
+    status: &TransportStatus,
 ) -> Result<(String, Vec<(String, String)>), TransportError> {
     let endpoint = format!("{GRAPH_TOKEN}/{}/oauth2/v2.0/token", c.tenant_id);
     if uuid::Uuid::parse_str(&c.tenant_id).is_err() {
@@ -512,7 +554,7 @@ fn microsoft_form(
             key_file,
         } => {
             let assertion =
-                microsoft_certificate_assertion(c, certificate_file, key_file, &endpoint)?;
+                microsoft_certificate_assertion(c, certificate_file, key_file, &endpoint, status)?;
             form.push(("scope".into(), scope.into()));
             form.push((
                 "client_assertion_type".into(),
@@ -540,6 +582,7 @@ fn microsoft_certificate_assertion(
     certificate_file: &str,
     key_file: &str,
     endpoint: &str,
+    status: &TransportStatus,
 ) -> Result<String, TransportError> {
     use x509_parser::{pem::parse_x509_pem, prelude::FromDer};
     let cert_pem = read_secret(certificate_file)?;
@@ -556,6 +599,7 @@ fn microsoft_certificate_assertion(
     if now < not_before || now >= not_after {
         return Err(TransportError::Permanent);
     }
+    status.set_certificate_expiry(Some(not_after));
     let public_key = cert.public_key().subject_public_key.data.as_ref();
     let key = EncodingKey::from_rsa_pem(&key_pem).map_err(|_| TransportError::Permanent)?;
     let mut header = Header::new(Algorithm::PS256);
@@ -605,7 +649,7 @@ struct GoogleClaims<'a> {
     iat: i64,
     exp: i64,
 }
-async fn google_form(c: &GoogleConfig) -> Result<(String, Vec<(String, String)>), TransportError> {
+fn google_form(c: &GoogleConfig) -> Result<(String, Vec<(String, String)>), TransportError> {
     let data = read_secret(&c.service_account_file)?;
     let sa: ServiceAccount =
         serde_json::from_slice(&data).map_err(|_| TransportError::Permanent)?;
@@ -704,19 +748,20 @@ impl MailTransport for GraphTransport {
             .push(&self.config.sender)
             .push("sendMail");
         let payload = json!({"message":{"subject":m.subject,"body":{"contentType":"HTML","content":m.html},"toRecipients":[{"emailAddress":{"address":m.recipient}}],"internetMessageHeaders":[{"name":"x-craftcloud-message-id","value":m.message_id}]},"saveToSentItems":self.config.save_to_sent});
+        let mut rejected = None;
         for attempt in 0..2 {
-            let token = self.provider.token(attempt == 1).await?;
+            let token = self.provider.token(rejected).await?;
             let result = self
                 .provider
                 .client
                 .post(endpoint.as_str())
-                .bearer_auth(token.as_str())
+                .bearer_auth(token.value.as_str())
                 .json(&payload)
                 .send()
                 .await;
             match result {
                 Ok(r) if r.status().as_u16() == 401 && attempt == 0 => {
-                    self.provider.invalidate().await;
+                    rejected = Some(token.generation);
                     continue;
                 }
                 Ok(r) if r.status().as_u16() == 202 => {
@@ -818,12 +863,13 @@ impl MailTransport for SmtpOAuthTransport {
             .username
             .as_deref()
             .ok_or(TransportError::Permanent)?;
+        let mut rejected = None;
         for attempt in 0..2 {
-            let token = self.provider.token(attempt == 1).await?;
+            let token = self.provider.token(rejected).await?;
             let client = self
                 .config
                 .smtp
-                .with_xoauth2_token(username, token.as_str())?;
+                .with_xoauth2_token(username, token.value.as_str())?;
             let from = self
                 .config
                 .smtp
@@ -859,13 +905,12 @@ impl MailTransport for SmtpOAuthTransport {
                     return Ok(Delivery);
                 }
                 Err(error)
-                    if crate::smtp::smtp_error(&error) == TransportError::Authentication
-                        && attempt == 0 =>
+                    if xoauth2_error(&error) == TransportError::Authentication && attempt == 0 =>
                 {
-                    self.provider.invalidate().await;
+                    rejected = Some(token.generation);
                 }
                 Err(error) => {
-                    let error = crate::smtp::smtp_error(&error);
+                    let error = xoauth2_error(&error);
                     if error == TransportError::Authentication {
                         self.status.set_error("smtp_authentication_failed");
                     }
@@ -876,6 +921,25 @@ impl MailTransport for SmtpOAuthTransport {
         Err(TransportError::Authentication)
     }
 }
+
+/// Classifies an SMTP error from an XOAUTH2 session. Besides a plain 535,
+/// providers such as Gmail answer a rejected token with a 334 challenge that
+/// carries a JSON error. lettre refuses to answer it and reports a client
+/// error, which would otherwise look like a retryable network failure.
+fn xoauth2_error(error: &lettre::transport::smtp::Error) -> TransportError {
+    let classified = crate::smtp::smtp_error(error);
+    if classified == TransportError::Transient && error.is_client() {
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            if cause.to_string().contains(XOAUTH2_CHALLENGE_MESSAGE) {
+                return TransportError::Authentication;
+            }
+            source = cause.source();
+        }
+    }
+    classified
+}
+const XOAUTH2_CHALLENGE_MESSAGE: &str = "does not expect a challenge";
 
 fn valid_bare_mailbox(value: &str) -> bool {
     if value.is_empty()
@@ -1049,6 +1113,65 @@ mod tests {
         std::fs::remove_dir(directory).unwrap();
     }
     #[test]
+    #[allow(clippy::unwrap_used)]
+    fn preflight_rejects_whitespace_only_client_secret() {
+        let path = std::env::temp_dir().join(format!("craftcloud-blank-{}", Uuid::new_v4()));
+        std::fs::write(&path, b" \r\n\t").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = OAuthConfig {
+            tenant_id: Uuid::new_v4().to_string(),
+            client_id: "client".into(),
+            credential: OAuthCredential::ClientSecretFile(path.to_str().unwrap().into()),
+        };
+        let result = preflight_oauth(&config, &TransportStatus::default());
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(result, Err(TransportError::Permanent)));
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn xoauth2_challenge_error_is_an_authentication_failure() {
+        let challenge = lettre::transport::smtp::authentication::Mechanism::Xoauth2
+            .response(
+                &lettre::transport::smtp::authentication::Credentials::new("u".into(), "t".into()),
+                Some("eyJzdGF0dXMiOiI0MDEifQ=="),
+            )
+            .unwrap_err();
+        assert_eq!(xoauth2_error(&challenge), TransportError::Authentication);
+    }
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn rejected_generation_reuses_newer_cached_token() {
+        let provider = TokenProvider::microsoft(
+            OAuthConfig {
+                tenant_id: Uuid::new_v4().to_string(),
+                client_id: "client".into(),
+                credential: OAuthCredential::ClientSecretFile("unused".into()),
+            },
+            "scope",
+            TransportStatus::default(),
+        )
+        .unwrap();
+        {
+            let mut state = provider.token.lock().await;
+            state.generation = 2;
+            state.cached = Some(CachedToken {
+                value: Zeroizing::new("fresh".into()),
+                refresh_at: i64::MAX,
+                generation: 2,
+            });
+        }
+        // A caller rejected with the older generation reuses the newer token;
+        // only a rejection of the current generation triggers a fetch, which
+        // fails here because the credential file does not exist.
+        let token = provider.token(Some(1)).await.unwrap();
+        assert_eq!((token.value.as_str(), token.generation), ("fresh", 2));
+        assert!(provider.token(Some(2)).await.is_err());
+    }
+    #[test]
     fn certificate_assertion_rejects_invalid_certificate() {
         let base = std::env::temp_dir().join(format!("craftcloud-cert-{}", Uuid::new_v4()));
         let cert_path = base.with_extension("pem");
@@ -1066,6 +1189,7 @@ mod tests {
                 cert_path.to_str().ok_or(TransportError::Permanent)?,
                 key_path.to_str().ok_or(TransportError::Permanent)?,
                 "https://example.invalid/token",
+                &TransportStatus::default(),
             )
         })();
         let _ = std::fs::remove_file(cert_path);

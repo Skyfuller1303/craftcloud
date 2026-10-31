@@ -26,6 +26,17 @@ if smtp_overrides "$config" >/dev/null 2>&1; then exit 1; fi
 sed -i '/CRAFTCLOUD_GRAPH_CERT_SOURCE/d; /CRAFTCLOUD_GRAPH_KEY_SOURCE/d' "$config"
 [ "$(smtp_overrides "$config")" = '-f compose.graph.yaml -f compose.graph-secret.yaml' ]
 
+# A Graph secret next to SMTP OAuth settings fails with a message, not an unset-variable error.
+cat >"$config" <<'EOF'
+CRAFTCLOUD_MAIL_TRANSPORT=graph
+CRAFTCLOUD_GRAPH_CLIENT_SECRET_SOURCE=/synthetic/secret
+CRAFTCLOUD_SMTP_AUTH=xoauth2
+CRAFTCLOUD_SMTP_OAUTH_PROVIDER=google
+EOF
+if smtp_overrides "$config" >"$SMTP_TMP/out" 2>"$SMTP_TMP/err"; then exit 1; fi
+! grep -qi 'unbound' "$SMTP_TMP/err"
+[ -s "$SMTP_TMP/err" ]
+
 # Microsoft and Google OAuth credential modes.
 cat >"$config" <<'EOF'
 CRAFTCLOUD_MAIL_TRANSPORT=smtp

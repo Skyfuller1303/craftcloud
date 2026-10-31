@@ -208,7 +208,7 @@ async fn deliver_one(
                 pool,
                 &claim,
                 err.is_permanent(),
-                queue_failure_code(err.code()),
+                queue_failure_code(err.code(), transport.uses_smtp()),
                 err.retry_after(),
             )
             .await
@@ -217,8 +217,10 @@ async fn deliver_one(
     }
 }
 
-fn queue_failure_code(code: &'static str) -> &'static str {
+fn queue_failure_code(code: &'static str, smtp: bool) -> &'static str {
     match code {
+        "permanent" if smtp => "smtp_permanent",
+        "transient" if smtp => "smtp_transient",
         "ErrorAccessDenied" => "provider_access_denied",
         "ErrorInvalidUser" => "provider_invalid_user",
         "ErrorMailboxNotEnabledForRESTAPI" => "provider_mailbox_unavailable",
@@ -318,7 +320,7 @@ mod tests {
             "provider_rate_limited",
             "untrusted provider body",
         ] {
-            let code = super::queue_failure_code(input);
+            let code = super::queue_failure_code(input, false);
             assert!(!code.is_empty() && code.len() <= 64);
             assert!(
                 code.bytes()
@@ -326,8 +328,21 @@ mod tests {
             );
         }
         assert_eq!(
-            super::queue_failure_code("invalid_client"),
+            super::queue_failure_code("invalid_client", true),
             "invalid_client"
+        );
+        assert_eq!(
+            super::queue_failure_code("permanent", true),
+            "smtp_permanent"
+        );
+        assert_eq!(
+            super::queue_failure_code("transient", true),
+            "smtp_transient"
+        );
+        assert_eq!(super::queue_failure_code("transient", false), "transient");
+        assert_eq!(
+            super::queue_failure_code("smtp_authentication_failed", true),
+            "smtp_authentication_failed"
         );
     }
 

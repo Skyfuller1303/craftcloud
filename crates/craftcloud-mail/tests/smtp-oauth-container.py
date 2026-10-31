@@ -18,7 +18,7 @@ import urllib.parse
 import uuid
 
 
-CASES = ("success", "expired", "535_refresh", "permanent_535", "wrong_sender", "google", "untrusted_ca")
+CASES = ("success", "expired", "535_refresh", "permanent_535", "334_refresh", "334_permanent", "wrong_sender", "google", "untrusted_ca")
 SENDER = "sender@example.invalid"
 
 
@@ -119,7 +119,17 @@ class SmtpHandler(socketserver.BaseRequestHandler):
                 self.server.xoauth_token_valid &= token_ok
                 self.server.auth_count += 1
                 reject = self.server.case == "permanent_535" or (self.server.case == "535_refresh" and self.server.auth_count == 1)
-                if reject:
+                challenge = self.server.case == "334_permanent" or (self.server.case == "334_refresh" and self.server.auth_count == 1)
+                if challenge:
+                    # Gmail-style failure: a 334 JSON error challenge, then 535 after the client's empty line.
+                    self.reply(file, "334 " + base64.b64encode(b'{"status":"400","schemes":"Bearer","scope":"https://mail.google.com/"}').decode("ascii"))
+                    reply = file.readline()
+                    if reply.strip(b"\r\n") == b"" and reply:
+                        self.reply(file, "535-5.7.8 Username and Password not accepted.")
+                        self.reply(file, "535 5.7.8 Learn more")
+                    else:
+                        return
+                elif reject:
                     self.reply(file, "535 5.7.8 Authentication credentials invalid")
                 elif user_ok and token_ok:
                     authenticated = True
@@ -200,7 +210,7 @@ def main():
                 subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 expected = {
                     "success": (1, 1), "expired": (2, 2), "535_refresh": (2, 2),
-                    "permanent_535": (2, 2), "wrong_sender": (0, 0), "google": (1, 1),
+                    "permanent_535": (2, 2), "334_refresh": (2, 2), "334_permanent": (2, 2), "wrong_sender": (0, 0), "google": (1, 1),
                     "untrusted_ca": (1, 0),
                 }[case]
                 counts = (token.token_count, smtp.auth_count)

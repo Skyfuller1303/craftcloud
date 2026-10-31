@@ -179,6 +179,12 @@ pub trait MailTransport: Send + Sync {
         &self,
         message: MailMessage,
     ) -> impl std::future::Future<Output = Result<Delivery, TransportError>> + Send;
+
+    /// Whether generic failures belong to an SMTP connection. The queue keeps
+    /// the `smtp_permanent` and `smtp_transient` codes for those transports.
+    fn uses_smtp(&self) -> bool {
+        true
+    }
 }
 
 pub struct SmtpTransport {

@@ -51,11 +51,7 @@ smtp_overrides() {
     graph_mode=none
     if [ -n "$graph_cert" ] && [ -n "$graph_key" ]; then graph_mode=certificate; fi
     if [ -n "$graph_secret" ]; then
-        if [ "$oauth_provider" = google ] && [ "$oauth_mode" != service ]; then
-        printf '%s\n' 'Google SMTP OAuth requires a service-account file' >&2
-        return 1
-    fi
-    [ "$graph_mode" = none ] || { printf '%s\n' 'Graph certificate and client secret are conflicting credentials' >&2; return 1; }
+        [ "$graph_mode" = none ] || { printf '%s\n' 'Graph certificate and client secret are conflicting credentials' >&2; return 1; }
         graph_mode=secret
     fi
     if [ "$graph_mode" != none ] && [ "$smtp_transport" != graph ]; then
