@@ -65,6 +65,7 @@ None of these are implemented by this blueprint. Update this list in the same PR
 
 Offen nach AC-07 und AC-08 (2026-10-30):
 
+  - AC-11: Die Sperre von FigCraft-Livelinks für Launcher- und CLI-Sitzungen im Modus „nur zugewiesene Apps“ hat keinen HTTP-Test, und die Widerrufspfade für solche Links (`enqueue_org_app_revocations`, `enqueue_file_tool_revocations_pool`, Verarbeitung in `process_revocations`) sind nur über die Grund-Kennung unit-getestet. Integrationstests nachziehen.
   - Zeitabhängige FigCraft-Worker-Tests (`projects_files::figcraft_stop_orders_revoke_snapshot_remove_and_recovers_failures`, `figcraft_worker::busy_file_guard_defers_revocation_without_counting_an_attempt`) schlugen am 2026-10-31 unter paralleler Buildlast je einmal fehl und bestanden bei Wiederholung. Stabilisieren (feste Uhr oder Warten auf Zustand statt fester Wartezeit).
   - Die Geräte-Referenz `ds_<hex>` ist zweimal definiert: als SQL-Ausdruck in `craftcloud-db/src/device_sessions.rs` und in Rust (`admin_device_ref` in `craftcloud-api/src/device.rs`). Beide müssen identisch bleiben; der Integrationstest erkennt eine Abweichung.
   - Bei `GET /organizations/{id}/members` kommt ein 422 für eine ungültige `query` erst nach dem 403 für unerlaubte Admin-Filter.
