@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2034 # several variables are read by the sourced ops02.sh
 set -eu
 umask 077
 
@@ -16,12 +17,32 @@ DATA_DIR_ENV=${CRAFTCLOUD_DATA_DIR:-}
 CADDY_CONFIG_DIR=$CONFIG_DIR/caddy
 SKIP_SYSTEMD=${CRAFTCLOUD_SKIP_SYSTEMD:-0}
 IMAGE_PREFIX=${CRAFTCLOUD_IMAGE_PREFIX:-}
+IMAGE_ARCHIVE=
+DB_MODE=auto
+DB_URL_FILE=
+DB_ADMIN_URL_FILE=
+DB_ALLOW_INSECURE_LOCAL=0
+DB_ROLES_READY=0
+PROXY_MODE=auto
+PROXY_INSTALL=0
+CERTBOT=0
+PROXY_CERT=
+PROXY_KEY=
+LOCAL_PORT=8080
+LOCAL_FIGCRAFT_PORT=47900
+LOCAL_PORT_SET=0
+DB_SAVED=0
+PROXY_SAVED=0
+DB_TARGET=
+DB_QUERY=
+DB_CA_SOURCE=
 FIGCRAFT=${CRAFTCLOUD_FIGCRAFT:-enabled}
 FIGCRAFT_SET=0
 [ -z "${CRAFTCLOUD_FIGCRAFT:-}" ] || FIGCRAFT_SET=1
 ARCHIVE=
 DOMAIN=
 ACME_EMAIL=
+ACME_EMAIL_GIVEN=
 HTTP_PORT=80
 HTTPS_PORT=443
 DOMAIN_SET=0
@@ -35,6 +56,29 @@ usage() {
     cat <<'USAGE'
 Usage: install.sh [options] <craftcloud-version.tar.gz>
   --domain NAME          Public DNS name
+  --image-archive FILE   Prebuilt image craftcloud-<version>-image-<arch>.tar.zst from the
+                         release (SHA256SUMS beside it); without it the image is built here
+  --db auto|bundled|external
+                         PostgreSQL: the bundled container (default when nothing is found),
+                         or an existing PostgreSQL 16, 17 or 18 server
+  --database-url-file F  External database: one line postgres://HOST[:PORT]/DATABASE[?sslmode=...]
+                         without user and password (the installer creates the two roles)
+  --db-admin-url-file F  Administrator URL (with credentials) to create the roles now; without it
+                         the installer writes the SQL for you to run, then use --db-roles-ready
+  --db-roles-ready       The role SQL was run; continue the installation
+  --db-allow-insecure-local
+                         Allow a database on this host without sslmode=verify-full
+  --proxy auto|caddy|nginx|apache|none
+                         Reverse proxy: bundled Caddy with automatic TLS (default when ports
+                         80/443 are free), or your own nginx or Apache, or none (own proxy)
+  --proxy-install        With nginx or Apache: install the configuration (after a backup,
+                         tested before reload); without it only templates are written
+  --certbot              With --proxy-install: obtain the certificate with certbot
+  --proxy-cert F --proxy-key F
+                         With --proxy-install: certificate and key you already have
+  --local-port PORT      nginx, Apache, none: loopback port of CraftCloud (default 8080)
+  --local-figcraft-port PORT
+                         nginx, Apache, none: loopback port of the FigCraft server (default 47900)
   --acme-email ADDRESS   ACME account email
   --data-dir PATH        Persistent data directory
   --http-port PORT       HTTP host port (default 80)
@@ -149,6 +193,8 @@ verify_archive_checksum() {
     checksum_actual=$(sha256sum "$1" | awk '{print $1}')
     [ "$checksum_actual" = "$checksum_expected" ] || fail 'archive checksum mismatch'
 }
+
+. "$SELF_DIR/ops02.sh"
 
 release_complete() {
     # release_complete <release-dir> <version>
@@ -272,6 +318,8 @@ ensure_figcraft_files() {
 compose_files() {
     printf '%s' '-f compose.yaml -f compose.install.yaml'
     [ "$FIGCRAFT" != enabled ] || printf '%s' ' -f compose.figcraft.yaml'
+    # Database and proxy choices (OPS-02), read from the environment file.
+    ops_overlay_files "$env_file" "$compose_dir" "$FIGCRAFT"
     # smtp_files contains only fixed -f filenames emitted by smtp_overrides.
     [ -z "${smtp_files:-}" ] || printf ' %s' "$smtp_files"
     [ "$1" != 1 ] || printf '%s' ' -f compose.setup.yaml'
@@ -287,12 +335,25 @@ generate_two_factor_key() {
 while [ "$#" -gt 0 ]; do
     case $1 in
         --domain) [ "$#" -ge 2 ] || fail '--domain needs a value'; DOMAIN=$2; DOMAIN_SET=1; shift 2 ;;
-        --acme-email) [ "$#" -ge 2 ] || fail '--acme-email needs a value'; ACME_EMAIL=$2; shift 2 ;;
+        --acme-email) [ "$#" -ge 2 ] || fail '--acme-email needs a value'; ACME_EMAIL=$2; ACME_EMAIL_GIVEN=$2; shift 2 ;;
         --data-dir) [ "$#" -ge 2 ] || fail '--data-dir needs a value'; DATA_DIR=$2; DATA_DIR_SET=1; shift 2 ;;
         --http-port) [ "$#" -ge 2 ] || fail '--http-port needs a value'; HTTP_PORT=$2; HTTP_PORT_SET=1; shift 2 ;;
         --https-port) [ "$#" -ge 2 ] || fail '--https-port needs a value'; HTTPS_PORT=$2; HTTPS_PORT_SET=1; shift 2 ;;
         --figcraft) FIGCRAFT=enabled; FIGCRAFT_SET=1; shift ;;
         --no-figcraft) FIGCRAFT=disabled; FIGCRAFT_SET=1; shift ;;
+        --image-archive) [ "$#" -ge 2 ] || fail '--image-archive needs a value'; IMAGE_ARCHIVE=$2; shift 2 ;;
+        --db) [ "$#" -ge 2 ] || fail '--db needs a value'; DB_MODE=$2; shift 2 ;;
+        --database-url-file) [ "$#" -ge 2 ] || fail '--database-url-file needs a value'; DB_URL_FILE=$2; shift 2 ;;
+        --db-admin-url-file) [ "$#" -ge 2 ] || fail '--db-admin-url-file needs a value'; DB_ADMIN_URL_FILE=$2; shift 2 ;;
+        --db-allow-insecure-local) DB_ALLOW_INSECURE_LOCAL=1; shift ;;
+        --db-roles-ready) DB_ROLES_READY=1; shift ;;
+        --proxy) [ "$#" -ge 2 ] || fail '--proxy needs a value'; PROXY_MODE=$2; shift 2 ;;
+        --proxy-install) PROXY_INSTALL=1; shift ;;
+        --certbot) CERTBOT=1; shift ;;
+        --proxy-cert) [ "$#" -ge 2 ] || fail '--proxy-cert needs a value'; PROXY_CERT=$2; shift 2 ;;
+        --proxy-key) [ "$#" -ge 2 ] || fail '--proxy-key needs a value'; PROXY_KEY=$2; shift 2 ;;
+        --local-port) [ "$#" -ge 2 ] || fail '--local-port needs a value'; LOCAL_PORT=$2; LOCAL_PORT_SET=1; shift 2 ;;
+        --local-figcraft-port) [ "$#" -ge 2 ] || fail '--local-figcraft-port needs a value'; LOCAL_FIGCRAFT_PORT=$2; shift 2 ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -317,6 +378,25 @@ if [ -f "$env_file" ]; then
     saved_image_prefix=$(sed -n 's/^CRAFTCLOUD_IMAGE_PREFIX=//p' "$env_file" | tail -n 1)
     saved_project=$(sed -n 's/^CRAFTCLOUD_PROJECT_NAME=//p' "$env_file" | tail -n 1)
     saved_figcraft=$(sed -n 's/^CRAFTCLOUD_FIGCRAFT=//p' "$env_file" | tail -n 1)
+    saved_db=$(ops_env_get "$env_file" CRAFTCLOUD_DB)
+    saved_proxy=$(ops_env_get "$env_file" CRAFTCLOUD_PROXY)
+    saved_local_port=$(ops_env_get "$env_file" CRAFTCLOUD_LOCAL_PORT)
+    saved_local_fig=$(ops_env_get "$env_file" CRAFTCLOUD_LOCAL_FIGCRAFT_PORT)
+    if [ -n "$saved_db" ]; then
+        [ "$DB_MODE" = auto ] || [ "$DB_MODE" = "$saved_db" ] || fail 'database choice differs from existing config'
+        DB_MODE=$saved_db
+        DB_SAVED=1
+    fi
+    if [ -n "$saved_proxy" ]; then
+        [ "$PROXY_MODE" = auto ] || [ "$PROXY_MODE" = "$saved_proxy" ] || fail 'proxy choice differs from existing config'
+        PROXY_MODE=$saved_proxy
+        PROXY_SAVED=1
+    fi
+    if [ -n "$saved_local_port" ]; then
+        [ "$LOCAL_PORT_SET" -eq 0 ] || [ "$LOCAL_PORT" = "$saved_local_port" ] || fail 'local port differs from existing config'
+        LOCAL_PORT=$saved_local_port
+    fi
+    [ -z "$saved_local_fig" ] || LOCAL_FIGCRAFT_PORT=$saved_local_fig
     if [ -n "$saved_figcraft" ]; then
         [ "$FIGCRAFT_SET" -eq 0 ] || [ "$FIGCRAFT" = "$saved_figcraft" ] || fail 'FigCraft setting differs from existing config; use craftcloud-ctl figcraft enable|disable'
         FIGCRAFT=$saved_figcraft
@@ -349,7 +429,7 @@ if [ -f "$env_file" ]; then
     fi
 fi
 case $FIGCRAFT in enabled|disabled) ;; *) fail 'CRAFTCLOUD_FIGCRAFT must be enabled or disabled' ;; esac
-[ -n "$IMAGE_PREFIX" ] || IMAGE_PREFIX=craftcloud-server:
+[ -n "$IMAGE_PREFIX" ] || IMAGE_PREFIX=craftcloud:
 [ -n "$IMAGE_PREFIX" ] || fail 'image prefix is required'
 case $IMAGE_PREFIX in *[!A-Za-z0-9._:/-]*) fail 'invalid image prefix' ;; esac
 [ -n "$IMAGE_PREFIX" ] || fail 'image prefix is required'
@@ -365,6 +445,33 @@ case $HTTP_PORT:$HTTPS_PORT in *[!0-9:]*|:*|*:) fail 'ports must be numeric' ;; 
 [ "$HTTP_PORT" -ge 1 ] && [ "$HTTP_PORT" -le 65535 ] || fail 'invalid HTTP port'
 [ "$HTTPS_PORT" -ge 1 ] && [ "$HTTPS_PORT" -le 65535 ] || fail 'invalid HTTPS port'
 
+case $LOCAL_PORT:$LOCAL_FIGCRAFT_PORT in *[!0-9:]*|:*|*:) fail 'local ports must be numeric' ;; esac
+[ "$LOCAL_PORT" -ge 1024 ] && [ "$LOCAL_PORT" -le 65535 ] || fail 'local port must be between 1024 and 65535'
+[ "$LOCAL_FIGCRAFT_PORT" -ge 1024 ] && [ "$LOCAL_FIGCRAFT_PORT" -le 65535 ] || fail 'local FigCraft port must be between 1024 and 65535'
+[ "$LOCAL_PORT" != "$LOCAL_FIGCRAFT_PORT" ] || fail 'the local CraftCloud and FigCraft ports must differ'
+if [ "$DB_SAVED" -eq 0 ]; then ops_choose_db; fi
+if [ "$PROXY_SAVED" -eq 0 ]; then ops_choose_proxy; fi
+case $PROXY_MODE in caddy|nginx|apache|none) ;; *) fail 'invalid proxy choice' ;; esac
+case $DB_MODE in bundled|external) ;; *) fail 'invalid database choice' ;; esac
+if [ "$PROXY_INSTALL" -eq 1 ]; then
+    case $PROXY_MODE in nginx|apache) ;; *) fail '--proxy-install needs --proxy nginx or --proxy apache' ;; esac
+fi
+[ "$CERTBOT" -eq 0 ] || [ "$PROXY_INSTALL" -eq 1 ] || fail '--certbot needs --proxy-install'
+if [ -n "$PROXY_CERT$PROXY_KEY" ]; then
+    [ -n "$PROXY_CERT" ] && [ -n "$PROXY_KEY" ] || fail '--proxy-cert and --proxy-key belong together'
+    safe_path "$PROXY_CERT"
+    safe_path "$PROXY_KEY"
+fi
+TLS_CERT=${PROXY_CERT:-/etc/letsencrypt/live/$DOMAIN/fullchain.pem}
+TLS_KEY=${PROXY_KEY:-/etc/letsencrypt/live/$DOMAIN/privkey.pem}
+if [ "$DB_MODE" = external ] && [ -n "$DB_URL_FILE" ]; then
+    safe_path "$DB_URL_FILE"
+    ops_parse_db_url "$DB_URL_FILE"
+fi
+if [ -n "$DB_ADMIN_URL_FILE" ]; then
+    [ "$DB_MODE" = external ] || fail '--db-admin-url-file belongs to --db external'
+    safe_path "$DB_ADMIN_URL_FILE"
+fi
 need() { command -v "$1" >/dev/null 2>&1 || fail "required command missing: $1"; }
 safe_path "$DATA_DIR"
 if paths_overlap "$INSTALL_ROOT" "$CONFIG_DIR" || paths_overlap "$INSTALL_ROOT" "$DATA_DIR" || paths_overlap "$CONFIG_DIR" "$DATA_DIR"; then
@@ -385,12 +492,17 @@ docker compose version --short >/dev/null 2>&1 || fail 'Docker Compose plugin un
 compose_version=$(docker compose version --short | sed 's/^v//')
 compose_major=$(printf '%s' "$compose_version" | awk -F. '{print $1+0}')
 compose_minor=$(printf '%s' "$compose_version" | awk -F. '{print $2+0}')
-[ "$compose_major" -gt 2 ] || { [ "$compose_major" -eq 2 ] && [ "$compose_minor" -ge 24 ]; } || fail 'Docker Compose 2.24 or newer required'
+compose_patch=$(printf '%s' "$compose_version" | awk -F. '{gsub(/[^0-9].*/, "", $3); print $3+0}')
+[ "$compose_major" -gt 2 ] || { [ "$compose_major" -eq 2 ] && { [ "$compose_minor" -gt 24 ] || { [ "$compose_minor" -eq 24 ] && [ "$compose_patch" -ge 4 ]; }; }; } || fail 'Docker Compose 2.24.4 or newer required'
 docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null) || fail 'Docker Engine unavailable'
 docker_major=$(printf '%s' "$docker_version" | awk -F. '{gsub(/[^0-9].*/, "", $1); print $1+0}')
 [ "$docker_major" -ge 25 ] || fail 'Docker Engine 25 or newer required'
 
 verify_archive_checksum "$ARCHIVE"
+if [ -n "$IMAGE_ARCHIVE" ]; then
+    safe_path "$IMAGE_ARCHIVE"
+    [ -f "$IMAGE_ARCHIVE" ] || fail 'image archive not found'
+fi
 archive_name=$(basename -- "$ARCHIVE")
 version=$(printf '%s' "$archive_name" | sed -n 's/^craftcloud-\([0-9][0-9A-Za-z.+-]*\)\.tar\.gz$/\1/p')
 [ -n "$version" ] || fail 'archive name must be craftcloud-<version>.tar.gz'
@@ -440,8 +552,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
             port_hex=$(printf '%04X' "$1")
             protocol=$2
             tables_checked=0
-            if [ "$protocol" = tcp ]; then tables='/proc/net/tcp /proc/net/tcp6'
-            else tables='/proc/net/udp /proc/net/udp6'; fi
+            if [ "$protocol" = tcp ]; then tables="$OPS_PROC_NET/tcp $OPS_PROC_NET/tcp6"
+            else tables="$OPS_PROC_NET/udp $OPS_PROC_NET/udp6"; fi
             for table in $tables; do
                 [ -r "$table" ] || continue
                 tables_checked=1
@@ -450,9 +562,15 @@ if [ "$DRY_RUN" -eq 0 ]; then
             [ "$tables_checked" -eq 1 ] || fail 'cannot verify whether install ports are free'
             return 1
         }
-        port_in_use "$HTTP_PORT" tcp && fail "port $HTTP_PORT is already in use"
-        port_in_use "$HTTPS_PORT" tcp && fail "port $HTTPS_PORT is already in use"
-        port_in_use "$HTTPS_PORT" udp && fail "UDP port $HTTPS_PORT is already in use"
+        if [ "$PROXY_MODE" = caddy ]; then
+            port_in_use "$HTTP_PORT" tcp && fail "port $HTTP_PORT is already in use"
+            port_in_use "$HTTPS_PORT" tcp && fail "port $HTTPS_PORT is already in use"
+            port_in_use "$HTTPS_PORT" udp && fail "UDP port $HTTPS_PORT is already in use"
+        else
+            # The public ports belong to your own web server; CraftCloud needs its two loopback ports.
+            port_in_use "$LOCAL_PORT" tcp && fail "local port $LOCAL_PORT is already in use (choose another with --local-port)"
+            port_in_use "$LOCAL_FIGCRAFT_PORT" tcp && fail "local port $LOCAL_FIGCRAFT_PORT is already in use (choose another with --local-figcraft-port)"
+        fi
     fi
     if command -v getent >/dev/null 2>&1 && ! getent ahosts "$DOMAIN" >/dev/null 2>&1; then
         printf '%s\n' "craftcloud-install: warning: DNS lookup failed for $DOMAIN" >&2
@@ -528,6 +646,9 @@ if [ ! -e "$env_file" ]; then
     [ "$DOMAIN" != localhost ] || tls_mode=internal
     bootstrap_token=$(secret)
     secret_db_superuser=$(secret)
+    # An existing PostgreSQL server: the installer never creates or stores its
+    # administrator password. The value is a fixed placeholder for the unused bundled database.
+    [ "$DB_MODE" != external ] || secret_db_superuser=external-database-unused
     secret_db_owner=$(secret)
     secret_db_runtime=$(secret)
     secret_metrics=$(secret)
@@ -543,6 +664,11 @@ if [ ! -e "$env_file" ]; then
         printf 'CRAFTCLOUD_DATA_DIR=%s\nCRAFTCLOUD_CONFIG_DIR=%s\nCRAFTCLOUD_PROJECT_NAME=%s\nCRAFTCLOUD_BACKUP_KEEP=%s\n' "$DATA_DIR" "$CONFIG_DIR" "$PROJECT" "${CRAFTCLOUD_BACKUP_KEEP:-7}"
         printf 'CRAFTCLOUD_IMAGE_PREFIX=%s\nCRAFTCLOUD_IMAGE=%s\n' "$IMAGE_PREFIX" "$IMAGE_PREFIX$version_image_tag"
         printf 'CRAFTCLOUD_FIGCRAFT=%s\n' "$FIGCRAFT"
+        printf 'CRAFTCLOUD_DB=%s\nCRAFTCLOUD_PROXY=%s\n' "$DB_MODE" "$PROXY_MODE"
+        printf 'CRAFTCLOUD_LOCAL_PORT=%s\nCRAFTCLOUD_LOCAL_FIGCRAFT_PORT=%s\n' "$LOCAL_PORT" "$LOCAL_FIGCRAFT_PORT"
+        if [ "$DB_MODE" = external ]; then
+            printf 'CRAFTCLOUD_DB_TARGET=%s\nCRAFTCLOUD_DB_QUERY=%s\nCRAFTCLOUD_DB_CA=%s\n' "$DB_TARGET" "$DB_QUERY" "$([ -n "$DB_CA_SOURCE" ] && echo 1 || echo 0)"
+        fi
         printf 'CC_SECRET_DB_SUPERUSER_PASSWORD=%s\n' "$secret_db_superuser"
         printf 'CC_SECRET_DB_OWNER_PASSWORD=%s\n' "$secret_db_owner"
         printf 'CC_SECRET_DB_RUNTIME_PASSWORD=%s\n' "$secret_db_runtime"
@@ -568,6 +694,44 @@ chmod 0600 "$env_file"
 if ! grep -q '^CRAFTCLOUD_CADDY_CONFIG_DIR=' "$env_file"; then printf 'CRAFTCLOUD_CADDY_CONFIG_DIR=%s\n' "$CADDY_CONFIG_DIR" >>"$env_file"; fi
 # Configurations from before the FigCraft setting existed record the chosen value.
 if ! grep -q '^CRAFTCLOUD_FIGCRAFT=' "$env_file"; then env_set CRAFTCLOUD_FIGCRAFT "$FIGCRAFT"; fi
+# Configurations from before OPS-02 get the bundled database and Caddy.
+if ! grep -q '^CRAFTCLOUD_DB=' "$env_file"; then env_set CRAFTCLOUD_DB bundled; fi
+if ! grep -q '^CRAFTCLOUD_PROXY=' "$env_file"; then env_set CRAFTCLOUD_PROXY caddy; fi
+if [ "$DB_MODE" = external ] && [ "$fresh_config" -eq 1 ] && [ -n "$DB_CA_SOURCE" ]; then
+    [ ! -L "$CONFIG_DIR/db-ca.pem" ] || fail 'db-ca.pem must not be a symbolic link'
+    cp -- "$DB_CA_SOURCE" "$CONFIG_DIR/db-ca.pem"
+    chmod 0644 "$CONFIG_DIR/db-ca.pem"
+fi
+if [ "$DB_MODE" = external ]; then
+    roles_sql=$CONFIG_DIR/external-db-roles.sql
+    db_name=$(ops_env_get "$env_file" CRAFTCLOUD_DB_TARGET)
+    db_name=${db_name##*/}
+    pg_image=$(sed -n 's/^x-postgres-image: &postgres-image //p' "$compose_dir/compose.yaml")
+    [ -n "$pg_image" ] || fail 'cannot read the PostgreSQL client image from compose.yaml'
+    if [ "$DB_ROLES_READY" -eq 0 ]; then
+        ops_write_role_sql "$roles_sql" "$db_name" "$(ops_env_get "$env_file" CC_SECRET_DB_OWNER_PASSWORD)" "$(ops_env_get "$env_file" CC_SECRET_DB_RUNTIME_PASSWORD)"
+    fi
+    if [ -n "$DB_ADMIN_URL_FILE" ]; then
+        db_major=$(ops_admin_db_major "$DB_ADMIN_URL_FILE" "$pg_image")
+        case $db_major in ''|*[!0-9]*) fail 'cannot read the PostgreSQL version with the administrator URL (host, credentials or TLS)' ;; esac
+        if [ "$db_major" -lt 16 ] || [ "$db_major" -gt 18 ]; then
+            fail "PostgreSQL $db_major is not supported; CraftCloud needs PostgreSQL 16, 17 or 18"
+        fi
+        printf '%s\n' "craftcloud-install: the external database is PostgreSQL $db_major; creating the CraftCloud roles with the administrator URL"
+        ops_run_admin_sql "$DB_ADMIN_URL_FILE" "$roles_sql" "$pg_image"
+        DB_ROLES_READY=1
+    fi
+    if [ "$DB_ROLES_READY" -eq 1 ]; then
+        rm -f -- "$roles_sql"
+    else
+        printf '%s\n' "craftcloud-install: the external database needs the two CraftCloud roles (craftcloud_owner and craftcloud_runtime)."
+        printf '%s\n' "  The SQL is in $roles_sql (mode 0600, it contains the generated role passwords; it is never printed)."
+        printf '%s\n' '  Run it as a database administrator, for example: psql -v ON_ERROR_STOP=1 -f FILE postgres'
+        printf '%s\n' '  Then run this installer again with the same options and --db-roles-ready.'
+        printf '%s\n' '  (With --db-admin-url-file the installer runs the SQL itself.)'
+        exit 0
+    fi
+fi
 mkdir -p "$CADDY_CONFIG_DIR"
 if [ ! -e "$CADDY_CONFIG_DIR/Caddyfile" ]; then
     caddy_empty=1
@@ -600,10 +764,15 @@ compose() {
     # shellcheck disable=SC2086 # the file list is intentionally word-split
     (cd "$compose_dir" && docker compose --project-name "$PROJECT" --env-file "$env_file" $compose_list "$@")
 }
-build_services='migrate server backup restore'
-[ "$FIGCRAFT" != enabled ] || build_services="$build_services figcraft"
-# shellcheck disable=SC2086 # the service list is intentionally word-split
-compose 0 build --build-arg "CRAFTCLOUD_VERSION=$version" --build-arg "CRAFTCLOUD_COMMIT=$release_commit" $build_services
+if [ -n "$IMAGE_ARCHIVE" ]; then
+    # The prebuilt image replaces the long build on this server.
+    ops_load_image_archive "$IMAGE_ARCHIVE" "$version" "$CRAFTCLOUD_IMAGE"
+else
+    # One image serves server, migrate, backup, restore and the FigCraft companion.
+    build_services='migrate server backup restore'
+    # shellcheck disable=SC2086 # the service list is intentionally word-split
+    compose 0 build --build-arg "CRAFTCLOUD_VERSION=$version" --build-arg "CRAFTCLOUD_COMMIT=$release_commit" $build_services
+fi
 setup_pending=0
 [ ! -f "$CONFIG_DIR/bootstrap-token" ] || setup_pending=1
 if [ "$setup_pending" -eq 1 ]; then
@@ -636,10 +805,17 @@ else
 fi
 setup_url=https://$DOMAIN/admin
 [ "$HTTPS_PORT" = 443 ] || setup_url=https://$DOMAIN:$HTTPS_PORT/admin
+if [ "$PROXY_MODE" != caddy ]; then
+    # Templates are written for the domain and ports of this installation.
+    ops_proxy_write_templates "$compose_dir"
+    if [ "$PROXY_INSTALL" -eq 1 ]; then ops_proxy_install; else ops_proxy_instructions; fi
+fi
 printf 'CraftCloud installed. Setup: %s\n' "$setup_url"
 if [ -f "$CONFIG_DIR/bootstrap-token" ]; then printf 'Bootstrap secret file: %s (keep private; do not share its contents in logs)\n' "$CONFIG_DIR/bootstrap-token"; fi
 if [ "$FIGCRAFT" = enabled ]; then
-    printf 'FigCraft live collaboration: enabled (endpoint under https://%s/figcraft/). Disable with: craftcloud-ctl figcraft disable\n' "$DOMAIN"
+    fig_host=$DOMAIN
+    [ "$HTTPS_PORT" = 443 ] || fig_host=$DOMAIN:$HTTPS_PORT
+    printf 'FigCraft live collaboration: enabled (endpoint under https://%s/figcraft/). Disable with: craftcloud-ctl figcraft disable\n' "$fig_host"
 else
     printf 'FigCraft live collaboration: disabled. Enable with: craftcloud-ctl figcraft enable\n'
 fi

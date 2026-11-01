@@ -1,0 +1,32 @@
+# Your own web server (nginx or Apache) or another proxy in front of CraftCloud
+# (OPS-02). Applied with compose.yaml by the installer when --proxy is nginx,
+# apache or none. The bundled Caddy does not start; the server publishes only
+# 127.0.0.1:<port> on the Docker host.
+#
+# Why a trusted proxy address and not 127.0.0.1: the server never sees the
+# loopback address of the host. A connection to a published port reaches the
+# container from the gateway of its Docker network. That gateway is the only
+# address CraftCloud trusts for X-Forwarded-For; the network is a dedicated
+# bridge with a fixed subnet that holds only the CraftCloud server and (when
+# enabled) the FigCraft server. The templates in deploy/proxy replace the
+# header with the real client address.
+services:
+  caddy:
+    # A service in a profile that is never activated does not start.
+    profiles: [bundled-caddy]
+
+  server:
+    ports:
+      - "127.0.0.1:${CRAFTCLOUD_LOCAL_PORT:-8080}:8080"
+    environment:
+      CRAFTCLOUD_TRUSTED_PROXIES: ${CRAFTCLOUD_PROXY_GATEWAY:-172.29.206.1}/32
+    networks: [proxy]
+
+networks:
+  # Not `internal`: a published port needs a routable bridge. This also gives
+  # the server outbound access; restrict it with the host firewall if needed.
+  proxy:
+    ipam:
+      config:
+        - subnet: ${CRAFTCLOUD_PROXY_SUBNET:-172.29.206.0/24}
+          gateway: ${CRAFTCLOUD_PROXY_GATEWAY:-172.29.206.1}

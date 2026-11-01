@@ -4,8 +4,49 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-pub(super) fn run(root: &Path, version: &str) -> ExitCode {
-    match create_release(root, version) {
+/// Options after the version: `--no-image` and `--image-arch amd64,arm64`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Options {
+    no_image: bool,
+    image_arch: String,
+}
+
+fn parse_options(args: &[String]) -> Result<Options, String> {
+    let mut options = Options::default();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--no-image" => options.no_image = true,
+            "--image-arch" => {
+                options.image_arch = rest
+                    .next()
+                    .ok_or("--image-arch needs a list such as amd64,arm64")?
+                    .clone();
+            }
+            other => return Err(format!("unknown release option {other:?}")),
+        }
+    }
+    if options.no_image && !options.image_arch.is_empty() {
+        return Err("--no-image and --image-arch exclude each other".to_owned());
+    }
+    Ok(options)
+}
+
+/// Name of the prebuilt image archive, matched by `install.sh --image-archive`.
+#[cfg(test)]
+fn image_archive_name(version: &str, arch: &str) -> String {
+    format!("craftcloud-{version}-image-{arch}.tar.zst")
+}
+
+pub(super) fn run(root: &Path, version: &str, args: &[String]) -> ExitCode {
+    let options = match parse_options(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("release: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    match create_release(root, version, &options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("release: {message}");
@@ -14,7 +55,7 @@ pub(super) fn run(root: &Path, version: &str) -> ExitCode {
     }
 }
 
-fn create_release(root: &Path, version: &str) -> Result<(), String> {
+fn create_release(root: &Path, version: &str, options: &Options) -> Result<(), String> {
     validate_version(version)?;
     let dirty = git_output(root, &["status", "--porcelain", "--untracked-files=all"])?;
     ensure_clean_tree(&dirty)?;
@@ -70,6 +111,31 @@ fn create_release(root: &Path, version: &str) -> Result<(), String> {
         return Err(format!("release archive generator failed: {status}"));
     }
     println!("created {}", archive.display());
+    if options.no_image {
+        println!("release: image archives skipped (--no-image)");
+        return Ok(());
+    }
+    // The images are built from the same source tree as the archive.
+    let image_helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/release_image.py");
+    let status = python_command()?
+        .args([
+            "-I",
+            image_helper.to_string_lossy().as_ref(),
+            raw_tar.to_string_lossy().as_ref(),
+            staging_path.to_string_lossy().as_ref(),
+            output.to_string_lossy().as_ref(),
+            version,
+            commit,
+            options.image_arch.as_str(),
+        ])
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("cannot start image archive generator: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "the source archive was created, but the image archive generator failed: {status}"
+        ));
+    }
     Ok(())
 }
 
@@ -269,6 +335,35 @@ mod tests {
     }
 
     #[test]
+    fn release_options_are_parsed_strictly() {
+        let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse_options(&args(&[])), Ok(Options::default()));
+        assert_eq!(
+            parse_options(&args(&["--no-image"])),
+            Ok(Options {
+                no_image: true,
+                image_arch: String::new()
+            })
+        );
+        assert_eq!(
+            parse_options(&args(&["--image-arch", "amd64,arm64"]))
+                .map(|options| options.image_arch),
+            Ok("amd64,arm64".to_owned())
+        );
+        assert!(parse_options(&args(&["--image-arch"])).is_err());
+        assert!(parse_options(&args(&["--no-image", "--image-arch", "amd64"])).is_err());
+        assert!(parse_options(&args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn image_archive_names_follow_the_installer_pattern() {
+        assert_eq!(
+            image_archive_name("0.1.0", "amd64"),
+            "craftcloud-0.1.0-image-amd64.tar.zst"
+        );
+    }
+
+    #[test]
     fn release_requires_clean_tree() {
         assert!(ensure_clean_tree("").is_ok());
         assert!(ensure_clean_tree("?? untracked\n").is_err());
@@ -380,15 +475,17 @@ mod tests {
         let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() else {
             return;
         };
-        let test_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/test_release_archive.py");
-        let status = python_command()
-            .expect("Python 3.11 or newer is required")
-            .args(["-I", test_script.to_string_lossy().as_ref()])
-            .current_dir(root)
-            .status();
-        assert!(
-            status.is_ok_and(|status| status.success()),
-            "Python release generator tests failed"
-        );
+        for name in ["test_release_archive.py", "test_release_image.py"] {
+            let test_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+            let status = python_command()
+                .expect("Python 3.11 or newer is required")
+                .args(["-I", test_script.to_string_lossy().as_ref()])
+                .current_dir(root)
+                .status();
+            assert!(
+                status.is_ok_and(|status| status.success()),
+                "Python release generator tests failed: {name}"
+            );
+        }
     }
 }

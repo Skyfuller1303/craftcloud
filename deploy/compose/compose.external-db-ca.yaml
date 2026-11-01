@@ -1,0 +1,18 @@
+# Private certificate authority for the external database (OPS-02). The installer
+# copies the file named by sslrootcert to ${CRAFTCLOUD_CONFIG_DIR}/db-ca.pem
+# (public certificate, no key) and rewrites the URL to /run/db-ca/ca.pem.
+x-db-ca: &db-ca
+  type: bind
+  source: ${CRAFTCLOUD_CONFIG_DIR:?set CRAFTCLOUD_CONFIG_DIR}/db-ca.pem
+  target: /run/db-ca/ca.pem
+  read_only: true
+
+services:
+  migrate:
+    volumes: [*db-ca]
+  server:
+    volumes: [*db-ca]
+  backup:
+    volumes: [*db-ca]
+  restore:
+    volumes: [*db-ca]

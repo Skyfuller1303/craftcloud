@@ -64,6 +64,11 @@ pub enum DbError {
     Connection(String),
     /// The configured database URL is not a valid PostgreSQL URL.
     InvalidUrl,
+    /// The PostgreSQL server has a major version this build does not support.
+    UnsupportedServer {
+        /// Major version reported by the server (16 for 16.4, 18 for 18.6).
+        major: u32,
+    },
     /// The schema does not match this build.
     Schema(SchemaProblem),
     /// Applying migrations failed. The text names the problem class only.
@@ -84,6 +89,12 @@ impl fmt::Display for DbError {
             Self::CheckViolation { .. } => write!(f, "a value violates a database constraint"),
             Self::Connection(what) => write!(f, "database connection failed: {what}"),
             Self::InvalidUrl => write!(f, "the database URL is not a valid PostgreSQL URL"),
+            Self::UnsupportedServer { major } => write!(
+                f,
+                "unsupported PostgreSQL version {major}: CraftCloud supports PostgreSQL {} to {}",
+                crate::pool::MIN_POSTGRES_MAJOR,
+                crate::pool::MAX_POSTGRES_MAJOR
+            ),
             Self::Schema(problem) => write!(f, "database schema check failed: {problem}"),
             Self::Migration(what) => write!(f, "migration failed: {what}"),
             Self::Internal => write!(f, "internal database error"),

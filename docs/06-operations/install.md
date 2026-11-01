@@ -1,16 +1,18 @@
 # CraftCloud auf einem eigenen Linux-Server installieren
 
-Diese Anleitung richtet sich an Administratoren, die CraftCloud erstmals betreiben. CraftCloud speichert Konten, Organisationen und Dateien; PostgreSQL und der HTTPS-Proxy Caddy laufen im mitgelieferten Docker-Stack. Auf dem Host müssen Sie weder PostgreSQL noch Rust oder Node.js installieren. Der Installationsbefehl baut das Server-Image aus dem Quellarchiv; es werden keine fertigen CraftCloud-Images aus einer Registry geladen.
+Diese Anleitung richtet sich an Administratoren, die CraftCloud erstmals betreiben. CraftCloud speichert Konten, Organisationen und Dateien; PostgreSQL und der HTTPS-Proxy Caddy laufen im mitgelieferten Docker-Stack. Auf dem Host müssen Sie weder PostgreSQL noch Rust oder Node.js installieren. CraftCloud selbst läuft in **einem** Image (`craftcloud:<version>`), das Server, Admin-Oberfläche und den FigCraft-Server enthält; PostgreSQL bleibt ein eigener Container oder ein vorhandener Server. Es werden keine fertigen Images aus einer Registry geladen: Entweder baut der Installationsbefehl das Image aus dem Quellarchiv, oder Sie laden das mit dem Release gelieferte Image-Archiv (siehe [Vorgebautes Image](#vorgebautes-image-statt-lokalem-build)).
+
+Drei Wege stehen zur Wahl, die Sie unten finden: [Weg A](#weg-a-mitgelieferter-caddy-standard) mit dem mitgelieferten Caddy (Standard), [Weg B](#weg-b-vorhandener-nginx-oder-apache-mit-certbot) mit einem vorhandenen nginx oder Apache und [Weg C](#weg-c-ein-einzelner-container-mit-docker-run) mit einem einzelnen `docker run`. Die [Datenbankwahl](#datenbank-wählen) gilt für alle drei.
 
 Der Stand ist ein lokaler Prototyp. Ein externer Betreiber muss die unten beschriebene Abnahme auf einer echten VM noch durchführen. Insbesondere sind eine Docker-Desktop-Probe und ein funktionierender Healthcheck keine Freigabe für einen Mehrmandanten-Produktivbetrieb. SMTP und E-Mail-Verifikation müssen für diesen Betrieb ausdrücklich eingerichtet und geprüft werden.
 
 ## Host, Software und Netzwerk vorbereiten
 
-Vorgesehene Plattformen sind Debian 13 (trixie) und Ubuntu 24.04 LTS auf x86_64 oder arm64. Benötigt werden Docker Engine mindestens 25, das Docker-Compose-Plugin mindestens 2.24 sowie die üblichen Linux-Werkzeuge `sh`, `tar`, `sha256sum`, `curl`, `ss`, `getent`, `df` und `install`. Verwenden Sie gepflegte Pakete aus einer vertrauenswürdigen Quelle und kontrollieren Sie `docker version` und `docker compose version`. Der Benutzer muss den Docker-Daemon erreichen können. Docker-Zugriff verleiht praktisch Root-Rechte; geben Sie ihn nur Administratoren.
+Vorgesehene Plattformen sind Debian 13 (trixie) und Ubuntu 24.04 LTS auf x86_64 oder arm64. Benötigt werden Docker Engine mindestens 25, das Docker-Compose-Plugin mindestens 2.24.4 sowie die üblichen Linux-Werkzeuge `sh`, `tar`, `sha256sum`, `curl`, `ss`, `getent`, `df` und `install`. Verwenden Sie gepflegte Pakete aus einer vertrauenswürdigen Quelle und kontrollieren Sie `docker version` und `docker compose version`. Der Benutzer muss den Docker-Daemon erreichen können. Docker-Zugriff verleiht praktisch Root-Rechte; geben Sie ihn nur Administratoren.
 
 Mindestens 2 GiB RAM und 10 GiB freier Speicher sind erforderlich. Für den lokalen Build und kleine Installationen empfehlen wir 4 CPU-Kerne, 8 GiB RAM und mindestens 30 GiB freien SSD-Speicher, zusätzlich zum Platz für Dateien, Versionen, Datenbank und sieben vollständige Backups. Die Mindestwerte garantieren keinen erfolgreichen Build bei zusätzlicher Last. Das Datenverzeichnis muss auf einem lokalen Linux-Dateisystem mit Hard-Links und Unix-Dateirechten liegen, beispielsweise ext4 oder XFS.
 
-Richten Sie einen DNS-A-Eintrag und, nur bei funktionierendem IPv6, einen AAAA-Eintrag für beispielsweise `cloud.example.org` auf den Server ein. Öffnen Sie TCP 80 und 443; UDP 443 ist für HTTP/3 optional. PostgreSQL und der interne Server-Port werden nicht veröffentlicht. Der Build braucht ausgehenden Zugriff auf die in Dockerfile und Lockfiles genannten Paketquellen; Caddy braucht Zugriff auf die Zertifizierungsstelle. Schützen Sie SSH, halten Sie Host und Docker aktuell und synchronisieren Sie die Uhr.
+Richten Sie einen DNS-A-Eintrag und, nur bei funktionierendem IPv6, einen AAAA-Eintrag für beispielsweise `cloud.example.org` auf den Server ein. Öffnen Sie TCP 80 und 443; UDP 443 ist für HTTP/3 optional. PostgreSQL und der interne Server-Port werden nicht veröffentlicht (bei Weg B nur auf `127.0.0.1`). Der Build braucht ausgehenden Zugriff auf die in Dockerfile und Lockfiles genannten Paketquellen; Caddy braucht Zugriff auf die Zertifizierungsstelle. Schützen Sie SSH, halten Sie Host und Docker aktuell und synchronisieren Sie die Uhr.
 
 Für die Standardverzeichnisse benötigt der Installer Schreibrechte auf `/opt`, `/etc`, `/var/lib` und das systemd-Verzeichnis. Verwenden Sie dafür beispielsweise `sudo`; das Skript prüft Voraussetzungen und Zugriffe, installiert aber keine Host-Pakete selbst.
 
@@ -34,9 +36,105 @@ Der Installer legt versionierte Quellen unter `/opt/craftcloud/releases/<version
 
 Neben den Datenbank- und Token-Geheimnissen erzeugt der Installer einmalig einen Schlüssel für die Zwei-Faktor-Anmeldung (`CC_SECRET_TWO_FACTOR_KEY` in `craftcloud.env`, Base64 von 32 Zufallsbytes). Ohne ihn antwortet die 2FA-Einrichtung mit `503`. Wiederholung und Upgrade ändern einen vorhandenen Schlüssel nie; fehlt er in einer älteren Konfiguration, wird er beim `upgrade` ergänzt. Der Schlüssel ist **nicht** im Backup: Bewahren Sie eine getrennte, geschützte Kopie auf, denn ein Restore der Datenbank braucht denselben Schlüssel, sonst müssen alle Personen 2FA neu einrichten. `craftcloud-ctl status` zeigt, ob er vorhanden ist; sein Wert wird nirgends ausgegeben. Eine Rotation mit altem Schlüssel (`CRAFTCLOUD_SECRET_KEY_OLD_FILE`) ist eine Betreiberaufgabe außerhalb des Installers, siehe [deployment.md](deployment.md).
 
+## Weg A: mitgelieferter Caddy (Standard)
+
+Sind die Ports 80 und 443 frei und läuft auf dem Server kein nginx oder Apache, richtet der Installer den mitgelieferten Caddy mit automatischem Zertifikat (Let's Encrypt) ein. Das ist der Befehl aus dem Abschnitt „Release beziehen und prüfen“. `--proxy caddy` wählt ihn ausdrücklich.
+
+## Weg B: vorhandener nginx oder Apache (mit certbot)
+
+Läuft auf dem Server schon ein Webserver auf Port 80 und 443, darf CraftCloud nicht mit einem eigenen Caddy kollidieren. Der Installer erkennt einen laufenden nginx oder Apache (`--proxy auto`) und schlägt ihn vor; Sie können ihn auch ausdrücklich wählen:
+
+```sh
+sudo sh craftcloud-0.1.0/deploy/install/install.sh --proxy nginx \
+  --domain cloud.example.org --acme-email admin@example.org \
+  --non-interactive ./craftcloud-0.1.0.tar.gz
+```
+
+Mit `--proxy nginx`, `--proxy apache` oder `--proxy none` (eigener Proxy) startet **kein** Caddy. Der CraftCloud-Server veröffentlicht nur `127.0.0.1:8080` (anderer Port mit `--local-port`) und der FigCraft-Server nur `127.0.0.1:47900` (`--local-figcraft-port`). Die Ports 80 und 443 prüft der Installer dann nicht; sie gehören Ihrem Webserver.
+
+Der Installer **schreibt nur Vorlagen** nach `/etc/craftcloud/proxy/` (`craftcloud.nginx.conf` und `craftcloud.apache.conf`, mit Ihrer Domain, den Ports und dem Größenlimit) und nennt die nächsten Schritte. Er ändert keine Webserver-Konfiguration, solange Sie `--proxy-install` nicht angeben. Die Schritte von Hand für nginx:
+
+```sh
+sudo apt install certbot python3-certbot-nginx   # nur wenn Sie certbot noch nicht haben
+sudo certbot certonly --nginx -d cloud.example.org
+sudo cp /etc/craftcloud/proxy/craftcloud.nginx.conf /etc/nginx/conf.d/craftcloud.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Für Apache: `sudo a2enmod proxy proxy_http proxy_wstunnel headers rewrite ssl`, `sudo certbot certonly --apache -d cloud.example.org`, die Vorlage nach `/etc/apache2/sites-available/craftcloud.conf` kopieren, `sudo a2ensite craftcloud`, dann `sudo apachectl configtest && sudo systemctl reload apache2`.
+
+Mit `--proxy-install` erledigt der Installer das selbst, vorsichtig: Er sichert die eine Datei, die er ändert (nach `/etc/craftcloud/proxy/backup/`), prüft die Konfiguration mit `nginx -t` bzw. `apachectl configtest`, lädt nur bei Erfolg neu und stellt bei einem fehlgeschlagenen Test den vorherigen Stand wieder her. Bei Apache prüft er die Module und nennt fehlende; aktivieren muss sie der Administrator. Das Zertifikat kommt entweder aus eigenen Dateien (`--proxy-cert DATEI --proxy-key DATEI`) oder von certbot (`--proxy-install --certbot`). certbot wird **nie** automatisch installiert; fehlt es, nennt der Installer die Pakete für Debian und Ubuntu. Mit `--certbot` richtet er zuerst eine minimale Port-80-Konfiguration ein, ruft `certbot certonly --nginx` (bzw. `--apache`) für die Domain auf und aktiviert danach die vollständige Konfiguration; nicht interaktiv braucht das `--acme-email`, und certbot erhält `--agree-tos`. Die Erneuerung bleibt beim certbot-Timer Ihres Systems (`systemctl list-timers | grep certbot`). Mit eigenem Zertifikat kümmern Sie sich selbst um die Erneuerung.
+
+Was die Vorlagen sicherstellen: HTTPS mit Weiterleitung von HTTP, HSTS, WebSocket-Weiterleitung für den FigCraft-Livepfad `/figcraft/`, Upload ohne Zwischenspeichern (große Dateien bis zum Dateigrößenlimit, Standard 5 GiB; Apache kann über 2 GiB nicht begrenzen, dort erzwingt der Server das Limit), lange Zeitlimits für Uploads und Livesitzungen, `/metrics` gesperrt. Der Proxy **überschreibt** `X-Forwarded-For` mit der Adresse des Clients und setzt `X-Forwarded-Proto: https`; `X-Forwarded-Host` und `Forwarded` leitet er nie weiter. Das ist sicherheitsrelevant: CraftCloud vertraut `X-Forwarded-For` nur von der Docker-Gateway-Adresse des Proxy-Netzes (`CRAFTCLOUD_TRUSTED_PROXIES`, Standard `172.29.206.1/32`, das Teilnetz lässt sich mit `CRAFTCLOUD_PROXY_SUBNET` und `CRAFTCLOUD_PROXY_GATEWAY` in `craftcloud.env` ändern, falls es mit einem vorhandenen Netz kollidiert), und Rate-Limit und Audit-Log sehen sonst nur diese Adresse. Steht vor Ihrem nginx noch ein weiterer Proxy oder ein CDN, müssen Sie dessen Adresse im nginx mit `set_real_ip_from` und `real_ip_header` bekannt machen, sonst sieht CraftCloud die Adresse des CDN. Das Docker-Netz `proxy` (nur Server und FigCraft-Server) ist nicht `internal`, weil Docker nur dort Ports veröffentlicht; die beiden Container haben dadurch ausgehenden Netzzugriff. Begrenzen Sie ihn bei Bedarf mit der Host-Firewall. Beachten Sie außerdem: Der Server vertraut `X-Forwarded-For` von jeder Verbindung, die über den veröffentlichten Loopback-Port ankommt. Wer auf dem Server selbst Konten hat, kann also die Client-Adresse fälschen, indem er `127.0.0.1:8080` direkt anspricht. Betreiben Sie den Server deshalb nicht auf einem Host mit nicht vertrauenswürdigen lokalen Benutzern, oder schränken Sie den Zugriff auf die Loopback-Ports mit der Host-Firewall ein.
+
+`--proxy none` schreibt die Vorlagen zum Anpassen und gibt die Eckdaten aus (Loopback-Ports, Pfad `/figcraft/`, die Header-Regeln), für Apache-fremde und nginx-fremde Proxys wie HAProxy oder Traefik.
+
+## Weg C: ein einzelner Container mit `docker run`
+
+Für Tests und kleine Installationen startet `all-in-one` den CraftCloud-Server und den FigCraft-Server in **einem** Container (ein kleiner Supervisor startet ein beendetes Programm mit wachsender Wartezeit neu und gibt das Stoppsignal an beide weiter). Das ersetzt `install.sh` nicht: Es gibt keine Datensicherung per Zeitplan, kein Upgrade-Werkzeug und keinen Proxy. Compose zusammen mit `install.sh` bleibt der empfohlene Weg.
+
+Voraussetzungen: ein Image (`docker load` des Image-Archivs oder `docker build`), ein erreichbarer PostgreSQL 16 bis 18 mit den beiden Rollen `craftcloud_owner` und `craftcloud_runtime` (die SQL-Befehle liefert der Installer, siehe [Datenbank wählen](#datenbank-wählen), oder `deploy/compose/db-init.sh` als Vorlage) und Geheimnisdateien, die dem Benutzer 65532 gehören und Modus 0400 haben:
+
+```sh
+sudo install -d -m 0500 -o 65532 -g 65532 /etc/craftcloud-run
+# Je Datei: Inhalt über die Standardeingabe, nie als Argument (hier eine Datei mit 64 Hex-Zeichen als Beispiel)
+od -An -N32 -tx1 /dev/urandom | tr -d ' \n' | sudo install -m 0400 -o 65532 -g 65532 /dev/stdin /etc/craftcloud-run/figcraft_key
+head -c 32 /dev/urandom | base64 | tr -d '\n' | sudo install -m 0400 -o 65532 -g 65532 /dev/stdin /etc/craftcloud-run/two_factor_key
+# db_owner_url und db_runtime_url enthalten die Datenbank-URLs mit den Rollen (postgres://craftcloud_owner:...@host:5432/craftcloud?sslmode=verify-full), ebenso mit Modus 0400.
+
+# Schema anlegen (einmalig und nach jedem Upgrade):
+docker run --rm -v /etc/craftcloud-run:/run/secrets:ro \
+  -e CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE=/run/secrets/db_owner_url \
+  -e CRAFTCLOUD_DATABASE_URL_FILE=/run/secrets/db_runtime_url \
+  -e CRAFTCLOUD_DATABASE_RUNTIME_ROLE=craftcloud_runtime \
+  craftcloud:0.1.0 migrate
+
+# Server und FigCraft-Server starten:
+docker run -d --name craftcloud --restart unless-stopped --stop-timeout 35 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:47900:47900 \
+  -e CRAFTCLOUD_PUBLIC_URL=https://cloud.example.org \
+  -e CRAFTCLOUD_TRUSTED_PROXIES=172.17.0.1/32 \
+  -e CRAFTCLOUD_DATABASE_URL_FILE=/run/secrets/db_runtime_url \
+  -e CRAFTCLOUD_SECRET_KEY_FILE=/run/secrets/two_factor_key \
+  -e CRAFTCLOUD_FIGCRAFT_KEY_FILE=/run/secrets/figcraft_key \
+  -v /etc/craftcloud-run:/run/secrets:ro \
+  -v craftcloud-store:/var/lib/craftcloud/store \
+  -v craftcloud-figcraft:/var/lib/craftcloud/figcraft \
+  craftcloud:0.1.0 all-in-one
+```
+
+`172.17.0.1` ist das Gateway des Standard-Docker-Netzes (`docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'`); von dort kommt die Verbindung Ihres Proxys auf dem Host an. Ein vorhandener nginx oder Apache verwendet dieselbe Vorlage wie bei Weg B (mit `--local-port 8080`). Die erste Einrichtung (Bootstrap-Geheimnis `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`) beschreibt [deployment.md](deployment.md). `docker stop craftcloud` sendet SIGTERM, beide Programme beenden sich innerhalb der 35 Sekunden. Die öffentliche FigCraft-Adresse leitet der Container aus `CRAFTCLOUD_PUBLIC_URL` ab (`wss://<Domain>/figcraft/`), wenn Sie `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` nicht setzen.
+
+## Datenbank wählen
+
+CraftCloud unterstützt ausschließlich **PostgreSQL 16, 17 und 18** (Debian 13 liefert 17, Ubuntu 24.04 liefert 16). Ältere und andere Versionen lehnt der Server beim Start mit der Meldung `unsupported PostgreSQL version N` ab. MySQL, MariaDB, SQLite und SQL Server werden nicht unterstützt. PostgreSQL ist nie Teil des CraftCloud-Images, damit Upgrades, Backups und Ausfälle der Datenbank getrennt behandelbar bleiben.
+
+`--db auto` (Standard) prüft, ob auf dem Server schon PostgreSQL läuft (Port 5432, Prozess, systemd-Unit, `pg_lsclusters`, `psql --version`), und meldet die Version. Interaktiv fragt der Installer, ob Sie sie verwenden möchten. Nicht interaktiv verwendet er eine gefundene Datenbank **nie** ohne ausdrückliches `--db external` und installiert stattdessen den mitgelieferten PostgreSQL-Container (`--db bundled`). Findet er MySQL oder MariaDB, erklärt er, dass sie nicht unterstützt werden, und bietet den mitgelieferten Container an.
+
+Für eine vorhandene Datenbank (`--db external`):
+
+1. Legen Sie eine Datei mit einer Zeile an, **ohne** Benutzer und Passwort, zum Beispiel `/root/craftcloud-db.url` mit dem Inhalt `postgres://db.example.org:5432/craftcloud?sslmode=verify-full`. Erlaubt sind nur `sslmode` und `sslrootcert` (absoluter Pfad zum Zertifikat Ihrer privaten Zertifizierungsstelle). Eine Datenbank auf einem **anderen Host** verlangt `sslmode=verify-full`. Für eine Datenbank **auf diesem Server** (`localhost`, `127.0.0.1`) genügt ohne `verify-full` nur ausdrücklich `--db-allow-insecure-local`; die Container erreichen sie als `host.docker.internal`, PostgreSQL muss dafür auf der Docker-Gateway-Adresse lauschen und `pg_hba.conf` das Docker-Teilnetz erlauben. Unix-Sockets gehen mit Containern nicht.
+2. Starten Sie den Installer mit `--db external --database-url-file /root/craftcloud-db.url`. Er erzeugt die Passwörter der beiden Rollen `craftcloud_owner` (besitzt die Tabellen, nur für die Migration) und `craftcloud_runtime` (nur Datenrechte, für den Server), aber **kein** Administratorpasswort, und schreibt die SQL-Befehle in `/etc/craftcloud/external-db-roles.sql` (Modus 0600, enthält die erzeugten Rollenpasswörter, wird nie ausgegeben). Danach hält er an.
+3. Führen Sie die Datei als Datenbankadministrator aus (`psql -v ON_ERROR_STOP=1 -f /etc/craftcloud/external-db-roles.sql postgres`) und starten Sie denselben Installerbefehl noch einmal mit `--db-roles-ready`. Die Datei wird danach gelöscht. Wer dem Installer die Administratorverbindung geben will, übergibt `--db-admin-url-file DATEI` (eine Zeile `postgres://admin:...@host/postgres?sslmode=verify-full`, Modus 0600): Dann führt der Installer die Befehle selbst in einem Container des PostgreSQL-Images aus, prüft dabei auch die Version, und gibt weder die Datei noch deren Inhalt aus.
+
+Backups, `craftcloud-ctl backup` und die Wiederherstellung funktionieren unverändert; die Datenbank selbst sichern Sie mit den Werkzeugen Ihres PostgreSQL-Servers zusätzlich.
+
+## Vorgebautes Image statt lokalem Build
+
+`cargo xtask release <version>` erzeugt neben dem Quellarchiv je Architektur ein Image-Archiv `craftcloud-<version>-image-amd64.tar.zst` (und `-arm64`, soweit der Builder es kann) und trägt es in `SHA256SUMS` ein. Legen Sie es neben das Quellarchiv und `SHA256SUMS`:
+
+```sh
+sudo sh craftcloud-0.1.0/deploy/install/install.sh --non-interactive --domain cloud.example.org \
+  --image-archive ./craftcloud-0.1.0-image-amd64.tar.zst ./craftcloud-0.1.0.tar.gz
+sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl upgrade ./craftcloud-0.1.1.tar.gz \
+  --image-archive ./craftcloud-0.1.1-image-amd64.tar.zst
+```
+
+Der Installer prüft die Prüfsumme, den Dateinamen (Version und Architektur dieses Servers) und die Architektur des geladenen Images und baut dann nichts mehr: Der lange Build auf dem Server entfällt, ohne dass eine Registry nötig ist. Docker muss `.zst` lesen können; sonst installieren Sie das Paket `zstd` (Debian und Ubuntu). Ohne `--image-archive` baut der Installer wie bisher aus dem Quellarchiv.
+
 ## FigCraft-Live (standardmäßig aktiv)
 
-Seit 2026-10-31 richtet der Installer den FigCraft-Begleitdienst (AC-06) standardmäßig mit ein, damit Personen rund um die Uhr live an gemeinsamen FigCraft-Dateien arbeiten können, ohne dass jemand einen eigenen FigCraft-Server startet. `craftcloud.env` enthält dafür `CRAFTCLOUD_FIGCRAFT=enabled`, den Pfad `CRAFTCLOUD_FIGCRAFT_SECRET_FILE` und die öffentliche Adresse `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` (`wss://<Domain>[:<HTTPS-Port>]/figcraft/`). Den Verwaltungsschlüssel (64 zufällige Hex-Zeichen) erzeugt der Installer einmalig als `/etc/craftcloud/figcraft.key` mit Modus 0600; er wird nie ausgegeben, nie überschrieben und ist **nicht** im Backup. Bewahren Sie wie beim 2FA-Schlüssel eine getrennte, geschützte Kopie auf. Der Begleitdienst wird beim Installieren lokal gebaut (Netzwerkzugriff auf `codeload.github.com`, zusätzliche Bauzeit und Speicher) und läuft nur im internen Compose-Netz; Caddy reicht `/figcraft/` weiter. Alle `docker compose`-Aufrufe von `install.sh` und `craftcloud-ctl` verwenden gemeinsam `compose.yaml`, `compose.install.yaml`, `compose.figcraft.yaml` (und während des Setups `compose.setup.yaml`).
+Seit 2026-10-31 richtet der Installer den FigCraft-Begleitdienst (AC-06) standardmäßig mit ein, damit Personen rund um die Uhr live an gemeinsamen FigCraft-Dateien arbeiten können, ohne dass jemand einen eigenen FigCraft-Server startet. `craftcloud.env` enthält dafür `CRAFTCLOUD_FIGCRAFT=enabled`, den Pfad `CRAFTCLOUD_FIGCRAFT_SECRET_FILE` und die öffentliche Adresse `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` (`wss://<Domain>[:<HTTPS-Port>]/figcraft/`). Den Verwaltungsschlüssel (64 zufällige Hex-Zeichen) erzeugt der Installer einmalig als `/etc/craftcloud/figcraft.key` mit Modus 0600; er wird nie ausgegeben, nie überschrieben und ist **nicht** im Backup. Bewahren Sie wie beim 2FA-Schlüssel eine getrennte, geschützte Kopie auf. Der FigCraft-Server ist Teil des CraftCloud-Images (Rolle `figcraft`, ein eigener Container aus demselben Image); beim lokalen Build wird er zusätzlich aus dem gepinnten Commit gebaut (Netzwerkzugriff auf `codeload.github.com`, zusätzliche Bauzeit und Speicher), mit dem Image-Archiv entfällt das. Er läuft nur im internen Compose-Netz; Caddy reicht `/figcraft/` weiter. Bei Weg B veröffentlicht er `127.0.0.1:47900` für Ihren Webserver. Alle `docker compose`-Aufrufe von `install.sh` und `craftcloud-ctl` verwenden gemeinsam `compose.yaml`, `compose.install.yaml`, `compose.figcraft.yaml` (und während des Setups `compose.setup.yaml`).
 
 Ausschalten bei der Installation:
 
@@ -126,7 +224,9 @@ Bei einer falschen Prüfsumme brechen Sie ab und beschaffen Archiv und Prüfsumm
 
 Das offene [P3-Gate](../07-roadmap/phase-03-dashboard.md) benötigt eine projektfremde Person auf einer frischen Debian-13-VM. Sie muss nur mit dieser Anleitung Software, DNS und Firewall einrichten, ein echtes ACME-Zertifikat beziehen, installieren, einrichten, anmelden, Personen einladen, Rollen ändern sowie Dateien hoch- und herunterladen. Zusätzlich sind Host-Neustart mit systemd-Wiederanlauf, tatsächlicher Timerlauf mit Rotation, verschlüsselte Kopie außer Haus, Restore in eine getrennte Instanz, Upgrade, Fehlerfall nach Migration, Rückwechsel und beide Deinstallationsvarianten zu prüfen. Ubuntu 24.04, arm64, die Mindestversionen von Docker/Compose und eigene Zertifikate benötigen eigene Nachweise.
 
-Windows Server ist kein Ziel dieser Installation. Eine spätere Unterstützung benötigt eine gesonderte Entscheidung über Linux-VM oder Windows-Container, Dienstverwaltung, Dateirechte, Pfad- und Netzwerkverhalten sowie einen vollständigen Installations- und Restore-Test. Docker Desktop unter Windows bleibt eine Entwicklungsumgebung.
+**Windows Server** ist kein Ziel dieser Installation. Betreiben Sie CraftCloud auf Windows-Infrastruktur in einer Linux-VM (Debian 13 oder Ubuntu 24.04) auf Hyper-V und folgen Sie dieser Anleitung in der VM. Gründe: CraftCloud und seine Images sind Linux-Container; Windows-Container können sie nicht ausführen. Docker Desktop mit WSL 2 ist eine Entwicklungsumgebung und auf Servern nicht empfohlen (kein Dienstmanager für den Start beim Hochfahren ohne angemeldete Person, andere Dateirechte, Netzwerk über eine zusätzliche Schicht). Eine spätere native Unterstützung bräuchte eine gesonderte Entscheidung samt vollständigem Installations- und Restore-Test.
+
+Auf einer echten Debian-VM bleiben für OPS-02 folgende Prüfungen offen, weil sie in den automatischen Tests nicht möglich sind: ein echtes Zertifikat von Let's Encrypt über `certbot` mit Erneuerungsprobe (`certbot renew --dry-run`), die Host-Firewall (nur 22, 80 und 443; die Loopback-Ports 8080 und 47900 dürfen nicht von außen erreichbar sein), eine Datenbank auf einem anderen Host mit `sslmode=verify-full` und privater Zertifizierungsstelle, eine PostgreSQL 16 oder 17 des Pakets (`apt install postgresql`) mit `listen_addresses` auf der Docker-Gateway-Adresse sowie ein `arm64`-Server mit dem arm64-Image-Archiv.
 
 ## E-Mail-Versand (AC-09)
 

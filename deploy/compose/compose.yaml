@@ -1,6 +1,8 @@
 # CraftCloud Docker Compose stack (CC-P03-07): PostgreSQL, a one-shot role
 # setup, a one-shot migration, the nonroot CraftCloud server and a Caddy proxy
-# with automatic TLS. Development prototype: read docs/06-operations/deployment.md
+# with automatic TLS. Every CraftCloud service (server, migrate, backup,
+# restore and the FigCraft companion) uses the same image, craftcloud:<version>
+# (OPS-02); the first argument of its entrypoint selects the role. Development prototype: read docs/06-operations/deployment.md
 # before exposing it.
 #
 #   cargo xtask compose-secrets --domain cloud.example.org   # writes .env (secrets, 0600)
@@ -43,6 +45,11 @@ services:
       - bootstrap_token
       - metrics_token
       - two_factor_key
+    # Where the database URLs point; compose.external-db.yaml overrides both
+    # for an existing PostgreSQL server. No secret.
+    environment:
+      DB_TARGET: ${CRAFTCLOUD_DB_TARGET:-db:5432/craftcloud}
+      DB_QUERY: ${CRAFTCLOUD_DB_QUERY:-}
     volumes:
       - ./secrets-init.sh:/secrets-init.sh:ro
       - secrets:/out
@@ -115,7 +122,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
-    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud:local}
     user: "65532:65532"
     command: ["migrate"]
     environment:
@@ -146,7 +153,7 @@ services:
   # never changed. The default command prints the usage.
   backup:
     <<: *hardening
-    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud:local}
     user: "65532:65532"
     profiles: [tools]
     command: ["--help"]
@@ -177,7 +184,7 @@ services:
   #   docker compose up -d
   restore:
     <<: *hardening
-    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud:local}
     user: "65532:65532"
     profiles: [tools]
     command: ["--help"]
@@ -206,7 +213,7 @@ services:
   server:
     <<: *hardening
     restart: unless-stopped
-    image: ${CRAFTCLOUD_IMAGE:-craftcloud-server:local}
+    image: ${CRAFTCLOUD_IMAGE:-craftcloud:local}
     user: "65532:65532"
     environment:
       CRAFTCLOUD_PUBLIC_URL: ${CRAFTCLOUD_PUBLIC_URL:?run `cargo xtask compose-secrets` first}

@@ -47,7 +47,10 @@ pub mod versions;
 pub mod workspaces;
 
 pub use error::{DbError, SchemaProblem};
-pub use pool::{connect, ping};
+pub use pool::{
+    MAX_POSTGRES_MAJOR, MIN_POSTGRES_MAJOR, check_server_version, connect, ensure_supported_major,
+    ping, postgres_major,
+};
 pub use scope::OrgScope;
 
 pub use sqlx::PgPool;

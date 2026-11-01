@@ -11,7 +11,7 @@ cat >"$TMP/bin/docker" <<'DOCKER'
 printf '%s\n' "$*" >>"${DOCKER_LOG:-/dev/null}"
 case "$*" in
     *"${DOCKER_FAIL:-@@never@@}"*) exit 1 ;;
-    'compose version --short') echo 2.24.0 ;;
+    'compose version --short') echo 2.24.4 ;;
     'version --format {{.Server.Version}}') echo 25.0.0 ;;
     *'exec -T caddy wget -qO- http://server:8080/api/v1/setup/status'*) echo '{"setup_required":false}' ;;
     *'exec -T server /usr/local/bin/craftcloud-server healthcheck'*) exit 0 ;;
@@ -86,7 +86,7 @@ if grep -- '-f compose.yaml ' "$TMP/docker.log" | grep -v -- '-f compose.figcraf
     exit 1
 fi
 grep -F -- '-f compose.install.yaml -f compose.figcraft.yaml -f compose.setup.yaml up -d' "$TMP/docker.log" >/dev/null
-grep -E -- 'build .* migrate server backup restore figcraft$' "$TMP/docker.log" >/dev/null
+grep -E -- 'build .* migrate server backup restore$' "$TMP/docker.log" >/dev/null
 if grep -F -- "$figcraft_key" "$TMP/install.log" "$TMP/reinstall.log" "$TMP/docker.log" >/dev/null; then
     echo 'the FigCraft key was printed' >&2
     exit 1
@@ -464,7 +464,7 @@ grep -F 'down --volumes' "$TMP/docker.log" >/dev/null
 cat >"$TMP/bin/systemctl" <<'SYSTEMCTL'
 #!/bin/sh
 printf '%s\n' "$*" >>"${SYSTEMCTL_LOG:-/dev/null}"
-case "$1" in disable|enable) exit 1 ;; esac
+case "$1" in disable|enable|is-active) exit 1 ;; esac
 exit 0
 SYSTEMCTL
 chmod +x "$TMP/bin/systemctl"

@@ -1035,6 +1035,7 @@ dependencies = [
  "craftcloud-storage",
  "ipnet",
  "libc",
+ "rustix 1.1.5",
  "serde_json",
  "sha2",
  "sqlx",

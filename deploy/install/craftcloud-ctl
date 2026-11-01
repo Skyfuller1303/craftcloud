@@ -28,11 +28,12 @@ if [ -n "${CRAFTCLOUD_IMAGE_PREFIX:-}" ] && [ -n "$saved_image_prefix" ] && [ "$
     exit 1
 fi
 IMAGE_PREFIX=${CRAFTCLOUD_IMAGE_PREFIX:-$saved_image_prefix}
-IMAGE_PREFIX=${IMAGE_PREFIX:-craftcloud-server:}
+IMAGE_PREFIX=${IMAGE_PREFIX:-craftcloud:}
 case $IMAGE_PREFIX in *[!A-Za-z0-9._:/-]*) printf '%s\n' 'craftcloud-ctl: invalid image prefix' >&2; exit 1 ;; esac
 SYSTEMD_DIR=${CRAFTCLOUD_SYSTEMD_DIR:-/etc/systemd/system}
 CURRENT=$INSTALL_ROOT/current
 . "$(dirname -- "$0")/smtp-overrides.sh"
+. "$(dirname -- "$0")/ops02.sh"
 smtp_files=$(smtp_overrides "$CONFIG_DIR/craftcloud.env")
 
 fail() { printf '%s\n' "craftcloud-ctl: $*" >&2; exit 1; }
@@ -162,10 +163,14 @@ compose_run() {
             files="$files -f compose.figcraft.yaml"
         else
             printf '%s\n' "craftcloud-ctl: warning: release $version has no compose.figcraft.yaml; running it without the FigCraft companion" >&2
+            fig=disabled
         fi
     fi
     # smtp_files contains only fixed -f filenames emitted by smtp_overrides;
     # overlays missing from an older release are dropped with a warning.
+    # Database and proxy choices (OPS-02) are recorded in the environment file.
+    ops_files=$(ops_overlay_files "$CONFIG_DIR/craftcloud.env" "$dir" "$fig") || exit 1
+    files="$files$ops_files"
     release_smtp_files=$(smtp_release_files "$dir" "$smtp_files" "$version")
     [ -z "$release_smtp_files" ] || files="$files $release_smtp_files"
     [ "$setup" != 1 ] || files="$files -f compose.setup.yaml"
@@ -337,10 +342,29 @@ ensure_two_factor_key() {
     mv -f "$ensure_tmp" "$ensure_env"
     printf '%s\n' "craftcloud-ctl: generated a two-factor encryption key in $ensure_env (keep a separate protected copy; backups do not contain it)"
 }
+# read_setup_status <release-root>: the JSON of GET /api/v1/setup/status. With the
+# bundled Caddy it is read through that container; with your own proxy through
+# the loopback port the server publishes (curl or wget on the host).
+read_setup_status() {
+    rss_proxy=$(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_PROXY)
+    case ${rss_proxy:-caddy} in
+        caddy) compose_at_setup "$1" exec -T caddy wget -qO- http://server:8080/api/v1/setup/status ;;
+        *)
+            rss_port=$(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_LOCAL_PORT)
+            rss_url=http://127.0.0.1:${rss_port:-8080}/api/v1/setup/status
+            if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 10 "$rss_url"
+            elif command -v wget >/dev/null 2>&1; then wget -qO- -T 10 "$rss_url"
+            else fail 'curl or wget is required to read the setup status when your own proxy is used'; fi
+            ;;
+    esac
+}
 # Recreates the proxy so that refreshed Caddy files take effect (the directory is a
 # read-only bind mount; Caddy reads it at start).
 recreate_caddy_if_changed() {
     [ "${CADDY_CHANGED:-0}" -eq 1 ] || return 0
+    # With your own proxy the bundled Caddy is not part of the installation.
+    proxy_now=$(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_PROXY)
+    [ -z "$proxy_now" ] || [ "$proxy_now" = caddy ] || return 0
     compose_for_setup_state "$1" up -d --force-recreate --no-deps caddy || printf '%s\n' 'craftcloud-ctl: warning: could not recreate the proxy; restart it to load the refreshed Caddy files' >&2
 }
 # Commands that change the installation (backup, upgrade, rollback, setup-complete,
@@ -377,6 +401,7 @@ case ${1:-} in
         fi
         fig_status=$(figcraft_setting) || exit 1
         printf '%s\n' "FigCraft live companion: $fig_status (change with: craftcloud-ctl figcraft enable|disable)"
+        printf '%s\n' "Database: $(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_DB | sed 's/^$/bundled/'); reverse proxy: $(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_PROXY | sed 's/^$/caddy/')"
         ;;
     logs) shift; compose_at "$active" logs --follow "$@" ;;
     backup)
@@ -420,7 +445,7 @@ case ${1:-} in
     setup-complete)
         acquire_lock
         [ -f "$CONFIG_DIR/bootstrap-token" ] || fail 'bootstrap secret file not present'
-        setup_status=$(compose_at_setup "$active" exec -T caddy wget -qO- http://server:8080/api/v1/setup/status) || fail 'cannot read setup status'
+        setup_status=$(read_setup_status "$active") || fail 'cannot read setup status'
         case $setup_status in *'"setup_required":false'*) ;; *) fail 'instance setup is not complete' ;; esac
         env_file=$CONFIG_DIR/craftcloud.env
         env_backup=$CONFIG_DIR/.craftcloud.env.$$
@@ -450,8 +475,14 @@ case ${1:-} in
         ;;
     upgrade)
         acquire_lock
-        [ "$#" -eq 2 ] || fail 'usage: craftcloud-ctl upgrade <archive.tar.gz>'
+        image_archive=
+        case $# in
+            2) ;;
+            4) [ "$3" = --image-archive ] || fail 'usage: craftcloud-ctl upgrade <archive.tar.gz> [--image-archive <image.tar.zst>]'; image_archive=$4 ;;
+            *) fail 'usage: craftcloud-ctl upgrade <archive.tar.gz> [--image-archive <image.tar.zst>]' ;;
+        esac
         archive=$2
+        [ -z "$image_archive" ] || [ -f "$image_archive" ] || fail 'image archive not found'
         [ -f "$archive" ] || fail 'archive not found'
         verify_archive_checksum "$archive"
         archive_name=$(basename -- "$archive")
@@ -487,11 +518,15 @@ case ${1:-} in
         metaver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$metadata")
         [ "$metaver" = "$new_version" ] && [ -n "$commit" ] || fail 'release metadata mismatch'
         export CRAFTCLOUD_IMAGE="$IMAGE_PREFIX$new_image_tag" CRAFTCLOUD_DATA_DIR="$DATA_DIR" CRAFTCLOUD_CONFIG_DIR="$CONFIG_DIR"
-        build_services='migrate server backup restore'
-        fig_now=$(figcraft_setting) || exit 1
-        if [ "$fig_now" = enabled ] && [ -f "$new_dir/compose.figcraft.yaml" ]; then build_services="$build_services figcraft"; fi
-        # shellcheck disable=SC2086 # the service list is intentionally word-split
-        compose_at "$new_root" build --build-arg "CRAFTCLOUD_VERSION=$new_version" --build-arg "CRAFTCLOUD_COMMIT=$commit" $build_services
+        if [ -n "$image_archive" ]; then
+            # The prebuilt image replaces the long build on this server.
+            ops_load_image_archive "$image_archive" "$new_version" "$CRAFTCLOUD_IMAGE"
+        else
+            # One image serves server, migrate, backup, restore and the FigCraft companion.
+            build_services='migrate server backup restore'
+            # shellcheck disable=SC2086 # the service list is intentionally word-split
+            compose_at "$new_root" build --build-arg "CRAFTCLOUD_VERSION=$new_version" --build-arg "CRAFTCLOUD_COMMIT=$commit" $build_services
+        fi
         restore_warning=0
         trap 'upgrade_status=$?; if [ "$restore_warning" -eq 1 ] && [ "$upgrade_status" -ne 0 ]; then printf "%s\\n" "Upgrade failed after migration attempt. Pre-upgrade backup: $backup_path. Restore manually if needed; see docs/06-operations/backup-upgrade-runbook.md. No automatic restore performed." >&2; fi' 0
         restore_warning=1
@@ -568,7 +603,7 @@ case ${1:-} in
                 }
                 if [ "$sub" = enable ]; then
                     ensure_figcraft_files
-                    compose_for_setup_state "$active" build figcraft || { restore_figcraft_setting; fail 'could not build the FigCraft image; setting restored'; }
+                    # The FigCraft server is part of the CraftCloud image; nothing to build.
                 else
                     printf '%s\n' 'craftcloud-ctl: warning: disabling FigCraft live collaboration. Active live files become unavailable and their links stop working. End live files in the cloud first so the last state is saved as a version; the data stays in the figcraft-data volume and the key stays in the config directory for a later enable.' >&2
                 fi
@@ -619,5 +654,5 @@ case ${1:-} in
             rm -rf -- "$DATA_DIR" "$CONFIG_DIR"
         fi
         ;;
-    *) fail 'usage: craftcloud-ctl status|logs|backup|upgrade <archive>|rollback|setup-complete|figcraft [status|enable|disable]|uninstall [--purge --confirm-purge]' ;;
+    *) fail 'usage: craftcloud-ctl status|logs|backup|upgrade <archive> [--image-archive <image>]|rollback|setup-complete|figcraft [status|enable|disable]|uninstall [--purge --confirm-purge]' ;;
 esac

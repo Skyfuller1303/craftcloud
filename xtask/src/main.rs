@@ -19,9 +19,9 @@ fn main() -> ExitCode {
             _ => usage(),
         },
         Some("web") if args.next().is_none() => web::run(&repo_root()),
-        Some("db-test") if args.next().is_none() => db_test::run(&repo_root()),
+        Some("db-test") => db_test::run(&repo_root(), &args.collect::<Vec<_>>()),
         Some("release") => match args.next() {
-            Some(version) if args.next().is_none() => release::run(&repo_root(), &version),
+            Some(version) => release::run(&repo_root(), &version, &args.collect::<Vec<_>>()),
             _ => usage(),
         },
         Some("compose-secrets") => compose::run(&repo_root(), &args.collect::<Vec<_>>()),
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: cargo xtask <ci [--skip-web]|web|db-test|release <version>|compose-secrets [<dir>] [--domain <name>] [--tls-internal] [--http-port <n>] [--https-port <n>]|openapi-snapshot [--update]>"
+        "usage: cargo xtask <ci [--skip-web]|web|db-test [--postgres 16|17|18]|release <version> [--no-image] [--image-arch amd64,arm64]|compose-secrets [<dir>] [--domain <name>] [--tls-internal] [--http-port <n>] [--https-port <n>]|openapi-snapshot [--update]>"
     );
     ExitCode::from(2)
 }

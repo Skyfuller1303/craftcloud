@@ -1,0 +1,8 @@
+# Publishes the FigCraft server on the loopback address of the Docker host for
+# your own web server (OPS-02). Applied after compose.figcraft.yaml and
+# compose.local-proxy.yaml.
+services:
+  figcraft:
+    ports:
+      - "127.0.0.1:${CRAFTCLOUD_LOCAL_FIGCRAFT_PORT:-47900}:47900"
+    networks: [proxy, figcraft]

@@ -50,7 +50,7 @@ Nach Migration `0018_figcraft_live.sql` aktiviert CraftCloud die Funktion nur, w
 | `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` | Öffentlich erreichbarer Endpunkt in persönlichen Links, normalerweise `wss://<Cloud-Domain>/figcraft/`. Unverschlüsseltes `ws` wird nur für Loopback akzeptiert. |
 | `CRAFTCLOUD_FIGCRAFT_KEY_FILE` | Absolute geschützte Datei mit dem FigCraft-Verwaltungsschlüssel; nicht der AC-02-Verschlüsselungsschlüssel. |
 | `CRAFTCLOUD_FIGCRAFT_SECRET_FILE` | Nur Compose: Hostdatei mit 64 zufälligen Hex-Zeichen, aus der `figcraft-init` den Verwaltungsschlüssel bereitstellt. |
-| `CRAFTCLOUD_FIGCRAFT_IMAGE` | Nur Compose: optionaler Name für das lokal gebaute, auf Commit und Archivprüfsumme gepinnte Begleitdienst-Image. |
+| `CRAFTCLOUD_FIGCRAFT_IMAGE` | Nur Compose, veraltet: Alias für das Image des Begleitdienstes, gilt noch eine Version. Seit OPS-02 läuft der FigCraft-Server aus dem CraftCloud-Image (`CRAFTCLOUD_IMAGE`, Rolle `figcraft`); es gibt kein eigenes Begleitdienst-Image mehr. |
 
 URLs dürfen weder Zugangsdaten noch Query oder Fragment enthalten. Legen Sie die Host-Schlüsseldatei außerhalb des Repositorys mit restriktiven Dateirechten an, etwa `umask 077; openssl rand -hex 32 > /geschuetzter/pfad/figcraft.key`, und tragen Sie ihren absoluten Pfad in `.env` ein. Die vorhandene Vorlage erzeugt diesen zusätzlichen Schlüssel nicht automatisch. Behandeln Sie ihn wie ein Administratorpasswort: Er verwaltet sämtliche Dokumente des Begleitdienstes.
 
@@ -153,6 +153,27 @@ Absolute URLs entstehen ausschließlich aus `CRAFTCLOUD_PUBLIC_URL`, nie aus `Ho
 
 Die Compose-Vorlage (Abschnitt „Docker Compose“ weiter unten, `deploy/compose/`) setzt Server-Image, Migrationspfad, Healthcheck, Secret-Besitz und Volume-Rechte um. Sie ist ein Entwicklungsprototyp, kein freigegebener Produktivbetrieb (siehe `docs/gaps.md`).
 
+## Ein Image mit Rollen, Datenbankversionen und eigener Proxy (OPS-02)
+
+Alle CraftCloud-Dienste des Compose-Stacks (`server`, `migrate`, `backup`, `restore` und der FigCraft-Begleitdienst) laufen aus demselben Image `craftcloud:<version>` ([ADR-0029](../09-decisions/adr-0029-appliance-image-and-proxy.md)). Das erste Argument des Entrypoints wählt die Rolle:
+
+| Rolle | Wirkung |
+|---|---|
+| `serve` (Standard, auch ohne Argument) | HTTP-Server mit Admin-Oberfläche |
+| `figcraft` | ersetzt den Prozess durch `figcraft-server --config $CRAFTCLOUD_FIGCRAFT_CONFIG` (Standard `/etc/figcraft-server/server.toml`) |
+| `migrate` | Migrationen anwenden und beenden |
+| `backup <Argumente>`, `restore <Verzeichnis>` | Kurzformen von `admin backup ...` und `admin backup restore ...` |
+| `healthcheck` | prüft den eigenen Listener (`CRAFTCLOUD_BIND`) |
+| `all-in-one` | Server und FigCraft-Server in einem Container unter einem Supervisor |
+
+`all-in-one` ist für `docker run`-Einzelinstallationen ([install.md](install.md), Weg C). Der Supervisor startet ein beendetes Programm mit Backoff neu (1 s, verdoppelt bis 30 s), gibt SIGTERM an beide Programme weiter und beendet übrige nach 25 s; ein Programm, das mit Code 2 (ungültige Konfiguration) endet, wird nicht neu gestartet. Er schreibt Schlüssel und Konfiguration des FigCraft-Servers nach `$CRAFTCLOUD_ALL_IN_ONE_DIR` (Standard `/var/lib/craftcloud/figcraft`, ein Volume). Nötig sind `CRAFTCLOUD_FIGCRAFT_KEY_FILE` und `CRAFTCLOUD_PUBLIC_URL` oder `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL`. Der FigCraft-Server lauscht dort auf `0.0.0.0:47900` im Container; veröffentlichen Sie ihn nur auf `127.0.0.1`.
+
+**PostgreSQL-Versionen:** Der Server prüft beim Verbindungsaufbau die Hauptversion und verweigert alles außer 16, 17 und 18. `cargo xtask db-test` prüft standardmäßig gegen 18.6; `cargo xtask db-test --postgres 16` (oder `17`) gegen die anderen Hauptversionen.
+
+**Eigener Reverse Proxy:** Mit den Overlays `compose.local-proxy.yaml` und `compose.local-proxy-figcraft.yaml` startet kein Caddy; der Server veröffentlicht `127.0.0.1:${CRAFTCLOUD_LOCAL_PORT:-8080}` und der FigCraft-Server `127.0.0.1:${CRAFTCLOUD_LOCAL_FIGCRAFT_PORT:-47900}`. `CRAFTCLOUD_TRUSTED_PROXIES` ist dann das Gateway des Netzes `proxy` (`${CRAFTCLOUD_PROXY_GATEWAY:-172.29.206.1}/32`), nicht `127.0.0.1/32`: Der Container sieht die Loopback-Adresse des Hosts nie, eine Verbindung zu einem veröffentlichten Port kommt vom Gateway an. Der Proxy überschreibt `X-Forwarded-For` mit der Client-Adresse (Vorlagen in `deploy/proxy/`); `X-Forwarded-Host` wird nie ausgewertet. Das Netz `proxy` ist nicht `internal`.
+
+**Vorhandene Datenbank:** `compose.external-db.yaml` (und mit privater Zertifizierungsstelle `compose.external-db-ca.yaml`) ersetzen den Container `db` und `db-init`. `CRAFTCLOUD_DB_TARGET` (`host:port/datenbank`) und `CRAFTCLOUD_DB_QUERY` (`?sslmode=verify-full&sslrootcert=/run/db-ca/ca.pem`) enthalten keine Zugangsdaten; `secrets-init` baut daraus mit den Rollenpasswörtern die URLs. Den Weg über den Installer beschreibt [install.md](install.md).
+
 ## Docker Compose (CC-P03-07)
 
 Die Vorlage liegt in `deploy/compose/` (Build-Kontext ist die Repository-Wurzel, `.dockerignore` dort). Sie startet `secrets-init` (einmalig), `db` (PostgreSQL 18), `db-init` (einmalig), `migrate` (einmalig), `server` und `caddy` (ADR-0016). Die Werkzeugdienste `backup` und `restore` (Profil `tools`) laufen nur auf Anforderung, siehe „Backup und Restore (PR-019)“. Sie ist ein Entwicklungsprototyp: Der Server ist nicht freigegeben, ein externer Betreiber-Test steht aus (CC-P03-09).
@@ -166,7 +187,7 @@ docker compose -f compose.yaml -f compose.setup.yaml up -d --build
 ```
 
 1. `cargo xtask compose-secrets [<dir>] [--domain <name>] [--tls-internal] [--http-port <n>] [--https-port <n>]` erzeugt `deploy/compose/.env` mit `CRAFTCLOUD_DOMAIN`, `CRAFTCLOUD_PUBLIC_URL` (`https://<domain>`, mit `:<port>` nur bei einem anderen HTTPS-Port), den veröffentlichten Ports, `CRAFTCLOUD_TLS_MODE` und sechs Secrets: drei Datenbankpasswörter (Superuser, Owner, Runtime), Bootstrap-Token, Metrik-Token sowie `CC_SECRET_TWO_FACTOR_KEY` (Base64 von 32 Zufallsbytes, siehe Abschnitt Zwei-Faktor-Anmeldung; je 256 Bit aus der Zufallsquelle des Betriebssystems, URL-sicher, dieselbe Quelle wie die Server-Tokens). Die Datenbank-URLs stehen nicht in `.env`: `secrets-init` baut sie aus den Passwörtern von Owner und Runtime, sodass URL und Passwort nicht auseinanderlaufen können. Die Datei wird nie überschrieben (zum Neuerzeugen wegräumen) und ihre Werte werden nie ausgegeben; unter Unix hat sie Modus 0600, unter Windows setzt der Befehl keine Rechte. `.env` steht in `.gitignore`; `.env.example` zeigt nur das Layout.
-2. `docker compose ... up -d --build` baut das Image (`craftcloud-server:local`, Name über `CRAFTCLOUD_IMAGE` änderbar), verteilt die Secrets, legt die Datenbankrollen an, migriert und startet Server und Proxy. `depends_on` mit `service_completed_successfully` und `service_healthy` erzwingt die Reihenfolge; scheitert `migrate`, startet der Server nicht.
+2. `docker compose ... up -d --build` baut das Image (`craftcloud:local`, Name über `CRAFTCLOUD_IMAGE` änderbar; vor OPS-02 `craftcloud-server:local`), verteilt die Secrets, legt die Datenbankrollen an, migriert und startet Server und Proxy. `depends_on` mit `service_completed_successfully` und `service_healthy` erzwingt die Reihenfolge; scheitert `migrate`, startet der Server nicht.
 3. Im Browser `https://<domain>/admin` öffnen und das Setup mit dem Bootstrap-Token abschließen (steht als `CC_SECRET_BOOTSTRAP` in `.env`). Danach `docker compose up -d` **ohne** `compose.setup.yaml`: Der Server wird ohne Bootstrap-Datei neu erzeugt, und `secrets-init` löscht die Token-Datei aus dem Secret-Volume, sodass der Token in keinem Container mehr liegt. Der Eintrag bleibt in `.env` (Compose erwartet ihn für `secrets-init`); wer ihn dort nicht aufbewahren will, ersetzt den Wert durch einen Platzhalter.
 4. **Upgrade:** zuerst ein Backup mit Restore-Probe auf einer getrennten Instanz (`docker compose run --rm backup admin backup create --out /backups/<Name>`, Ablauf im [Runbook](backup-upgrade-runbook.md)), dann Quellen aktualisieren und `docker compose up -d --build`. `migrate` läuft bei jedem `up` vor dem Server, wendet nur ausstehende Migrationen an und nur vorwärts; der Rückweg auf eine ältere Version ist das Backup.
 5. **Logs und Zustand:** `docker compose logs -f server` (JSON, eine Zeile je Anfrage), `docker compose ps` zeigt `healthy` für `db`, `server` und `caddy`. Von außen: `https://<domain>/health/ready`. Offline-Befehle laufen im Serverdienst, zum Beispiel `docker compose exec server /usr/local/bin/craftcloud-server admin maintenance --once --dry-run`.

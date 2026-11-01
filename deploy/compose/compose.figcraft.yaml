@@ -27,12 +27,14 @@ services:
     mem_limit: 64m
     pids_limit: 32
 
+  # The FigCraft server is part of the CraftCloud image (role `figcraft`); there
+  # is no separate image any more. CRAFTCLOUD_FIGCRAFT_IMAGE still works as an
+  # alias for one release and then falls back to the CraftCloud image.
   figcraft:
-    build:
-      context: ../..
-      dockerfile: deploy/compose/figcraft/Dockerfile
-    image: ${CRAFTCLOUD_FIGCRAFT_IMAGE:-craftcloud-figcraft:ddda495a6ff4}
+    image: ${CRAFTCLOUD_FIGCRAFT_IMAGE:-${CRAFTCLOUD_IMAGE:-craftcloud:local}}
+    command: ["figcraft"]
     user: "65532:65532"
+    healthcheck: {disable: true}
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

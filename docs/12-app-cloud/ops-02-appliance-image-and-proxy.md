@@ -2,6 +2,8 @@
 
 > **Repository:** CraftCloud. **Worktree:** `D:\ArtCraft\CraftCloud\wt-ops02`, Branch `feat/ops-02-appliance` (Basis: aktuelles `main`; legt der Koordinator an). **Bericht:** `D:\ArtCraft\output\craftcloud-codex\OPS-02\REPORT.md`. **Migration:** keine. **Review:** unabhängig (Betrieb, Netzwerkgrenze, Geheimnisse). **Keine Veröffentlichung:** keine Images in einer Registry, kein GitHub-Release, kein Push.
 
+> **Stand 2026-11-01:** lokal umgesetzt im Worktree `wt-ops02` (Branch `feat/ops-02-appliance`), noch nicht committet und nicht gepusht; Abnahme und offene Punkte stehen im Bericht `D:\ArtCraft\output\craftcloud-codex\OPS-02\REPORT.md`, die Entscheidungen im [ADR-0029](../09-decisions/adr-0029-appliance-image-and-proxy.md). Abweichung von Entscheidung 4: `CRAFTCLOUD_TRUSTED_PROXIES` ist die Gateway-Adresse des Proxy-Netzes (`/32`), nicht `127.0.0.1/32`, weil ein Container die Loopback-Adresse des Hosts nie sieht.
+
 ## Prompt für Codex
 
 ```

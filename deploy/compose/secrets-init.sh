@@ -48,6 +48,17 @@ out_dir() {
 OWNER_ROLE=craftcloud_owner
 RUNTIME_ROLE=craftcloud_runtime
 DATABASE=craftcloud
+# Where the URLs point. Defaults: the bundled `db` container. For an existing
+# PostgreSQL server the installer passes host:port/database and an optional
+# query (TLS settings); neither contains a credential.
+DB_TARGET=${DB_TARGET:-db:5432/$DATABASE}
+DB_QUERY=${DB_QUERY:-}
+case "$DB_TARGET$DB_QUERY" in
+    *[!]A-Za-z0-9.:/_?=\&[-]*)
+        echo "secrets-init: DB_TARGET or DB_QUERY contains unsupported characters" >&2
+        exit 1
+        ;;
+esac
 
 # The URLs embed the passwords unescaped, so only URL-safe characters are allowed.
 url_safe() {
@@ -103,11 +114,11 @@ copy 999 db-init db_owner_password
 copy 999 db-init db_runtime_password
 prune db-init db_superuser_password db_owner_password db_runtime_password
 
-printf 'postgres://%s:%s@db:5432/%s' "$OWNER_ROLE" "$owner_password" "$DATABASE" | put 65532 migrate db_owner_url
-printf 'postgres://%s:%s@db:5432/%s' "$RUNTIME_ROLE" "$runtime_password" "$DATABASE" | put 65532 migrate db_runtime_url
+printf 'postgres://%s:%s@%s%s' "$OWNER_ROLE" "$owner_password" "$DB_TARGET" "$DB_QUERY" | put 65532 migrate db_owner_url
+printf 'postgres://%s:%s@%s%s' "$RUNTIME_ROLE" "$runtime_password" "$DB_TARGET" "$DB_QUERY" | put 65532 migrate db_runtime_url
 prune migrate db_owner_url db_runtime_url
 
-printf 'postgres://%s:%s@db:5432/%s' "$RUNTIME_ROLE" "$runtime_password" "$DATABASE" | put 65532 server db_runtime_url
+printf 'postgres://%s:%s@%s%s' "$RUNTIME_ROLE" "$runtime_password" "$DB_TARGET" "$DB_QUERY" | put 65532 server db_runtime_url
 # The two-factor encryption key is Base64 of 32 random bytes. It is checked for shape
 # only; the value is never printed.
 two_factor_key=$(cat "$SRC/two_factor_key")

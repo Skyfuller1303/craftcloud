@@ -14,8 +14,10 @@ mod config;
 mod healthcheck;
 mod mail_setup;
 mod mail_worker;
+mod roles;
 mod secret;
 mod server;
+mod supervisor;
 
 use base64::Engine;
 use std::io::{self, Read};
@@ -48,9 +50,12 @@ const GIT_COMMIT: &str = match option_env!("CRAFTCLOUD_COMMIT") {
     None => "unknown",
 };
 
-const USAGE: &str = "usage: craftcloud-server [migrate | healthcheck | admin issue-password-reset --email <address> | admin user reset-2fa <email> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>]]\n\
+const USAGE: &str = "usage: craftcloud-server [serve | figcraft | all-in-one | backup <args> | restore <dir> | migrate | healthcheck | admin issue-password-reset --email <address> | admin user reset-2fa <email> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>]]\n\
     \n\
-    (no argument)                          start the HTTP server\n\
+    (no argument), serve                   start the HTTP server\n\
+    figcraft                               run the bundled FigCraft server in place of this process\n\
+    all-in-one                             run the server and the FigCraft server in one container\n\
+    backup ARGS, restore DIR               short for `admin backup ARGS` and `admin backup restore DIR`\n\
     migrate                                apply pending database migrations and exit\n\
     healthcheck                            exit 0 if GET /health/ready on the local listener answers 200 (container healthcheck)\n\
     admin issue-password-reset --email E   print a one-hour password reset link for account E\n\
@@ -105,6 +110,8 @@ enum Command {
     Serve,
     Migrate,
     Healthcheck,
+    Figcraft,
+    AllInOne,
     IssuePasswordReset { email: String },
     ResetTwoFactor { email: String },
     SetOrgOwner { org: String, email: String },
@@ -118,10 +125,13 @@ enum Command {
 }
 
 fn parse_args(args: &[String]) -> Result<Command, String> {
-    match args {
+    let args = roles::expand_role(args);
+    match args.as_slice() {
         [] => Ok(Command::Serve),
         [one] if one == "migrate" => Ok(Command::Migrate),
         [one] if one == "healthcheck" => Ok(Command::Healthcheck),
+        [one] if one == "figcraft" => Ok(Command::Figcraft),
+        [one] if one == "all-in-one" => Ok(Command::AllInOne),
         [one] if one == "--help" || one == "-h" => Ok(Command::Help),
         [one] if one == "--version" || one == "-V" => Ok(Command::Version),
         [admin, action, flag, email]
@@ -210,7 +220,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 digest: Some(digest.clone()),
             })
         }
-        [one] => Err(format!("unknown argument {one:?}")),
+        [one] => Err(format!(
+            "unknown argument {one:?}; roles: {}",
+            roles::ROLE_LIST
+        )),
         _ => Err("too many arguments".to_owned()),
     }
 }
@@ -262,6 +275,17 @@ async fn async_main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             };
+        }
+        Ok(Command::Figcraft) => return roles::run_figcraft(),
+        Ok(Command::AllInOne) => {
+            init_tracing(
+                if std::env::var("CRAFTCLOUD_LOG_FORMAT").is_ok_and(|format| format == "json") {
+                    LogFormat::Json
+                } else {
+                    LogFormat::Text
+                },
+            );
+            return roles::run_all_in_one(shutdown_signal()).await;
         }
         Ok(Command::BackupVerify { dir, digest }) => {
             // Offline: reads the backup directory only. No configuration,
@@ -316,9 +340,12 @@ async fn async_main() -> ExitCode {
         Command::BackupRestore { dir, digest } => {
             backup_restore(&config, &dir, digest.as_deref()).await
         }
-        Command::Help | Command::Version | Command::Healthcheck | Command::BackupVerify { .. } => {
-            Ok(())
-        }
+        Command::Help
+        | Command::Version
+        | Command::Healthcheck
+        | Command::Figcraft
+        | Command::AllInOne
+        | Command::BackupVerify { .. } => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1400,6 +1427,51 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn roles_select_their_commands() {
+        assert!(matches!(parse_args(&words(&["serve"])), Ok(Command::Serve)));
+        assert!(matches!(parse_args(&[]), Ok(Command::Serve)));
+        assert!(matches!(
+            parse_args(&words(&["figcraft"])),
+            Ok(Command::Figcraft)
+        ));
+        assert!(matches!(
+            parse_args(&words(&["all-in-one"])),
+            Ok(Command::AllInOne)
+        ));
+        assert!(matches!(
+            parse_args(&words(&["migrate"])),
+            Ok(Command::Migrate)
+        ));
+        assert!(matches!(
+            parse_args(&words(&["healthcheck"])),
+            Ok(Command::Healthcheck)
+        ));
+        assert!(matches!(
+            parse_args(&words(&["backup", "create", "--out", "/backups/a"])),
+            Ok(Command::BackupCreate { out }) if out == "/backups/a"
+        ));
+        assert!(matches!(
+            parse_args(&words(&["restore", "/backups/a"])),
+            Ok(Command::BackupRestore { dir, digest: None }) if dir == "/backups/a"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_role_is_refused_and_the_roles_are_listed() {
+        let Err(message) = parse_args(&words(&["frobnicate"])) else {
+            panic!("an unknown role must be refused");
+        };
+        assert!(message.contains("frobnicate"), "{message}");
+        assert!(message.contains("all-in-one"), "{message}");
+        assert!(parse_args(&words(&["serve", "extra"])).is_err());
+        assert!(parse_args(&words(&["backup"])).is_err());
+    }
 
     #[test]
     fn app_catalog_read_is_bounded_and_requires_utf8() {

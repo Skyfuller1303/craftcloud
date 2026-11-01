@@ -1,0 +1,47 @@
+# An existing PostgreSQL server instead of the bundled `db` container (OPS-02).
+# Applied after compose.yaml and compose.install.yaml by the installer when
+# --db external is used. The connection target (host, port, database and the
+# TLS query) comes from CRAFTCLOUD_DB_TARGET and CRAFTCLOUD_DB_QUERY; the two
+# role passwords are the generated ones and are turned into database URLs by
+# `secrets-init`, as for the bundled database. PostgreSQL 16, 17 and 18 are supported.
+#
+# The server, migrate, backup and restore services join a routable network and
+# can reach the Docker host as host.docker.internal (a PostgreSQL on the same
+# machine must listen on that address and allow the Docker subnet in pg_hba.conf).
+services:
+  secrets-init:
+    environment:
+      DB_TARGET: ${CRAFTCLOUD_DB_TARGET:?set CRAFTCLOUD_DB_TARGET}
+      DB_QUERY: ${CRAFTCLOUD_DB_QUERY:-}
+
+  # Not started: a service in a profile that is never activated stays off.
+  db:
+    profiles: [bundled-db]
+  db-init:
+    profiles: [bundled-db]
+
+  migrate:
+    depends_on: !override
+      secrets-init: {condition: service_completed_successfully}
+    networks: [dbegress]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  server:
+    networks: [dbegress]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  backup:
+    depends_on: !override
+      secrets-init: {condition: service_completed_successfully}
+    networks: [dbegress]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  restore:
+    depends_on: !override
+      secrets-init: {condition: service_completed_successfully}
+    networks: [dbegress]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+networks:
+  # Not `internal`: the database is outside the Compose project.
+  dbegress: {}

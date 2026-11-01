@@ -42,6 +42,7 @@ sha2 = { version = "0.10", default-features = false }
 subtle = "2"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 libc = "0.2"
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid", "time"] }
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio"] }

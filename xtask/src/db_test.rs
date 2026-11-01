@@ -13,9 +13,16 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Pinned PostgreSQL image (exact minor version). The digest is printed at
-/// start so test logs record what actually ran.
-const IMAGE: &str = "postgres:18.6";
+/// Pinned PostgreSQL images (exact minor versions) by major version. The
+/// default is the version the Compose stack ships; 16 and 17 check the other
+/// supported majors (OPS-02). The digest is printed at start so test logs
+/// record what actually ran.
+const IMAGES: [(u32, &str); 3] = [
+    (16, "postgres:16.15"),
+    (17, "postgres:17.11"),
+    (18, "postgres:18.6"),
+];
+const DEFAULT_MAJOR: u32 = 18;
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Removes the container when dropped, also on failure paths.
@@ -43,8 +50,37 @@ impl Drop for Container {
     }
 }
 
-pub fn run(root: &Path) -> ExitCode {
-    match run_inner(root) {
+/// The image for `--postgres <major>`; `None` selects the default major.
+pub fn image_for(major: Option<u32>) -> Result<&'static str, String> {
+    let wanted = major.unwrap_or(DEFAULT_MAJOR);
+    IMAGES
+        .iter()
+        .find(|(candidate, _)| *candidate == wanted)
+        .map(|(_, image)| *image)
+        .ok_or_else(|| format!("unsupported PostgreSQL major {wanted}; use 16, 17 or 18"))
+}
+
+/// Parses `[--postgres <major>]`.
+pub fn parse_major(args: &[String]) -> Result<Option<u32>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--postgres" => value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("invalid PostgreSQL major {value:?}")),
+        _ => Err("usage: db-test [--postgres 16|17|18]".to_owned()),
+    }
+}
+
+pub fn run(root: &Path, args: &[String]) -> ExitCode {
+    let image = match parse_major(args).and_then(image_for) {
+        Ok(image) => image,
+        Err(message) => {
+            eprintln!("db-test: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    match run_inner(root, image) {
         Ok(code) => code,
         Err(message) => {
             eprintln!("db-test: {message}");
@@ -53,31 +89,31 @@ pub fn run(root: &Path) -> ExitCode {
     }
 }
 
-fn run_inner(root: &Path) -> Result<ExitCode, String> {
+fn run_inner(root: &Path, image: &str) -> Result<ExitCode, String> {
     println!("==> checking docker");
     let version = docker_output(&["version", "--format", "{{.Server.Version}}"])
         .map_err(|e| format!("docker is not available ({e}); start Docker Desktop first"))?;
     println!("docker server {}", version.trim());
 
-    if docker_output(&["image", "inspect", IMAGE, "--format", "{{.Id}}"]).is_err() {
-        println!("==> pulling {IMAGE}");
+    if docker_output(&["image", "inspect", image, "--format", "{{.Id}}"]).is_err() {
+        println!("==> pulling {image}");
         let status = Command::new("docker")
-            .args(["pull", IMAGE])
+            .args(["pull", image])
             .status()
             .map_err(|e| format!("cannot run docker pull: {e}"))?;
         if !status.success() {
-            return Err(format!("docker pull {IMAGE} failed"));
+            return Err(format!("docker pull {image} failed"));
         }
     }
     let digest = docker_output(&[
         "image",
         "inspect",
-        IMAGE,
+        image,
         "--format",
         "{{index .RepoDigests 0}}",
     ])
     .unwrap_or_else(|_| "unknown".to_owned());
-    println!("image {IMAGE} digest {}", digest.trim());
+    println!("image {image} digest {}", digest.trim());
 
     let port = free_port()?;
     let password = random_hex(32);
@@ -99,7 +135,7 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
             "POSTGRES_PASSWORD",
             "-p",
             &format!("127.0.0.1:{port}:5432"),
-            IMAGE,
+            image,
             "postgres",
             "-c",
             "fsync=off",
@@ -240,6 +276,25 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn postgres_major_selects_a_pinned_image() {
+        assert_eq!(image_for(None), Ok("postgres:18.6"));
+        assert_eq!(image_for(Some(16)), Ok("postgres:16.15"));
+        assert_eq!(image_for(Some(17)), Ok("postgres:17.11"));
+        assert!(image_for(Some(15)).is_err());
+        assert!(image_for(Some(19)).is_err());
+    }
+
+    #[test]
+    fn postgres_option_is_parsed_strictly() {
+        let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse_major(&args(&[])), Ok(None));
+        assert_eq!(parse_major(&args(&["--postgres", "16"])), Ok(Some(16)));
+        assert!(parse_major(&args(&["--postgres"])).is_err());
+        assert!(parse_major(&args(&["--postgres", "x"])).is_err());
+        assert!(parse_major(&args(&["--other", "16"])).is_err());
     }
 
     #[test]
