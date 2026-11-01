@@ -289,8 +289,9 @@ mod tests {
         assert!(text(&out).contains("applied migration 18"));
         assert!(text(&out).contains("applied migration 19"));
         assert!(text(&out).contains("applied migration 20"));
+        assert!(text(&out).contains("applied migration 21"));
         assert!(text(&out).contains("applied migration 22"));
-        assert!(text(&out).contains("applied 21 migration(s)"));
+        assert!(text(&out).contains("applied 22 migration(s)"));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));

@@ -1862,14 +1862,14 @@ mod tests {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
             a.len() + b.len(),
-            21,
+            22,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 21);
+        assert_eq!(count, 22);
         migrate::verify(&db.pool).await.unwrap();
     }
 
