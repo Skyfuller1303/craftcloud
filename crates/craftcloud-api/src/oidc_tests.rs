@@ -233,7 +233,7 @@ mod tests {
             Req::new("POST", "/api/v1/auth/oidc/finish")
                 .origin(Some(TEST_ORIGIN))
                 .header("cookie", &flow.cookie)
-                .json(json!({"pending_id":pending_id,"password":password})),
+                .json(json!({"pending_id":pending_id,"password":password,"confirm_desktop":true})),
         )
         .await
     }
@@ -332,6 +332,65 @@ mod tests {
                 "sso_required":false, "trust_mfa":true, "version":null
             }))).await;
         assert_eq!(configured.status, StatusCode::OK, "{}", configured.text);
+        assert_eq!(configured.body["domain_claims"][0]["status"], "pending");
+
+        // The owner-claimed domain is inert until the instance operator approves it:
+        // no discovery hint and no just-in-time account.
+        control(&client, &provider.base_url, json!({"mode":"success"})).await;
+        let discover_body = json!({"email":"someone@example.test"});
+        let hint = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/oidc/discover")
+                .origin(Some(TEST_ORIGIN))
+                .json(discover_body.clone()),
+        )
+        .await;
+        assert_eq!(hint.status, StatusCode::OK, "{}", hint.text);
+        assert_eq!(hint.body["organization_id"], Value::Null);
+        let inert = run_flow(&app, &client, org, None).await;
+        assert_eq!(inert.callback.status, StatusCode::SEE_OTHER);
+        let refused = finish(&app, &inert, None).await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.text);
+        assert_eq!(refused.code(), "SSO_IDENTITY_REJECTED");
+        let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM external_identities")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(accounts, 0);
+        let pending_claims = call(
+            &app,
+            Req::new("GET", "/api/v1/admin/sso/domain-claims")
+                .header("cookie", &format!("craftcloud_session={}", operator.token)),
+        )
+        .await;
+        assert_eq!(
+            pending_claims.status,
+            StatusCode::OK,
+            "{}",
+            pending_claims.text
+        );
+        assert_eq!(pending_claims.body["items"][0]["domain"], "example.test");
+        let approved = call(
+            &app,
+            Req::new(
+                "PUT",
+                &format!("/api/v1/admin/sso/domain-claims/{org}/example.test"),
+            )
+            .origin(Some(TEST_ORIGIN))
+            .header("cookie", &format!("craftcloud_session={}", operator.token))
+            .header("x-csrf-token", &operator.csrf)
+            .json(json!({"decision":"approved"})),
+        )
+        .await;
+        assert_eq!(approved.status, StatusCode::OK, "{}", approved.text);
+        let hint = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/oidc/discover")
+                .origin(Some(TEST_ORIGIN))
+                .json(discover_body),
+        )
+        .await;
+        assert_eq!(hint.body["organization_id"], json!(org));
 
         for mode in [
             "wrong_issuer",
@@ -577,12 +636,49 @@ mod tests {
             .unwrap()
             .strip_prefix("/admin/#oidc=")
             .unwrap();
-        let native_finish = call(
+        // The pending sign-in names the device and client, and cannot be completed unconfirmed.
+        let described = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/oidc/pending")
+                .origin(Some(TEST_ORIGIN))
+                .header("cookie", &native.cookie)
+                .json(json!({"pending_id":pending_id})),
+        )
+        .await;
+        assert_eq!(described.status, StatusCode::OK, "{}", described.text);
+        assert_eq!(
+            described.body["desktop"],
+            json!({"client_kind":"cli","device_name":"OIDC test CLI"})
+        );
+        let unconfirmed = call(
             &app,
             Req::new("POST", "/api/v1/auth/oidc/finish")
                 .origin(Some(TEST_ORIGIN))
                 .header("cookie", &native.cookie)
                 .json(json!({"pending_id":pending_id})),
+        )
+        .await;
+        assert_eq!(
+            unconfirmed.status,
+            StatusCode::CONFLICT,
+            "{}",
+            unconfirmed.text
+        );
+        assert_eq!(unconfirmed.code(), "SSO_DESKTOP_CONFIRMATION_REQUIRED");
+        let foreign_binding = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/oidc/pending")
+                .origin(Some(TEST_ORIGIN))
+                .json(json!({"pending_id":pending_id})),
+        )
+        .await;
+        assert_eq!(foreign_binding.status, StatusCode::BAD_REQUEST);
+        let native_finish = call(
+            &app,
+            Req::new("POST", "/api/v1/auth/oidc/finish")
+                .origin(Some(TEST_ORIGIN))
+                .header("cookie", &native.cookie)
+                .json(json!({"pending_id":pending_id,"confirm_desktop":true})),
         )
         .await;
         assert_eq!(
@@ -986,6 +1082,16 @@ mod tests {
             "active"
         );
         assert_eq!(finish(&app, &stale, None).await.code(), "SSO_LINK_REQUIRED");
+        let bound_pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oidc_pending_logins WHERE user_id=$1")
+                .bind(victim)
+                .fetch_one(&env.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            bound_pending, 1,
+            "a link-required pending login is tied to the account it concerns"
+        );
         control(
             &client,
             &provider.base_url,

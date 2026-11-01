@@ -9,7 +9,12 @@ use uuid::Uuid;
 
 use crate::DbError;
 
-/// Begin serialized SCIM transaction after rechecking the bearer hash.
+/// Begin serialized SCIM transaction after verifying the bearer hash.
+///
+/// The hash is first checked without any row lock, so unauthenticated callers
+/// can never queue behind or hold an organization lock. Only a matching token
+/// locks the organization, and the token is then rechecked under that lock to
+/// serialize against rotation and revocation.
 ///
 /// Returns `None` for missing organizations and invalid/revoked tokens. This
 /// deliberately keeps those cases indistinguishable to SCIM callers.
@@ -18,6 +23,17 @@ pub async fn begin(
     org_id: Uuid,
     bearer: &str,
 ) -> Result<Option<Transaction<'static, Postgres>>, DbError> {
+    let hash = Sha256::digest(bearer.as_bytes());
+    let authentic: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM scim_tokens WHERE org_id=$1 AND token_hash=$2)",
+    )
+    .bind(org_id)
+    .bind(hash.as_slice())
+    .fetch_one(pool)
+    .await?;
+    if !authentic {
+        return Ok(None);
+    }
     let mut tx = pool.begin().await?;
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM organizations WHERE id=$1 FOR UPDATE)")
@@ -27,7 +43,6 @@ pub async fn begin(
     if !exists {
         return Ok(None);
     }
-    let hash = Sha256::digest(bearer.as_bytes());
     let valid: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM scim_tokens WHERE org_id=$1 AND token_hash=$2)",
     )
@@ -200,6 +215,19 @@ pub async fn create_user(
     ctx: &crate::audit::AuditCtx,
 ) -> Result<User, DbError> {
     lock_org(tx, org_id).await?;
+    // userName becomes the global mailbox of a new account: only domains the
+    // instance operator approved for this organization may be provisioned.
+    let approved = match input.user_name.rsplit_once('@') {
+        Some((local, domain)) if !local.is_empty() => {
+            crate::sso::domain_approved(tx, org_id, &domain.to_ascii_lowercase()).await?
+        }
+        _ => false,
+    };
+    if !approved {
+        return Err(DbError::CheckViolation {
+            constraint: Some("scim_domain_unapproved".to_owned()),
+        });
+    }
     ensure_capacity(tx, org_id, input.active, now).await?;
     let user_id = Uuid::new_v4();
     let id = Uuid::new_v4();

@@ -1113,6 +1113,7 @@ mod tests {
         // AC-10 tables did not exist in either legacy schema.
         for table in [
             "organization_sso",
+            "sso_domain_claims",
             "instance_sso_policy",
             "external_identities",
             "scim_users",
@@ -1190,6 +1191,7 @@ mod tests {
                             | "figcraft_outbox"
                             | "member_app_access"
                             | "organization_sso"
+                            | "sso_domain_claims"
                             | "instance_sso_policy"
                             | "external_identities"
                             | "scim_users"
@@ -1321,6 +1323,7 @@ mod tests {
         // AC-10 tables did not exist in either legacy schema.
         for table in [
             "organization_sso",
+            "sso_domain_claims",
             "instance_sso_policy",
             "external_identities",
             "scim_users",
@@ -1369,6 +1372,7 @@ mod tests {
                     Some(
                         "member_app_access"
                             | "organization_sso"
+                            | "sso_domain_claims"
                             | "instance_sso_policy"
                             | "external_identities"
                             | "scim_users"

@@ -3733,6 +3733,103 @@ paths:
           $ref: '#/components/responses/Ac10Failure'
         '503':
           $ref: '#/components/responses/Ac10Failure'
+  /admin/sso/domain-claims:
+    get:
+      tags:
+      - Organizations
+      summary: Operator-only list of organization email-domain claims; pending by default
+      parameters:
+      - in: query
+        name: status
+        required: false
+        schema:
+          type: string
+          enum:
+          - pending
+          - approved
+          - rejected
+      responses:
+        '200':
+          description: Operator-only list of organization email-domain claims; pending by default
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoDomainClaimList'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /admin/sso/domain-claims/{org_id}/{domain}:
+    put:
+      tags:
+      - Organizations
+      summary: Operator-only approval or rejection of one organization domain claim; audited
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: domain
+        required: true
+        schema:
+          type: string
+          maxLength: 253
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsoDomainClaimDecision'
+      responses:
+        '200':
+          description: Operator-only approval or rejection of one organization domain claim; audited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoDomainClaimResult'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
   /organizations/{org_id}/scim:
     get:
       tags:
@@ -4828,6 +4925,45 @@ paths:
           $ref: '#/components/responses/Ac10Failure'
         '503':
           $ref: '#/components/responses/Ac10Failure'
+  /auth/oidc/pending:
+    post:
+      tags:
+      - Auth
+      summary: Describe a pending native sign-in so the person can confirm the device and app; read-only
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcPendingRequest'
+      responses:
+        '200':
+          description: Describe a pending native sign-in so the person can confirm the device and app; read-only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcPendingInfo'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
   /auth/oidc/device/exchange:
     post:
       tags:
@@ -5101,9 +5237,100 @@ components:
           type: string
           writeOnly: true
           maxLength: 128
+        confirm_desktop:
+          type: boolean
+          description: Required for a native flow (409 SSO_DESKTOP_CONFIRMATION_REQUIRED otherwise); set after the person confirmed the device and app shown by /auth/oidc/pending.
       required:
       - pending_id
       additionalProperties: false
+    OidcPendingRequest:
+      type: object
+      properties:
+        pending_id:
+          type: string
+          writeOnly: true
+          maxLength: 128
+      required:
+      - pending_id
+      additionalProperties: false
+    OidcPendingInfo:
+      type: object
+      properties:
+        desktop:
+          nullable: true
+          type: object
+          properties:
+            client_kind:
+              type: string
+            device_name:
+              type: string
+          required:
+          - client_kind
+          - device_name
+      required:
+      - desktop
+    SsoDomainClaim:
+      type: object
+      properties:
+        organization_id:
+          type: string
+          format: uuid
+        organization_name:
+          type: string
+        domain:
+          type: string
+        status:
+          type: string
+          enum:
+          - pending
+          - approved
+          - rejected
+        requested_at:
+          type: string
+          format: date-time
+      required:
+      - organization_id
+      - organization_name
+      - domain
+      - status
+      - requested_at
+    SsoDomainClaimList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SsoDomainClaim'
+      required:
+      - items
+    SsoDomainClaimDecision:
+      type: object
+      properties:
+        decision:
+          type: string
+          enum:
+          - approved
+          - rejected
+      required:
+      - decision
+      additionalProperties: false
+    SsoDomainClaimResult:
+      type: object
+      properties:
+        organization_id:
+          type: string
+          format: uuid
+        domain:
+          type: string
+        status:
+          type: string
+          enum:
+          - approved
+          - rejected
+      required:
+      - organization_id
+      - domain
+      - status
     OidcFinished:
       type: object
       properties:
@@ -5147,6 +5374,23 @@ components:
             type: string
           minItems: 1
           maxItems: 100
+        domain_claims:
+          type: array
+          description: Operator approval state of each allowed domain; only approved domains are effective.
+          items:
+            type: object
+            properties:
+              domain:
+                type: string
+              status:
+                type: string
+                enum:
+                - pending
+                - approved
+                - rejected
+            required:
+            - domain
+            - status
         enabled:
           type: boolean
         jit_enabled:

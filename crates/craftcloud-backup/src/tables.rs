@@ -68,6 +68,7 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("figcraft_links", 18),
     table("figcraft_outbox", 18),
     table("organization_sso", 21),
+    table("sso_domain_claims", 21),
     table("instance_sso_policy", 21),
     table("external_identities", 21),
     table("scim_users", 21),
@@ -204,11 +205,11 @@ mod tests {
         // AC-06 adds FigCraft state at 18; AC-09 adds one-use email state at 19.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len() - 15
+            BACKUP_TABLES.len() - 16
         );
         assert_eq!(
             backup_tables_for(14).unwrap().len(),
-            BACKUP_TABLES.len() - 15
+            BACKUP_TABLES.len() - 16
         );
         assert_eq!(
             excluded_tables_for(14),
@@ -235,7 +236,7 @@ mod tests {
         assert!(!excluded_tables_for(15).contains(&"file_locks"));
         assert_eq!(
             backup_tables_for(16).unwrap().len(),
-            BACKUP_TABLES.len() - 14
+            BACKUP_TABLES.len() - 15
         );
         assert_eq!(
             excluded_tables_for(16),

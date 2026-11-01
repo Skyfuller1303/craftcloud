@@ -13,6 +13,21 @@ CREATE TABLE organization_sso (
  version bigint NOT NULL DEFAULT 1 CHECK(version > 0),
  updated_at timestamptz NOT NULL DEFAULT now()
 );
+-- An allowed domain is inert until the instance operator approves the claim.
+-- A domain can be approved for at most one organization; domains are stored as
+-- lower-case ASCII (punycode for internationalized names), validated by the API.
+CREATE TABLE sso_domain_claims (
+ org_id uuid NOT NULL REFERENCES organization_sso(org_id) ON DELETE CASCADE,
+ domain text NOT NULL CHECK(domain = lower(domain) AND octet_length(domain) BETWEEN 3 AND 253),
+ status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+ requested_at timestamptz NOT NULL DEFAULT now(),
+ decided_at timestamptz NULL,
+ decided_by uuid NULL REFERENCES users(id) ON DELETE RESTRICT,
+ PRIMARY KEY(org_id,domain),
+ CHECK((status='pending') = (decided_at IS NULL))
+);
+CREATE UNIQUE INDEX sso_domain_claims_approved_idx ON sso_domain_claims(lower(domain)) WHERE status='approved';
+CREATE INDEX sso_domain_claims_status_idx ON sso_domain_claims(status,requested_at);
 CREATE TABLE instance_sso_policy (
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  enabled boolean NOT NULL DEFAULT true
@@ -61,6 +76,9 @@ CREATE TABLE sso_session_bindings (
  user_id uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
  mfa boolean NOT NULL,
  provider_mfa boolean NOT NULL DEFAULT false,
+ -- Exactly one of these mirrors session_id, so purging or deleting the session cascades.
+ browser_session_id uuid GENERATED ALWAYS AS (CASE WHEN session_kind='browser' THEN session_id END) STORED REFERENCES sessions(id) ON DELETE CASCADE,
+ device_session_id uuid GENERATED ALWAYS AS (CASE WHEN session_kind='device' THEN session_id END) STORED REFERENCES device_sessions(id) ON DELETE CASCADE,
  PRIMARY KEY(session_kind,session_id,org_id)
 );
 CREATE TABLE organization_session_cutoffs (

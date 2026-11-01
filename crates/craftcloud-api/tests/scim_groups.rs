@@ -36,11 +36,13 @@ mod tests {
             )
             .await;
             assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+            let org = Uuid::parse_str(created.body["id"].as_str().unwrap()).unwrap();
+            crate::common::approve_example_domain(&env.pool, org).await;
             Self {
                 env,
                 operator,
                 owner,
-                org: Uuid::parse_str(created.body["id"].as_str().unwrap()).unwrap(),
+                org,
                 owner_id,
             }
         }
@@ -468,6 +470,7 @@ mod tests {
                 .iter()
                 .all(|item| { item["workspace_id"] == workspace.to_string() })
         );
+        crate::common::approve_domain(&w.env.pool, foreign_org_id, "foreign.test").await;
         let foreign_token_response = call(
             &w.env.app,
             Req::new(
@@ -505,7 +508,7 @@ mod tests {
             &w.env.app,
             Req::new("POST", &format!("/scim/v2/organizations/{foreign_org_id}/Users"))
                 .header("authorization", &format!("Bearer {foreign_token}"))
-                .json(json!({"schemas":[USER_SCHEMA],"userName":"ac10-foreign-member@example.test","displayName":"Foreign member"})),
+                .json(json!({"schemas":[USER_SCHEMA],"userName":"ac10-foreign-member@foreign.test","displayName":"Foreign member"})),
         ).await;
         assert_eq!(
             foreign_user.status,

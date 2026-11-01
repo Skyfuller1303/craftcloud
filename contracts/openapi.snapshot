@@ -10,6 +10,8 @@ PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=Quota
 PATCH /api/v1/admin/organizations/{org_id}/seats auth=cookie|bearer req=- ok=SeatLimitResponse codes=200,400,401,403,404,422,500,503
 GET /api/v1/admin/sso auth=cookie|bearer req=- ok=InstanceSsoPolicy codes=200,400,401,403,404,409,413,422,429,500,503
 PUT /api/v1/admin/sso auth=cookie+csrf|bearer req=InstanceSsoPolicy ok=InstanceSsoPolicy codes=200,400,401,403,404,409,413,422,429,500,503
+GET /api/v1/admin/sso/domain-claims auth=cookie|bearer req=- ok=SsoDomainClaimList codes=200,400,401,403,404,409,413,422,429,500,503
+PUT /api/v1/admin/sso/domain-claims/{org_id}/{domain} auth=cookie+csrf|bearer req=SsoDomainClaimDecision ok=SsoDomainClaimResult codes=200,400,401,403,404,409,413,422,429,500,503
 GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
 POST /api/v1/admin/users/email-verification auth=cookie+csrf|bearer req=- ok=EmailVerificationBatchResponse codes=202,400,401,403,429,500,503
 GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,422,500,503
@@ -42,6 +44,7 @@ GET /api/v1/auth/oidc/callback auth=none req=- ok=- codes=303,400,401,403,404,40
 POST /api/v1/auth/oidc/device/exchange auth=none req=OidcExchange ok=DeviceLoginResponse codes=200,400,401,403,404,409,413,422,429,500,503
 POST /api/v1/auth/oidc/discover auth=none req=OidcDiscover ok=OidcHint codes=200,400,401,403,404,409,413,422,429,500,503
 POST /api/v1/auth/oidc/finish auth=none req=OidcFinish ok=OidcFinished codes=200,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/auth/oidc/pending auth=none req=OidcPendingRequest ok=OidcPendingInfo codes=200,400,401,403,404,409,413,422,429,500,503
 POST /api/v1/auth/oidc/start auth=none req=OidcStart ok=OidcAuthorization codes=200,400,401,403,404,409,413,422,429,500,502,503
 POST /api/v1/auth/password-reset auth=none req=ResetPasswordRequest ok=- codes=204,400,413,415,422,429,500,503
 POST /api/v1/auth/password/change auth=cookie+csrf|bearer req=ChangePasswordRequest ok=- codes=204,400,401,403,413,415,422,429,500,503
@@ -214,6 +217,8 @@ OidcExchange
 OidcFinish
 OidcFinished
 OidcHint
+OidcPendingInfo
+OidcPendingRequest
 OidcStart
 Organization
 OrganizationApps
@@ -248,6 +253,10 @@ SharedTarget
 SharedWithMeResponse
 SsoConfiguration
 SsoConfigurationWrite
+SsoDomainClaim
+SsoDomainClaimDecision
+SsoDomainClaimList
+SsoDomainClaimResult
 SsoProviderTest
 TwoFactorConfirmRequest
 TwoFactorDisableRequest

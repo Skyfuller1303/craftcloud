@@ -243,10 +243,12 @@ function OidcFinish({ token, onFinished }: { token: string; onFinished: () => vo
   const [password, setPassword] = useState(""); const [factor, setFactor] = useState(""); const [mode, setMode] = useState<"password" | "code" | "recovery_code">("password");
   const [failure, setFailure] = useState<unknown>(null); const [busy, setBusy] = useState(false);
   const attempted = useRef(false);
-  async function finish() {
+  // `undefined` while the pending sign-in is being described; `null` for a browser sign-in.
+  const [native, setNative] = useState<{ client_kind: string; device_name: string } | null | undefined>(undefined);
+  async function finish(confirmed = false) {
     if (busy) return; setBusy(true); setFailure(null);
     try {
-      const result = await api.finishOidc({ pending_id: token, ...(password ? { password } : {}), ...(factor ? mode === "code" ? { code: factor } : mode === "recovery_code" ? { recovery_code: factor } : {} : {}) });
+      const result = await api.finishOidc({ pending_id: token, ...(confirmed ? { confirm_desktop: true } : {}), ...(password ? { password } : {}), ...(factor ? mode === "code" ? { code: factor } : mode === "recovery_code" ? { recovery_code: factor } : {} : {}) });
       if ("redirect_url" in result && typeof result.redirect_url === "string") {
         const target = new URL(result.redirect_url);
         const loopback = target.hostname === "127.0.0.1" || target.hostname === "[::1]";
@@ -265,9 +267,27 @@ function OidcFinish({ token, onFinished }: { token: string; onFinished: () => vo
       setBusy(false);
     }
   }
-  useEffect(() => { if (attempted.current) return; attempted.current = true; void finish(); }, []);
+  useEffect(() => {
+    if (attempted.current) return; attempted.current = true;
+    // A native flow is only completed after the person confirmed the device and app.
+    api.getOidcPending(token).then((info) => {
+      if (info.desktop) setNative(info.desktop);
+      else { setNative(null); void finish(); }
+    }, (error: unknown) => { setNative(null); setFailure(error); });
+  }, []);
   const needsPassword = mode === "password" || (isApiError(failure) && failure.code === "SSO_LINK_REQUIRED");
   const setupRequired = isApiError(failure) && failure.code === "SSO_TWO_FACTOR_SETUP_REQUIRED";
+  if (native) {
+    return <div className="screen screen--narrow"><ScreenHeading>{t("Confirm sign-in")}</ScreenHeading>
+      {failure !== null && <Alert>{failure instanceof InvalidNativeOidcDestination ? t("Invalid native sign-in destination.") : describeError(t, failure)}</Alert>}
+      <p>{t("Sign in CraftCloud on {device}?", { device: native.device_name })}</p>
+      <p>{t("Application type: {client}", { client: native.client_kind })}</p>
+      <p>{t("Only continue if you started this sign-in in a CraftCloud app on that device.")}</p>
+      <Button className="button button--primary" isDisabled={busy} onPress={() => void finish(true)}>{t("Sign in on this device")}</Button>
+      <Button className="button" isDisabled={busy} onPress={onFinished}>{t("Cancel")}</Button>
+    </div>;
+  }
+  if (native === undefined && failure === null) return <div className="screen screen--narrow"><p role="status">{t("Loading…")}</p></div>;
   return <div className="screen screen--narrow"><ScreenHeading>{t("Finish organization sign-in")}</ScreenHeading>
     {failure !== null && <Alert>{failure instanceof InvalidNativeOidcDestination ? t("Invalid native sign-in destination.") : describeError(t, failure)}</Alert>}
     {setupRequired && <Alert tone="info">{t("Your organization requires a second factor. Contact your organization owner or administrator to restore local access and set up multi-factor authentication.")}</Alert>}

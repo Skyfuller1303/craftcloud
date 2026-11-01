@@ -940,10 +940,29 @@ pub(crate) async fn normalize_errors(
     let path = request.uri().path().to_owned();
     let headers = request.headers().clone();
     let operation = audit_operation(&method, &path);
-    let response = next.run(request).await;
+    // Per-address budget before any token check, database or lock work.
+    let limited = match (&services, path.starts_with("/scim/v2/")) {
+        (Some(services), true) => {
+            let ip = request
+                .extensions()
+                .get::<crate::client_ip::ClientIp>()
+                .map(|v| v.0);
+            services
+                .rate_limit_ip(crate::services::IpClass::Scim, ip, &headers)
+                .err()
+        }
+        _ => None,
+    };
+    let response = match limited {
+        Some(rejection) => *rejection,
+        None => next.run(request).await,
+    };
     let status = response.status();
+    // Unauthenticated and throttled requests never reach the database for auditing.
     if let (Some((org, action)), Some(services)) = (operation, services)
         && (status.is_client_error() || status.is_server_error())
+        && status != StatusCode::UNAUTHORIZED
+        && status != StatusCode::TOO_MANY_REQUESTS
     {
         // A failed operation must not wait indefinitely for its best-effort audit.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {

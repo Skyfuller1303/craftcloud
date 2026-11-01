@@ -47,10 +47,10 @@ pub async fn resolve_identity(
     {
         return Ok(Resolution::Rejected);
     }
-    let config: Option<(bool, bool, i64, Vec<String>)> = sqlx::query_as(
-        "SELECT s.enabled,s.jit_enabled,s.version,s.allowed_domains FROM organization_sso s JOIN organizations o ON o.id=s.org_id WHERE s.org_id=$1 AND COALESCE((SELECT enabled FROM instance_sso_policy WHERE singleton),true)")
+    let config: Option<(bool, bool, i64)> = sqlx::query_as(
+        "SELECT s.enabled,s.jit_enabled,s.version FROM organization_sso s JOIN organizations o ON o.id=s.org_id WHERE s.org_id=$1 AND COALESCE((SELECT enabled FROM instance_sso_policy WHERE singleton),true)")
         .bind(org).fetch_optional(&mut *conn).await?;
-    let Some((true, jit, version, domains)) = config else {
+    let Some((true, jit, version)) = config else {
         return Ok(Resolution::Rejected);
     };
     if version != config_version {
@@ -96,16 +96,16 @@ pub async fn resolve_identity(
         if status.is_some() || !jit || !identity.email_verified {
             return Ok(Resolution::Rejected);
         }
-        let allowed = identity
+        // Only an operator-approved claim makes the provider's email domain meaningful.
+        let domain = identity
             .email
             .as_deref()
             .and_then(|e| craftcloud_core::NormalizedEmail::parse(e).ok())
-            .and_then(|e| {
-                e.as_str()
-                    .rsplit_once('@')
-                    .map(|(_, d)| domains.iter().any(|v| v == d))
-            })
-            .unwrap_or(false);
+            .and_then(|e| e.as_str().rsplit_once('@').map(|(_, d)| d.to_owned()));
+        let allowed = match domain {
+            Some(d) => crate::sso::domain_approved(conn, org, &d).await?,
+            None => false,
+        };
         if !allowed {
             return Ok(Resolution::Rejected);
         }
@@ -141,7 +141,7 @@ pub async fn resolve_identity(
         return Ok(Resolution::Rejected);
     }
     let domain = normalized.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
-    if !domains.iter().any(|d| d == domain) {
+    if !crate::sso::domain_approved(conn, org, domain).await? {
         return Ok(Resolution::Rejected);
     }
     // SCIM externalId is explicitly configured as the provider's stable subject.
@@ -171,10 +171,11 @@ pub async fn resolve_identity(
         .await?;
         return Ok(Resolution::Resolved(user));
     }
-    let existing: Option<(Uuid, bool, bool, Option<String>)> = sqlx::query_as("SELECT id, disabled_at IS NOT NULL, email_verified_at IS NOT NULL, password_hash FROM users WHERE normalized_email=$1 FOR UPDATE")
+    let existing: Option<(Uuid, bool, bool, Option<String>, bool)> = sqlx::query_as("SELECT id, disabled_at IS NOT NULL, email_verified_at IS NOT NULL, password_hash, instance_role IS NOT NULL FROM users WHERE normalized_email=$1 FOR UPDATE")
         .bind(&normalized).fetch_optional(&mut *conn).await?;
-    if let Some((user, disabled, email_verified, current_hash)) = existing {
-        if disabled {
+    if let Some((user, disabled, email_verified, current_hash, instance_account)) = existing {
+        // An instance operator account is never linked to a tenant-controlled identity.
+        if disabled || instance_account {
             return Ok(Resolution::Rejected);
         }
         if current_hash.is_none() {
@@ -347,13 +348,15 @@ pub async fn issue_session(
     .bind(user)
     .fetch_one(&mut **conn)
     .await?;
-    let provider_factor = trust_mfa && identity_mfa;
+    // Provider MFA only counts for this organization and only for accounts without a
+    // local factor: it never replaces a configured TOTP factor or its lockout.
+    let provider_factor = trust_mfa && identity_mfa && !configured_factor;
     let locked_factor: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL AND failed_attempts >= $2)").bind(user).bind(crate::two_factor::MAX_FAILED_ATTEMPTS).fetch_one(&mut **conn).await?;
-    if locked_factor && !provider_factor {
+    if locked_factor {
         return Ok(LoginOutcome::Rejected);
     }
 
-    if configured_factor && !provider_factor && local_factor.is_none() {
+    if configured_factor && local_factor.is_none() {
         return Ok(LoginOutcome::FactorRequired);
     }
     if require_factor && !provider_factor && !configured_factor {

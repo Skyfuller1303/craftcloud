@@ -141,6 +141,8 @@ fn run_inner(root: &Path) -> Result<ExitCode, String> {
             "--ignored",
         ])
         .env("CC_TEST_DATABASE_URL", &url)
+        // The OIDC interoperability test talks to a synthetic provider on loopback.
+        .env("CRAFTCLOUD_TEST_OIDC_LOOPBACK", "1")
         .current_dir(root)
         .status()
         .map_err(|e| format!("cannot start cargo: {e}"))?;

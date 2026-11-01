@@ -61,8 +61,12 @@ pub(crate) async fn owner_tx(
         crate::orgs::Gate::Closed(response) => Err(Box::new(response)),
     }
 }
-fn dto(c: &sso::Configuration) -> serde_json::Value {
-    json!({"configured":true,"discovery_url":c.discovery_url,"client_id":c.client_id,"allowed_domains":c.allowed_domains,"enabled":c.enabled,"jit_enabled":c.jit_enabled,"sso_required":c.sso_required,"trust_mfa":c.trust_mfa,"version":c.version,"client_secret_configured":true})
+fn dto(c: &sso::Configuration, claims: &[sso::DomainClaim]) -> serde_json::Value {
+    let domain_claims: Vec<_> = claims
+        .iter()
+        .map(|k| json!({"domain":k.domain,"status":k.status}))
+        .collect();
+    json!({"configured":true,"discovery_url":c.discovery_url,"client_id":c.client_id,"allowed_domains":c.allowed_domains,"domain_claims":domain_claims,"enabled":c.enabled,"jit_enabled":c.jit_enabled,"sso_required":c.sso_required,"trust_mfa":c.trust_mfa,"version":c.version,"client_secret_configured":true})
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,7 +108,10 @@ pub(crate) async fn get(
         Err(r) => return *r,
     };
     match sso::configuration_in(&mut tx, org).await {
-        Ok(Some(c)) => Json(dto(&c)).into_response(),
+        Ok(Some(c)) => match sso::claims_for_org(&mut tx, org).await {
+            Ok(claims) => Json(dto(&c, &claims)).into_response(),
+            Err(_) => internal(&headers),
+        },
         Ok(None) => Json(json!({"configured":false})).into_response(),
         Err(_) => internal(&headers),
     }
@@ -194,11 +201,16 @@ pub(crate) async fn put(
     )
     .await
     .is_err()
-        || tx.commit().await.is_err()
     {
         return internal(&headers);
     }
-    Json(dto(&c)).into_response()
+    let Ok(claims) = sso::claims_for_org(&mut tx, org).await else {
+        return internal(&headers);
+    };
+    if tx.commit().await.is_err() {
+        return internal(&headers);
+    }
+    Json(dto(&c, &claims)).into_response()
 }
 pub(crate) async fn delete(
     State(state): State<ApiState>,
@@ -372,6 +384,97 @@ pub(crate) async fn instance_put(
     .await
     {
         Ok(()) => Json(json!({"enabled":input.enabled})).into_response(),
+        Err(_) => internal(&headers),
+    }
+}
+
+fn claim_dto(k: &sso::DomainClaim) -> serde_json::Value {
+    json!({"organization_id":k.org_id,"organization_name":k.org_name,"domain":k.domain,"status":k.status,"requested_at":crate::orgs::rfc3339(k.requested_at)})
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaimsQuery {
+    status: Option<String>,
+}
+/// Operator list of domain claims; pending ones by default.
+pub(crate) async fn claims_list(
+    State(state): State<ApiState>,
+    session: AuthenticatedSession,
+    headers: HeaderMap,
+    q: Result<axum::extract::Query<ClaimsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Some(s) = state.services else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(r) = operator(&s, &session, &headers).await {
+        return *r;
+    }
+    let status = match q {
+        Ok(axum::extract::Query(q)) => q.status.unwrap_or_else(|| "pending".to_owned()),
+        Err(_) => return validation_failed(&["status"], &headers),
+    };
+    if !matches!(status.as_str(), "pending" | "approved" | "rejected") {
+        return validation_failed(&["status"], &headers);
+    }
+    match sso::claims_by_status(&s.pool, &status, 200).await {
+        Ok(items) => {
+            Json(json!({"items":items.iter().map(claim_dto).collect::<Vec<_>>()})).into_response()
+        }
+        Err(_) => internal(&headers),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaimDecisionRequest {
+    decision: String,
+}
+/// Operator decision: `approved` makes the organization's domain effective for
+/// sign-in, provisioning and discovery; `rejected` withdraws or refuses it.
+pub(crate) async fn claim_decide(
+    State(state): State<ApiState>,
+    session: AuthenticatedSession,
+    Path((org, domain)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+    body: Result<Json<ClaimDecisionRequest>, JsonRejection>,
+) -> Response {
+    let Some(s) = state.services else {
+        return unavailable(&headers, "AUTH_UNAVAILABLE");
+    };
+    if let Err(r) = operator(&s, &session, &headers).await {
+        return *r;
+    }
+    let input = match body {
+        Ok(Json(v)) => v,
+        Err(e) => return rejection_response(&e, &headers),
+    };
+    let approve = match input.decision.as_str() {
+        "approved" => true,
+        "rejected" => false,
+        _ => return validation_failed(&["decision"], &headers),
+    };
+    if !valid_domain(&domain) {
+        return validation_failed(&["domain"], &headers);
+    }
+    match sso::decide_claim(
+        &s.pool,
+        org,
+        &domain,
+        approve,
+        &crate::audit::ctx(&headers, Some(session.user_id)),
+    )
+    .await
+    {
+        Ok(sso::ClaimDecision::Applied) => {
+            Json(json!({"organization_id":org,"domain":domain,"status":input.decision}))
+                .into_response()
+        }
+        Ok(sso::ClaimDecision::NotFound) => crate::orgs::not_found(&headers),
+        Ok(sso::ClaimDecision::DomainTaken) => error_response(
+            StatusCode::CONFLICT,
+            "SSO_DOMAIN_ALREADY_APPROVED",
+            "Another organization already holds an approved claim on this domain.",
+            &headers,
+        ),
         Err(_) => internal(&headers),
     }
 }

@@ -54,6 +54,8 @@ pub fn settings() -> AuthSettings {
         public_origin: Some(ORIGIN.to_owned()),
         cookie_secure: true,
         ip_limit: 100_000,
+        oidc_ip_limit: 100_000,
+        scim_ip_limit: 100_000,
         pwchange_limit: 100_000,
         failed_login_pair_limit: 100_000,
         failed_login_account_limit: 100_000,
@@ -503,4 +505,28 @@ impl Drop for TestEnv {
         })
         .join();
     }
+}
+
+/// Registers an SSO row and an operator-approved claim so SCIM may provision
+/// example.test mailboxes (unapproved domains are inert).
+#[allow(dead_code)]
+pub async fn approve_example_domain(pool: &sqlx::PgPool, org: Uuid) {
+    approve_domain(pool, org, "example.test").await;
+}
+
+/// Like [`approve_example_domain`] for another domain (a domain is approved for one organization only).
+#[allow(dead_code)]
+pub async fn approve_domain(pool: &sqlx::PgPool, org: Uuid, domain: &str) {
+    sqlx::query("INSERT INTO organization_sso(org_id,discovery_url,client_id,client_secret_ciphertext,allowed_domains,enabled) VALUES($1,'https://issuer.example.test','client',decode(repeat('ab',30),'hex'),ARRAY[$2::text],false)")
+        .bind(org)
+        .bind(domain)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sso_domain_claims(org_id,domain,status,decided_at) VALUES($1,$2,'approved',now())")
+        .bind(org)
+        .bind(domain)
+        .execute(pool)
+        .await
+        .unwrap();
 }

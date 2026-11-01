@@ -251,7 +251,7 @@ pub(crate) async fn start(
             &h,
         );
     }
-    if let Err(r) = s.rate_limit_ip(crate::services::IpClass::Login, ip.map(|v| v.0.0), &h) {
+    if let Err(r) = s.rate_limit_ip(crate::services::IpClass::Oidc, ip.map(|v| v.0.0), &h) {
         return *r;
     }
     let b = match b {
@@ -332,12 +332,16 @@ pub(crate) struct AuthorizeQuery {
 }
 pub(crate) async fn authorize(
     State(state): State<ApiState>,
+    ip: Option<Extension<ClientIp>>,
     h: HeaderMap,
     q: Result<Query<AuthorizeQuery>, QueryRejection>,
 ) -> Response {
     let Some(s) = state.services else {
         return unavailable(&h, "AUTH_UNAVAILABLE");
     };
+    if let Err(r) = s.rate_limit_ip(crate::services::IpClass::Oidc, ip.map(|v| v.0.0), &h) {
+        return *r;
+    }
     let q = match q {
         Ok(Query(q)) => q,
         Err(_) => return invalid(&h),
@@ -376,12 +380,16 @@ pub(crate) struct Callback {
 }
 pub(crate) async fn callback(
     State(state): State<ApiState>,
+    ip: Option<Extension<ClientIp>>,
     h: HeaderMap,
     q: Result<Query<Callback>, QueryRejection>,
 ) -> Response {
     let Some(s) = state.services else {
         return unavailable(&h, "AUTH_UNAVAILABLE");
     };
+    if let Err(r) = s.rate_limit_ip(crate::services::IpClass::Oidc, ip.map(|v| v.0.0), &h) {
+        return *r;
+    }
     let q = match q {
         Ok(Query(q)) => q,
         Err(_) => return invalid(&h),
@@ -490,6 +498,65 @@ pub(crate) struct Finish {
     password: Option<String>,
     code: Option<String>,
     recovery_code: Option<String>,
+    /// Required for a native flow: the person confirmed the shown device and client.
+    #[serde(default)]
+    confirm_desktop: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingInfo {
+    pending_id: String,
+}
+/// Describes the pending sign-in so a native flow can be confirmed before it is
+/// completed. Read-only: the capability is neither consumed nor counted.
+pub(crate) async fn pending_info(
+    State(state): State<ApiState>,
+    ip: Option<Extension<ClientIp>>,
+    h: HeaderMap,
+    b: Result<Json<PendingInfo>, JsonRejection>,
+) -> Response {
+    let Some(s) = state.services else {
+        return unavailable(&h, "AUTH_UNAVAILABLE");
+    };
+    if !origin_ok(&h, &s.settings) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "CSRF_FAILED",
+            "The request origin is not allowed.",
+            &h,
+        );
+    }
+    if let Err(r) = s.rate_limit_ip(crate::services::IpClass::Oidc, ip.map(|v| v.0.0), &h) {
+        return *r;
+    }
+    let b = match b {
+        Ok(Json(v)) => v,
+        Err(e) => return rejection_response(&e, &h),
+    };
+    let Some(token) = OpaqueToken::parse(&b.pending_id) else {
+        return invalid(&h);
+    };
+    let Some(browser_binding) = binding(&h, &s) else {
+        return invalid(&h);
+    };
+    let row = match flows::pending(&s.pool, &token.hash(), s.clock.now()).await {
+        Ok(Some(v)) => v,
+        _ => return invalid(&h),
+    };
+    if !bool::from(row.binding_hash.as_slice().ct_eq(&browser_binding)) {
+        return invalid(&h);
+    }
+    let Some(p) = decrypt::<Pending>(&s, row.org_id, b"oidc-pending", &row.payload_ciphertext)
+    else {
+        return invalid(&h);
+    };
+    match p.desktop {
+        Some(d) => {
+            Json(json!({"desktop":{"client_kind":d.client_kind,"device_name":d.device_name}}))
+        }
+        None => Json(json!({"desktop":null})),
+    }
+    .into_response()
 }
 fn needed(h: &HeaderMap, code: &str) -> Response {
     error_response(
@@ -576,6 +643,14 @@ pub(crate) async fn finish(
     else {
         return invalid(&h);
     };
+    if p.desktop.is_some() && !b.confirm_desktop {
+        return error_response(
+            StatusCode::CONFLICT,
+            "SSO_DESKTOP_CONFIRMATION_REQUIRED",
+            "Confirm the device and app that is signing in.",
+            &h,
+        );
+    }
     let mut tx = match s.pool.begin().await {
         Ok(v) => v,
         Err(_) => return internal(&h),
@@ -614,7 +689,15 @@ pub(crate) async fn finish(
     let user = match resolution {
         db::Resolution::Resolved(u) => u,
         db::Resolution::LinkRequired(u) => {
+            // The account is known now: tie the capability to it so recovery deletes it.
+            // Nothing else was written yet, so committing here is safe.
+            if flows::bind_user(&mut tx, &token.hash(), u).await.is_err() {
+                return internal(&h);
+            }
             if password.is_empty() {
+                if tx.commit().await.is_err() {
+                    return internal(&h);
+                }
                 return needed(&h, "SSO_LINK_REQUIRED");
             }
             let account = match craftcloud_db::accounts::get(&s.pool, u).await {
@@ -649,6 +732,7 @@ pub(crate) async fn finish(
                     Ok(t) => t,
                     Err(_) => return internal(&h),
                 };
+                let _ = flows::bind_user(&mut failed, &token.hash(), u).await;
                 let _ = flows::attempted(&mut failed, &token.hash()).await;
                 let _ = failed.commit().await;
                 return needed(&h, "SSO_LINK_REQUIRED");
@@ -834,6 +918,10 @@ pub(crate) async fn finish(
         {
             Ok(true) => {}
             _ => return internal(&h),
+        }
+        // The completion code carries this account's device credentials.
+        if flows::bind_user(&mut tx, &code.hash(), user).await.is_err() {
+            return internal(&h);
         }
         let mut target = match url::Url::parse(&d.redirect_uri) {
             Ok(u) => u,

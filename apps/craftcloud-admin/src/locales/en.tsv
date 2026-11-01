@@ -789,3 +789,19 @@
 	No SCIM events yet.	No SCIM events yet.
 	Unknown action	Unknown action
 	Company sign-in links will be disconnected. Link them again after signing in with your new password.	Company sign-in links will be disconnected. Link them again after signing in with your new password.
+	Confirm sign-in	Confirm sign-in
+	Sign in CraftCloud on {device}?	Sign in CraftCloud on {device}?
+	Application type: {client}	Application type: {client}
+	Only continue if you started this sign-in in a CraftCloud app on that device.	Only continue if you started this sign-in in a CraftCloud app on that device.
+	Sign in on this device	Sign in on this device
+	A domain only takes effect after the instance operator approved it.	A domain only takes effect after the instance operator approved it.
+	Domain approval status	Domain approval status
+	Approved	Approved
+	Rejected by the instance operator	Rejected by the instance operator
+	Pending operator approval	Pending operator approval
+	Pending domain claims	Pending domain claims
+	No pending domain claims.	No pending domain claims.
+	Approve {domain} for {organization}	Approve {domain} for {organization}
+	Reject {domain} for {organization}	Reject {domain} for {organization}
+	Approve	Approve
+	Reject	Reject

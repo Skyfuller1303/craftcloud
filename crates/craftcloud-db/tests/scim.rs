@@ -70,6 +70,20 @@ mod tests {
         }
     }
 
+    /// Unapproved domains are inert, so SCIM provisioning needs an approved claim.
+    async fn approve_example_domain(pool: &craftcloud_db::PgPool, org: Uuid) {
+        sqlx::query("INSERT INTO organization_sso(org_id,discovery_url,client_id,client_secret_ciphertext,allowed_domains,enabled,jit_enabled,sso_required,trust_mfa) VALUES($1,'https://issuer.example.test','client',decode(repeat('ab',30),'hex'),ARRAY['example.test'],true,false,false,true)")
+            .bind(org)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sso_domain_claims(org_id,domain,status,decided_at) VALUES($1,'example.test','approved',now())")
+            .bind(org)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn token_hash_rotation_and_resource_reads_are_organization_scoped() {
@@ -160,6 +174,7 @@ mod tests {
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
+        approve_example_domain(&db.pool, org).await;
         let input = scim::UserInput {
             user_name: "mapped@example.test".to_owned(),
             display_name: "Mapped".to_owned(),
@@ -250,6 +265,7 @@ mod tests {
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
+        approve_example_domain(&db.pool, org).await;
         let now = OffsetDateTime::now_utc();
         let mut create = db.pool.begin().await.unwrap();
         let member = scim::create_user(
@@ -273,8 +289,6 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO organization_sso(org_id,discovery_url,client_id,client_secret_ciphertext,allowed_domains,enabled,jit_enabled,sso_required,trust_mfa) VALUES($1,'https://issuer.example.test','client',decode(repeat('ab',30),'hex'),ARRAY['example.test'],true,false,false,true)")
-            .bind(org).execute(&db.pool).await.unwrap();
 
         let mut recovery = db.pool.begin().await.unwrap();
         sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")

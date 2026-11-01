@@ -27,6 +27,8 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
   const [state, setState] = useState<State>({ status: "loading" });
   const [round, setRound] = useState(0);
   const [ssoEnabled, setSsoEnabled] = useState<boolean | null>(null);
+  const [claims, setClaims] = useState<{ organization_id: string; organization_name: string; domain: string }[]>([]);
+  const [claimError, setClaimError] = useState<unknown>(null);
   const reload = useCallback(() => setRound((current) => current + 1), []);
 
   useEffect(() => {
@@ -51,8 +53,16 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
     if (!isOperator) return;
     let live = true;
     void api.getAdminSso().then((value) => { if (live) setSsoEnabled(value.enabled); }, () => { if (live) setSsoEnabled(null); });
+    void api.getSsoDomainClaims().then((value) => { if (live) setClaims(value.items); }, () => { if (live) setClaims([]); });
     return () => { live = false; };
   }, [api, isOperator, round]);
+  function decide(claim: { organization_id: string; domain: string }, decision: "approved" | "rejected") {
+    setClaimError(null);
+    void api.decideSsoDomainClaim(claim.organization_id, claim.domain, decision).then(
+      () => setClaims((current) => current.filter((item) => !(item.organization_id === claim.organization_id && item.domain === claim.domain))),
+      (error: unknown) => setClaimError(error),
+    );
+  }
 
   if (!isOperator) {
     return <p className="muted">{t("Only the instance operator can see the system status.")}</p>;
@@ -69,6 +79,13 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
           }} />
           <span>{t("Allow organization single sign-on")}</span>
         </label>
+        <h3>{t("Pending domain claims")}</h3>
+        {claimError !== null && <ErrorNotice error={claimError} />}
+        {claims.length === 0 ? <p className="muted">{t("No pending domain claims.")}</p> : <ul>{claims.map((claim) => <li key={`${claim.organization_id}/${claim.domain}`}>
+          <span>{claim.domain} ({claim.organization_name})</span>{" "}
+          <Button className="button button--primary" aria-label={t("Approve {domain} for {organization}", { domain: claim.domain, organization: claim.organization_name })} onPress={() => decide(claim, "approved")}>{t("Approve")}</Button>{" "}
+          <Button className="button" aria-label={t("Reject {domain} for {organization}", { domain: claim.domain, organization: claim.organization_name })} onPress={() => decide(claim, "rejected")}>{t("Reject")}</Button>
+        </li>)}</ul>}
       </section>
       <EmailSystem revision={round} />
       <p>

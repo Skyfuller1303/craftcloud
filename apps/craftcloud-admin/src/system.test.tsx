@@ -47,6 +47,24 @@ async function openSystem(user: User) {
 }
 
 describe("system view", () => {
+  it("lists pending domain claims and approves one, which is then removed from the list", async () => {
+    const claim = { organization_id: ORG_A.id, organization_name: "Acme Studio", domain: "acme.test", status: "pending", requested_at: "2026-10-30T10:00:00Z" };
+    const { fetch, calls } = mockFetch(viewRoutes({
+      "GET /admin/health": { body: HEALTH },
+      "GET /admin/sso": { body: { enabled: true } },
+      "GET /admin/sso/domain-claims": { body: { items: [claim] } },
+      [`PUT /admin/sso/domain-claims/${ORG_A.id}/acme.test`]: { body: { organization_id: ORG_A.id, domain: "acme.test", status: "approved" } },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await openSystem(user);
+    expect(await screen.findByText("acme.test (Acme Studio)")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Approve acme.test for Acme Studio" }));
+    await waitFor(() => expect(screen.queryByText("acme.test (Acme Studio)")).toBeNull());
+    expect(calls.find((call) => call.method === "PUT" && call.path.endsWith("/acme.test"))?.body).toEqual({ decision: "approved" });
+    expect(screen.getByText("No pending domain claims.")).toBeTruthy();
+  });
+
   it("shows the components, uploads, maintenance, audit counters, version and uptime", async () => {
     const { fetch, calls } = mockFetch(viewRoutes({ "GET /admin/health": { body: HEALTH } }));
     const user = userEvent.setup();

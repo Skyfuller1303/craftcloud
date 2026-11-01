@@ -786,3 +786,19 @@
 	No SCIM events yet.	Bisher keine SCIM-Ereignisse.
 	Unknown action	Unbekannte Aktion
 	Company sign-in links will be disconnected. Link them again after signing in with your new password.	Verknüpfungen zur Firmenanmeldung werden getrennt. Verknüpfen Sie sie nach der Anmeldung mit Ihrem neuen Passwort erneut.
+	Confirm sign-in	Anmeldung bestätigen
+	Sign in CraftCloud on {device}?	CraftCloud auf {device} anmelden?
+	Application type: {client}	Anwendungstyp: {client}
+	Only continue if you started this sign-in in a CraftCloud app on that device.	Fahren Sie nur fort, wenn Sie diese Anmeldung selbst in einer CraftCloud-App auf diesem Gerät gestartet haben.
+	Sign in on this device	Auf diesem Gerät anmelden
+	A domain only takes effect after the instance operator approved it.	Eine Domäne wirkt erst, nachdem der Instanzbetreiber sie freigegeben hat.
+	Domain approval status	Freigabestatus der Domänen
+	Approved	Freigegeben
+	Rejected by the instance operator	Vom Instanzbetreiber abgelehnt
+	Pending operator approval	Wartet auf Freigabe durch den Instanzbetreiber
+	Pending domain claims	Offene Domänenansprüche
+	No pending domain claims.	Keine offenen Domänenansprüche.
+	Approve {domain} for {organization}	{domain} für {organization} freigeben
+	Reject {domain} for {organization}	{domain} für {organization} ablehnen
+	Approve	Freigeben
+	Reject	Ablehnen

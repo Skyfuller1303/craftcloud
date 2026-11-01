@@ -77,12 +77,15 @@ export const ENDPOINTS = {
   oidcDiscover: { method: "POST", path: "/auth/oidc/discover" },
   oidcStart: { method: "POST", path: "/auth/oidc/start" },
   oidcFinish: { method: "POST", path: "/auth/oidc/finish" },
+  oidcPending: { method: "POST", path: "/auth/oidc/pending" },
   organizationSso: { method: "GET", path: "/organizations/{org_id}/sso" },
   saveOrganizationSso: { method: "PUT", path: "/organizations/{org_id}/sso" },
   deleteOrganizationSso: { method: "DELETE", path: "/organizations/{org_id}/sso" },
   testOrganizationSso: { method: "POST", path: "/organizations/{org_id}/sso/test" },
   adminSso: { method: "GET", path: "/admin/sso" },
   updateAdminSso: { method: "PUT", path: "/admin/sso" },
+  adminSsoDomainClaims: { method: "GET", path: "/admin/sso/domain-claims" },
+  decideSsoDomainClaim: { method: "PUT", path: "/admin/sso/domain-claims/{org_id}/{domain}" },
   scimStatus: { method: "GET", path: "/organizations/{org_id}/scim" },
   scimToken: { method: "POST", path: "/organizations/{org_id}/scim/token" },
   deleteScimToken: { method: "DELETE", path: "/organizations/{org_id}/scim/token" },
@@ -339,13 +342,16 @@ export interface ApiClient {
   login(body: LoginRequest): Promise<LoginResponse>;
   discoverOidc(email: string): Promise<{ organization_id: string | null }>;
   startOidc(organizationId: string): Promise<{ authorization_url: string }>;
-  finishOidc(body: { pending_id: string; password?: string; code?: string; recovery_code?: string }): Promise<{ completed: true } | { redirect_url: string }>;
+  finishOidc(body: { pending_id: string; password?: string; code?: string; recovery_code?: string; confirm_desktop?: boolean }): Promise<{ completed: true } | { redirect_url: string }>;
+  getOidcPending(pendingId: string): Promise<{ desktop: { client_kind: string; device_name: string } | null }>;
   getOrganizationSso(orgId: string): Promise<Record<string, unknown>>;
   saveOrganizationSso(orgId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
   deleteOrganizationSso(orgId: string): Promise<void>;
   testOrganizationSso(orgId: string): Promise<Record<string, unknown>>;
   getAdminSso(): Promise<{ enabled: boolean }>;
   updateAdminSso(enabled: boolean): Promise<{ enabled: boolean }>;
+  getSsoDomainClaims(): Promise<{ items: { organization_id: string; organization_name: string; domain: string; status: string; requested_at: string }[] }>;
+  decideSsoDomainClaim(orgId: string, domain: string, decision: "approved" | "rejected"): Promise<{ organization_id: string; domain: string; status: string }>;
   getScimStatus(orgId: string): Promise<Record<string, unknown>>;
   createScimToken(orgId: string): Promise<{ token: string }>;
   deleteScimToken(orgId: string): Promise<void>;
@@ -614,12 +620,15 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     discoverOidc: (email) => call(ENDPOINTS.oidcDiscover, { body: { email }, anonymous: true }),
     startOidc: (organizationId) => call(ENDPOINTS.oidcStart, { body: { organization_id: organizationId }, anonymous: true }),
     finishOidc: (body) => call(ENDPOINTS.oidcFinish, { body, anonymous: true }),
+    getOidcPending: (pendingId) => call(ENDPOINTS.oidcPending, { body: { pending_id: pendingId }, anonymous: true }),
     getOrganizationSso: (orgId) => call(ENDPOINTS.organizationSso, { params: { org_id: orgId } }),
     saveOrganizationSso: (orgId, body) => call(ENDPOINTS.saveOrganizationSso, { params: { org_id: orgId }, body }),
     deleteOrganizationSso: (orgId) => call(ENDPOINTS.deleteOrganizationSso, { params: { org_id: orgId } }),
     testOrganizationSso: (orgId) => call(ENDPOINTS.testOrganizationSso, { params: { org_id: orgId }, body: {} }),
     getAdminSso: () => call(ENDPOINTS.adminSso),
     updateAdminSso: (enabled) => call(ENDPOINTS.updateAdminSso, { body: { enabled } }),
+    getSsoDomainClaims: () => call(ENDPOINTS.adminSsoDomainClaims),
+    decideSsoDomainClaim: (orgId, domain, decision) => call(ENDPOINTS.decideSsoDomainClaim, { params: { org_id: orgId, domain }, body: { decision } }),
     getScimStatus: (orgId) => call(ENDPOINTS.scimStatus, { params: { org_id: orgId } }),
     createScimToken: (orgId) => call(ENDPOINTS.scimToken, { params: { org_id: orgId }, body: {} }),
     deleteScimToken: (orgId) => call(ENDPOINTS.deleteScimToken, { params: { org_id: orgId } }),

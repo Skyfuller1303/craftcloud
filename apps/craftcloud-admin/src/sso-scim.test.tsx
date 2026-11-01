@@ -52,6 +52,18 @@ describe("organization SSO and SCIM settings", () => {
     await waitFor(() => expect((secret as HTMLInputElement).value).toBe(""));
   });
 
+  it("shows unapproved domains as pending operator approval", async () => {
+    openSettings();
+    const { fetch } = mockFetch(routes("owner", {
+      [`GET /organizations/${ORG_A.id}/sso`]: { body: { discovery_url: "https://idp.example.test/.well-known/openid-configuration", client_id: "craft", allowed_domains: ["example.test", "acme.test"], domain_claims: [{ domain: "example.test", status: "approved" }, { domain: "acme.test", status: "pending" }], enabled: true, jit_enabled: true, sso_required: false, trust_mfa: true, version: 7 } },
+    }));
+    renderApp(fetch);
+    await screen.findByLabelText("OIDC discovery URL");
+    const list = await screen.findByRole("list", { name: "Domain approval status" });
+    expect(list.textContent).toContain("example.test: Approved");
+    expect(list.textContent).toContain("acme.test: Pending operator approval");
+  });
+
   it("restores provider MFA trust when removing SSO configuration", async () => {
     openSettings();
     const { fetch } = mockFetch(routes());
@@ -168,6 +180,7 @@ describe("SSO login and OIDC callback", () => {
     const { fetch, calls } = mockFetch({
       "GET /setup/status": { body: { setup_required: false } },
       "GET /auth/session": apiError(401, "UNAUTHENTICATED"),
+      "POST /auth/oidc/pending": { body: { desktop: null } },
       "POST /auth/oidc/finish": (call) => {
         const body = call.body as Record<string, unknown>;
         if (body.password === undefined) return apiError(400, "SSO_LINK_REQUIRED");
@@ -186,5 +199,37 @@ describe("SSO login and OIDC callback", () => {
     await user.click(screen.getByRole("button", { name: "Continue" }));
     expect((await screen.findByRole("alert")).textContent).toContain("Invalid native sign-in destination.");
     expect(calls.some((call) => call.path === "/auth/oidc/finish" && (call.body as Record<string, unknown>).code === "123456")).toBe(true);
+  });
+});
+
+describe("native OIDC confirmation", () => {
+  it("asks which device and app signs in before completing a native flow", async () => {
+    const { fetch, calls } = mockFetch({
+      "GET /setup/status": { body: { setup_required: false } },
+      "GET /auth/session": apiError(401, "UNAUTHENTICATED"),
+      "POST /auth/oidc/pending": { body: { desktop: { client_kind: "launcher", device_name: "Studio PC" } } },
+      "POST /auth/oidc/finish": { body: { redirect_url: "http://127.0.0.1:43121/oidc/callback?code=c&state=s" } },
+    });
+    const user = userEvent.setup();
+    renderApp(fetch, { oidcPending: "pending-native" });
+    expect(await screen.findByText("Sign in CraftCloud on Studio PC?")).toBeTruthy();
+    expect(screen.getByText("Application type: launcher")).toBeTruthy();
+    expect(calls.some((call) => call.path === "/auth/oidc/finish")).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Sign in on this device" }));
+    await waitFor(() => expect(calls.some((call) => call.path === "/auth/oidc/finish")).toBe(true));
+    expect(calls.find((call) => call.path === "/auth/oidc/finish")?.body).toMatchObject({ pending_id: "pending-native", confirm_desktop: true });
+  });
+
+  it("cancelling a native confirmation never calls finish", async () => {
+    const { fetch, calls } = mockFetch({
+      "GET /setup/status": { body: { setup_required: false } },
+      "GET /auth/session": apiError(401, "UNAUTHENTICATED"),
+      "POST /auth/oidc/pending": { body: { desktop: { client_kind: "app", device_name: "Laptop" } } },
+    });
+    const user = userEvent.setup();
+    renderApp(fetch, { oidcPending: "pending-native" });
+    await screen.findByText("Sign in CraftCloud on Laptop?");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(calls.some((call) => call.path === "/auth/oidc/finish")).toBe(false);
   });
 });

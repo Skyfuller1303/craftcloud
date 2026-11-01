@@ -14,6 +14,7 @@ export function SsoScimSettings({ organization, workspaces }: { organization: Or
   const owner = organization.role === "owner";
   const [config, setConfig] = useState<Record<string, unknown> | null>(null);
   const [domains, setDomains] = useState("");
+  const claims = Array.isArray(config?.domain_claims) ? config.domain_claims as { domain: string; status: string }[] : [];
   const [provider, setProvider] = useState({ discovery_url: "", client_id: "", enabled: false, jit_enabled: false, sso_required: false, trust_mfa: true, version: null as number | null });
   const [clientSecret, setClientSecret] = useState("");
   const [mappings, setMappings] = useState<{ group_id: string; workspace_id: string; role: "viewer" | "editor" }[]>([]);
@@ -66,6 +67,8 @@ export function SsoScimSettings({ organization, workspaces }: { organization: Or
       <Field label={t("OIDC discovery URL")} name="sso-discovery-url" value={provider.discovery_url} onChange={(value) => setProvider({ ...provider, discovery_url: value })} />
       <Field label={t("Client ID")} name="sso-client-id" value={provider.client_id} onChange={(value) => setProvider({ ...provider, client_id: value })} />
       <Field label={t("Allowed e-mail domains (comma separated)")} name="sso-domains" value={domains} onChange={setDomains} />
+      <p>{t("A domain only takes effect after the instance operator approved it.")}</p>
+      {claims.length > 0 && <ul aria-label={t("Domain approval status")}>{claims.map((claim) => <li key={claim.domain}>{claim.domain}: {claim.status === "approved" ? t("Approved") : claim.status === "rejected" ? t("Rejected by the instance operator") : t("Pending operator approval")}</li>)}</ul>}
       <Field label={t("Client secret (leave blank to keep current secret)")} name="sso-client-secret" type="password" required={false} value={clientSecret} onChange={setClientSecret} />
       {(["enabled", "jit_enabled", "sso_required", "trust_mfa"] as const).map((key) => <label className="checkbox" key={key}><input type="checkbox" checked={provider[key]} onChange={(event) => setProvider({ ...provider, [key]: event.currentTarget.checked })} /><span>{providerLabels[key]}</span></label>)}
       {provider.sso_required && <p role="note">{t("Warning: local password sign-in will be blocked for this organization while single sign-on is required. Instance operator recovery remains available.")}</p>}

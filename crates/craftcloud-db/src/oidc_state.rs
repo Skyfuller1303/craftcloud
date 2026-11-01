@@ -92,6 +92,20 @@ pub async fn pending_in(
 ) -> Result<Option<PendingRecord>, DbError> {
     Ok(sqlx::query_as("SELECT org_id,config_version,binding_hash,payload_ciphertext,attempts,expires_at FROM oidc_pending_logins WHERE token_hash=$1 AND expires_at>$2 AND attempts<5 FOR UPDATE").bind(hash.as_slice()).bind(now).fetch_optional(conn).await?)
 }
+/// Records which existing account a pending capability concerns, so credential
+/// recovery of that account deletes it (`password_reset` removes rows by `user_id`).
+pub async fn bind_user(
+    conn: &mut PgConnection,
+    hash: &[u8; 32],
+    user: Uuid,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE oidc_pending_logins SET user_id=$2 WHERE token_hash=$1")
+        .bind(hash.as_slice())
+        .bind(user)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
 /// Counts every proof attempt durably, including failures across server processes.
 pub async fn attempted(conn: &mut PgConnection, hash: &[u8; 32]) -> Result<(), DbError> {
     sqlx::query(

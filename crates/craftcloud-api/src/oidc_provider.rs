@@ -15,7 +15,11 @@ use openidconnect::{
     },
     http::{Request as HttpRequest, Response as HttpResponse},
 };
-use tokio::sync::Semaphore;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 use zeroize::Zeroize;
 
@@ -23,6 +27,37 @@ const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DISCOVERY_SUFFIX: &str = "/.well-known/openid-configuration";
 static REQUEST_LIMIT: Semaphore = Semaphore::const_new(8);
+/// Concurrent requests to one provider host, so a single slow provider cannot
+/// occupy the whole global budget and starve every other organization.
+const HOST_REQUEST_LIMIT: usize = 3;
+const MAX_TRACKED_HOSTS: usize = 512;
+static HOST_LIMITS: Mutex<Option<HashMap<String, Arc<Semaphore>>>> = Mutex::new(None);
+
+/// The shared permit pool of one provider host. Idle entries are dropped when the
+/// table is full; a held permit keeps its semaphore alive independently.
+fn host_semaphore(host: &str) -> Arc<Semaphore> {
+    let mut guard = HOST_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let key = host.to_ascii_lowercase();
+    if let Some(existing) = map.get(&key) {
+        return Arc::clone(existing);
+    }
+    if map.len() >= MAX_TRACKED_HOSTS {
+        map.retain(|_, s| Arc::strong_count(s) > 1);
+    }
+    let created = Arc::new(Semaphore::new(HOST_REQUEST_LIMIT));
+    if map.len() < MAX_TRACKED_HOSTS {
+        map.insert(key, Arc::clone(&created));
+    }
+    created
+}
+
+async fn acquire_host(host: &str) -> Result<OwnedSemaphorePermit, io::Error> {
+    tokio::time::timeout(REQUEST_TIMEOUT, host_semaphore(host).acquire_owned())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OIDC host limit timeout"))?
+        .map_err(|_| io::Error::other("OIDC host limit closed"))
+}
 
 pub(crate) struct ProviderSettings {
     pub discovery_url: String,
@@ -350,10 +385,6 @@ async fn send_pinned(request: HttpRequest<Vec<u8>>) -> Result<HttpResponse<Vec<u
 async fn send_pinned_inner(
     request: HttpRequest<Vec<u8>>,
 ) -> Result<HttpResponse<Vec<u8>>, io::Error> {
-    let _permit = tokio::time::timeout(REQUEST_TIMEOUT, REQUEST_LIMIT.acquire())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OIDC request limit timeout"))?
-        .map_err(|_| io::Error::other("OIDC request limit closed"))?;
     let url = Url::parse(&request.uri().to_string())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid URL"))?;
     let url = checked_url(url.as_str())
@@ -361,6 +392,12 @@ async fn send_pinned_inner(
     let host = url
         .host_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing host"))?;
+    // Host permit first: waiting on a saturated host never holds a global permit.
+    let _host_permit = acquire_host(host).await?;
+    let _permit = tokio::time::timeout(REQUEST_TIMEOUT, REQUEST_LIMIT.acquire())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OIDC request limit timeout"))?
+        .map_err(|_| io::Error::other("OIDC request limit closed"))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing port"))?;
@@ -541,6 +578,27 @@ mod tests {
             "127.0.0.1:443".parse().expect("valid socket address"),
         ];
         assert!(validate_resolution(answers).is_err());
+    }
+
+    #[tokio::test]
+    async fn one_saturated_provider_host_leaves_global_capacity_for_other_hosts() {
+        let mut held = Vec::new();
+        for _ in 0..HOST_REQUEST_LIMIT {
+            held.push(acquire_host("slow-idp.example").await.expect("host permit"));
+        }
+        // The slow host is exhausted for further requests (case-insensitive key)...
+        assert!(
+            host_semaphore("SLOW-IDP.example").try_acquire().is_err(),
+            "per-host budget must be exhausted"
+        );
+        // ...while another provider is still served and the global budget is untouched.
+        let other = acquire_host("other-idp.example")
+            .await
+            .expect("other host permit");
+        assert!(REQUEST_LIMIT.available_permits() >= 1);
+        drop(other);
+        drop(held);
+        assert!(host_semaphore("slow-idp.example").try_acquire().is_ok());
     }
 
     #[test]

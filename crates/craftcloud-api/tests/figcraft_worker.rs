@@ -590,6 +590,82 @@ mod tests {
         assert_eq!(rows, 0, "switching the 2FA requirement off must not revoke");
     }
 
+    async fn save_sso_policy(env: &TestEnv, org: Uuid, sso_required: bool, trust_mfa: bool) {
+        let mut tx = env.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM organizations WHERE id=$1 FOR UPDATE")
+            .bind(org)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        craftcloud_db::sso::save_configuration(
+            &mut tx,
+            &craftcloud_db::sso::Configuration {
+                org_id: org,
+                discovery_url: "https://idp.example.test/.well-known/openid-configuration"
+                    .to_owned(),
+                client_id: "client".to_owned(),
+                client_secret_ciphertext: vec![0xab; 40],
+                allowed_domains: vec!["example.test".to_owned()],
+                enabled: true,
+                jit_enabled: false,
+                sso_required,
+                trust_mfa,
+                version: 1,
+            },
+            &craftcloud_db::audit::AuditCtx {
+                actor_id: None,
+                request_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn tightening_sso_policy_enqueues_durable_figcraft_revocations_and_relaxing_does_not() {
+        let fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let org: Uuid = sqlx::query_scalar("SELECT org_id FROM files WHERE id=$1")
+            .bind(fixture.file)
+            .fetch_one(&fixture.env.pool)
+            .await
+            .unwrap();
+        let holder = fixture.env.operator_id;
+        // First configuration without a requirement tightens nothing.
+        save_sso_policy(&fixture.env, org, false, true).await;
+        assert_eq!(
+            take_security_rows(&fixture.env, fixture.file, holder).await,
+            0
+        );
+        // false -> true revokes live links.
+        save_sso_policy(&fixture.env, org, true, true).await;
+        assert_eq!(
+            take_security_rows(&fixture.env, fixture.file, holder).await,
+            1
+        );
+        // Unchanged policy, and relaxing the requirement, revoke nothing.
+        save_sso_policy(&fixture.env, org, true, true).await;
+        save_sso_policy(&fixture.env, org, false, true).await;
+        assert_eq!(
+            take_security_rows(&fixture.env, fixture.file, holder).await,
+            0
+        );
+        // Distrusting provider MFA is a tightening too.
+        save_sso_policy(&fixture.env, org, false, false).await;
+        assert_eq!(
+            take_security_rows(&fixture.env, fixture.file, holder).await,
+            1
+        );
+        // Trusting it again is not.
+        save_sso_policy(&fixture.env, org, false, true).await;
+        assert_eq!(
+            take_security_rows(&fixture.env, fixture.file, holder).await,
+            0
+        );
+    }
+
     /// Counts (and clears) the security outbox rows of one capability holder.
     async fn take_security_rows(env: &TestEnv, file: Uuid, user: Uuid) -> i64 {
         let count: i64 = sqlx::query_scalar(

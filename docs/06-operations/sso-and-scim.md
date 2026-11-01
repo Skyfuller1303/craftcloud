@@ -20,7 +20,7 @@ Erlaubte E-Mail-Domains sind exakte, kleingeschriebene DNS-Namen ohne Wildcard. 
 
 Die dauerhafte Identität ist das Paar aus Issuer und Subject, niemals eine E-Mail-Adresse. Ein bekanntes Subject bleibt demselben Konto zugeordnet, auch wenn sich seine E-Mail ändert. Ein neues Subject mit einer bereits belegten, verifizierten lokalen Adresse verlangt das aktuelle lokale Passwort. Die Bindung und Sitzung entstehen erst nach vollständigem Abschluss einschließlich eines nötigen zweiten Faktors. Eine verifizierte Adresse ohne Passwortnachweis führt nicht zur Kontoübernahme. Bei aktivierter Erstanlage können neue Konten beziehungsweise nachgewiesene lokale Konten als gewöhnliche Mitglieder beitreten; deaktivierte Mitgliedschaften werden nicht still reaktiviert. Platzlimits werden unter der Organisationssperre geprüft.
 
-Die Voreinstellung vertraut einem signierten `amr` mit dem exakten Wert `mfa`. Der Owner kann diese Anerkennung abschalten. Bei bestehendem CraftCloud-TOTP wird andernfalls dessen Code oder ein Wiederherstellungscode verlangt. Eine gesperrte TOTP-Konfiguration wird nicht als „kein Faktor vorhanden“ behandelt. Änderungen an der aktuellen Vertrauens- oder 2FA-Pflicht können erneute Anmeldung verlangen (`SSO_MFA_REQUIRED`).
+Die Voreinstellung vertraut einem signierten `amr` mit dem exakten Wert `mfa`, aber nur für Konten ohne eigenen CraftCloud-Faktor und nur innerhalb der Organisation, deren Anbieter es bestätigt hat. Der Owner kann diese Anerkennung abschalten. Ist ein CraftCloud-TOTP eingerichtet, wird immer dessen Code oder ein Wiederherstellungscode verlangt, auch bei Anbieter-MFA. Eine gesperrte TOTP-Konfiguration wird nicht als „kein Faktor vorhanden“ behandelt. Änderungen an der aktuellen Vertrauens- oder 2FA-Pflicht können erneute Anmeldung verlangen (`SSO_MFA_REQUIRED`).
 
 Ein neues, passwortloses SSO-Konto ohne anerkanntes Anbieter-MFA erhält bei einer Organisation mit 2FA-Pflicht keine Sitzung (`SSO_TWO_FACTOR_SETUP_REQUIRED`). Es gibt in AC-10 keinen passwortlosen TOTP-Einrichtungsdialog. Für solches Onboarding muss der Anbieter MFA korrekt ausweisen oder ein lokaler Onboarding-Schritt vorgeschaltet werden. Noch nicht angelegte Konten werden regulär eingeladen, verifizieren ihre Adresse und richten TOTP ein; für bereits vorprovisionierte Konten kann der Operator kontrolliert einen lokalen Passwortreset bereitstellen. Diese bewusst geschlossene Grenze verhindert einen MFA-Bypass und ist als Einschränkung im Bericht auszuweisen.
 
@@ -55,3 +55,15 @@ The automatic company-login hint requires a domain that matches exactly one enab
 ## Password recovery and company-account links
 
 A successful password recovery removes every external company-account identity from that global account and ends its old sessions. This prevents an identity created before the real mailbox owner recovered the account from retaining access. The person can sign in with the new local password and explicitly link their intended company identity again. Recovery during local TOTP onboarding therefore also requires fresh linking; a normal known-password change does not perform this recovery operation.
+
+## Domain approval and instance switch (review fixes)
+
+Allowed e-mail domains entered by an organization owner are only claims. They have no effect on account creation, SCIM provisioning or the company-login hint until the instance operator approves them under System, "Pending domain claims" (or through `GET /api/v1/admin/sso/domain-claims` and `PUT /api/v1/admin/sso/domain-claims/{org_id}/{domain}`). Approval and rejection are audited. A domain can be approved for one organization only; a second organization claiming it stays pending and the approval request is answered with `409 SSO_DOMAIN_ALREADY_APPROVED`. Verify domain ownership outside CraftCloud before approving (for example by DNS TXT record or a ticket from a known administrator); automated DNS proof is not part of this release. Owners see the state of each domain in the organization settings as pending, approved or rejected.
+
+When you switch OIDC off for the whole instance, "SSO required" is no longer enforced, so members can sign in with their local passwords again; switching it back on restores the requirement.
+
+Provider MFA is recognized only for the organization whose provider asserted it. Accounts with a local TOTP factor must still present that factor (and remain blocked while the factor is locked). A provider identity is never linked to an instance operator account.
+
+SCIM requests are limited per client address (`scim_ip_limit`, 600 per window by default), and the OIDC start, authorize and callback routes share `oidc_ip_limit` (30 per window by default). The metrics classes `scim` and `oidc` count rejected requests. Requests to one identity provider host use at most three concurrent connections.
+
+A native sign-in shows the device name and client type in the browser and completes only after the person confirms.

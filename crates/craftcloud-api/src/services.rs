@@ -34,6 +34,10 @@ pub(crate) enum IpClass {
     Setup,
     Reset,
     Accept,
+    /// OIDC start, authorize and callback (each can reach an external provider).
+    Oidc,
+    /// SCIM provisioning requests, before any token or database work.
+    Scim,
 }
 
 impl IpClass {
@@ -44,6 +48,8 @@ impl IpClass {
             Self::Setup => "setup",
             Self::Reset => "reset",
             Self::Accept => "accept",
+            Self::Oidc => "oidc",
+            Self::Scim => "scim",
         }
     }
 }
@@ -103,6 +109,11 @@ pub struct AuthSettings {
     /// Requests per `rate_window` and client address (IPv4 exact, IPv6 /64)
     /// for each of the login, setup and reset routes.
     pub ip_limit: u32,
+    /// OIDC start, authorize and callback requests per `rate_window` and client address.
+    pub oidc_ip_limit: u32,
+    /// SCIM requests per `rate_window` and client address; directories send bursts,
+    /// so this is much higher than the interactive limits.
+    pub scim_ip_limit: u32,
     /// Password change attempts per `rate_window` and user.
     pub pwchange_limit: u32,
     /// Invitations a user may create per `rate_window`.
@@ -148,6 +159,8 @@ impl Default for AuthSettings {
             public_origin: None,
             cookie_secure: true,
             ip_limit: 10,
+            oidc_ip_limit: 30,
+            scim_ip_limit: 600,
             pwchange_limit: 5,
             invite_limit: 30,
             member_search_limit: 60,
@@ -202,6 +215,8 @@ pub struct Services {
     setup_ip: WindowLimiter,
     reset_ip: WindowLimiter,
     accept_ip: WindowLimiter,
+    oidc_ip: WindowLimiter,
+    scim_ip: WindowLimiter,
     pwchange: WindowLimiter,
     profile: WindowLimiter,
     invite_create: WindowLimiter,
@@ -286,6 +301,8 @@ impl Services {
             setup_ip: WindowLimiter::new(cap),
             reset_ip: WindowLimiter::new(cap),
             accept_ip: WindowLimiter::new(cap),
+            oidc_ip: WindowLimiter::new(cap),
+            scim_ip: WindowLimiter::new(cap),
             pwchange: WindowLimiter::new(cap),
             profile: WindowLimiter::new(cap),
             invite_create: WindowLimiter::new(cap),
@@ -470,19 +487,16 @@ impl Services {
         ip: Option<IpAddr>,
         headers: &HeaderMap,
     ) -> Result<(), Box<Response>> {
-        let limiter = match class {
-            IpClass::Login => &self.login_ip,
-            IpClass::Setup => &self.setup_ip,
-            IpClass::Reset => &self.reset_ip,
-            IpClass::Accept => &self.accept_ip,
+        let (limiter, limit) = match class {
+            IpClass::Login => (&self.login_ip, self.settings.ip_limit),
+            IpClass::Setup => (&self.setup_ip, self.settings.ip_limit),
+            IpClass::Reset => (&self.reset_ip, self.settings.ip_limit),
+            IpClass::Accept => (&self.accept_ip, self.settings.ip_limit),
+            IpClass::Oidc => (&self.oidc_ip, self.settings.oidc_ip_limit),
+            IpClass::Scim => (&self.scim_ip, self.settings.scim_ip_limit),
         };
         limiter
-            .check(
-                &ip_key(ip),
-                self.now_secs(),
-                self.settings.ip_limit,
-                self.window_secs(),
-            )
+            .check(&ip_key(ip), self.now_secs(), limit, self.window_secs())
             .map_err(|retry| self.too_many(class.label(), retry, headers))
     }
 

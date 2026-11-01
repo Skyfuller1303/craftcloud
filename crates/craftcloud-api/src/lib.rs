@@ -124,6 +124,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/auth/oidc/authorize", &["GET"]),
     ("/api/v1/auth/oidc/callback", &["GET"]),
     ("/api/v1/auth/oidc/finish", &["POST"]),
+    ("/api/v1/auth/oidc/pending", &["POST"]),
     ("/api/v1/auth/oidc/device/exchange", &["POST"]),
     (
         "/api/v1/organizations/{org_id}/sso",
@@ -131,6 +132,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ),
     ("/api/v1/organizations/{org_id}/sso/test", &["POST"]),
     ("/api/v1/admin/sso", &["GET", "PUT"]),
+    ("/api/v1/admin/sso/domain-claims", &["GET"]),
+    (
+        "/api/v1/admin/sso/domain-claims/{org_id}/{domain}",
+        &["PUT"],
+    ),
     ("/api/v1/organizations/{org_id}/scim", &["GET"]),
     (
         "/api/v1/organizations/{org_id}/scim/token",
@@ -326,6 +332,7 @@ pub fn router_with_shared(
         .route("/api/v1/auth/oidc/authorize", get(oidc::authorize))
         .route("/api/v1/auth/oidc/callback", get(oidc::callback))
         .route("/api/v1/auth/oidc/finish", post(oidc::finish))
+        .route("/api/v1/auth/oidc/pending", post(oidc::pending_info))
         .route("/api/v1/auth/oidc/device/exchange", post(oidc::exchange))
         .route(
             "/api/v1/organizations/{org_id}/sso",
@@ -340,6 +347,14 @@ pub fn router_with_shared(
         .route(
             "/api/v1/admin/sso",
             get(sso_settings::instance_get).put(sso_settings::instance_put),
+        )
+        .route(
+            "/api/v1/admin/sso/domain-claims",
+            get(sso_settings::claims_list),
+        )
+        .route(
+            "/api/v1/admin/sso/domain-claims/{org_id}/{domain}",
+            put(sso_settings::claim_decide),
         )
         .route("/api/v1/organizations/{org_id}/scim", get(scim::status))
         .route(

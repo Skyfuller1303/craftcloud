@@ -41,6 +41,7 @@ mod tests {
                 .as_str()
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .unwrap();
+            crate::common::approve_example_domain(&env.pool, org).await;
             Self {
                 env,
                 operator,
