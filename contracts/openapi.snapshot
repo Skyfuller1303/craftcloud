@@ -8,6 +8,8 @@ GET /api/v1/admin/maintenance auth=cookie|bearer req=- ok=MaintenanceStatus code
 GET /api/v1/admin/organizations auth=cookie|bearer req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
 PATCH /api/v1/admin/organizations/{org_id}/seats auth=cookie|bearer req=- ok=SeatLimitResponse codes=200,400,401,403,404,422,500,503
+GET /api/v1/admin/sso auth=cookie|bearer req=- ok=InstanceSsoPolicy codes=200,400,401,403,404,409,413,422,429,500,503
+PUT /api/v1/admin/sso auth=cookie+csrf|bearer req=InstanceSsoPolicy ok=InstanceSsoPolicy codes=200,400,401,403,404,409,413,422,429,500,503
 GET /api/v1/admin/users auth=cookie|bearer req=- ok=AdminUserPage codes=200,400,401,403,422,500,503
 POST /api/v1/admin/users/email-verification auth=cookie+csrf|bearer req=- ok=EmailVerificationBatchResponse codes=202,400,401,403,429,500,503
 GET /api/v1/admin/users/{user_id}/devices auth=cookie|bearer req=- ok=AdminDevicePage codes=200,400,401,403,404,422,500,503
@@ -35,6 +37,12 @@ POST /api/v1/auth/login auth=none req=LoginRequest ok=LoginResponse codes=200,40
 POST /api/v1/auth/login/second-factor auth=none req=SecondFactorLoginRequest ok=LoginResponse codes=200,400,401,403,413,415,422,429,500,503
 POST /api/v1/auth/logout auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,500,503
 POST /api/v1/auth/logout-all auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,500,503
+GET /api/v1/auth/oidc/authorize auth=none req=- ok=- codes=303,400,401,403,404,409,413,422,429,500,503
+GET /api/v1/auth/oidc/callback auth=none req=- ok=- codes=303,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/auth/oidc/device/exchange auth=none req=OidcExchange ok=DeviceLoginResponse codes=200,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/auth/oidc/discover auth=none req=OidcDiscover ok=OidcHint codes=200,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/auth/oidc/finish auth=none req=OidcFinish ok=OidcFinished codes=200,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/auth/oidc/start auth=none req=OidcStart ok=OidcAuthorization codes=200,400,401,403,404,409,413,422,429,500,502,503
 POST /api/v1/auth/password-reset auth=none req=ResetPasswordRequest ok=- codes=204,400,413,415,422,429,500,503
 POST /api/v1/auth/password/change auth=cookie+csrf|bearer req=ChangePasswordRequest ok=- codes=204,400,401,403,413,415,422,429,500,503
 PATCH /api/v1/auth/profile auth=cookie+csrf|bearer req=UpdateProfileRequest ok=SessionInfo codes=200,400,401,403,413,415,422,429,500,503
@@ -85,7 +93,17 @@ PATCH /api/v1/organizations/{org_id}/members/{user_id} auth=cookie+csrf|bearer r
 PATCH /api/v1/organizations/{org_id}/members/{user_id}/apps auth=cookie|bearer req=MemberAppChangeRequest ok=MemberAppAssignmentsResponse codes=200,400,401,403,404,409,422,500,503
 PUT /api/v1/organizations/{org_id}/members/{user_id}/apps auth=cookie|bearer req=MemberAppAssignmentsRequest ok=MemberAppAssignmentsResponse codes=200,400,401,403,404,409,422,500,503
 GET /api/v1/organizations/{org_id}/overview auth=cookie|bearer req=- ok=OrganizationOverview codes=200,401,403,404,500,503
+GET /api/v1/organizations/{org_id}/scim auth=cookie|bearer req=- ok=ScimStatus codes=200,400,401,403,404,409,413,422,429,500,503
+GET /api/v1/organizations/{org_id}/scim/events auth=cookie|bearer req=- ok=ScimEvents codes=200,400,401,403,404,409,413,422,429,500,503
+GET /api/v1/organizations/{org_id}/scim/mappings auth=cookie|bearer req=- ok=ScimMappings codes=200,400,401,403,404,409,413,422,429,500,503
+PUT /api/v1/organizations/{org_id}/scim/mappings auth=cookie+csrf|bearer req=ScimMappings ok=ScimMappings codes=200,400,401,403,404,409,413,422,429,500,503
+DELETE /api/v1/organizations/{org_id}/scim/token auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/organizations/{org_id}/scim/token auth=cookie+csrf|bearer req=- ok=ScimToken codes=200,400,401,403,404,409,413,422,429,500,503
 GET /api/v1/organizations/{org_id}/shared-with-me auth=cookie|bearer req=- ok=SharedWithMeResponse codes=200,400,401,404,422,500,503
+DELETE /api/v1/organizations/{org_id}/sso auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,413,422,429,500,503
+GET /api/v1/organizations/{org_id}/sso auth=cookie|bearer req=- ok=SsoConfiguration codes=200,400,401,403,404,409,413,422,429,500,503
+PUT /api/v1/organizations/{org_id}/sso auth=cookie+csrf|bearer req=SsoConfigurationWrite ok=SsoConfiguration codes=200,400,401,403,404,409,413,422,429,500,503
+POST /api/v1/organizations/{org_id}/sso/test auth=cookie+csrf|bearer req=- ok=SsoProviderTest codes=200,400,401,403,404,409,413,422,429,500,503
 GET /api/v1/organizations/{org_id}/usage auth=cookie|bearer req=- ok=UsagePage codes=200,400,401,403,404,422,500,503
 GET /api/v1/organizations/{org_id}/workspaces auth=cookie|bearer req=- ok=WorkspacePage codes=200,400,401,404,422,500,503
 POST /api/v1/organizations/{org_id}/workspaces auth=cookie+csrf|bearer req=CreateWorkspaceRequest ok=Workspace codes=201,400,401,403,404,413,415,422,500,503
@@ -113,6 +131,18 @@ POST /api/v1/workspaces/{workspace_id}/projects auth=cookie+csrf|bearer req=Crea
 PUT /api/v1/workspaces/{workspace_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
 GET /health/live auth=none req=- ok=- codes=200,503
 GET /health/ready auth=none req=- ok=Readiness codes=200,503
+GET /scim/v2/organizations/{org_id}/Groups auth=scimBearer req=- ok=ScimList codes=200,400,401,403,404,409,413,422,429,500,503
+POST /scim/v2/organizations/{org_id}/Groups auth=scimBearer req=ScimGroup ok=ScimGroup codes=201,400,401,403,404,409,413,422,429,500,503
+DELETE /scim/v2/organizations/{org_id}/Groups/{id} auth=scimBearer req=- ok=- codes=204,400,401,403,404,409,413,422,429,500,503
+GET /scim/v2/organizations/{org_id}/Groups/{id} auth=scimBearer req=- ok=ScimGroup codes=200,400,401,403,404,409,413,422,429,500,503
+PATCH /scim/v2/organizations/{org_id}/Groups/{id} auth=scimBearer req=ScimPatch ok=ScimGroup codes=200,400,401,403,404,409,413,422,429,500,503
+PUT /scim/v2/organizations/{org_id}/Groups/{id} auth=scimBearer req=ScimGroup ok=ScimGroup codes=200,400,401,403,404,409,413,422,429,500,503
+GET /scim/v2/organizations/{org_id}/Users auth=scimBearer req=- ok=ScimList codes=200,400,401,403,404,409,413,422,429,500,503
+POST /scim/v2/organizations/{org_id}/Users auth=scimBearer req=ScimUser ok=ScimUser codes=201,400,401,403,404,409,413,422,429,500,503
+DELETE /scim/v2/organizations/{org_id}/Users/{id} auth=scimBearer req=- ok=- codes=204,400,401,403,404,409,413,422,429,500,503
+GET /scim/v2/organizations/{org_id}/Users/{id} auth=scimBearer req=- ok=ScimUser codes=200,400,401,403,404,409,413,422,429,500,503
+PATCH /scim/v2/organizations/{org_id}/Users/{id} auth=scimBearer req=ScimPatch ok=ScimUser codes=200,400,401,403,404,409,413,422,429,500,503
+PUT /scim/v2/organizations/{org_id}/Users/{id} auth=scimBearer req=ScimUser ok=ScimUser codes=200,400,401,403,404,409,413,422,429,500,503
 # component schemas
 AcceptInvitationRequest
 AcceptedInvitation
@@ -160,6 +190,7 @@ GrantChangeRequest
 GrantCreateRequest
 GrantPage
 HealthLevel
+InstanceSsoPolicy
 Invitation
 InvitationDeliveryResponse
 InvitationPage
@@ -176,6 +207,14 @@ MemberAppAssignmentsResponse
 MemberAppChangeRequest
 MemberPage
 MyOrganizationPage
+OidcAuthorization
+OidcDesktop
+OidcDiscover
+OidcExchange
+OidcFinish
+OidcFinished
+OidcHint
+OidcStart
 Organization
 OrganizationApps
 OrganizationLock
@@ -189,6 +228,16 @@ Readiness
 RecoveryCodesResponse
 ResetLinkResponse
 ResetPasswordRequest
+ScimError
+ScimEvents
+ScimGroup
+ScimList
+ScimMappings
+ScimMeta
+ScimPatch
+ScimStatus
+ScimToken
+ScimUser
 SeatLimitResponse
 SecondFactorLoginRequest
 SecondFactorProof
@@ -197,6 +246,9 @@ SessionList
 SetupCompleteRequest
 SharedTarget
 SharedWithMeResponse
+SsoConfiguration
+SsoConfigurationWrite
+SsoProviderTest
 TwoFactorConfirmRequest
 TwoFactorDisableRequest
 TwoFactorSetupRequest

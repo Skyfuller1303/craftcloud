@@ -826,7 +826,55 @@ async fn finish_upload(finish: Finish) -> Response {
     {
         Ok(true) => {}
         Ok(false) => {
-            let setup_required = match tx.two_factor_setup_required(user_id).await {
+            let organization_policy = match tx
+                .session_organization_policy(
+                    login_session_id,
+                    user_id,
+                    credential_kind == crate::session::CredentialKind::Device,
+                    now,
+                )
+                .await
+            {
+                Ok(policy) => policy,
+                Err(error) => {
+                    guard.key = None;
+                    drop(tx);
+                    delete_object(&services, &key).await;
+                    fail_session(&services, org_id, upload_id).await;
+                    return db_failure(
+                        &error,
+                        &headers,
+                        "organization session policy check failed",
+                    );
+                }
+            };
+            let global_session_valid = organization_policy.is_some();
+            let organization_failure = match organization_policy {
+                Some((craftcloud_db::sso::SessionPolicy::Revoked, _)) => Some((
+                    "ORGANIZATION_REAUTHENTICATION_REQUIRED",
+                    "Sign in again to access this organization.",
+                )),
+                Some((craftcloud_db::sso::SessionPolicy::SsoRequired, _)) => Some((
+                    "SSO_REQUIRED",
+                    "Sign in with this organization's company account.",
+                )),
+                Some((
+                    craftcloud_db::sso::SessionPolicy::Allowed {
+                        mfa: false,
+                        sso: true,
+                    },
+                    true,
+                )) => Some((
+                    "SSO_MFA_REQUIRED",
+                    "Sign in again with the required additional factor.",
+                )),
+                _ => None,
+            };
+            let setup_required = match if global_session_valid {
+                tx.two_factor_setup_required(user_id).await
+            } else {
+                Ok(false)
+            } {
                 Ok(value) => value,
                 Err(error) => {
                     guard.key = None;
@@ -847,7 +895,9 @@ async fn finish_upload(finish: Finish) -> Response {
                 Some(upload_id),
                 "unauthenticated",
             );
-            let mut response = if setup_required {
+            let mut response = if let Some((code, message)) = organization_failure {
+                error_response(StatusCode::FORBIDDEN, code, message, &headers)
+            } else if setup_required {
                 error_response(
                     StatusCode::FORBIDDEN,
                     "TWO_FACTOR_SETUP_REQUIRED",

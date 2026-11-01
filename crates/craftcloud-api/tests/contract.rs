@@ -165,6 +165,10 @@ mod tests {
                         "{method} {template} is listed but answered {}",
                         reply.status
                     );
+                } else if template.starts_with("/scim/v2/") {
+                    assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+                    assert_eq!(reply.body["status"], "405");
+                    assert_eq!(reply.headers[header::CONTENT_TYPE], "application/scim+json");
                 } else {
                     assert_eq!(
                         (reply.status, reply.body["error"]["code"].as_str()),
@@ -207,7 +211,12 @@ mod tests {
     }
 
     fn body_schema(content: &Value) -> Option<String> {
-        schema_name(content.get("application/json")?.get("schema")?)
+        schema_name(
+            content
+                .get("application/json")
+                .or_else(|| content.get("application/scim+json"))?
+                .get("schema")?,
+        )
     }
 
     /// One line per operation: method, path, authentication, request and success
@@ -322,7 +331,11 @@ mod tests {
             .as_object()
             .expect("component responses");
         for (name, response) in components {
-            let describes_error = response.get("content").is_some_and(is_error_schema);
+            let describes_error = if name == "ScimFailure" {
+                response.get("content").and_then(body_schema).as_deref() == Some("ScimError")
+            } else {
+                response.get("content").is_some_and(is_error_schema)
+            };
             // Component responses are either errors (schema Error) or declared
             // here on purpose; none is allowed to have another error body.
             assert!(
@@ -357,7 +370,27 @@ mod tests {
                     } else {
                         response.get("content").is_some_and(is_error_schema)
                     };
-                    assert!(ok, "{method} {path} {code} does not use schemas/Error");
+                    let ok = if path.starts_with("/scim/v2/") {
+                        response
+                            .get("content")
+                            .or_else(|| {
+                                response
+                                    .get("$ref")
+                                    .and_then(Value::as_str)
+                                    .and_then(|r| r.rsplit('/').next())
+                                    .and_then(|name| components.get(name))
+                                    .and_then(|r| r.get("content"))
+                            })
+                            .and_then(body_schema)
+                            .as_deref()
+                            == Some("ScimError")
+                    } else {
+                        ok
+                    };
+                    assert!(
+                        ok,
+                        "{method} {path} {code} does not use the required error schema"
+                    );
                 }
             }
         }

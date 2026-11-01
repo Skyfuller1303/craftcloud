@@ -15,6 +15,7 @@ import { usePagedList } from "../usePagedList.ts";
 import { ScreenBoundary } from "../components/ScreenBoundary.tsx";
 import { ProfileSection } from "./ProfileSection.tsx";
 import { VerificationNotice } from "./EmailAccount.tsx";
+import { SsoScimSettings } from "./SsoScimSettings.tsx";
 
 // Every screen is its own chunk, loaded on first use, so the first paint only
 // needs the shell (code splitting; the strict CSP forbids inline code, and a
@@ -463,7 +464,7 @@ export function Shell({
           ) : section === "admin-activity" ? (
             orgAdmin ? <ActivityScreen key={organizationId} scope={scope} isOperator={isOperator} workspaces={workspaces.items} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "org-settings" ? (
-            orgAdmin && organization !== null ? <OrganizationSettingsScreen organization={organization} onUpdated={(updated) => organizations.mutate((items) => items.map((item) => item.id === updated.id ? updated : item))} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
+            orgAdmin && organization !== null ? <OrganizationSettingsScreen organization={organization} workspaces={workspaces.items} onUpdated={(updated) => organizations.mutate((items) => items.map((item) => item.id === updated.id ? updated : item))} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "instance-organizations" ? (
             isOperator ? <AdminOperatorScreen key="organizations" section="organizations" /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "instance-accounts" ? (
@@ -549,7 +550,7 @@ export function Shell({
   );
 }
 
-function OrganizationSettingsScreen({ organization, onUpdated }: { organization: Organization; onUpdated: (updated: Organization) => void }) {
+function OrganizationSettingsScreen({ organization, workspaces, onUpdated }: { organization: Organization; workspaces: Workspace[]; onUpdated: (updated: Organization) => void }) {
   const { t } = useI18n();
   const { api } = useAuth();
   const [name, setName] = useState(organization.name);
@@ -613,6 +614,7 @@ function OrganizationSettingsScreen({ organization, onUpdated }: { organization:
       {twoFactorAvailable
         ? <TwoFactorSettingsScreen organization={organization} onFactorChanged={() => undefined} onOrganizationUpdated={onUpdated} />
         : <p className="muted">{t("Two-factor policy is unavailable on this server.")}</p>}
+      <SsoScimSettings key={organization.id} organization={organization} workspaces={workspaces} />
     </div>
   );
 }

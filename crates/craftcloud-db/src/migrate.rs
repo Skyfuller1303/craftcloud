@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(
             embedded_versions(),
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
             ]
         );
     }
@@ -417,6 +417,6 @@ mod tests {
         assert_eq!(migrator_up_to(18).iter().count(), 18);
         assert_eq!(migrator_up_to(19).iter().count(), 19);
         assert_eq!(migrator_up_to(20).iter().count(), 20);
-        assert_eq!(migrator_up_to(99).iter().count(), 20);
+        assert_eq!(migrator_up_to(99).iter().count(), 21);
     }
 }

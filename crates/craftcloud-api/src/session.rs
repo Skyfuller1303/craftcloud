@@ -88,6 +88,9 @@ enum Kind {
     Internal,
     Ambiguous,
     TwoFactorSetupRequired,
+    SsoRequired,
+    SsoMfaRequired,
+    OrganizationSessionRevoked,
 }
 
 impl AuthRejection {
@@ -137,6 +140,21 @@ impl IntoResponse for AuthRejection {
                 StatusCode::BAD_REQUEST,
                 "AMBIGUOUS_CREDENTIALS",
                 "Send either a session cookie or a bearer token, not both.",
+            ),
+            Kind::OrganizationSessionRevoked => (
+                StatusCode::FORBIDDEN,
+                "ORGANIZATION_REAUTHENTICATION_REQUIRED",
+                "Sign in again to access this organization; your other memberships remain available.",
+            ),
+            Kind::SsoMfaRequired => (
+                StatusCode::FORBIDDEN,
+                "SSO_MFA_REQUIRED",
+                "Sign in again with the additional factor required by this organization.",
+            ),
+            Kind::SsoRequired => (
+                StatusCode::FORBIDDEN,
+                "SSO_REQUIRED",
+                "Sign in with this organization’s company account.",
             ),
             Kind::TwoFactorSetupRequired => (
                 StatusCode::FORBIDDEN,
@@ -254,9 +272,27 @@ impl FromRequestParts<ApiState> for AuthenticatedSession {
             )
         };
 
-        match organization_requires_two_factor(&services, user_id, parts.uri.path()).await {
+        match organization_requires_two_factor(
+            &services,
+            user_id,
+            parts.uri.path(),
+            session_id,
+            credential_kind,
+            created_at,
+        )
+        .await
+        {
             Ok(true) => return Err(AuthRejection::new(Kind::TwoFactorSetupRequired, parts)),
             Ok(false) => {}
+            Err(AuthRejectionKind::SsoMfaRequired) => {
+                return Err(AuthRejection::new(Kind::SsoMfaRequired, parts));
+            }
+            Err(AuthRejectionKind::SsoRequired) => {
+                return Err(AuthRejection::new(Kind::SsoRequired, parts));
+            }
+            Err(AuthRejectionKind::Revoked) => {
+                return Err(AuthRejection::new(Kind::OrganizationSessionRevoked, parts));
+            }
             Err(AuthRejectionKind::Internal) => {
                 return Err(AuthRejection::new(Kind::Internal, parts));
             }
@@ -280,6 +316,9 @@ async fn organization_requires_two_factor(
     services: &crate::services::Services,
     user_id: Uuid,
     path: &str,
+    session_id: Uuid,
+    credential_kind: CredentialKind,
+    created_at: OffsetDateTime,
 ) -> Result<bool, AuthRejectionKind> {
     // Axum route captures are percent-decoded. Decode each raw URI segment
     // separately so encoded slashes cannot change the route structure.
@@ -343,6 +382,29 @@ async fn organization_requires_two_factor(
     if !route_resource_visible(services, user_id, org_id, member, &segments, path).await? {
         return Ok(false);
     }
+    let kind = if credential_kind == CredentialKind::Device {
+        "device"
+    } else {
+        "browser"
+    };
+    let sso_without_mfa = match craftcloud_db::sso::session_policy(
+        &services.pool,
+        org_id,
+        user_id,
+        kind,
+        session_id,
+        created_at,
+    )
+    .await
+    .map_err(|_| AuthRejectionKind::Internal)?
+    {
+        craftcloud_db::sso::SessionPolicy::SsoRequired => {
+            return Err(AuthRejectionKind::SsoRequired);
+        }
+        craftcloud_db::sso::SessionPolicy::Revoked => return Err(AuthRejectionKind::Revoked),
+        craftcloud_db::sso::SessionPolicy::Allowed { mfa: true, .. } => return Ok(false),
+        craftcloud_db::sso::SessionPolicy::Allowed { mfa: false, sso } => sso,
+    };
     let required: Option<bool> =
         sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
             .bind(org_id)
@@ -354,6 +416,9 @@ async fn organization_requires_two_factor(
             })?;
     if required != Some(true) {
         return Ok(false);
+    }
+    if sso_without_mfa {
+        return Err(AuthRejectionKind::SsoMfaRequired);
     }
     let (enabled, _) = craftcloud_db::two_factor::status(&services.pool, user_id)
         .await
@@ -530,6 +595,9 @@ async fn route_resource_visible(
 #[derive(Debug)]
 enum AuthRejectionKind {
     Internal,
+    SsoRequired,
+    SsoMfaRequired,
+    Revoked,
 }
 
 async fn sqlx_scalar_org(

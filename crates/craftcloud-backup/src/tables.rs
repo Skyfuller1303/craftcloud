@@ -67,6 +67,14 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("figcraft_live_files", 18),
     table("figcraft_links", 18),
     table("figcraft_outbox", 18),
+    table("organization_sso", 21),
+    table("instance_sso_policy", 21),
+    table("external_identities", 21),
+    table("scim_users", 21),
+    table("scim_groups", 21),
+    table("scim_group_members", 21),
+    table("scim_group_mappings", 21),
+    table("scim_workspace_ownership", 21),
     table("audit_events", 11),
 ];
 
@@ -90,6 +98,11 @@ pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("outbound_emails", 19),
     ("email_verification_tokens", 19),
     ("pending_email_changes", 19),
+    ("oidc_transactions", 21),
+    ("oidc_pending_logins", 21),
+    ("sso_session_bindings", 21),
+    ("organization_session_cutoffs", 21),
+    ("scim_tokens", 21),
 ];
 
 /// The names of [`EXCLUDED_WITH_VERSION`].
@@ -105,6 +118,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "outbound_emails",
     "email_verification_tokens",
     "pending_email_changes",
+    "oidc_transactions",
+    "oidc_pending_logins",
+    "sso_session_bindings",
+    "organization_session_cutoffs",
+    "scim_tokens",
 ];
 
 /// The migration bookkeeping table: recreated by running the migrations.
@@ -186,11 +204,11 @@ mod tests {
         // AC-06 adds FigCraft state at 18; AC-09 adds one-use email state at 19.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len() - 7
+            BACKUP_TABLES.len() - 15
         );
         assert_eq!(
             backup_tables_for(14).unwrap().len(),
-            BACKUP_TABLES.len() - 7
+            BACKUP_TABLES.len() - 15
         );
         assert_eq!(
             excluded_tables_for(14),
@@ -217,7 +235,7 @@ mod tests {
         assert!(!excluded_tables_for(15).contains(&"file_locks"));
         assert_eq!(
             backup_tables_for(16).unwrap().len(),
-            BACKUP_TABLES.len() - 6
+            BACKUP_TABLES.len() - 14
         );
         assert_eq!(
             excluded_tables_for(16),
@@ -296,6 +314,14 @@ mod tests {
         // A synthetic future table: backups of older schemas must not expect it.
         let specs = [
             table("users", 1),
+            table("organization_sso", 21),
+            table("instance_sso_policy", 21),
+            table("external_identities", 21),
+            table("scim_users", 21),
+            table("scim_groups", 21),
+            table("scim_group_members", 21),
+            table("scim_group_mappings", 21),
+            table("scim_workspace_ownership", 21),
             table("audit_events", 11),
             table("future_things", 15),
         ];

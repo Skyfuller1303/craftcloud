@@ -1110,6 +1110,20 @@ mod tests {
         // AC-11 adds app assignments and appends seat_limit and
         // app_access_mode to organizations.
         std::fs::remove_file(out.join("tables").join("member_app_access.copy")).unwrap();
+        // AC-10 tables did not exist in either legacy schema.
+        for table in [
+            "organization_sso",
+            "instance_sso_policy",
+            "external_identities",
+            "scim_users",
+            "scim_groups",
+            "scim_group_members",
+            "scim_group_mappings",
+            "scim_workspace_ownership",
+        ] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+
         let versions_path = out.join("tables").join("file_versions.copy");
         let current_versions = std::fs::read_to_string(&versions_path).unwrap();
         let old_versions: String = current_versions
@@ -1175,6 +1189,14 @@ mod tests {
                             | "figcraft_links"
                             | "figcraft_outbox"
                             | "member_app_access"
+                            | "organization_sso"
+                            | "instance_sso_policy"
+                            | "external_identities"
+                            | "scim_users"
+                            | "scim_groups"
+                            | "scim_group_members"
+                            | "scim_group_mappings"
+                            | "scim_workspace_ownership"
                     )
                 )
             });
@@ -1296,6 +1318,20 @@ mod tests {
         let out = dir.child("backup");
         w.create_backup(&out).await.unwrap();
         std::fs::remove_file(out.join("tables").join("member_app_access.copy")).unwrap();
+        // AC-10 tables did not exist in either legacy schema.
+        for table in [
+            "organization_sso",
+            "instance_sso_policy",
+            "external_identities",
+            "scim_users",
+            "scim_groups",
+            "scim_group_members",
+            "scim_group_mappings",
+            "scim_workspace_ownership",
+        ] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+
         let org_path = out.join("tables").join("organizations.copy");
         let old_orgs: String = std::fs::read_to_string(&org_path)
             .unwrap()
@@ -1327,7 +1363,35 @@ mod tests {
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(19);
             let tables = m["tables"].as_array_mut().unwrap();
-            tables.retain(|t| t["name"] != "member_app_access");
+            tables.retain(|t| {
+                !matches!(
+                    t["name"].as_str(),
+                    Some(
+                        "member_app_access"
+                            | "organization_sso"
+                            | "instance_sso_policy"
+                            | "external_identities"
+                            | "scim_users"
+                            | "scim_groups"
+                            | "scim_group_members"
+                            | "scim_group_mappings"
+                            | "scim_workspace_ownership"
+                    )
+                )
+            });
+            m["excluded_tables"].as_array_mut().unwrap().retain(|t| {
+                !matches!(
+                    t.as_str(),
+                    Some(
+                        "oidc_transactions"
+                            | "oidc_pending_logins"
+                            | "sso_session_bindings"
+                            | "organization_session_cutoffs"
+                            | "scim_tokens"
+                    )
+                )
+            });
+            let tables = m["tables"].as_array_mut().unwrap();
             for (name, text) in [("organizations", &old_orgs), ("figcraft_links", &old_links)] {
                 let entry = tables.iter_mut().find(|t| t["name"] == name).unwrap();
                 entry["bytes"] = json!(text.len());
@@ -1359,7 +1423,11 @@ mod tests {
         assert!(craftcloud_db::migrate::verify(&target.pool).await.is_err());
 
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
-        assert_eq!(applied.len(), 1, "only migration 20 is applied");
+        assert_eq!(
+            applied.iter().map(|m| m.version).collect::<Vec<_>>(),
+            vec![20, 21],
+            "restore precedes both later forward migrations"
+        );
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         let defaults: (Option<i32>, String) =
             sqlx::query_as("SELECT seat_limit, app_access_mode FROM organizations WHERE id = $1")

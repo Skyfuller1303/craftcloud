@@ -3492,6 +3492,1381 @@ paths:
         '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /organizations/{org_id}/sso:
+    get:
+      tags:
+      - Organizations
+      summary: Owner-only OIDC provider and SSO policy
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Owner-only OIDC provider and SSO policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoConfiguration'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+    put:
+      tags:
+      - Organizations
+      summary: Owner-only OIDC provider and SSO policy
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SsoConfigurationWrite'
+      responses:
+        '200':
+          description: Owner-only OIDC provider and SSO policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoConfiguration'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+    delete:
+      tags:
+      - Organizations
+      summary: Owner-only OIDC provider and SSO policy
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Owner-only OIDC provider and SSO policy
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /organizations/{org_id}/sso/test:
+    post:
+      tags:
+      - Organizations
+      summary: Verify discovery and JWKS connectivity; not an interactive login test
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Verify discovery and JWKS connectivity; not an interactive login test
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SsoProviderTest'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /admin/sso:
+    get:
+      tags:
+      - Organizations
+      summary: Operator-only instance OIDC switch; local recovery always remains available
+      responses:
+        '200':
+          description: Operator-only instance OIDC switch; local recovery always remains available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstanceSsoPolicy'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+    put:
+      tags:
+      - Organizations
+      summary: Operator-only instance OIDC switch; local recovery always remains available
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InstanceSsoPolicy'
+      responses:
+        '200':
+          description: Operator-only instance OIDC switch; local recovery always remains available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstanceSsoPolicy'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /organizations/{org_id}/scim:
+    get:
+      tags:
+      - Organizations
+      summary: Owner-only provisioning status; never returns a token
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Owner-only provisioning status; never returns a token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScimStatus'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /organizations/{org_id}/scim/token:
+    post:
+      tags:
+      - Organizations
+      summary: Rotate SCIM credential; reveal plaintext once
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Rotate SCIM credential; reveal plaintext once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScimToken'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+    delete:
+      tags:
+      - Organizations
+      summary: Revoke SCIM credential
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Revoke SCIM credential
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /organizations/{org_id}/scim/mappings:
+    get:
+      tags:
+      - Organizations
+      summary: Owner-only group mappings; manual memberships take precedence
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Owner-only group mappings; manual memberships take precedence
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScimMappings'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+    put:
+      tags:
+      - Organizations
+      summary: Owner-only group mappings; manual memberships take precedence
+      security:
+      - cookieAuth: []
+        csrfToken: []
+      - bearerAuth: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScimMappings'
+      responses:
+        '200':
+          description: Owner-only group mappings; manual memberships take precedence
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScimMappings'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /organizations/{org_id}/scim/events:
+    get:
+      tags:
+      - Organizations
+      summary: Latest 100 provisioning events without payloads
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Latest 100 provisioning events without payloads
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScimEvents'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /scim/v2/organizations/{org_id}/Users:
+    get:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Users
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: query
+        name: filter
+        schema:
+          type: string
+          maxLength: 1024
+        description: Only userName eq JSON-string (Users) or displayName eq JSON-string (Groups).
+      - in: query
+        name: startIndex
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - in: query
+        name: count
+        schema:
+          type: integer
+          minimum: 0
+          default: 100
+        description: Clamped to 100.
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Users
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimList'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    post:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Users
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimUser'
+      responses:
+        '201':
+          description: Tenant-token authorized SCIM Users
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+  /scim/v2/organizations/{org_id}/Users/{id}:
+    get:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Users resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Users resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    put:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Users resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimUser'
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Users resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    patch:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Users resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimPatch'
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Users resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    delete:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Users resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Tenant-token authorized SCIM Users resource
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+  /scim/v2/organizations/{org_id}/Groups:
+    get:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Groups
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: query
+        name: filter
+        schema:
+          type: string
+          maxLength: 1024
+        description: Only userName eq JSON-string (Users) or displayName eq JSON-string (Groups).
+      - in: query
+        name: startIndex
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - in: query
+        name: count
+        schema:
+          type: integer
+          minimum: 0
+          default: 100
+        description: Clamped to 100.
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Groups
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimList'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    post:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Groups
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimGroup'
+      responses:
+        '201':
+          description: Tenant-token authorized SCIM Groups
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimGroup'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+  /scim/v2/organizations/{org_id}/Groups/{id}:
+    get:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Groups resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Groups resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimGroup'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    put:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Groups resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimGroup'
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Groups resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimGroup'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    patch:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Groups resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimPatch'
+      responses:
+        '200':
+          description: Tenant-token authorized SCIM Groups resource
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimGroup'
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+    delete:
+      tags:
+      - Organizations
+      summary: Tenant-token authorized SCIM Groups resource
+      security:
+      - scimBearer: []
+      parameters:
+      - in: path
+        name: org_id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Tenant-token authorized SCIM Groups resource
+        '400':
+          $ref: '#/components/responses/ScimFailure'
+        '401':
+          $ref: '#/components/responses/ScimFailure'
+        '403':
+          $ref: '#/components/responses/ScimFailure'
+        '404':
+          $ref: '#/components/responses/ScimFailure'
+        '409':
+          $ref: '#/components/responses/ScimFailure'
+        '413':
+          $ref: '#/components/responses/ScimFailure'
+        '422':
+          $ref: '#/components/responses/ScimFailure'
+        '429':
+          $ref: '#/components/responses/ScimFailure'
+        '500':
+          $ref: '#/components/responses/ScimFailure'
+        '503':
+          $ref: '#/components/responses/ScimFailure'
+      servers:
+      - url: https://craftcloud.example.invalid
+  /auth/oidc/discover:
+    post:
+      tags:
+      - Auth
+      summary: Public email-domain hint; ambiguous domains return null
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcDiscover'
+      responses:
+        '200':
+          description: Public email-domain hint; ambiguous domains return null
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcHint'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /auth/oidc/start:
+    post:
+      tags:
+      - Auth
+      summary: Create PKCE login state and one-use browser launch
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcStart'
+      responses:
+        '200':
+          description: Create PKCE login state and one-use browser launch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcAuthorization'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+        '502':
+          $ref: '#/components/responses/Ac10Failure'
+  /auth/oidc/authorize:
+    get:
+      tags:
+      - Auth
+      summary: Claim one-use launch and bind the initiating browser
+      security: []
+      responses:
+        '303':
+          description: Claim one-use launch and bind the initiating browser
+          headers:
+            Location:
+              schema:
+                type: string
+              description: Fixed browser handoff; never an arbitrary caller-controlled redirect.
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+      parameters:
+      - in: query
+        name: flow
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+  /auth/oidc/callback:
+    get:
+      tags:
+      - Auth
+      summary: Consume browser-bound state; validate issuer, signature, audience, time, nonce and PKCE
+      security: []
+      responses:
+        '303':
+          description: Consume browser-bound state; validate issuer, signature, audience, time, nonce and PKCE
+          headers:
+            Location:
+              schema:
+                type: string
+              description: Fixed browser handoff; never an arbitrary caller-controlled redirect.
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+      parameters:
+      - in: query
+        name: state
+        required: true
+        schema:
+          type: string
+          maxLength: 256
+      - in: query
+        name: code
+        required: false
+        schema:
+          type: string
+          maxLength: 4096
+      - in: query
+        name: error
+        required: false
+        schema:
+          type: string
+          maxLength: 256
+      - in: query
+        name: session_state
+        required: false
+        schema:
+          type: string
+          maxLength: 1024
+      - in: query
+        name: iss
+        required: false
+        schema:
+          type: string
+          maxLength: 2048
+  /auth/oidc/finish:
+    post:
+      tags:
+      - Auth
+      summary: Complete local linking or second factor; SSO_LINK_REQUIRED and SSO_SECOND_FACTOR_REQUIRED retain pending
+        flow
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcFinish'
+      responses:
+        '200':
+          description: Complete local linking or second factor; SSO_LINK_REQUIRED and SSO_SECOND_FACTOR_REQUIRED retain
+            pending flow
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcFinished'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
+  /auth/oidc/device/exchange:
+    post:
+      tags:
+      - Auth
+      summary: Redeem a 60-second one-use native completion code with PKCE over TLS
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OidcExchange'
+      responses:
+        '200':
+          description: Redeem a 60-second one-use native completion code with PKCE over TLS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceLoginResponse'
+        '400':
+          $ref: '#/components/responses/Ac10Failure'
+        '401':
+          $ref: '#/components/responses/Ac10Failure'
+        '403':
+          $ref: '#/components/responses/Ac10Failure'
+        '404':
+          $ref: '#/components/responses/Ac10Failure'
+        '409':
+          $ref: '#/components/responses/Ac10Failure'
+        '413':
+          $ref: '#/components/responses/Ac10Failure'
+        '422':
+          $ref: '#/components/responses/Ac10Failure'
+        '429':
+          $ref: '#/components/responses/Ac10Failure'
+        '500':
+          $ref: '#/components/responses/Ac10Failure'
+        '503':
+          $ref: '#/components/responses/Ac10Failure'
 components:
   parameters:
     OrgId:
@@ -3598,6 +4973,11 @@ components:
       schema: {type: string, format: date-time}
       description: Events before this time (exclusive); must be after `from`.
   securitySchemes:
+    scimBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque cc_scim_ token
+      description: Organization-scoped SCIM credential; never accepted as a normal API session.
     cookieAuth:
       type: apiKey
       in: cookie
@@ -3627,6 +5007,503 @@ components:
         are never accepted. Device revocation, password change/reset, account disable, logout-all and removal
         from the final organization revoke access immediately.
   schemas:
+    OidcDesktop:
+      type: object
+      properties:
+        client_kind:
+          type: string
+          enum:
+          - app
+          - launcher
+          - cli
+        client_id:
+          type: string
+          pattern: ^[a-z0-9-]{1,32}$
+        device_name:
+          type: string
+          maxLength: 64
+        redirect_uri:
+          type: string
+          format: uri
+          description: Literal 127.0.0.1 or [::1], explicit ephemeral port, HTTP, exact /oidc/callback, no query, credentials
+            or fragment.
+        code_challenge:
+          type: string
+          minLength: 43
+          maxLength: 43
+        state:
+          type: string
+          minLength: 32
+          maxLength: 128
+      required:
+      - client_kind
+      - client_id
+      - device_name
+      - redirect_uri
+      - code_challenge
+      - state
+      additionalProperties: false
+    OidcStart:
+      type: object
+      properties:
+        organization_id:
+          type: string
+          format: uuid
+        desktop:
+          $ref: '#/components/schemas/OidcDesktop'
+      required:
+      - organization_id
+      additionalProperties: false
+    OidcAuthorization:
+      type: object
+      properties:
+        authorization_url:
+          type: string
+          format: uri
+          description: Same-origin one-time browser-launch URL; not the provider password UI embedded in a client.
+      required:
+      - authorization_url
+    OidcDiscover:
+      type: object
+      properties:
+        email:
+          type: string
+          maxLength: 320
+      required:
+      - email
+      additionalProperties: false
+    OidcHint:
+      type: object
+      properties:
+        organization_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+      required:
+      - organization_id
+    OidcFinish:
+      type: object
+      properties:
+        pending_id:
+          type: string
+          writeOnly: true
+          maxLength: 128
+        password:
+          type: string
+          maxLength: 4096
+          writeOnly: true
+        code:
+          type: string
+          writeOnly: true
+          maxLength: 16
+        recovery_code:
+          type: string
+          writeOnly: true
+          maxLength: 128
+      required:
+      - pending_id
+      additionalProperties: false
+    OidcFinished:
+      type: object
+      properties:
+        completed:
+          type: boolean
+        redirect_url:
+          type: string
+          format: uri
+          description: 'Native completion only: validated literal loopback URL with one-use code and native state.'
+    OidcExchange:
+      type: object
+      properties:
+        code:
+          type: string
+          writeOnly: true
+          maxLength: 128
+        code_verifier:
+          type: string
+          writeOnly: true
+          minLength: 43
+          maxLength: 128
+      required:
+      - code
+      - code_verifier
+      additionalProperties: false
+    SsoConfiguration:
+      type: object
+      properties:
+        configured:
+          type: boolean
+        discovery_url:
+          type: string
+          format: uri
+          maxLength: 2048
+        client_id:
+          type: string
+          maxLength: 256
+        allowed_domains:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 100
+        enabled:
+          type: boolean
+        jit_enabled:
+          type: boolean
+        sso_required:
+          type: boolean
+        trust_mfa:
+          type: boolean
+        version:
+          type: integer
+          format: int64
+        client_secret_configured:
+          type: boolean
+      required:
+      - configured
+    SsoConfigurationWrite:
+      type: object
+      properties:
+        discovery_url:
+          type: string
+          format: uri
+          maxLength: 2048
+        client_id:
+          type: string
+          maxLength: 256
+        client_secret:
+          type: string
+          maxLength: 4096
+          writeOnly: true
+        allowed_domains:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 100
+        enabled:
+          type: boolean
+        jit_enabled:
+          type: boolean
+        sso_required:
+          type: boolean
+        trust_mfa:
+          type: boolean
+        version:
+          type:
+          - integer
+          - 'null'
+      required:
+      - discovery_url
+      - client_id
+      - allowed_domains
+      - enabled
+      - jit_enabled
+      - sso_required
+      - trust_mfa
+      additionalProperties: false
+    SsoProviderTest:
+      type: object
+      properties:
+        success:
+          type: boolean
+        issuer:
+          type: string
+          format: uri
+      required:
+      - success
+      - issuer
+    InstanceSsoPolicy:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+      required:
+      - enabled
+      additionalProperties: false
+    ScimStatus:
+      type: object
+      properties:
+        token_configured:
+          type: boolean
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              display_name:
+                type: string
+            required:
+            - id
+            - display_name
+      required:
+      - token_configured
+      - groups
+    ScimToken:
+      type: object
+      properties:
+        token:
+          type: string
+          description: Shown only by this rotation response. Keep secret; a later GET never returns it.
+      required:
+      - token
+    ScimMappings:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              group_id:
+                type: string
+                format: uuid
+              workspace_id:
+                type: string
+                format: uuid
+              role:
+                type: string
+                enum:
+                - viewer
+                - editor
+            required:
+            - group_id
+            - workspace_id
+            - role
+            additionalProperties: false
+          maxItems: 100
+      required:
+      - items
+      additionalProperties: false
+    ScimEvents:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                format: uuid
+              action:
+                type: string
+              created_at:
+                type: string
+                format: date-time
+            required:
+            - id
+            - action
+            - created_at
+          maxItems: 100
+      required:
+      - items
+    ScimMeta:
+      type: object
+      properties:
+        resourceType:
+          type: string
+          enum:
+          - User
+          - Group
+        created:
+          type: string
+          format: date-time
+        lastModified:
+          type: string
+          format: date-time
+        location:
+          type: string
+          format: uri
+    ScimUser:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items:
+            type: string
+            enum:
+            - urn:ietf:params:scim:schemas:core:2.0:User
+          minItems: 1
+          maxItems: 1
+        id:
+          type: string
+          format: uuid
+        externalId:
+          type:
+          - string
+          - 'null'
+          maxLength: 255
+        userName:
+          type: string
+          maxLength: 320
+        displayName:
+          type: string
+          maxLength: 400
+        active:
+          type: boolean
+        emails:
+          type: array
+          items:
+            type: object
+            properties:
+              value:
+                type: string
+              primary:
+                type: boolean
+          maxItems: 10
+        name:
+          type: object
+          properties:
+            formatted:
+              type: string
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              value:
+                type: string
+                format: uuid
+        meta:
+          $ref: '#/components/schemas/ScimMeta'
+      required:
+      - schemas
+      - userName
+      additionalProperties: false
+    ScimGroup:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items:
+            type: string
+            enum:
+            - urn:ietf:params:scim:schemas:core:2.0:Group
+          minItems: 1
+          maxItems: 1
+        id:
+          type: string
+          format: uuid
+        externalId:
+          type:
+          - string
+          - 'null'
+          maxLength: 255
+        displayName:
+          type: string
+          maxLength: 400
+        members:
+          type: array
+          items:
+            type: object
+            properties:
+              value:
+                type: string
+                format: uuid
+              display:
+                type: string
+              $ref:
+                type: string
+                format: uri
+            required:
+            - value
+          maxItems: 100
+        meta:
+          $ref: '#/components/schemas/ScimMeta'
+      required:
+      - schemas
+      - displayName
+      additionalProperties: false
+    ScimPatch:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items:
+            type: string
+            enum:
+            - urn:ietf:params:scim:api:messages:2.0:PatchOp
+          minItems: 1
+          maxItems: 1
+        Operations:
+          type: array
+          items:
+            type: object
+            properties:
+              op:
+                type: string
+                enum:
+                - add
+                - replace
+                - remove
+                - Add
+                - Replace
+                - Remove
+              path:
+                type: string
+                maxLength: 1024
+              value: {}
+            required:
+            - op
+          minItems: 1
+          maxItems: 100
+      required:
+      - schemas
+      - Operations
+      additionalProperties: false
+    ScimList:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items:
+            type: string
+        totalResults:
+          type: integer
+          format: int64
+        startIndex:
+          type: integer
+          format: int64
+        itemsPerPage:
+          type: integer
+          format: int64
+        Resources:
+          type: array
+          items:
+            oneOf:
+            - $ref: '#/components/schemas/ScimUser'
+            - $ref: '#/components/schemas/ScimGroup'
+          maxItems: 100
+      required:
+      - schemas
+      - totalResults
+      - startIndex
+      - itemsPerPage
+      - Resources
+    ScimError:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items:
+            type: string
+            enum:
+            - urn:ietf:params:scim:api:messages:2.0:Error
+        status:
+          type: string
+        scimType:
+          type: string
+        detail:
+          type: string
+      required:
+      - schemas
+      - status
+      - detail
     OrganizationApps:
       type: object
       required: [mode, seat_usage, apps]
@@ -4796,6 +6673,18 @@ components:
         csrf_token: {type: string, description: Only when an account was created and logged in}
         expires_at: {type: string, format: date-time, description: Session expiry, only when a session was issued}
   responses:
+    Ac10Failure:
+      description: The request was rejected; codes are stable and provider secrets are never included.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ScimFailure:
+      description: RFC 7644 failure; request correlation remains in the x-request-id header.
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/ScimError'
     LoginChallengeOrInvalid:
       description: >-
         INVALID_CREDENTIALS for unknown account, wrong password or disabled account; or

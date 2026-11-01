@@ -756,12 +756,46 @@ impl OrgTx {
         if enabled != Some(true) {
             return Ok(false);
         }
+        let created: Option<OffsetDateTime> = if device {
+            sqlx::query_scalar("SELECT created_at FROM device_sessions WHERE id=$1 AND user_id=$2")
+                .bind(session_id)
+                .bind(user_id)
+                .fetch_optional(&mut *self.tx)
+                .await?
+        } else {
+            sqlx::query_scalar("SELECT created_at FROM sessions WHERE id=$1 AND user_id=$2")
+                .bind(session_id)
+                .bind(user_id)
+                .fetch_optional(&mut *self.tx)
+                .await?
+        };
+        let Some(created) = created else {
+            return Ok(false);
+        };
+        let (mfa, sso) = match crate::sso::session_policy_in(
+            &mut self.tx,
+            self.org_id,
+            user_id,
+            if device { "device" } else { "browser" },
+            session_id,
+            created,
+        )
+        .await?
+        {
+            crate::sso::SessionPolicy::Allowed { mfa, sso } => (mfa, sso),
+            crate::sso::SessionPolicy::SsoRequired | crate::sso::SessionPolicy::Revoked => {
+                return Ok(false);
+            }
+        };
         let require_two_factor: bool =
             sqlx::query_scalar("SELECT require_two_factor FROM organizations WHERE id=$1")
                 .bind(self.org_id)
                 .fetch_one(&mut *self.tx)
                 .await?;
-        if require_two_factor {
+        if require_two_factor && sso && !mfa {
+            return Ok(false);
+        }
+        if require_two_factor && !mfa {
             let factor_enabled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_two_factor WHERE user_id=$1 AND enabled_at IS NOT NULL)")
                 .bind(user_id).fetch_one(&mut *self.tx).await?;
             if !factor_enabled {
@@ -776,6 +810,42 @@ impl OrgTx {
                 .bind(session_id).bind(user_id).bind(now).fetch_optional(&mut *self.tx).await?
         };
         Ok(live.is_some())
+    }
+
+    /// Classifies an organization denial without treating a still-valid global
+    /// credential as logged out of every tenant.
+    pub async fn session_organization_policy(
+        &mut self,
+        session: Uuid,
+        user: Uuid,
+        device: bool,
+        now: OffsetDateTime,
+    ) -> Result<Option<(crate::sso::SessionPolicy, bool)>, DbError> {
+        let query = if device {
+            "SELECT d.created_at FROM device_sessions d JOIN users u ON u.id=d.user_id WHERE d.id=$1 AND d.user_id=$2 AND d.revoked_at IS NULL AND d.absolute_expires_at>$3 AND u.disabled_at IS NULL FOR SHARE OF d"
+        } else {
+            "SELECT d.created_at FROM sessions d JOIN users u ON u.id=d.user_id WHERE d.id=$1 AND d.user_id=$2 AND d.revoked_at IS NULL AND d.absolute_expires_at>$3 AND u.disabled_at IS NULL FOR SHARE OF d"
+        };
+        let created: Option<OffsetDateTime> = sqlx::query_scalar(query)
+            .bind(session)
+            .bind(user)
+            .bind(now)
+            .fetch_optional(&mut *self.tx)
+            .await?;
+        let Some(created) = created else {
+            return Ok(None);
+        };
+        let policy = crate::sso::session_policy_in(
+            &mut self.tx,
+            self.org_id,
+            user,
+            if device { "device" } else { "browser" },
+            session,
+            created,
+        )
+        .await?;
+        let required = self.require_two_factor().await?;
+        Ok(Some((policy, required)))
     }
 
     pub async fn two_factor_setup_required(&mut self, user_id: Uuid) -> Result<bool, DbError> {

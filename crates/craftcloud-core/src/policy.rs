@@ -222,6 +222,12 @@ pub enum Action {
     OrganizationUpdate,
     /// Change the organization's mandatory two-factor policy.
     OrganizationTwoFactorPolicyUpdate,
+    /// Manage the organization OIDC provider and login policy (owner only).
+    SsoManage,
+    /// Manage organization SCIM credentials and mappings (owner only).
+    ScimManage,
+    /// Enable or disable OIDC for the instance (operator only).
+    InstanceSsoManage,
     /// Create an organization (operator).
     OrganizationCreate,
     /// List organization metadata of the whole instance (operator).
@@ -400,6 +406,9 @@ impl Action {
             | Self::MemberSearch => false,
             Self::OrganizationUpdate
             | Self::OrganizationTwoFactorPolicyUpdate
+            | Self::SsoManage
+            | Self::ScimManage
+            | Self::InstanceSsoManage
             | Self::OrganizationCreate
             | Self::MemberAdd
             | Self::MemberChangeRole
@@ -443,11 +452,14 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 72] = [
+    pub const ALL: [Action; 75] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
         Action::OrganizationTwoFactorPolicyUpdate,
+        Action::SsoManage,
+        Action::ScimManage,
+        Action::InstanceSsoManage,
         Action::OrganizationCreate,
         Action::OrganizationListAll,
         Action::UserListAll,
@@ -853,6 +865,7 @@ fn can_user_without_app(actor: &Actor, action: Action, resource: &Resource) -> D
             | A::MaintenanceRead
             | A::HealthRead
             | A::InstanceAuditRead
+            | A::InstanceSsoManage
             | A::OrganizationQuotaSet
             | A::OrganizationSeatLimitSet
             | A::UserDisable
@@ -888,6 +901,13 @@ fn can_user_without_app(actor: &Actor, action: Action, resource: &Resource) -> D
             Some(OrgRole::Member | OrgRole::Guest) => Decision::Forbidden,
             None => Decision::Hidden,
         },
+        (A::SsoManage | A::ScimManage, Resource::Organization { org_id }) => {
+            match role_in(actor, *org_id) {
+                Some(OrgRole::Owner) => allow(action, Some(*org_id)),
+                Some(_) => Decision::Forbidden,
+                None => Decision::Hidden,
+            }
+        }
         (A::OrganizationUpdate, Resource::Organization { org_id }) => {
             match role_in(actor, *org_id) {
                 Some(OrgRole::Owner | OrgRole::Admin) => allow(action, Some(*org_id)),
@@ -1573,6 +1593,8 @@ mod tests {
 
     #[test]
     fn organization_read_and_update() {
+        check(Action::SsoManage, org(), [H, F, F, Y]);
+        check(Action::ScimManage, org(), [H, F, F, Y]);
         check(Action::OrganizationRead, org(), [H, Y, Y, Y]);
         check(Action::OrganizationUpdate, org(), [H, F, Y, Y]);
         // The overview is owner/admin only; a workspace admin is still a plain
@@ -1969,6 +1991,7 @@ mod tests {
             Action::MaintenanceRead,
             Action::HealthRead,
             Action::InstanceAuditRead,
+            Action::InstanceSsoManage,
             Action::OrganizationQuotaSet,
             Action::OrganizationSeatLimitSet,
             Action::UserDisable,
@@ -2165,6 +2188,9 @@ mod tests {
             Action::OrganizationRead,
             Action::OrganizationUpdate,
             Action::OrganizationTwoFactorPolicyUpdate,
+            Action::SsoManage,
+            Action::ScimManage,
+            Action::InstanceSsoManage,
             Action::OrganizationCreate,
             Action::OrganizationListAll,
             Action::UserListAll,
@@ -2243,6 +2269,9 @@ mod tests {
                 | Action::OrganizationRead
                 | Action::OrganizationUpdate
                 | Action::OrganizationTwoFactorPolicyUpdate
+                | Action::SsoManage
+                | Action::ScimManage
+                | Action::InstanceSsoManage
                 | Action::OrganizationCreate
                 | Action::OrganizationListAll
                 | Action::UserListAll

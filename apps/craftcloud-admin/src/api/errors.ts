@@ -82,6 +82,12 @@ export function classifyError(error: unknown): ErrorKind {
 
 function codeMessage(t: Translate, error: ApiError): string | undefined {
   switch (error.code) {
+    case "ORGANIZATION_REAUTHENTICATION_REQUIRED":
+      return t("Sign in again to access this organization. Your other memberships remain available.");
+    case "SSO_REQUIRED":
+      return t("Sign in with your company account to access this organization.");
+    case "SSO_MFA_REQUIRED":
+      return t("Sign in again with the additional factor required by this organization.");
     case "EMAIL_DELIVERY_UNAVAILABLE":
       return t("E-mail delivery is not available on this server.");
     case "INVALID_EMAIL_TOKEN":

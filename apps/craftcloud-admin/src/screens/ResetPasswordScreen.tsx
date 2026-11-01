@@ -119,6 +119,7 @@ export function ResetPasswordScreen({
             error={errors.repeat}
           />
           <p className="muted">{t("All other sessions of this account end when the password is set.")}</p>
+          <p className="muted">{t("Company sign-in links will be disconnected. Link them again after signing in with your new password.")}</p>
           <Button type="submit" className="button button--primary" isDisabled={action.pending}>
             {action.pending ? t("Saving…") : t("Set password")}
           </Button>

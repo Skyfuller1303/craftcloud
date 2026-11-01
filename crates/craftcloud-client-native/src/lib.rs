@@ -24,6 +24,9 @@ use ureq::{
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+mod oidc;
+pub use oidc::{Browser, OidcClientDetails, SystemBrowser, login_oidc};
+
 /// Longest wait for name resolution and for connecting (including the TLS handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Longest wait for the request head to be written once connected.

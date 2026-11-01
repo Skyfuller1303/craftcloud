@@ -122,6 +122,7 @@ export function renderApp(
   options: {
     inviteToken?: string | null;
     resetToken?: string | null;
+    oidcPending?: string | null;
     language?: string;
     xhrFactory?: () => XMLHttpRequest;
   } = {},
@@ -131,6 +132,7 @@ export function renderApp(
       <App
         inviteToken={options.inviteToken ?? null}
         resetToken={options.resetToken ?? null}
+        oidcPending={options.oidcPending ?? null}
         createClient={(onUnauthenticated) =>
           createApiClient({
             fetchImpl,

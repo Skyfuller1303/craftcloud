@@ -2243,6 +2243,11 @@ mod tests {
         let data = pattern(120_000, 22);
         let id = w.upload_id(&c.editor.1, c.file, &data).await;
         let logout = async {
+            sqlx::query("UPDATE organizations SET require_two_factor=true WHERE id=$1")
+                .bind(c.org)
+                .execute(&w.env.pool)
+                .await
+                .unwrap();
             let r = w
                 .send(Req::new("POST", "/api/v1/auth/logout").session(&c.editor.1))
                 .await;
@@ -2250,6 +2255,11 @@ mod tests {
         };
         assert_nothing_stored_after(&w, &c.editor.1, id, &data, logout).await;
         // Another login of the same user is unaffected and can upload.
+        sqlx::query("UPDATE organizations SET require_two_factor=false WHERE id=$1")
+            .bind(c.org)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
         let again = w.relogin("editor").await;
         let fresh = pattern(2000, 23);
         let next = w.upload_id(&again, c.file, &fresh).await;

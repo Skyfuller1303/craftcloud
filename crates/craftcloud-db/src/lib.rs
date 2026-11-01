@@ -29,12 +29,14 @@ pub mod mail_security;
 pub mod maintenance;
 pub mod members;
 pub mod migrate;
+pub mod oidc;
 pub mod organizations;
 pub mod overview;
 pub mod password_reset;
 mod pool;
 pub mod projects;
 pub mod recovery;
+pub mod scim;
 mod scope;
 pub mod sessions;
 pub mod setup;
@@ -49,3 +51,9 @@ pub use pool::{connect, ping};
 pub use scope::OrgScope;
 
 pub use sqlx::PgPool;
+
+/// Organization SSO session policy.
+pub mod sso;
+
+/// Bounded OIDC login state.
+pub mod oidc_state;

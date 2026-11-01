@@ -74,6 +74,21 @@ export const ENDPOINTS = {
   serverInfo: { method: "GET", path: "/info" },
   setupComplete: { method: "POST", path: "/setup/complete" },
   login: { method: "POST", path: "/auth/login" },
+  oidcDiscover: { method: "POST", path: "/auth/oidc/discover" },
+  oidcStart: { method: "POST", path: "/auth/oidc/start" },
+  oidcFinish: { method: "POST", path: "/auth/oidc/finish" },
+  organizationSso: { method: "GET", path: "/organizations/{org_id}/sso" },
+  saveOrganizationSso: { method: "PUT", path: "/organizations/{org_id}/sso" },
+  deleteOrganizationSso: { method: "DELETE", path: "/organizations/{org_id}/sso" },
+  testOrganizationSso: { method: "POST", path: "/organizations/{org_id}/sso/test" },
+  adminSso: { method: "GET", path: "/admin/sso" },
+  updateAdminSso: { method: "PUT", path: "/admin/sso" },
+  scimStatus: { method: "GET", path: "/organizations/{org_id}/scim" },
+  scimToken: { method: "POST", path: "/organizations/{org_id}/scim/token" },
+  deleteScimToken: { method: "DELETE", path: "/organizations/{org_id}/scim/token" },
+  scimMappings: { method: "GET", path: "/organizations/{org_id}/scim/mappings" },
+  updateScimMappings: { method: "PUT", path: "/organizations/{org_id}/scim/mappings" },
+  scimEvents: { method: "GET", path: "/organizations/{org_id}/scim/events" },
   loginSecondFactor: { method: "POST", path: "/auth/login/second-factor" },
   twoFactorStatus: { method: "GET", path: "/auth/2fa" },
   twoFactorSetup: { method: "POST", path: "/auth/2fa/setup" },
@@ -322,6 +337,21 @@ export interface ApiClient {
   serverInfo(): Promise<ServerInfo>;
   setupComplete(body: SetupCompleteRequest): Promise<SetupCompleteResponse>;
   login(body: LoginRequest): Promise<LoginResponse>;
+  discoverOidc(email: string): Promise<{ organization_id: string | null }>;
+  startOidc(organizationId: string): Promise<{ authorization_url: string }>;
+  finishOidc(body: { pending_id: string; password?: string; code?: string; recovery_code?: string }): Promise<{ completed: true } | { redirect_url: string }>;
+  getOrganizationSso(orgId: string): Promise<Record<string, unknown>>;
+  saveOrganizationSso(orgId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+  deleteOrganizationSso(orgId: string): Promise<void>;
+  testOrganizationSso(orgId: string): Promise<Record<string, unknown>>;
+  getAdminSso(): Promise<{ enabled: boolean }>;
+  updateAdminSso(enabled: boolean): Promise<{ enabled: boolean }>;
+  getScimStatus(orgId: string): Promise<Record<string, unknown>>;
+  createScimToken(orgId: string): Promise<{ token: string }>;
+  deleteScimToken(orgId: string): Promise<void>;
+  getScimMappings(orgId: string): Promise<Record<string, unknown>>;
+  updateScimMappings(orgId: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+  getScimEvents(orgId: string): Promise<{ items: Record<string, unknown>[] }>;
   loginSecondFactor(body: SecondFactorLoginRequest): Promise<LoginResponse>;
   getTwoFactorStatus(): Promise<TwoFactorStatus>;
   setupTwoFactor(password: string): Promise<TwoFactorSetup>;
@@ -581,6 +611,21 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       csrfToken = result.csrf_token;
       return result;
     },
+    discoverOidc: (email) => call(ENDPOINTS.oidcDiscover, { body: { email }, anonymous: true }),
+    startOidc: (organizationId) => call(ENDPOINTS.oidcStart, { body: { organization_id: organizationId }, anonymous: true }),
+    finishOidc: (body) => call(ENDPOINTS.oidcFinish, { body, anonymous: true }),
+    getOrganizationSso: (orgId) => call(ENDPOINTS.organizationSso, { params: { org_id: orgId } }),
+    saveOrganizationSso: (orgId, body) => call(ENDPOINTS.saveOrganizationSso, { params: { org_id: orgId }, body }),
+    deleteOrganizationSso: (orgId) => call(ENDPOINTS.deleteOrganizationSso, { params: { org_id: orgId } }),
+    testOrganizationSso: (orgId) => call(ENDPOINTS.testOrganizationSso, { params: { org_id: orgId }, body: {} }),
+    getAdminSso: () => call(ENDPOINTS.adminSso),
+    updateAdminSso: (enabled) => call(ENDPOINTS.updateAdminSso, { body: { enabled } }),
+    getScimStatus: (orgId) => call(ENDPOINTS.scimStatus, { params: { org_id: orgId } }),
+    createScimToken: (orgId) => call(ENDPOINTS.scimToken, { params: { org_id: orgId }, body: {} }),
+    deleteScimToken: (orgId) => call(ENDPOINTS.deleteScimToken, { params: { org_id: orgId } }),
+    getScimMappings: (orgId) => call(ENDPOINTS.scimMappings, { params: { org_id: orgId } }),
+    updateScimMappings: (orgId, body) => call(ENDPOINTS.updateScimMappings, { params: { org_id: orgId }, body }),
+    getScimEvents: (orgId) => call(ENDPOINTS.scimEvents, { params: { org_id: orgId } }),
     async loginSecondFactor(body) {
       const result = await call<LoginResponse>(ENDPOINTS.loginSecondFactor, { body, anonymous: true });
       csrfToken = result.csrf_token;

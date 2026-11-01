@@ -526,8 +526,13 @@ impl OrgTx {
         let Some(current) = self.workspace_member(workspace_id, user_id).await? else {
             return Ok(WorkspaceRoleOutcome::NotMember);
         };
+        let ownership_removed=sqlx::query("DELETE FROM scim_workspace_ownership WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3").bind(self.org_id).bind(workspace_id).bind(user_id).execute(&mut *self.tx).await?.rows_affected();
         if current.workspace_role() == Some(role) {
-            return Ok(WorkspaceRoleOutcome::Unchanged(current));
+            return Ok(if ownership_removed > 0 {
+                WorkspaceRoleOutcome::Changed(current)
+            } else {
+                WorkspaceRoleOutcome::Unchanged(current)
+            });
         }
         sqlx::query("DELETE FROM file_locks WHERE org_id = $1 AND holder_user_id = $2 AND file_id IN (SELECT f.id FROM files f WHERE f.workspace_id = $3)")
             .bind(self.org_id)
@@ -578,6 +583,7 @@ impl OrgTx {
             .bind(workspace_id)
             .execute(&mut *self.tx)
             .await?;
+        sqlx::query("DELETE FROM scim_workspace_ownership WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3").bind(self.org_id).bind(workspace_id).bind(user_id).execute(&mut *self.tx).await?;
         let removed = sqlx::query(
             "DELETE FROM workspace_members WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3",
         )

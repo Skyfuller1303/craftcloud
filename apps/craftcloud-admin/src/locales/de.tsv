@@ -731,3 +731,58 @@
 	Seat limit for {name}	Platzlimit für {name}
 	Enter a whole number of seats.	Gib eine ganze Zahl von Plätzen ein.
 	Seats used	Belegte Plätze
+	Only organization owners can manage single sign-on and SCIM. Contact the organization owner for help.	Nur Organisationsinhaber können Single Sign-on und SCIM verwalten. Bitte wende dich an den Organisationsinhaber.
+	Single sign-on	Single Sign-on
+	Save single sign-on	Single Sign-on speichern
+	Remove configuration	Konfiguration entfernen
+	SCIM provisioning	SCIM-Bereitstellung
+	A generated SCIM token is shown once. Copy it now and store it securely.	Ein erzeugtes SCIM-Token wird nur einmal angezeigt. Kopiere es jetzt und speichere es sicher.
+	SCIM token — copy now	SCIM-Token — jetzt kopieren
+	Generate SCIM token	SCIM-Token erzeugen
+	Revoke SCIM token	SCIM-Token widerrufen
+	Save mappings	Zuordnungen speichern
+	Recent SCIM events	Letzte SCIM-Ereignisse
+	Allow organization single sign-on	Single Sign-on für Organisationen erlauben
+	Client secret (leave blank to keep current secret)	Client-Secret (leer lassen, um das aktuelle Secret beizubehalten)
+	Continue	Weiter
+	Finish organization sign-in	Organisationsanmeldung abschließen
+	If requested, confirm your local account or second factor.	Bestätige bei Aufforderung dein lokales Konto oder den zweiten Faktor.
+	SCIM status	SCIM-Status
+	OIDC discovery URL	OIDC-Discovery-URL
+	Client ID	Client-ID
+	Allowed e-mail domains (comma separated)	Erlaubte E-Mail-Domains (durch Komma getrennt)
+	Enable single sign-on	Single Sign-on aktivieren
+	Create accounts automatically on first sign-in	Konten bei der ersten Anmeldung automatisch erstellen
+	Require single sign-on	Single Sign-on voraussetzen
+	Trust provider multi-factor authentication	Mehr-Faktor-Authentifizierung des Anbieters vertrauen
+	Callback URL	Callback-URL
+	Test provider connection	Anbieter-Verbindung testen
+	Connection test succeeded.	Verbindungstest erfolgreich.
+	Provider issuer	Anbieter-Issuer
+	Copy token	Token kopieren
+	Dismiss token	Token ausblenden
+	SCIM group	SCIM-Gruppe
+	Choose a group	Gruppe auswählen
+	Choose a workspace	Workspace auswählen
+	Remove mapping	Zuordnung entfernen
+	Add mapping	Zuordnung hinzufügen
+	Your organization requires a second factor. Contact your organization owner or administrator to restore local access and set up multi-factor authentication.	Deine Organisation verlangt einen zweiten Faktor. Wende dich an den Organisationsinhaber oder Administrator, um den lokalen Zugang wiederherzustellen und Mehr-Faktor-Authentifizierung einzurichten.
+	Single sign-on is required for this organization. Continue with your organization sign-on.	Für diese Organisation ist Single Sign-on erforderlich. Fahre mit der Organisationsanmeldung fort.
+	SCIM base URL	SCIM-Basis-URL
+	Invalid native sign-in destination.	Ungültiges Ziel für die native Anmeldung.
+	Sign in with company account	Mit Unternehmenskonto anmelden
+	Warning: local password sign-in will be blocked for this organization while single sign-on is required. Instance operator recovery remains available.	Warnung: Bei erforderlichem Single Sign-on ist die lokale Passwortanmeldung für diese Organisation gesperrt. Die Wiederherstellung durch den Instanzbetreiber bleibt verfügbar.
+
+	Sign in with your company account to access this organization.	Melde dich mit deinem Firmenkonto an, um auf diese Organisation zuzugreifen.
+	Sign in again with the additional factor required by this organization.	Melde dich erneut mit dem zusätzlichen Faktor an, den diese Organisation verlangt.
+
+	Link accounts: this company identity will be able to sign in to your CraftCloud account. Continue only if you trust this organization’s identity provider.	Konten verknüpfen: Dieses Firmenkonto kann sich künftig bei deinem CraftCloud-Konto anmelden. Fahre nur fort, wenn du dem Identitätsanbieter dieser Organisation vertraust.
+
+	Sign in again to access this organization. Your other memberships remain available.	Melde dich erneut an, um auf diese Organisation zuzugreifen. Deine anderen Mitgliedschaften bleiben erreichbar.
+
+
+	SCIM token configured	SCIM-Token eingerichtet
+	SCIM token not configured	SCIM-Token nicht eingerichtet
+	No SCIM events yet.	Bisher keine SCIM-Ereignisse.
+	Unknown action	Unbekannte Aktion
+	Company sign-in links will be disconnected. Link them again after signing in with your new password.	Verknüpfungen zur Firmenanmeldung werden getrennt. Verknüpfen Sie sie nach der Anmeldung mit Ihrem neuen Passwort erneut.

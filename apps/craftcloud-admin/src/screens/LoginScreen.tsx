@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Button, Form } from "react-aria-components";
 import { describeError } from "../api/errors.ts";
@@ -24,9 +24,23 @@ export function LoginScreen({
   const [busy, setBusy] = useState(false);
   const [challengeId, setChallengeId] = useState<string | null>(null);
   const [recoveryMode, setRecoveryMode] = useState(false);
+  const [discoveredOrg, setDiscoveredOrg] = useState<string | null>(null);
   const [secondFactor, setSecondFactor] = useState("");
   const form = useRef<HTMLFormElement>(null);
   const sessionEnded = state.phase === "anonymous" && state.sessionEnded;
+
+  // Discovery is a hint. A failed or older SSO endpoint never blocks local recovery.
+  useEffect(() => {
+    setDiscoveredOrg(null);
+    if (busy || !email.includes("@")) return;
+    let live = true;
+    const timer = window.setTimeout(() => {
+      void api.discoverOidc(email.trim()).then((result) => {
+        if (live) setDiscoveredOrg(result.organization_id);
+      }).catch(() => { if (live) setDiscoveredOrg(null); });
+    }, 250);
+    return () => { live = false; window.clearTimeout(timer); };
+  }, [api, email, busy]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -61,14 +75,24 @@ export function LoginScreen({
           return;
         }
       }
-      setFailure(
-        describeError(t, error, {
-          INVALID_CREDENTIALS: t("E-mail address or password is incorrect."),
-        }),
-      );
+      setFailure(isApiError(error) && error.code === "SSO_REQUIRED"
+        ? t("Single sign-on is required for this organization. Continue with your organization sign-on.")
+        : describeError(t, error, { INVALID_CREDENTIALS: t("E-mail address or password is incorrect.") }));
       setPassword("");
       setBusy(false);
     }
+  }
+
+  async function beginSso() {
+    if (!discoveredOrg || busy) return;
+    setBusy(true); setFailure(null);
+    try {
+      const result = await api.startOidc(discoveredOrg);
+      const target = new URL(result.authorization_url, window.location.origin);
+      const flows = target.searchParams.getAll("flow");
+      if (target.origin !== window.location.origin || target.pathname !== "/api/v1/auth/oidc/authorize" || target.username !== "" || target.password !== "" || target.hash !== "" || flows.length !== 1 || flows[0] === undefined || flows[0].length === 0 || flows[0].length > 512 || [...target.searchParams.keys()].some((key) => key !== "flow")) throw new Error("Invalid sign-in destination.");
+      window.location.assign(target.href);
+    } catch (error) { setFailure(describeError(t, error)); setBusy(false); }
   }
 
   async function submitSecondFactor(event: FormEvent) {
@@ -152,6 +176,7 @@ export function LoginScreen({
         <Button type="submit" className="button button--primary" isDisabled={busy}>
           {busy ? t("Logging in…") : t("Log in")}
         </Button>
+        {discoveredOrg !== null && <Button type="button" className="button" isDisabled={busy} onPress={() => void beginSso()}>{t("Sign in with company account")}</Button>}
       </Form>
       )}
     </div>

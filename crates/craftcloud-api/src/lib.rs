@@ -29,15 +29,23 @@ mod invitations;
 mod locks;
 pub mod maintenance;
 mod observe;
+mod oidc;
+#[cfg(test)]
+extern crate self as craftcloud_api;
+mod oidc_provider;
+#[cfg(test)]
+mod oidc_tests;
 mod orgs;
 mod overview;
 mod pagination;
 mod projects;
 mod ratelimit;
 mod responses;
+mod scim;
 mod services;
 mod session;
 mod setup;
+mod sso_settings;
 mod two_factor;
 mod uploads;
 mod versions;
@@ -111,6 +119,38 @@ impl Default for ApiConfig {
 /// a `.route(` that is not listed here.
 pub const ROUTES: &[(&str, &[&str])] = &[
     ("/health/live", &["GET"]),
+    ("/api/v1/auth/oidc/discover", &["POST"]),
+    ("/api/v1/auth/oidc/start", &["POST"]),
+    ("/api/v1/auth/oidc/authorize", &["GET"]),
+    ("/api/v1/auth/oidc/callback", &["GET"]),
+    ("/api/v1/auth/oidc/finish", &["POST"]),
+    ("/api/v1/auth/oidc/device/exchange", &["POST"]),
+    (
+        "/api/v1/organizations/{org_id}/sso",
+        &["GET", "PUT", "DELETE"],
+    ),
+    ("/api/v1/organizations/{org_id}/sso/test", &["POST"]),
+    ("/api/v1/admin/sso", &["GET", "PUT"]),
+    ("/api/v1/organizations/{org_id}/scim", &["GET"]),
+    (
+        "/api/v1/organizations/{org_id}/scim/token",
+        &["POST", "DELETE"],
+    ),
+    (
+        "/api/v1/organizations/{org_id}/scim/mappings",
+        &["GET", "PUT"],
+    ),
+    ("/api/v1/organizations/{org_id}/scim/events", &["GET"]),
+    ("/scim/v2/organizations/{org_id}/Users", &["GET", "POST"]),
+    (
+        "/scim/v2/organizations/{org_id}/Users/{id}",
+        &["GET", "PUT", "PATCH", "DELETE"],
+    ),
+    ("/scim/v2/organizations/{org_id}/Groups", &["GET", "POST"]),
+    (
+        "/scim/v2/organizations/{org_id}/Groups/{id}",
+        &["GET", "PUT", "PATCH", "DELETE"],
+    ),
     ("/health/ready", &["GET"]),
     ("/api/v1/info", &["GET"]),
     ("/api/v1/setup/status", &["GET"]),
@@ -281,6 +321,61 @@ pub fn router_with_shared(
     let audit_services = state.services.clone();
     let routes = Router::new()
         .route("/health/live", get(health_live))
+        .route("/api/v1/auth/oidc/discover", post(oidc::discover))
+        .route("/api/v1/auth/oidc/start", post(oidc::start))
+        .route("/api/v1/auth/oidc/authorize", get(oidc::authorize))
+        .route("/api/v1/auth/oidc/callback", get(oidc::callback))
+        .route("/api/v1/auth/oidc/finish", post(oidc::finish))
+        .route("/api/v1/auth/oidc/device/exchange", post(oidc::exchange))
+        .route(
+            "/api/v1/organizations/{org_id}/sso",
+            get(sso_settings::get)
+                .put(sso_settings::put)
+                .delete(sso_settings::delete),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/sso/test",
+            post(sso_settings::test),
+        )
+        .route(
+            "/api/v1/admin/sso",
+            get(sso_settings::instance_get).put(sso_settings::instance_put),
+        )
+        .route("/api/v1/organizations/{org_id}/scim", get(scim::status))
+        .route(
+            "/api/v1/organizations/{org_id}/scim/token",
+            post(scim::rotate_token).delete(scim::revoke_token),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/scim/mappings",
+            get(scim::mappings).put(scim::set_mappings),
+        )
+        .route(
+            "/api/v1/organizations/{org_id}/scim/events",
+            get(scim::events),
+        )
+        .route(
+            "/scim/v2/organizations/{org_id}/Users",
+            get(scim::list_users).post(scim::create_user),
+        )
+        .route(
+            "/scim/v2/organizations/{org_id}/Users/{id}",
+            get(scim::get_user)
+                .put(scim::put_user)
+                .patch(scim::patch_user)
+                .delete(scim::delete_user),
+        )
+        .route(
+            "/scim/v2/organizations/{org_id}/Groups",
+            get(scim::list_groups).post(scim::create_group),
+        )
+        .route(
+            "/scim/v2/organizations/{org_id}/Groups/{id}",
+            get(scim::get_group)
+                .put(scim::put_group)
+                .patch(scim::patch_group)
+                .delete(scim::delete_group),
+        )
         .route("/health/ready", get(health::health_ready))
         .route("/api/v1/info", get(info::discover))
         .route("/api/v1/setup/status", get(setup::status))
@@ -579,6 +674,7 @@ fn with_middleware(
     streaming: bool,
     audit_services: Option<Arc<Services>>,
 ) -> Router {
+    let scim_audit_services = audit_services.clone();
     // Innermost: stores the policy denials (403) that handlers marked.
     let router = router.layer(middleware::from_fn_with_state(
         audit_services.clone(),
@@ -600,7 +696,14 @@ fn with_middleware(
             ))
     };
     // API answers are never cacheable; outermost so it also covers errors.
-    with_request_context(router, config).layer(SetResponseHeaderLayer::overriding(
+    with_request_context(
+        router.layer(middleware::from_fn_with_state(
+            scim_audit_services,
+            scim::normalize_errors,
+        )),
+        config,
+    )
+    .layer(SetResponseHeaderLayer::overriding(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store"),
     ))
@@ -613,6 +716,10 @@ async fn reject_ambiguous_credentials(
 ) -> Response {
     let settings =
         services.map_or_else(AuthSettings::default, |services| services.settings.clone());
+    // SCIM has its own credential boundary and rejects every presented cookie.
+    if request.uri().path().starts_with("/scim/v2/") {
+        return next.run(request).await;
+    }
     if session::ambiguous_credentials(request.headers(), &settings) {
         return error_response(
             StatusCode::BAD_REQUEST,

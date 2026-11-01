@@ -1,6 +1,6 @@
 # CC-F19 — Unternehmens-SSO und optional SCIM
 
-> **Status:** geplantes Feature-Briefing, nicht implementiert. **Zielphase:** P6 (Enterprise / extensions). **Priorität:** später / nur nach Gate.  
+> **Status:** AC-10 implementiert die lokale OIDC-/SCIM-Funktion; unabhängige Abnahme und tatsächliche Prüfergebnisse stehen im Aufgabenbericht. **Zielphase:** P6 (Enterprise / extensions). **Priorität:** später / nur nach Gate.
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen
@@ -48,3 +48,8 @@ Zusätzlich: OpenAPI aktualisiert; aussagekräftige Tests erfolgreich; negative 
 ## Nichtumfang und Abnahmefragen
 
 Keine ungeprüfte Cross-App-/Cloud-Kopplung, keine proprietären Lizenzen kopieren, keine zusätzlichen Infrastruktur-Abhängigkeiten ohne ADR. Vor Merge prüfen: **API-Owner?** **Datenmigration?** **Offline-Verhalten?** **Echte Pilot-Validierung?**
+
+
+## Lokaler Implementierungsstand AC-10
+
+[ADR-0026](../09-decisions/adr-0026-sso-and-scim.md) konkretisiert den Vertrag. Die [Betriebsanleitung](../06-operations/sso-and-scim.md) beschreibt Konfiguration, Kontobindung, MFA, Desktop und den umgesetzten SCIM-Umfang einschließlich seiner Grenzen. Migration 0021 ergänzt organisationseigene Provider, stabile Identitätsbindungen und Provisionierungszustand. Die Bindung bei E-Mail-Wechsel wird durch den echten Container-IdP in `crates/craftcloud-api/src/oidc_tests.rs` geprüft; HTTP-Provisionierung durch `crates/craftcloud-api/tests/scim.rs`. Ein Testname allein ist kein Ausführungsnachweis: maßgeblich sind die Logs und der Abschlussbericht von AC-10.

@@ -328,3 +328,12 @@ The browser UI is a static single-page app served by `craftcloud-server` under `
 
 Residual risks: the UI directory is trusted build output (whoever writes it controls the UI); the UI and the API share an origin, so an XSS in the UI would be an XSS against the API session; colour contrast and assistive-technology behaviour are not verified in real browsers (docs/gaps.md).
 
+
+
+## AC-10: Organisationseigene Identitätsanbieter und SCIM
+
+OIDC ergänzt die Vertrauensgrenze zum vom Organisations-Owner kontrollierten Anbieter. Stabile Issuer-/Subject-Bindung, lokaler Passwortnachweis bei bestehender verifizierter Adresse und explizites SCIM-externalId verhindern E-Mail-basierte Kontoübernahme. Der Server bindet einmalige Login-Zustände erst an den tatsächlich geöffneten Browser, prüft PKCE, state, nonce, Signatur, Audience und Zeiten und gibt keine Anbieter-Tokens weiter. Discovery, JWKS und Tokenabrufe verwenden begrenzte Antworten, feste Deadlines, keine Proxys oder Redirects und validierte, gepinnte öffentliche DNS-Ziele. Die Test-Ausnahme für lokalen HTTP-IdP ist ausschließlich in Test-/Test-Utility-Builds verfügbar.
+
+SCIM besitzt eine getrennte gehashte Organisations-Capability. Die Organisationssperre serialisiert Tokenrotation, Rechteänderung und Provisionierung. Ein fremdes Token, fremde Ressourcen und administrative Rollen werden abgewiesen. Globale Mailboxen werden durch Verzeichnisänderungen nicht übertragen. Eigene Ressourcen enthalten keine stillen E-Mail-Zuordnungen. Manuelle Workspace-Mitgliedschaften haben Vorrang; Gruppen verleihen höchstens viewer oder editor. Ein dauerhafter organisationsgebundener Sitzungsschnitt und erneute Upload-Abschlussprüfung verhindern Entzug- und Reaktivierungsrennen. Andere Mandanten werden nicht global deaktiviert.
+
+Restrisiken bleiben kompromittierte IdPs und lokale Clients, bewusst weitergegebene Tokens, fehlender Schutz fremder Proxy-Logs, die globale Vertrauenswirkung einer ausdrücklich verknüpften Kontoidentität und die bekannte asynchrone FigCraft-Widerrufsgrenze. Passwortloses TOTP-Onboarding ohne anerkanntes Anbieter-MFA verlangt einen kontrollierten lokalen Recovery-Schritt; der Server lässt hierfür keine Pflicht aus. [ADR-0026](../09-decisions/adr-0026-sso-and-scim.md) und die [Betriebsanleitung](../06-operations/sso-and-scim.md) halten die Abwägungen fest. Die unabhängige Prüfung und tatsächlich ausgeführten Missbrauchstests stehen im AC-10-Bericht.

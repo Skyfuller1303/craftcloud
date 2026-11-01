@@ -428,6 +428,20 @@ async fn consume_inner(
     .bind(new_password_hash)
     .execute(&mut *tx)
     .await?;
+    // Recovery establishes a new local credential. Tenant-controlled federation
+    // links must be explicitly re-established with that credential.
+    sqlx::query("DELETE FROM external_identities WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM oidc_pending_logins WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sso_session_bindings WHERE user_id=$1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM two_factor_login_challenges WHERE user_id=$1")
         .bind(user_id)
         .execute(&mut *tx)

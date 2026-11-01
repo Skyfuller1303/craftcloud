@@ -26,6 +26,7 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
   const { api } = useAuth();
   const [state, setState] = useState<State>({ status: "loading" });
   const [round, setRound] = useState(0);
+  const [ssoEnabled, setSsoEnabled] = useState<boolean | null>(null);
   const reload = useCallback(() => setRound((current) => current + 1), []);
 
   useEffect(() => {
@@ -46,6 +47,12 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
       current = false;
     };
   }, [api, isOperator, round]);
+  useEffect(() => {
+    if (!isOperator) return;
+    let live = true;
+    void api.getAdminSso().then((value) => { if (live) setSsoEnabled(value.enabled); }, () => { if (live) setSsoEnabled(null); });
+    return () => { live = false; };
+  }, [api, isOperator, round]);
 
   if (!isOperator) {
     return <p className="muted">{t("Only the instance operator can see the system status.")}</p>;
@@ -53,6 +60,16 @@ export function SystemScreen({ isOperator }: { isOperator: boolean }) {
 
   return (
     <div className="stack">
+      <section className="section">
+        <h2 className="section__title">{t("Single sign-on")}</h2>
+        <label className="checkbox">
+          <input type="checkbox" checked={ssoEnabled === true} disabled={ssoEnabled === null} onChange={(event) => {
+            const enabled = event.currentTarget.checked;
+            void api.updateAdminSso(enabled).then((value) => setSsoEnabled(value.enabled), () => setSsoEnabled(!enabled));
+          }} />
+          <span>{t("Allow organization single sign-on")}</span>
+        </label>
+      </section>
       <EmailSystem revision={round} />
       <p>
         <Button className="button" onPress={reload} isDisabled={state.status === "loading"}>

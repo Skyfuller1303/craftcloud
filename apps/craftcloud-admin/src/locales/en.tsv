@@ -734,3 +734,58 @@
 	Seat limit for {name}	Seat limit for {name}
 	Enter a whole number of seats.	Enter a whole number of seats.
 	Seats used	Seats used
+	Only organization owners can manage single sign-on and SCIM. Contact the organization owner for help.	Only organization owners can manage single sign-on and SCIM. Contact the organization owner for help.
+	Single sign-on	Single sign-on
+	Save single sign-on	Save single sign-on
+	Remove configuration	Remove configuration
+	SCIM provisioning	SCIM provisioning
+	A generated SCIM token is shown once. Copy it now and store it securely.	A generated SCIM token is shown once. Copy it now and store it securely.
+	SCIM token — copy now	SCIM token — copy now
+	Generate SCIM token	Generate SCIM token
+	Revoke SCIM token	Revoke SCIM token
+	Save mappings	Save mappings
+	Recent SCIM events	Recent SCIM events
+	Allow organization single sign-on	Allow organization single sign-on
+	Client secret (leave blank to keep current secret)	Client secret (leave blank to keep current secret)
+	Continue	Continue
+	Finish organization sign-in	Finish organization sign-in
+	If requested, confirm your local account or second factor.	If requested, confirm your local account or second factor.
+	SCIM status	SCIM status
+	SCIM base URL	SCIM base URL
+	OIDC discovery URL	OIDC discovery URL
+	Client ID	Client ID
+	Allowed e-mail domains (comma separated)	Allowed e-mail domains (comma separated)
+	Enable single sign-on	Enable single sign-on
+	Create accounts automatically on first sign-in	Create accounts automatically on first sign-in
+	Require single sign-on	Require single sign-on
+	Trust provider multi-factor authentication	Trust provider multi-factor authentication
+	Callback URL	Callback URL
+	Test provider connection	Test provider connection
+	Connection test succeeded.	Connection test succeeded.
+	Provider issuer	Provider issuer
+	Copy token	Copy token
+	Dismiss token	Dismiss token
+	SCIM group	SCIM group
+	Choose a group	Choose a group
+	Choose a workspace	Choose a workspace
+	Remove mapping	Remove mapping
+	Add mapping	Add mapping
+	Your organization requires a second factor. Contact your organization owner or administrator to restore local access and set up multi-factor authentication.	Your organization requires a second factor. Contact your organization owner or administrator to restore local access and set up multi-factor authentication.
+	Single sign-on is required for this organization. Continue with your organization sign-on.	Single sign-on is required for this organization. Continue with your organization sign-on.
+	Sign in with company account	Sign in with company account
+	Warning: local password sign-in will be blocked for this organization while single sign-on is required. Instance operator recovery remains available.	Warning: local password sign-in will be blocked for this organization while single sign-on is required. Instance operator recovery remains available.
+	Invalid native sign-in destination.	Invalid native sign-in destination.
+
+	Sign in with your company account to access this organization.	Sign in with your company account to access this organization.
+	Sign in again with the additional factor required by this organization.	Sign in again with the additional factor required by this organization.
+
+	Link accounts: this company identity will be able to sign in to your CraftCloud account. Continue only if you trust this organization’s identity provider.	Link accounts: this company identity will be able to sign in to your CraftCloud account. Continue only if you trust this organization’s identity provider.
+
+	Sign in again to access this organization. Your other memberships remain available.	Sign in again to access this organization. Your other memberships remain available.
+
+
+	SCIM token configured	SCIM token configured
+	SCIM token not configured	SCIM token not configured
+	No SCIM events yet.	No SCIM events yet.
+	Unknown action	Unknown action
+	Company sign-in links will be disconnected. Link them again after signing in with your new password.	Company sign-in links will be disconnected. Link them again after signing in with your new password.

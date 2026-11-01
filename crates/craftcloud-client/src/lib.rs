@@ -15,6 +15,8 @@ use zeroize::Zeroize;
 
 pub mod dto;
 pub use dto::*;
+pub mod oidc;
+pub use oidc::{OidcAuthorization, OidcDesktopRequest, OidcStartRequest};
 
 /// HTTP request passed to an implementation-specific transport.
 #[derive(Clone)]
@@ -356,6 +358,29 @@ impl<T: CloudTransport> CloudClient<T> {
             *user = Some(t.user.clone());
         }
         self.set_tokens(t.into())
+    }
+    /// Starts a native OIDC authorization. The authorization endpoint is called once; it is
+    /// never retried because the caller must preserve the one-time state and PKCE verifier.
+    pub fn begin_oidc(&self, request: OidcStartRequest) -> Result<OidcAuthorization, CloudError> {
+        self.json("POST", "/api/v1/auth/oidc/start", Some(&request), None, &[])
+    }
+    /// Exchanges an OIDC code for the normal CraftCloud device session.
+    pub fn exchange_oidc(&self, code: &str, verifier: &str) -> Result<(), CloudError> {
+        let request = oidc::OidcExchangeRequest {
+            code,
+            code_verifier: verifier,
+        };
+        let tokens: DeviceLoginResponse = self.json(
+            "POST",
+            "/api/v1/auth/oidc/device/exchange",
+            Some(&request),
+            None,
+            &[],
+        )?;
+        if let Ok(mut user) = self.user.lock() {
+            *user = Some(tokens.user.clone());
+        }
+        self.set_tokens(tokens.into())
     }
     /// Completes a login that answered [`CloudError::SecondFactorChallenge`] with the
     /// challenge id it carried. On success the client holds the session as after `login`.

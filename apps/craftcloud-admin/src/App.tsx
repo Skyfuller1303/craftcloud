@@ -1,10 +1,11 @@
-import { lazy, useState } from "react";
+import { lazy, useEffect, useRef, useState } from "react";
 import { Button } from "react-aria-components";
 import { describeError } from "./api/errors.ts";
+import { isApiError } from "./api/client.ts";
 import type { ApiClient } from "./api/client.ts";
 import { AuthProvider, useAuth } from "./auth.tsx";
 import { AnnouncerProvider } from "./components/Announcer.tsx";
-import { Alert, ScreenHeading } from "./components/forms.tsx";
+import { Alert, Field, ScreenHeading } from "./components/forms.tsx";
 import { Preferences } from "./components/Preferences.tsx";
 import { useI18n } from "./i18n/index.tsx";
 import { readTheme, saveTheme } from "./preferences.ts";
@@ -23,6 +24,12 @@ const Shell = lazy(() => import("./screens/Shell.tsx").then((m) => ({ default: m
 const INVITE_PATH = /\/invite\/?$/;
 const RESET_PATH = /\/reset-password\/?$/;
 export type EmailToken = { token: string; kind: "verify" | "change" };
+export function takeOidcPending(location: Pick<Location, "pathname" | "hash">, history: Pick<History, "replaceState">, baseUrl: string): string | null {
+  if (!location.hash.startsWith("#oidc=")) return null;
+  const value = location.hash.slice(6);
+  history.replaceState(null, "", baseUrl);
+  return value !== "" && value.length <= 512 ? value : null;
+}
 
 export function takeEmailToken(location: Pick<Location, "pathname" | "hash">, history: Pick<History, "replaceState">, baseUrl: string): EmailToken | null {
   const kind = /\/verify-email\/?$/.test(location.pathname) ? "verify" : /\/change-email\/?$/.test(location.pathname) ? "change" : null;
@@ -76,16 +83,18 @@ export function App({
   inviteToken: initialInviteToken = null,
   resetToken: initialResetToken = null,
   emailToken: initialEmailToken = null,
+  oidcPending: initialOidcPending = null,
 }: {
   createClient: (onUnauthenticated: () => void) => ApiClient;
   inviteToken?: string | null;
   resetToken?: string | null;
   emailToken?: EmailToken | null;
+  oidcPending?: string | null;
 }) {
   return (
     <AnnouncerProvider>
       <AuthProvider createClient={createClient}>
-        <Screens initialInviteToken={initialInviteToken} initialResetToken={initialResetToken} initialEmailToken={initialEmailToken} />
+        <Screens initialInviteToken={initialInviteToken} initialResetToken={initialResetToken} initialEmailToken={initialEmailToken} initialOidcPending={initialOidcPending} />
       </AuthProvider>
     </AnnouncerProvider>
   );
@@ -95,10 +104,12 @@ function Screens({
   initialInviteToken,
   initialResetToken,
   initialEmailToken,
+  initialOidcPending,
 }: {
   initialInviteToken: string | null;
   initialResetToken: string | null;
   initialEmailToken: EmailToken | null;
+  initialOidcPending: string | null;
 }) {
   const { t } = useI18n();
   const { state, refresh } = useAuth();
@@ -106,6 +117,7 @@ function Screens({
   const [inviteToken, setInviteToken] = useState(initialInviteToken);
   const [resetToken, setResetToken] = useState(initialResetToken);
   const [emailToken, setEmailToken] = useState(initialEmailToken);
+  const [oidcPending, setOidcPending] = useState(initialOidcPending);
   const [wantsLogin, setWantsLogin] = useState(false);
   const [loginNotice, setLoginNotice] = useState<string | undefined>(undefined);
   const [shellNotice, setShellNotice] = useState<string | undefined>(undefined);
@@ -162,6 +174,8 @@ function Screens({
         }}
       />
     );
+  } else if (oidcPending !== null) {
+    content = <OidcFinish token={oidcPending} onFinished={() => { setOidcPending(null); void refresh(); }} />;
   } else if (inviteToken !== null && (state.phase === "authenticated" || !wantsLogin)) {
     content = (
       <InviteScreen
@@ -195,7 +209,7 @@ function Screens({
     );
   }
 
-  const framed = state.phase !== "authenticated" || inviteToken !== null || resetToken !== null || emailToken !== null;
+  const framed = state.phase !== "authenticated" || inviteToken !== null || resetToken !== null || emailToken !== null || oidcPending !== null;
   return (
     <>
       <a className="skip-link" href="#main">
@@ -220,4 +234,48 @@ function Screens({
       )}
     </>
   );
+}
+
+class InvalidNativeOidcDestination extends Error {}
+
+function OidcFinish({ token, onFinished }: { token: string; onFinished: () => void }) {
+  const { api } = useAuth(); const { t } = useI18n();
+  const [password, setPassword] = useState(""); const [factor, setFactor] = useState(""); const [mode, setMode] = useState<"password" | "code" | "recovery_code">("password");
+  const [failure, setFailure] = useState<unknown>(null); const [busy, setBusy] = useState(false);
+  const attempted = useRef(false);
+  async function finish() {
+    if (busy) return; setBusy(true); setFailure(null);
+    try {
+      const result = await api.finishOidc({ pending_id: token, ...(password ? { password } : {}), ...(factor ? mode === "code" ? { code: factor } : mode === "recovery_code" ? { recovery_code: factor } : {} : {}) });
+      if ("redirect_url" in result && typeof result.redirect_url === "string") {
+        const target = new URL(result.redirect_url);
+        const loopback = target.hostname === "127.0.0.1" || target.hostname === "[::1]";
+        const port = Number(target.port);
+        const params = [...target.searchParams];
+        if (target.protocol !== "http:" || target.hash !== "" || !loopback || target.username !== "" || target.password !== "" || target.pathname !== "/oidc/callback" || !Number.isInteger(port) || port < 1 || port > 65535 || params.length !== 2 || new Set(params.map(([key]) => key)).size !== 2 || !target.searchParams.has("code") || !target.searchParams.has("state") || params.some(([key, value]) => !["code", "state"].includes(key) || value.length === 0 || value.length > 2048)) throw new InvalidNativeOidcDestination();
+        window.location.assign(target.href);
+        return;
+      }
+      onFinished(); setPassword(""); setFactor("");
+    }
+    catch (error) {
+      setFailure(error);
+      if (isApiError(error) && error.code === "SSO_LINK_REQUIRED") setMode("password");
+      else if (isApiError(error) && error.code === "SSO_SECOND_FACTOR_REQUIRED") setMode("code");
+      setBusy(false);
+    }
+  }
+  useEffect(() => { if (attempted.current) return; attempted.current = true; void finish(); }, []);
+  const needsPassword = mode === "password" || (isApiError(failure) && failure.code === "SSO_LINK_REQUIRED");
+  const setupRequired = isApiError(failure) && failure.code === "SSO_TWO_FACTOR_SETUP_REQUIRED";
+  return <div className="screen screen--narrow"><ScreenHeading>{t("Finish organization sign-in")}</ScreenHeading>
+    {failure !== null && <Alert>{failure instanceof InvalidNativeOidcDestination ? t("Invalid native sign-in destination.") : describeError(t, failure)}</Alert>}
+    {setupRequired && <Alert tone="info">{t("Your organization requires a second factor. Contact your organization owner or administrator to restore local access and set up multi-factor authentication.")}</Alert>}
+    <p>{t("If requested, confirm your local account or second factor.")}</p>
+    {needsPassword && <Alert tone="info">{t("Link accounts: this company identity will be able to sign in to your CraftCloud account. Continue only if you trust this organization’s identity provider.")}</Alert>}
+    {needsPassword && <Field label={t("Password")} name="oidc-link-password" type="password" value={password} onChange={setPassword} required={false} />}
+    {mode !== "password" && <Field label={mode === "code" ? t("Authentication code") : t("Recovery code")} name="oidc-factor" type="text" value={factor} onChange={setFactor} required={false} />}
+    <Button className="button button--primary" isDisabled={busy || setupRequired} onPress={() => void finish()}>{t("Continue")}</Button>
+    {mode !== "password" && <Button className="button" onPress={() => { setMode(mode === "code" ? "recovery_code" : "code"); setFactor(""); }}>{mode === "code" ? t("Use a recovery code") : t("Use an authentication code")}</Button>}
+  </div>;
 }

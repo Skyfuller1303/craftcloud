@@ -6,7 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
+openidconnect = { version = "=4.0.1", default-features = false }
+reqwest = { version = "=0.12.23", default-features = false, features = ["rustls-tls", "stream"] }
+url.workspace = true
 craftcloud-core.workspace = true
 craftcloud-auth.workspace = true
 craftcloud-storage.workspace = true
@@ -23,13 +29,14 @@ base64.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 ipnet.workspace = true
-tokio = { workspace = true, features = ["time", "rt", "sync"] }
+tokio = { workspace = true, features = ["time", "rt", "sync", "net"] }
 tower-http = { workspace = true, features = ["request-id", "limit", "trace", "set-header"] }
 tracing.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["serde"] }
 time.workspace = true
 
 [dev-dependencies]
+reqwest = { version = "=0.12.23", default-features = false, features = ["json"] }
 sha1.workspace = true
 hmac.workspace = true
 # The SDK is exercised against the real router (tests/sdk_second_factor.rs); path-only, not shipped.
@@ -49,7 +56,6 @@ figcraft-collab.workspace = true
 figcraft-doc.workspace = true
 figcraft-format.workspace = true
 tungstenite.workspace = true
-url.workspace = true
 zip.workspace = true
 
 [lints]
