@@ -24,6 +24,7 @@ Stand 2026-10-30. Dieser Ordner beschreibt den nächsten Ausbau von CraftCloud a
 | AC-08 | [Admin-Konsole](ac-08-admin-console.md) | CraftCloud | AC-01, AC-03, AC-02 | Opus-Review (Sicherheit) |
 | OPS-01 | [Installation auf eigenem Server und Releases](ops-01-install-and-releases.md) | CraftCloud | — | Review (Betrieb, Geheimnisse) |
 | OPS-02 | [Komplett-Image, Datenbank-Erkennung und eigener Webserver](ops-02-appliance-image-and-proxy.md) | CraftCloud | OPS-01 | Review (Betrieb, Netzwerkgrenze) |
+| AC-13 | [Setup-Assistent für die Ersteinrichtung](ac-13-setup-wizard.md) | CraftCloud | OPS-02, AC-12, AC-09/09b, AC-11 | Opus-Review (Sicherheit) |
 | AC-09 | [E-Mail-Versand und Adressverifikation](ac-09-email-delivery.md) | CraftCloud | AC-02 (Serverschlüssel) | Opus-Review (Sicherheit) |
 | AC-09b | [E-Mail über Microsoft Graph und SMTP mit OAuth](ac-09b-microsoft-graph-mail.md) | CraftCloud | AC-09 | Opus-Review (Sicherheit) |
 | AC-10 | [Unternehmens-Anmeldung (OIDC) und Provisionierung (SCIM)](ac-10-sso-and-scim.md) | CraftCloud | AC-01, AC-09 | Opus-Review (Sicherheit) |
