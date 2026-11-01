@@ -5,9 +5,9 @@
 # role passwords are the generated ones and are turned into database URLs by
 # `secrets-init`, as for the bundled database. PostgreSQL 16, 17 and 18 are supported.
 #
-# The server, migrate, backup and restore services join a routable network and
-# can reach the Docker host as host.docker.internal (a PostgreSQL on the same
-# machine must listen on that address and allow the Docker subnet in pg_hba.conf).
+# The services need a routable network to reach the database: compose.external-db-egress.yaml
+# (bundled Caddy) or compose.external-db-proxy.yaml (own proxy, the `proxy` network) adds it.
+# They can reach the Docker host as host.docker.internal.
 services:
   secrets-init:
     environment:
@@ -23,25 +23,17 @@ services:
   migrate:
     depends_on: !override
       secrets-init: {condition: service_completed_successfully}
-    networks: [dbegress]
     extra_hosts: ["host.docker.internal:host-gateway"]
 
   server:
-    networks: [dbegress]
     extra_hosts: ["host.docker.internal:host-gateway"]
 
   backup:
     depends_on: !override
       secrets-init: {condition: service_completed_successfully}
-    networks: [dbegress]
     extra_hosts: ["host.docker.internal:host-gateway"]
 
   restore:
     depends_on: !override
       secrets-init: {condition: service_completed_successfully}
-    networks: [dbegress]
     extra_hosts: ["host.docker.internal:host-gateway"]
-
-networks:
-  # Not `internal`: the database is outside the Compose project.
-  dbegress: {}

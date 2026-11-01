@@ -132,6 +132,46 @@ case1() {
     say "case 1 passed"
 }
 
+
+# start_argv_poller <secret>: a container in the host PID namespace of the Docker VM
+# that scans the command line of EVERY process (all containers included) for the
+# secret and records hits in $BASE/argv-hits. A positive control proves that it sees
+# a secret that is an argument.
+start_argv_poller() {
+    printf '%s\n' "$1" >"$BASE/argv-pattern"
+    chmod 0600 "$BASE/argv-pattern"
+    : >"$BASE/argv-hits"
+    docker rm -f ops02-argv-poll >/dev/null 2>&1 || true
+    docker run -d --name ops02-argv-poll --pid host --cpus 1 -v "$BASE:$BASE" debian:trixie sh -c \
+        "while :; do for f in /proc/[0-9]*/cmdline; do if tr '\\0' ' ' <\$f 2>/dev/null | grep -qF -f $BASE/argv-pattern; then echo \$f >>$BASE/argv-hits; fi; done; sleep 0.02; done" >/dev/null
+    sleep 2
+    docker run --rm debian:trixie sh -c 'sleep 3' "$1" >/dev/null
+    [ -s "$BASE/argv-hits" ] || die "the argument scanner did not see a secret that is an argument (control failed)"
+    : >"$BASE/argv-hits"
+    echo "argument scanner works (positive control)"
+}
+stop_argv_poller() {
+    docker rm -f ops02-argv-poll >/dev/null 2>&1 || true
+    if [ -s "$BASE/argv-hits" ]; then die "the administrator password was an argument of a process: $(head -n 3 "$BASE/argv-hits")"; fi
+    echo "no process ever had the administrator password in its arguments"
+    rm -f "$BASE/argv-pattern" "$BASE/argv-hits"
+}
+
+# token_requests <https-base> <http-base>: requests with tokens in path and query,
+# against the proxy (login page, API, FigCraft path, HTTP redirect, 404).
+token_requests() {
+    for url in "$1/api/v1/invitations/TOKENSECRET123?reset=TOKENQUERY456" "$1/figcraft/TOKENSECRET123?join=TOKENQUERY456" \
+        "$1/admin/TOKENSECRET123?x=TOKENQUERY456" "$2/p/TOKENSECRET123?x=TOKENQUERY456" "$1/nothing/TOKENSECRET123"; do
+        curl -ks -o /dev/null --max-time 10 "$url" || true
+    done
+    sleep 1
+}
+# no_token_in_logs <dirs...>: neither token appears in any file below the directories.
+no_token_in_logs() {
+    if grep -r -I -l -e TOKENSECRET123 -e TOKENQUERY456 "$@" 2>/dev/null; then die "a token from a request path or query is in a web server log (files above)"; fi
+    echo "no token from a request path or query in any log below: $*"
+}
+
 make_certificate() { # make_certificate <dir> <subjectAltName>
     mkdir -p "$1"
     openssl req -x509 -newkey rsa:2048 -nodes -days 2 -keyout "$1/key.pem" -out "$1/cert.pem" -subj /CN=localhost \
@@ -141,6 +181,8 @@ make_certificate() { # make_certificate <dir> <subjectAltName>
 
 proxy_case() { # proxy_case <nginx|apache> <case>
     kind=$1; c=$2
+    # Start with empty web server logs so that the token search below proves something.
+    find /var/log/nginx /var/log/apache2 -type f -exec truncate -s 0 {} + 2>/dev/null || true
     extract_release "$V1" "$BASE/$c-rel"
     installer_env "$c"
     arch=$(docker version --format '{{.Server.Arch}}')
@@ -172,6 +214,8 @@ case2() {
     python3 -I "$SRC/deploy/install/tests/integration/ops02_e2e.py" --base https://127.0.0.1:18443 --public-url https://localhost:18443 \
         --bootstrap-file "$BASE/$c/etc/bootstrap-token" --upload-mib 100 --figcraft-port 18082 --second-address 127.0.0.2 --hsts 2>&1 | tee "$OUT/case2-e2e.log"
     grep -q '^not ok' "$OUT/case2-e2e.log" && die "e2e failed"
+    token_requests https://127.0.0.1:18443 http://127.0.0.1:18080
+    no_token_in_logs /var/log/nginx
     nginx -s quit || true
     secret_scan "$c" "$OUT"/case2-*.log "$OUT/$c-install.log"
     ctl "$c" uninstall --purge --confirm-purge >"$OUT/case2-uninstall.log" 2>&1
@@ -188,12 +232,18 @@ case3() {
     proxy_case apache "$c"
     python3 -I "$SRC/deploy/install/tests/integration/ops02_e2e.py" --base https://127.0.0.1:18443 --public-url https://localhost:18443         --bootstrap-file "$BASE/$c/etc/bootstrap-token" --upload-mib 10 --figcraft-port 18082 --second-address 127.0.0.2 --hsts 2>&1 | tee "$OUT/case3-e2e.log"
     grep -q '^not ok' "$OUT"/case3-*.log && die "apache e2e failed"
+    token_requests https://127.0.0.1:18443 http://127.0.0.1:18080
+    ls -l /var/log/apache2/ | tee "$OUT/case3-logs.txt"
+    no_token_in_logs /var/log/apache2
     apache2ctl stop || true
     secret_scan "$c" "$OUT"/case3-*.log "$OUT/$c-install.log"
     ctl "$c" uninstall --purge --confirm-purge >"$OUT/case3-uninstall.log" 2>&1
     no_leftovers "ops02-$c"
     rm -rf "$BASE/$c" "$BASE/$c-rel" "$BASE/$c-tls"
     rm -f /etc/apache2/sites-available/craftcloud.conf /etc/apache2/sites-enabled/craftcloud.conf
+    apache2ctl stop >/dev/null 2>&1 || true
+    sleep 1
+    rm -f /var/log/apache2/craftcloud-error.log
     say "case 3 passed"
 }
 
@@ -291,9 +341,12 @@ case4b() {
     printf 'postgres://%s:18434/craftcloud?sslmode=verify-full&sslrootcert=%s/ca.pem\n' "$PG_GATEWAY" "$d" >"$BASE/c4b-db.url"
     printf 'postgres://postgres:%s@%s:18434/postgres?sslmode=verify-full&sslrootcert=%s/ca.pem\n' "$admin_pw" "$PG_GATEWAY" "$d" >"$BASE/c4b-admin.url"
     chmod 0600 "$BASE/c4b-admin.url" "$BASE/c4b-db.url"
+    start_argv_poller "$admin_pw"
     sh "$BASE/$c-rel/craftcloud-$V1/deploy/install/install.sh" --non-interactive --domain localhost --acme-email ops@example.test \
         --db external --database-url-file "$BASE/c4b-db.url" --db-admin-url-file "$BASE/c4b-admin.url" --proxy caddy --http-port 18180 --https-port 18543 \
         --data-dir "$CRAFTCLOUD_DATA_DIR" --image-archive "$DIST/craftcloud-$V1-image-$arch.tar.zst" "$DIST/craftcloud-$V1.tar.gz" 2>&1 | tee "$OUT/case4b-install.log"
+    stop_argv_poller | tee "$OUT/case4b-argv.log"
+    [ "${PIPESTATUS[0]}" -eq 0 ] || die "argument scan failed"
     grep -q 'the external database is PostgreSQL 16' "$OUT/case4b-install.log" || die "version of the external database not reported"
     wait_ready https://localhost:18543/health/ready
     if grep -F -e "$PG_GATEWAY" -e "$admin_pw" "$OUT"/case4b-*.log >/dev/null; then die "database address or administrator password printed"; fi
@@ -375,6 +428,108 @@ SQL
     say "case 5 passed (stop ${elapsed}s)"
 }
 
+
+case6() {
+    say "case 6: --db external together with --proxy nginx: one routable network, two real client addresses keep separate limits"
+    rm -f "$OUT"/case6-*.log "$OUT"/c6-*.log
+    c=c6
+    rm -rf "$BASE/$c"
+    arch=$(docker version --format '{{.Server.Arch}}')
+    extract_release "$V1" "$BASE/$c-rel"
+    installer_env "$c"
+    make_certificate "$BASE/$c-tls" 'DNS:localhost,IP:127.0.0.1,IP:127.0.0.2'
+    start_pg16 ops02-pg16d 18435
+    d=$BASE/pg-ops02-pg16d
+    admin_pw=$(cat "$d/pw")
+    printf 'postgres://%s:18435/craftcloud?sslmode=verify-full&sslrootcert=%s/ca.pem\n' "$PG_GATEWAY" "$d" >"$BASE/c6-db.url"
+    printf 'postgres://postgres:%s@%s:18435/postgres?sslmode=verify-full&sslrootcert=%s/ca.pem\n' "$admin_pw" "$PG_GATEWAY" "$d" >"$BASE/c6-admin.url"
+    chmod 0600 "$BASE/c6-admin.url" "$BASE/c6-db.url"
+    nginx
+    sleep 1
+    sh "$BASE/$c-rel/craftcloud-$V1/deploy/install/install.sh" --non-interactive --domain localhost --acme-email ops@example.test \
+        --db external --database-url-file "$BASE/c6-db.url" --db-admin-url-file "$BASE/c6-admin.url" \
+        --proxy nginx --proxy-install --proxy-cert "$BASE/$c-tls/cert.pem" --proxy-key "$BASE/$c-tls/key.pem" \
+        --http-port 18080 --https-port 18443 --local-port 18081 --local-figcraft-port 18082 \
+        --data-dir "$CRAFTCLOUD_DATA_DIR" --image-archive "$DIST/craftcloud-$V1-image-$arch.tar.zst" "$DIST/craftcloud-$V1.tar.gz" 2>&1 | tee "$OUT/c6-install.log"
+    nets=$(docker inspect "ops02-$c-server-1" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}')
+    echo "server networks: $nets"
+    case $nets in *dbegress*) die "the server is on dbegress next to the proxy network: $nets" ;; esac
+    case $nets in *_proxy*) ;; *) die "the server is not on the proxy network: $nets" ;; esac
+    routable=0
+    for n in $nets; do [ "$(docker network inspect "$n" --format '{{.Internal}}')" = false ] && routable=$((routable + 1)); done
+    [ "$routable" -eq 1 ] || die "the server has $routable routable networks, expected exactly one"
+    for n in $nets; do
+        docker network inspect "$n" --format '{{.Name}} internal={{.Internal}} subnet={{range .IPAM.Config}}{{.Subnet}}{{end}}' | tee -a "$OUT/case6-networks.log"
+    done
+    python3 -I "$SRC/deploy/install/tests/integration/ops02_e2e.py" --base https://127.0.0.1:18443 --public-url https://localhost:18443 \
+        --bootstrap-file "$BASE/$c/etc/bootstrap-token" --upload-mib 10 --figcraft-port 18082 --second-address 127.0.0.2 --hsts 2>&1 | tee "$OUT/case6-e2e.log"
+    grep -q '^not ok' "$OUT/case6-e2e.log" && die "e2e failed (external database with an own proxy)"
+    grep -q 'a different real client address has its own limit' "$OUT/case6-e2e.log" || die "the second source address did not get its own limit"
+    nginx -s quit || true
+    if grep -F -e "$PG_GATEWAY" -e "$admin_pw" "$OUT"/c6-install.log "$OUT"/case6-*.log >/dev/null; then die "database address or administrator password printed"; fi
+    secret_scan "$c" "$OUT"/case6-*.log "$OUT/c6-install.log"
+    ctl "$c" uninstall --purge --confirm-purge >"$OUT/case6-uninstall.log" 2>&1
+    docker rm -f ops02-pg16d >/dev/null
+    no_leftovers "ops02-$c"
+    rm -rf "$BASE/$c" "$BASE/$c-rel" "$BASE/$c-tls" "$BASE/pg-ops02-pg16d" "$BASE/c6-db.url" "$BASE/c6-admin.url"
+    rm -f /etc/nginx/conf.d/craftcloud.conf
+    say "case 6 passed"
+}
+
+case7() {
+    say "case 7: --proxy apache --proxy-install with a configuration that fails the Apache configuration test: Apache stays up, the site is not enabled"
+    rm -f "$OUT"/case7-*.log "$OUT"/c7-*.log
+    c=c7
+    rm -rf "$BASE/$c"
+    rm -f /etc/apache2/sites-available/craftcloud.conf /etc/apache2/sites-enabled/craftcloud.conf
+    # The test container has no init process: a stopped Apache leaves a zombie and a stale pid file.
+    apache2ctl stop >/dev/null 2>&1 || true
+    sleep 1
+    rmdir /var/log/apache2/craftcloud-error.log 2>/dev/null || true
+    rm -f /var/run/apache2/apache2.pid /var/log/apache2/craftcloud-error.log
+    arch=$(docker version --format '{{.Server.Arch}}')
+    extract_release "$V1" "$BASE/$c-rel"
+    installer_env "$c"
+    make_certificate "$BASE/$c-bad" 'DNS:localhost,IP:127.0.0.1'
+    apache2ctl start || die "apache did not start"
+    sleep 1
+    # Forced configuration failure: a wrapper around apachectl that fails `configtest` as soon as the
+    # CraftCloud site is enabled and passes everything else (modules, graceful, real Apache) through.
+    cat >"$BASE/apachectl-guard" <<'GUARD'
+#!/bin/sh
+if [ "$1" = configtest ] && [ -e /etc/apache2/sites-enabled/craftcloud.conf ]; then
+    echo 'forced configtest failure (OPS-02 test)' >&2
+    exit 1
+fi
+exec apachectl "$@"
+GUARD
+    chmod +x "$BASE/apachectl-guard"
+    before=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18999/ || true)
+    echo "Apache answers on its existing listener before: $before"
+    [ "$before" != 000 ] || die "the existing Apache listener does not answer"
+    if CRAFTCLOUD_APACHECTL="$BASE/apachectl-guard" sh "$BASE/$c-rel/craftcloud-$V1/deploy/install/install.sh" --non-interactive --domain localhost --acme-email ops@example.test \
+        --proxy apache --proxy-install --proxy-cert "$BASE/$c-bad/cert.pem" --proxy-key "$BASE/$c-bad/key.pem" \
+        --http-port 18080 --https-port 18443 --local-port 18081 --local-figcraft-port 18082 \
+        --data-dir "$CRAFTCLOUD_DATA_DIR" --image-archive "$DIST/craftcloud-$V1-image-$arch.tar.zst" "$DIST/craftcloud-$V1.tar.gz" >"$OUT/c7-install.log" 2>&1; then
+        die "the installation must fail when the Apache configuration test fails"
+    fi
+    tail -3 "$OUT/c7-install.log"
+    grep -q 'the change was undone' "$OUT/c7-install.log" || die "undo message missing"
+    [ ! -e /etc/apache2/sites-enabled/craftcloud.conf ] && [ ! -L /etc/apache2/sites-enabled/craftcloud.conf ] || die "the site is still enabled"
+    [ ! -e /etc/apache2/sites-available/craftcloud.conf ] || die "the new site file is still there"
+    apachectl configtest 2>&1 | tail -1 | tee "$OUT/case7-configtest.log"
+    grep -q 'Syntax OK' "$OUT/case7-configtest.log" || die "the restored Apache configuration does not pass the test"
+    after=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18999/ || true)
+    echo "Apache answers on its existing listener after: $after"
+    [ "$after" != 000 ] || die "Apache stopped answering"
+    pgrep -x apache2 >/dev/null || die "no apache2 process runs"
+    apache2ctl stop || true
+    ctl "$c" uninstall --purge --confirm-purge >"$OUT/case7-uninstall.log" 2>&1
+    no_leftovers "ops02-$c"
+    rm -rf "$BASE/$c" "$BASE/$c-rel" "$BASE/$c-bad"
+    say "case 7 passed"
+}
+
 cleanup_images() {
     for v in "$V1" "$V2"; do docker rmi "craftcloud:$v" >/dev/null 2>&1 || true; done
     docker rmi "craftcloud:$V1-" >/dev/null 2>&1 || true
@@ -388,6 +543,8 @@ case ${1:-} in
     case4) case4 ;;
     case4b) case4b ;;
     case5) case5 ;;
+    case6) case6 ;;
+    case7) case7 ;;
     images-cleanup) cleanup_images ;;
-    *) echo "usage: $0 setup|case1|case2|case3|case4|case4b|case5|images-cleanup" >&2; exit 2 ;;
+    *) echo "usage: $0 setup|case1|case2|case3|case4|case4b|case5|case6|case7|images-cleanup" >&2; exit 2 ;;
 esac

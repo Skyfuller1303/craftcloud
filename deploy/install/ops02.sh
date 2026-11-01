@@ -26,6 +26,9 @@ ops_env_get() {
 # Prints the ` -f <file>` words for the database and proxy choices recorded in
 # the environment file. A missing overlay is an error and never silently
 # dropped: running without it would start the bundled Caddy or database.
+# An external database needs one routable network: dbegress with the bundled
+# Caddy, the `proxy` network with your own proxy (never two, so that the
+# default route and the trusted gateway stay the same network).
 ops_overlay_files() {
     ops_db=$(ops_env_get "$1" CRAFTCLOUD_DB)
     ops_proxy=$(ops_env_get "$1" CRAFTCLOUD_PROXY)
@@ -39,10 +42,13 @@ ops_overlay_files() {
         *) fail "CRAFTCLOUD_DB must be bundled or external" ;;
     esac
     case ${ops_proxy:-caddy} in
-        caddy) ;;
+        caddy)
+            [ "${ops_db:-bundled}" != external ] || ops_files="$ops_files compose.external-db-egress.yaml"
+            ;;
         nginx|apache|none)
             ops_files="$ops_files compose.local-proxy.yaml"
             [ "$3" != enabled ] || ops_files="$ops_files compose.local-proxy-figcraft.yaml"
+            [ "${ops_db:-bundled}" != external ] || ops_files="$ops_files compose.external-db-proxy.yaml"
             ;;
         *) fail "CRAFTCLOUD_PROXY must be caddy, nginx, apache or none" ;;
     esac
@@ -50,6 +56,29 @@ ops_overlay_files() {
         [ -f "$2/$ops_file" ] || fail "this release has no $ops_file, which the installation needs (database: ${ops_db:-bundled}, proxy: ${ops_proxy:-caddy}); use a release that contains it"
         printf ' -f %s' "$ops_file"
     done
+}
+
+# ops_sanitize_figcraft_image <env-file>: the separate FigCraft image no longer
+# exists. A leftover CRAFTCLOUD_FIGCRAFT_IMAGE that still names it (craftcloud-figcraft:...)
+# is ignored with a warning, in the environment file and in the environment of
+# this process, so that the companion runs from the CraftCloud image.
+ops_sanitize_figcraft_image() {
+    ops_fig_file=$(ops_env_get "$1" CRAFTCLOUD_FIGCRAFT_IMAGE)
+    case $ops_fig_file in
+        craftcloud-figcraft:*)
+            printf '%s\n' 'craftcloud: warning: CRAFTCLOUD_FIGCRAFT_IMAGE names the retired craftcloud-figcraft image; the setting is ignored and removed from the environment file' >&2
+            ops_fig_tmp=$1.tmp.$$
+            awk 'index($0, "CRAFTCLOUD_FIGCRAFT_IMAGE=") != 1' "$1" >"$ops_fig_tmp"
+            chmod 0600 "$ops_fig_tmp"
+            mv -f "$ops_fig_tmp" "$1"
+            ;;
+    esac
+    case ${CRAFTCLOUD_FIGCRAFT_IMAGE:-} in
+        craftcloud-figcraft:*)
+            printf '%s\n' 'craftcloud: warning: CRAFTCLOUD_FIGCRAFT_IMAGE in the environment names the retired craftcloud-figcraft image; it is ignored' >&2
+            unset CRAFTCLOUD_FIGCRAFT_IMAGE
+            ;;
+    esac
 }
 
 # --- Detection ----------------------------------------------------------------
@@ -184,6 +213,19 @@ ops_choose_db() {
     DB_MODE=bundled
 }
 
+# ops_check_db_name <name>: [a-z_][a-z0-9_]{0,62} and not a reserved word. The
+# generated SQL also quotes the name with format('%I').
+ops_check_db_name() {
+    case $1 in
+        ''|[!a-z_]*|*[!a-z0-9_]*) fail 'the database name must match [a-z_][a-z0-9_]{0,62} (lower case letters, digits, underscore)' ;;
+    esac
+    [ "${#1}" -le 63 ] || fail 'the database name is longer than 63 characters'
+    # shellcheck disable=SC2194 # the word list is the subject on purpose
+    case " all analyse analyze and any array as asc asymmetric both case cast check collate column constraint create current_catalog current_date current_role current_time current_timestamp current_user default deferrable desc distinct do else end except false fetch for foreign from grant group having in initially intersect into lateral leading limit localtime localtimestamp not null offset on only or order placing primary references returning select session_user some symmetric system_user table then to trailing true union unique user using variadic when where window with postgres template0 template1 " in
+        *" $1 "*) fail "the database name $1 is a reserved word or a system database" ;;
+    esac
+}
+
 # ops_parse_db_url <file> <config-dir>: reads the connection target of an
 # external database. The file holds one line: postgres://HOST[:PORT]/DATABASE[?QUERY]
 # with no user name and no password; the installer creates the two roles and
@@ -207,7 +249,7 @@ ops_parse_db_url() {
     case $ops_rest in */*) ops_path=${ops_rest#*/} ;; *) fail 'the database URL needs a database name (postgres://HOST:5432/DATABASE)' ;; esac
     ops_database=${ops_path%%\?*}
     case $ops_path in *\?*) ops_query=${ops_path#*\?} ;; *) ops_query= ;; esac
-    case $ops_database in ''|*[!A-Za-z0-9_]*) fail 'the database name may contain only letters, digits and underscore' ;; esac
+    ops_check_db_name "$ops_database"
     case $ops_authority in
         \[*\]:*) ops_host=${ops_authority%%\]*}]; ops_port=${ops_authority##*\]:} ;;
         \[*\]) ops_host=$ops_authority; ops_port=5432 ;;
@@ -245,15 +287,25 @@ ops_parse_db_url() {
             *) fail 'the database URL query may contain only sslmode and sslrootcert' ;;
         esac
     done
+    ops_host=$(printf '%s' "$ops_host" | tr 'A-Z' 'a-z')
+    DB_HOST_ORIG=$ops_host
+    DB_PORT_ORIG=$ops_port
+    DB_SSLMODE=$ops_sslmode
     case $ops_host in
         localhost|127.*|\[::1\]|host.docker.internal) ops_local=1 ;;
         *) ops_local=0 ;;
     esac
     if [ "$ops_local" -eq 1 ]; then
-        if [ "$ops_sslmode" != verify-full ] && [ "${DB_ALLOW_INSECURE_LOCAL:-0}" -ne 1 ]; then
+        if [ "$ops_sslmode" = verify-full ]; then
+            # The certificate is checked against the name the container connects to.
+            # A loopback name would have to be rewritten to the Docker host name,
+            # which the certificate does not contain, so only that name is allowed.
+            [ "$ops_host" = host.docker.internal ] || fail 'sslmode=verify-full with localhost or a loopback address cannot work from a container (the name is rewritten to host.docker.internal); use host.docker.internal as the host name, issue the certificate for it, and put it in the URL'
+        elif [ "${DB_ALLOW_INSECURE_LOCAL:-0}" -ne 1 ]; then
             fail 'a database on this host without sslmode=verify-full needs --db-allow-insecure-local'
         fi
-        # The containers reach the Docker host through its gateway name.
+        # The containers reach the Docker host through its gateway name (extra_hosts
+        # host.docker.internal:host-gateway in compose.external-db.yaml).
         ops_host=host.docker.internal
     else
         [ "$ops_sslmode" = verify-full ] || fail 'a database on another host needs sslmode=verify-full in the URL (and sslrootcert for a private CA)'
@@ -269,21 +321,36 @@ ops_parse_db_url() {
 # ops_write_role_sql <file> <database> <owner-password> <runtime-password>
 # Writes the SQL that creates the two application roles and the database
 # (idempotent, same rules as deploy/compose/db-init.sh). The file contains the
-# role passwords: mode 0600, never printed.
+# role passwords: mode 0600, never printed. Before the passwords are set, a
+# superuser session switches statement logging off for itself so that the
+# ALTER ROLE statements (which carry the passwords) do not reach the server log;
+# a session that may not do that prints a warning and continues. The password is
+# sent as text, as ALTER ROLE ... PASSWORD does; the client library (libpq) is
+# not asked to hash it, so use TLS (the installer requires it for remote servers).
 ops_write_role_sql() {
+    ops_check_db_name "$2"
     ops_sql_tmp=$1.tmp.$$
     {
         printf '%s\n' '-- CraftCloud roles for an existing PostgreSQL server. Run as an administrator:'
         printf '%s\n' '--   psql -v ON_ERROR_STOP=1 -f <this file> postgres'
         printf '%s\n' '-- The file contains the generated role passwords: keep it private and delete it afterwards.'
+        printf '%s\n' "SELECT rolsuper AS ops_super FROM pg_roles WHERE rolname = current_user \\gset"
+        printf '%s\n' '\if :ops_super'
+        printf '%s\n' "SET log_statement = 'none';"
+        printf '%s\n' "SET log_min_error_statement = 'panic';"
+        printf '%s\n' 'SET log_min_duration_statement = -1;'
+        printf '%s\n' '\else'
+        printf '%s\n' "\\echo 'warning: this session is not a superuser and cannot switch statement logging off; the role passwords may appear in the server log if log_statement or log_min_error_statement record them. Change the passwords afterwards or turn logging down.'"
+        printf '%s\n' '\endif'
         printf '%s\n' "SELECT 'CREATE ROLE craftcloud_owner LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'craftcloud_owner')\\gexec"
         printf '%s\n' "SELECT 'CREATE ROLE craftcloud_runtime LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'craftcloud_runtime')\\gexec"
         printf '%s\n' "ALTER ROLE craftcloud_owner   LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '$3';"
         printf '%s\n' "ALTER ROLE craftcloud_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '$4';"
-        printf '%s\n' "SELECT 'CREATE DATABASE $2 OWNER craftcloud_owner' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$2')\\gexec"
-        printf '%s\n' "ALTER DATABASE $2 OWNER TO craftcloud_owner;"
-        printf '%s\n' "REVOKE ALL ON DATABASE $2 FROM PUBLIC;"
-        printf '%s\n' "GRANT CONNECT ON DATABASE $2 TO craftcloud_runtime;"
+        printf '%s\n' "\\set dbname '$2'"
+        printf '%s\n' "SELECT format('CREATE DATABASE %I OWNER craftcloud_owner', :'dbname') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'dbname') \\gexec"
+        printf '%s\n' "SELECT format('ALTER DATABASE %I OWNER TO craftcloud_owner', :'dbname') \\gexec"
+        printf '%s\n' "SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'dbname') \\gexec"
+        printf '%s\n' "SELECT format('GRANT CONNECT ON DATABASE %I TO craftcloud_runtime', :'dbname') \\gexec"
         printf '%s\n' "\\connect $2"
         printf '%s\n' 'ALTER SCHEMA public OWNER TO craftcloud_owner;'
         printf '%s\n' 'REVOKE CREATE ON SCHEMA public FROM PUBLIC;'
@@ -291,6 +358,80 @@ ops_write_role_sql() {
     } >"$ops_sql_tmp"
     chmod 0600 "$ops_sql_tmp"
     mv -f "$ops_sql_tmp" "$1"
+}
+
+# ops_host_class <host>: prints loopback or remote.
+ops_host_class() {
+    case $1 in
+        localhost|127.*|\[::1\]|host.docker.internal) printf '%s\n' loopback ;;
+        *) printf '%s\n' remote ;;
+    esac
+}
+
+# ops_check_admin_url <admin-url-file>: the administrator URL follows the same
+# rules as the application URL. Same host and port as --database-url-file, a
+# remote server needs sslmode=verify-full, a server on this host needs it or
+# --db-allow-insecure-local. It needs a user and a password; the password may
+# not contain @ : / ? # % \ or white space (it is not percent-decoded). Prints
+# nothing from the file.
+ops_check_admin_url() {
+    [ -f "$1" ] && [ ! -L "$1" ] || fail 'the administrator URL file does not exist or is a symbolic link'
+    [ "$(wc -l <"$1")" -le 1 ] || fail 'the administrator URL file must contain a single line'
+    ops_au=$(head -n 1 "$1" | tr -d '\r')
+    case $ops_au in
+        postgres://*) ops_ar=${ops_au#postgres://} ;;
+        postgresql://*) ops_ar=${ops_au#postgresql://} ;;
+        *) fail 'the administrator URL must start with postgres://' ;;
+    esac
+    case $ops_ar in *[[:space:]]*|'') fail 'the administrator URL contains white space' ;; esac
+    case $ops_ar in *@*@*) fail 'the administrator password may not contain @ (it is not percent-decoded)' ;; esac
+    case $ops_ar in *@*) ;; *) fail 'the administrator URL needs a user name and a password (postgres://USER:PASSWORD@HOST:PORT/postgres)' ;; esac
+    ops_acred=${ops_ar%%@*}
+    ops_aafter=${ops_ar#*@}
+    case $ops_acred in *:*) ;; *) fail 'the administrator URL needs a password' ;; esac
+    ops_auser=${ops_acred%%:*}
+    ops_apass=${ops_acred#*:}
+    case $ops_auser in ''|*[!A-Za-z0-9._-]*) fail 'the administrator user name may contain only letters, digits, dot, underscore and hyphen' ;; esac
+    case $ops_apass in ''|*[:/?#%\\]*) fail 'the administrator password may not contain : / ? # % or a backslash (it is not percent-decoded)' ;; esac
+    ops_aauth=${ops_aafter%%/*}
+    case $ops_aafter in */*) ops_apath=${ops_aafter#*/} ;; *) fail 'the administrator URL needs a database name' ;; esac
+    case $ops_aauth in
+        \[*\]:*) ops_ahost=${ops_aauth%%\]*}]; ops_aport=${ops_aauth##*\]:} ;;
+        \[*\]) ops_ahost=$ops_aauth; ops_aport=5432 ;;
+        *:*) ops_ahost=${ops_aauth%%:*}; ops_aport=${ops_aauth#*:} ;;
+        *) ops_ahost=$ops_aauth; ops_aport=5432 ;;
+    esac
+    ops_ahost=$(printf '%s' "$ops_ahost" | tr 'A-Z' 'a-z')
+    case $ops_ahost in ''|*[!]A-Za-z0-9.:_[-]*) fail 'the administrator host name is not valid' ;; esac
+    case $ops_aport in ''|*[!0-9]*) fail 'the administrator port must be numeric' ;; esac
+    ops_aq=
+    case $ops_apath in *\?*) ops_aq=${ops_apath#*\?} ;; esac
+    ops_asslmode=
+    ops_old_ifs=$IFS
+    IFS='&'
+    # shellcheck disable=SC2086 # the query is intentionally split at '&'
+    set -- $ops_aq
+    IFS=$ops_old_ifs
+    for ops_apair in "$@"; do
+        case $ops_apair in
+            sslmode=*) ops_asslmode=${ops_apair#sslmode=} ;;
+            sslrootcert=*) ;;
+            '') ;;
+            *) fail 'the administrator URL query may contain only sslmode and sslrootcert' ;;
+        esac
+    done
+    # Same server as the application URL.
+    if [ "$(ops_host_class "$ops_ahost")" = loopback ] && [ "$(ops_host_class "${DB_HOST_ORIG:-}")" = loopback ]; then
+        :
+    else
+        [ "$ops_ahost" = "${DB_HOST_ORIG:-}" ] || fail 'the administrator URL must name the same host as --database-url-file'
+    fi
+    [ "$ops_aport" = "${DB_PORT_ORIG:-}" ] || fail 'the administrator URL must use the same port as --database-url-file'
+    if [ "$(ops_host_class "$ops_ahost")" = loopback ]; then
+        [ "$ops_asslmode" = verify-full ] || [ "${DB_ALLOW_INSECURE_LOCAL:-0}" -eq 1 ] || fail 'a database on this host needs sslmode=verify-full in the administrator URL, or --db-allow-insecure-local'
+    else
+        [ "$ops_asslmode" = verify-full ] || fail 'a database on another host needs sslmode=verify-full in the administrator URL'
+    fi
 }
 
 # ops_admin_ca_args <admin-url-file>: `--mount` arguments for the private
@@ -309,29 +450,73 @@ ops_admin_ca_args() {
     esac
 }
 
+# The script that runs INSIDE the container. It splits the administrator URL into
+# the libpq variables PGHOST, PGPORT, PGUSER, PGDATABASE, PGSSLMODE and
+# PGSSLROOTCERT and writes the password to a mode 0600 PGPASSFILE on a tmpfs, so
+# that neither the URL nor the password is ever an argument of a process (only
+# shell builtins touch it). The script itself contains no secret.
+OPS_ADMIN_ENV_SCRIPT='set -eu
+umask 077
+u=$(cat /run/admin-url)
+rest=${u#*://}
+cred=${rest%%@*}
+after=${rest#*@}
+PGUSER=${cred%%:*}
+pw=${cred#*:}
+hostport=${after%%/*}
+pathq=${after#*/}
+PGDATABASE=${pathq%%\?*}
+q=
+case $pathq in *\?*) q=${pathq#*\?} ;; esac
+case $hostport in
+    \[*\]:*) h=${hostport%%\]*}; PGHOST=${h#\[}; PGPORT=${hostport##*\]:} ;;
+    \[*\]) h=${hostport%%\]*}; PGHOST=${h#\[}; PGPORT=5432 ;;
+    *:*) PGHOST=${hostport%%:*}; PGPORT=${hostport#*:} ;;
+    *) PGHOST=$hostport; PGPORT=5432 ;;
+esac
+export PGUSER PGDATABASE PGHOST PGPORT
+IFS="&"
+for pair in $q; do
+    case $pair in
+        sslmode=*) PGSSLMODE=${pair#sslmode=}; export PGSSLMODE ;;
+        sslrootcert=*) PGSSLROOTCERT=${pair#sslrootcert=}; export PGSSLROOTCERT ;;
+    esac
+done
+unset IFS
+printf "*:*:*:*:%s\n" "$pw" >/run/pw/pgpass
+PGPASSFILE=/run/pw/pgpass
+export PGPASSFILE
+unset u rest cred after pw q
+trap "rm -f /run/pw/pgpass" EXIT
+'
+
 # ops_run_admin_sql <admin-url-file> <sql-file> <postgres-image>: runs the role
 # SQL with the administrator URL the operator gave, inside a container of the
 # pinned PostgreSQL image (no psql needed on the host). The URL file is mounted,
-# never passed on a command line; nothing it contains is printed.
+# never passed on a command line; the password reaches psql only through a
+# PGPASSFILE on a tmpfs. Warnings of the SQL file are shown, nothing else.
 ops_run_admin_sql() {
-    [ -f "$1" ] && [ ! -L "$1" ] || fail 'the administrator URL file does not exist or is a symbolic link'
+    ops_check_admin_url "$1"
     ops_ca_args=$(ops_admin_ca_args "$1")
-    # shellcheck disable=SC2086 # the mount arguments are plain paths and are intentionally split
-    docker run --rm -i --network host --add-host host.docker.internal:host-gateway $ops_ca_args \
-        --mount "type=bind,source=$1,target=/run/admin-url,readonly" \
-        --mount "type=bind,source=$2,target=/run/roles.sql,readonly" \
-        --entrypoint /bin/sh "$3" -c 'psql --no-psqlrc -v ON_ERROR_STOP=1 --quiet -f /run/roles.sql "$(cat /run/admin-url)"' >/dev/null \
-        || fail 'running the role setup with the administrator URL failed (host, credentials or TLS); no detail is printed on purpose'
+    ops_out=$(
+        # shellcheck disable=SC2086 # the mount arguments are plain paths and are intentionally split
+        docker run --rm -i --network host --add-host host.docker.internal:host-gateway --tmpfs /run/pw:mode=0700 $ops_ca_args \
+            --mount "type=bind,source=$1,target=/run/admin-url,readonly" \
+            --mount "type=bind,source=$2,target=/run/roles.sql,readonly" \
+            --entrypoint /bin/sh "$3" -c "$OPS_ADMIN_ENV_SCRIPT"'psql --no-psqlrc -v ON_ERROR_STOP=1 --quiet -f /run/roles.sql'
+    ) || fail 'running the role setup with the administrator URL failed (host, credentials or TLS); no detail is printed on purpose'
+    printf '%s\n' "$ops_out" | grep '^warning:' | sed 's/^/craftcloud-install: /' >&2 || true
 }
 
 # ops_admin_db_major <admin-url-file> <postgres-image>: major version of the
 # server behind the administrator URL, printed on stdout.
 ops_admin_db_major() {
+    ops_check_admin_url "$1"
     ops_ca_args=$(ops_admin_ca_args "$1")
     # shellcheck disable=SC2086 # the mount arguments are plain paths and are intentionally split
-    docker run --rm --network host --add-host host.docker.internal:host-gateway $ops_ca_args \
+    docker run --rm --network host --add-host host.docker.internal:host-gateway --tmpfs /run/pw:mode=0700 $ops_ca_args \
         --mount "type=bind,source=$1,target=/run/admin-url,readonly" \
-        --entrypoint /bin/sh "$2" -c 'psql --no-psqlrc -At -c "SHOW server_version_num" "$(cat /run/admin-url)"' 2>/dev/null \
+        --entrypoint /bin/sh "$2" -c "$OPS_ADMIN_ENV_SCRIPT"'psql --no-psqlrc -At -c "SHOW server_version_num"' 2>/dev/null \
         | awk '{ print int($1 / 10000) }'
 }
 
@@ -374,6 +559,9 @@ ops_render_proxy_template() {
     ops_listen_https='# Port 443 is opened by the ports.conf of your Apache.'
     [ "$6" = 80 ] || ops_listen_http="Listen $6"
     [ "$7" = 443 ] || ops_listen_https="Listen $7"
+    # Debian and Ubuntu define APACHE_LOG_DIR; other layouts use the logs directory of the server root.
+    ops_error_log='logs/craftcloud-error.log'
+    [ -d "${CRAFTCLOUD_APACHE_SITES_AVAILABLE:-/etc/apache2/sites-available}" ] && ops_error_log='${APACHE_LOG_DIR}/craftcloud-error.log'
     ops_render_tmp=$2.tmp.$$
     sed \
         -e "s|@DOMAIN@|$3|g" \
@@ -384,6 +572,7 @@ ops_render_proxy_template() {
         -e "s|@PUBLIC_PORT_SUFFIX@|$ops_suffix|g" \
         -e "s|@TLS_CERT@|$8|g" \
         -e "s|@TLS_KEY@|$9|g" \
+        -e "s|@APACHE_ERROR_LOG@|$ops_error_log|g" \
         -e "s|@APACHE_LISTEN_HTTP@|$ops_listen_http|g" \
         -e "s|@APACHE_LISTEN_HTTPS@|$ops_listen_https|g" \
         -e "s|@MAX_BODY@|$ops_max|g" \
@@ -413,17 +602,39 @@ ops_apache_missing_modules() {
     done
 }
 
+# ops_apache_sites_available / ops_apache_sites_enabled: Debian layout directories.
+ops_apache_sites_available() { printf '%s\n' "${CRAFTCLOUD_APACHE_SITES_AVAILABLE:-/etc/apache2/sites-available}"; }
+ops_apache_sites_enabled() { printf '%s\n' "${CRAFTCLOUD_APACHE_SITES_ENABLED:-/etc/apache2/sites-enabled}"; }
+
+# ops_proxy_reload <nginx|apache>: reloads the web server (CRAFTCLOUD_RELOAD_CMD is a test hook).
+ops_proxy_reload() {
+    if [ -n "${CRAFTCLOUD_RELOAD_CMD:-}" ]; then
+        # shellcheck disable=SC2086 # test hook
+        $CRAFTCLOUD_RELOAD_CMD
+    elif [ "$1" = nginx ]; then
+        if ops_unit_active nginx.service; then systemctl reload nginx
+        else "${CRAFTCLOUD_NGINX_BIN:-nginx}" -s reload; fi
+    else
+        if ops_unit_active apache2.service; then systemctl reload apache2
+        elif ops_unit_active httpd.service; then systemctl reload httpd
+        else "${CRAFTCLOUD_APACHECTL:-apachectl}" graceful; fi
+    fi
+}
+
 # ops_proxy_apply <nginx|apache> <config-file> <rendered-file> <backup-dir>
-# Installs the rendered configuration with a backup, tests it and reloads the
-# web server only if the test passes. A failed test restores the previous state.
-# Uses CRAFTCLOUD_NGINX_BIN / CRAFTCLOUD_APACHECTL (defaults nginx, apachectl)
-# and CRAFTCLOUD_RELOAD_CMD for tests.
+# One guarded change: back up the previous file, install the rendered one, for
+# Apache on the Debian layout also enable the site (a2ensite), test the whole
+# configuration, and only then reload. Any failure (test or reload) undoes
+# exactly what this call did (restores the previous file or removes the new one,
+# a2dissite for a site it enabled), checks that the restored configuration still
+# passes the test, and fails. Uses CRAFTCLOUD_NGINX_BIN / CRAFTCLOUD_APACHECTL.
 ops_proxy_apply() {
     ops_kind=$1; ops_target=$2; ops_new=$3; ops_backup=$4
     mkdir -p "$ops_backup"
     chmod 0700 "$ops_backup"
     ops_had=0
     ops_saved=
+    ops_enabled_by_us=0
     if [ -e "$ops_target" ]; then
         ops_had=1
         ops_saved=$ops_backup/$(basename -- "$ops_target").$(date -u +%Y%m%dT%H%M%SZ)
@@ -436,21 +647,29 @@ ops_proxy_apply() {
         nginx) ops_test="${CRAFTCLOUD_NGINX_BIN:-nginx} -t" ;;
         apache) ops_test="${CRAFTCLOUD_APACHECTL:-apachectl} configtest" ;;
     esac
-    # shellcheck disable=SC2086 # the command and its argument are intentionally split
-    if ! $ops_test >/dev/null 2>&1; then
-        if [ "$ops_had" -eq 1 ]; then cp -p -- "$ops_saved" "$ops_target"; else rm -f -- "$ops_target"; fi
-        fail "the $ops_kind configuration test failed with the CraftCloud configuration; the previous state was restored and nothing was reloaded (run '$ops_test' after fixing the problem to see the error)"
+    ops_apply_failure=
+    if [ "$ops_kind" = apache ] && [ "$ops_target" = "$(ops_apache_sites_available)/craftcloud.conf" ] && [ ! -e "$(ops_apache_sites_enabled)/craftcloud.conf" ]; then
+        if a2ensite craftcloud >/dev/null 2>&1; then ops_enabled_by_us=1; else ops_apply_failure='a2ensite craftcloud failed'; fi
     fi
-    if [ -n "${CRAFTCLOUD_RELOAD_CMD:-}" ]; then
-        # shellcheck disable=SC2086 # test hook
-        $CRAFTCLOUD_RELOAD_CMD || fail "reloading $ops_kind failed"
-    elif [ "$ops_kind" = nginx ]; then
-        if ops_unit_active nginx.service; then systemctl reload nginx || fail 'reloading nginx failed'
-        else "${CRAFTCLOUD_NGINX_BIN:-nginx}" -s reload || fail 'reloading nginx failed'; fi
-    else
-        if ops_unit_active apache2.service; then systemctl reload apache2 || fail 'reloading Apache failed'
-        elif ops_unit_active httpd.service; then systemctl reload httpd || fail 'reloading Apache failed'
-        else "${CRAFTCLOUD_APACHECTL:-apachectl}" graceful || fail 'reloading Apache failed'; fi
+    if [ -z "$ops_apply_failure" ]; then
+        # shellcheck disable=SC2086 # the command and its argument are intentionally split
+        $ops_test >/dev/null 2>&1 || ops_apply_failure="the $ops_kind configuration test failed with the CraftCloud configuration"
+    fi
+    if [ -z "$ops_apply_failure" ]; then
+        ops_proxy_reload "$ops_kind" >/dev/null 2>&1 || ops_apply_failure="reloading $ops_kind failed"
+    fi
+    if [ -n "$ops_apply_failure" ]; then
+        if [ "$ops_enabled_by_us" -eq 1 ]; then a2dissite craftcloud >/dev/null 2>&1 || true; fi
+        if [ "$ops_had" -eq 1 ]; then cp -p -- "$ops_saved" "$ops_target"; else rm -f -- "$ops_target"; fi
+        # shellcheck disable=SC2086
+        if $ops_test >/dev/null 2>&1; then
+            ops_restored='the restored configuration passes the test'
+            # A reload that failed may have left the server on the new file: reload the restored state.
+            ops_proxy_reload "$ops_kind" >/dev/null 2>&1 || ops_restored="$ops_restored, but reloading it failed: check the web server"
+        else
+            ops_restored="the restored configuration does NOT pass the test either: check the web server yourself (run '$ops_test')"
+        fi
+        fail "$ops_apply_failure; the change was undone ($ops_restored) (run '$ops_test' to see the error)"
     fi
 }
 
@@ -501,7 +720,7 @@ ops_proxy_write_templates() {
 # ops_apache_target: path of the Apache site file (Debian layout or conf.d).
 ops_apache_target() {
     if [ -n "${CRAFTCLOUD_APACHE_CONF_FILE:-}" ]; then printf '%s\n' "$CRAFTCLOUD_APACHE_CONF_FILE"
-    elif [ -d /etc/apache2/sites-available ]; then printf '%s\n' /etc/apache2/sites-available/craftcloud.conf
+    elif [ -d "$(ops_apache_sites_available)" ]; then printf '%s\n' "$(ops_apache_sites_available)/craftcloud.conf"
     else printf '%s\n' /etc/httpd/conf.d/craftcloud.conf; fi
 }
 
@@ -520,12 +739,6 @@ ops_http_only_config() {
             printf '<VirtualHost *:%s>\n    ServerName %s\n</VirtualHost>\n' "$HTTP_PORT" "$DOMAIN" >"$2"
             ;;
     esac
-}
-
-ops_reload_apache() {
-    if ops_unit_active apache2.service; then systemctl reload apache2
-    elif ops_unit_active httpd.service; then systemctl reload httpd
-    else "${CRAFTCLOUD_APACHECTL:-apachectl}" graceful; fi
 }
 
 # ops_proxy_install: the --proxy-install flow for nginx and Apache. It changes
@@ -565,11 +778,6 @@ ops_proxy_install() {
         [ -f "$TLS_CERT" ] && [ -f "$TLS_KEY" ] || fail "certbot did not create $TLS_CERT; use --proxy-cert and --proxy-key with the files it created"
     fi
     ops_proxy_apply "$PROXY_MODE" "$ops_target" "$CONFIG_DIR/proxy/craftcloud.$PROXY_MODE.conf" "$ops_backup"
-    if [ "$PROXY_MODE" = apache ] && [ "$ops_target" = /etc/apache2/sites-available/craftcloud.conf ] && [ ! -e /etc/apache2/sites-enabled/craftcloud.conf ]; then
-        a2ensite craftcloud >/dev/null || fail 'a2ensite craftcloud failed'
-        "${CRAFTCLOUD_APACHECTL:-apachectl}" configtest >/dev/null 2>&1 || fail 'Apache configuration test failed after enabling the site'
-        ops_reload_apache
-    fi
     printf '%s\n' "craftcloud-install: $PROXY_MODE is configured with $ops_target and was reloaded after a successful test."
 }
 

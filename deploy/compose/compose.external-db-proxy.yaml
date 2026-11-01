@@ -1,0 +1,14 @@
+# External PostgreSQL together with your own proxy (OPS-02): the database traffic
+# uses the `proxy` network of compose.local-proxy.yaml, so the server has exactly
+# one routable network. Two routable networks would let Docker pick the default
+# route (and with it the source address of published-port connections) by network
+# name, and the trusted proxy address would no longer match. A PostgreSQL on this
+# host allows the subnet of that network (CRAFTCLOUD_PROXY_SUBNET, default
+# 172.29.206.0/24) in pg_hba.conf.
+services:
+  migrate:
+    networks: [proxy]
+  backup:
+    networks: [proxy]
+  restore:
+    networks: [proxy]

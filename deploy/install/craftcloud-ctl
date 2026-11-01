@@ -169,6 +169,7 @@ compose_run() {
     # smtp_files contains only fixed -f filenames emitted by smtp_overrides;
     # overlays missing from an older release are dropped with a warning.
     # Database and proxy choices (OPS-02) are recorded in the environment file.
+    ops_sanitize_figcraft_image "$CONFIG_DIR/craftcloud.env"
     ops_files=$(ops_overlay_files "$CONFIG_DIR/craftcloud.env" "$dir" "$fig") || exit 1
     files="$files$ops_files"
     release_smtp_files=$(smtp_release_files "$dir" "$smtp_files" "$version")
@@ -401,7 +402,9 @@ case ${1:-} in
         fi
         fig_status=$(figcraft_setting) || exit 1
         printf '%s\n' "FigCraft live companion: $fig_status (change with: craftcloud-ctl figcraft enable|disable)"
-        printf '%s\n' "Database: $(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_DB | sed 's/^$/bundled/'); reverse proxy: $(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_PROXY | sed 's/^$/caddy/')"
+        status_db=$(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_DB)
+        status_proxy=$(ops_env_get "$CONFIG_DIR/craftcloud.env" CRAFTCLOUD_PROXY)
+        printf '%s\n' "Database: ${status_db:-bundled}; reverse proxy: ${status_proxy:-caddy}"
         ;;
     logs) shift; compose_at "$active" logs --follow "$@" ;;
     backup)
@@ -511,6 +514,10 @@ case ${1:-} in
             extract_release "$archive" "$new_version" "$new_root"
         fi
         new_dir=$(release_compose_dir "$new_root")
+        # The new release must provide the overlays of the recorded database and proxy choices.
+        upgrade_fig=$(figcraft_setting) || exit 1
+        [ -f "$new_dir/compose.figcraft.yaml" ] || upgrade_fig=disabled
+        ops_overlay_files "$CONFIG_DIR/craftcloud.env" "$new_dir" "$upgrade_fig" >/dev/null
         metadata=$new_root/CRAFTCLOUD-RELEASE.json
         [ -f "$metadata" ] || metadata=$new_root/craftcloud-$new_version/CRAFTCLOUD-RELEASE.json
         [ -f "$metadata" ] || fail 'CRAFTCLOUD-RELEASE.json missing'
@@ -569,6 +576,11 @@ case ${1:-} in
         valid_semver "$old_version" || fail 'previous release version is invalid'
         [ "$old" = "$INSTALL_ROOT/releases/$old_version" ] || fail 'previous release must be a direct child of releases'
         [ ! -L "$old" ] || fail 'previous release is a symbolic link'
+        # The target release must provide every Compose file the recorded database and
+        # proxy choices need. Check before anything (config image, symlink, Caddy files) changes.
+        rollback_fig=$(figcraft_setting) || exit 1
+        [ -f "$(release_compose_dir "$old")/compose.figcraft.yaml" ] || rollback_fig=disabled
+        ops_overlay_files "$CONFIG_DIR/craftcloud.env" "$(release_compose_dir "$old")" "$rollback_fig" >/dev/null
         set_config_image "$(version_of "$old")"
         rm -f -- "$INSTALL_ROOT/current.new"
         ln -s "$old" "$INSTALL_ROOT/current.new"

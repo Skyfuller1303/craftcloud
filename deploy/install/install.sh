@@ -471,6 +471,7 @@ fi
 if [ -n "$DB_ADMIN_URL_FILE" ]; then
     [ "$DB_MODE" = external ] || fail '--db-admin-url-file belongs to --db external'
     safe_path "$DB_ADMIN_URL_FILE"
+    [ -z "$DB_URL_FILE" ] || ops_check_admin_url "$DB_ADMIN_URL_FILE"
 fi
 need() { command -v "$1" >/dev/null 2>&1 || fail "required command missing: $1"; }
 safe_path "$DATA_DIR"
@@ -694,6 +695,7 @@ chmod 0600 "$env_file"
 if ! grep -q '^CRAFTCLOUD_CADDY_CONFIG_DIR=' "$env_file"; then printf 'CRAFTCLOUD_CADDY_CONFIG_DIR=%s\n' "$CADDY_CONFIG_DIR" >>"$env_file"; fi
 # Configurations from before the FigCraft setting existed record the chosen value.
 if ! grep -q '^CRAFTCLOUD_FIGCRAFT=' "$env_file"; then env_set CRAFTCLOUD_FIGCRAFT "$FIGCRAFT"; fi
+ops_sanitize_figcraft_image "$env_file"
 # Configurations from before OPS-02 get the bundled database and Caddy.
 if ! grep -q '^CRAFTCLOUD_DB=' "$env_file"; then env_set CRAFTCLOUD_DB bundled; fi
 if ! grep -q '^CRAFTCLOUD_PROXY=' "$env_file"; then env_set CRAFTCLOUD_PROXY caddy; fi

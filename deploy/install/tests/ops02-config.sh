@@ -49,14 +49,40 @@ exit 0
 NGINX
 cat >"$TMP/bin/apachectl" <<'APACHECTL'
 #!/bin/sh
-printf 'apachectl %s\n' "$*" >>"${NGINX_LOG:-/dev/null}"
+enabled=no
+[ ! -e "${CRAFTCLOUD_APACHE_SITES_ENABLED:-/nonexistent}/craftcloud.conf" ] || enabled=yes
+printf 'apachectl %s enabled=%s\n' "$*" "$enabled" >>"${NGINX_LOG:-/dev/null}"
 case "$1" in
     -M) printf '%s\n' ${APACHE_MODULES:-proxy_module proxy_http_module proxy_wstunnel_module headers_module rewrite_module ssl_module} ;;
     configtest) [ "${APACHE_FAIL:-0}" != 1 ] || exit 1 ;;
 esac
 exit 0
 APACHECTL
-chmod +x "$TMP/bin/"*
+cat >"$TMP/bin/a2ensite" <<'A2ENSITE'
+#!/bin/sh
+printf 'a2ensite %s\n' "$*" >>"${NGINX_LOG:-/dev/null}"
+[ "${A2ENSITE_FAIL:-0}" != 1 ] || exit 1
+ln -sf "$CRAFTCLOUD_APACHE_SITES_AVAILABLE/$1.conf" "$CRAFTCLOUD_APACHE_SITES_ENABLED/$1.conf"
+A2ENSITE
+cat >"$TMP/bin/a2dissite" <<'A2DISSITE'
+#!/bin/sh
+printf 'a2dissite %s\n' "$*" >>"${NGINX_LOG:-/dev/null}"
+rm -f "$CRAFTCLOUD_APACHE_SITES_ENABLED/$1.conf"
+A2DISSITE
+mkdir -p "$TMP/certbot-bin"
+cat >"$TMP/certbot-bin/certbot" <<'CERTBOT'
+#!/bin/sh
+# Records whether the HTTP site was already enabled when certbot ran, then creates the certificate.
+enabled=no
+[ ! -e "${CRAFTCLOUD_APACHE_SITES_ENABLED:-/nonexistent}/craftcloud.conf" ] || enabled=yes
+printf 'certbot %s site_enabled=%s\n' "$*" "$enabled" >>"${NGINX_LOG:-/dev/null}"
+domain=
+while [ "$#" -gt 0 ]; do [ "$1" != -d ] || domain=$2; shift; done
+mkdir -p "/etc/letsencrypt/live/$domain"
+printf cert >"/etc/letsencrypt/live/$domain/fullchain.pem"
+printf key >"/etc/letsencrypt/live/$domain/privkey.pem"
+CERTBOT
+chmod +x "$TMP/bin/"* "$TMP/certbot-bin/certbot"
 
 # A release built from the real deploy directory (compose files, templates, scripts).
 make_release() {
@@ -282,9 +308,13 @@ ok 'nginx: missing certificate or certbot is reported, certbot is never installe
 
 # --- 5. --proxy-install apache -----------------------------------------------------
 apache_args="--proxy apache --http-port 28340 --https-port 28341 --local-port 28342 --local-figcraft-port 28343 --proxy-install --proxy-cert $TMP/test.crt --proxy-key $TMP/test.key"
+mkdir -p "$TMP/apache/available" "$TMP/apache/enabled"
 apache_env() {
-    CRAFTCLOUD_APACHECTL="$TMP/bin/apachectl" CRAFTCLOUD_APACHE_CONF_FILE="$TMP/nginx-conf/apache.conf" CRAFTCLOUD_RELOAD_CMD="$TMP/bin/apachectl graceful" \
-    NGINX_LOG="$TMP/nginx.log" "$@"
+    (
+        export CRAFTCLOUD_APACHECTL="$TMP/bin/apachectl" CRAFTCLOUD_APACHE_SITES_AVAILABLE="$TMP/apache/available" CRAFTCLOUD_APACHE_SITES_ENABLED="$TMP/apache/enabled"
+        export CRAFTCLOUD_RELOAD_CMD="$TMP/bin/apachectl graceful" NGINX_LOG="$TMP/nginx.log"
+        "$@"
+    )
 }
 rm -rf "$TMP/apache-mod"
 # shellcheck disable=SC2086
@@ -293,7 +323,7 @@ grep -F 'Apache modules missing: proxy_http proxy_wstunnel rewrite ssl' "$TMP/ap
 rm -rf "$TMP/apache-ok"
 # shellcheck disable=SC2086
 apache_env install_into apache-ok $apache_args || { cat "$TMP/apache-ok.log"; die 'Apache installation failed'; }
-cmp "$TMP/nginx-conf/apache.conf" "$TMP/apache-ok/etc/proxy/craftcloud.apache.conf" || die 'Apache file differs from the rendered template'
+cmp "$TMP/apache/available/craftcloud.conf" "$TMP/apache-ok/etc/proxy/craftcloud.apache.conf" || die 'Apache file differs from the rendered template'
 grep -F 'apachectl graceful' "$TMP/nginx.log" >/dev/null || die 'Apache was not reloaded'
 ok 'Apache: modules are checked and named, configuration installed after configtest'
 
@@ -366,5 +396,113 @@ rm -f "$TMP/ext-ca/opt/releases/0.3.0/deploy/compose/compose.external-db.yaml" "
 if ctl_env ext-ca sh "$TMP/ext-ca/opt/current/deploy/install/craftcloud-ctl" start >"$TMP/ext-ca.start.log" 2>&1; then die 'start with a missing overlay must fail'; fi
 grep -F 'has no compose.external-db.yaml' "$TMP/ext-ca.start.log" >/dev/null || { cat "$TMP/ext-ca.start.log"; die 'missing overlay message'; }
 ok 'craftcloud-ctl: overlays follow the recorded choices; a missing overlay stops instead of starting the bundled services'
+
+
+# --- 9. review fixes -------------------------------------------------------------------------
+(cd "$TMP/output" && sha256sum craftcloud-0.3.0.tar.gz >>SHA256SUMS)
+# M4/M5: Apache - the site is enabled inside the guarded change, a failure undoes it.
+[ -L "$TMP/apache/enabled/craftcloud.conf" ] || die 'the Apache site was not enabled by a2ensite'
+awk '/a2ensite/ {en=1} /configtest enabled=/ {if (!en) bad=1; if ($0 !~ /enabled=yes/) bad=1} END {exit bad}' "$TMP/nginx.log" || die 'a2ensite must run before configtest, and the site must be enabled while it is tested'
+ok 'Apache: site enabled before the configuration test'
+rm -f "$TMP/apache/enabled/craftcloud.conf" "$TMP/apache/available/craftcloud.conf"
+: >"$TMP/nginx.log"
+if (export APACHE_FAIL=1; apache_env install_into apache-fail $apache_args); then die 'a failing Apache configtest must fail the installation'; fi
+grep -F 'the change was undone' "$TMP/apache-fail.log" >/dev/null || die 'undo message missing'
+[ ! -e "$TMP/apache/enabled/craftcloud.conf" ] && [ ! -L "$TMP/apache/enabled/craftcloud.conf" ] || die 'the site stays enabled after a failed test'
+[ ! -e "$TMP/apache/available/craftcloud.conf" ] || die 'the new site file stays after a failed test'
+grep -F 'a2dissite craftcloud' "$TMP/nginx.log" >/dev/null || die 'a2dissite not called'
+if grep -F 'graceful' "$TMP/nginx.log" >/dev/null; then die 'Apache was reloaded although the test failed'; fi
+ok 'Apache: a failed configtest disables the site, restores the file and does not reload'
+: >"$TMP/nginx.log"
+if (export A2ENSITE_FAIL=1; apache_env install_into apache-a2fail $apache_args); then die 'a failing a2ensite must fail the installation'; fi
+[ ! -L "$TMP/apache/enabled/craftcloud.conf" ] && [ ! -e "$TMP/apache/available/craftcloud.conf" ] || die 'a failed a2ensite left files behind'
+ok 'Apache: a failed a2ensite leaves nothing behind'
+
+# certbot: the HTTP site is enabled and reloaded BEFORE certbot runs
+rm -rf /etc/letsencrypt/live/cloud.example.test
+: >"$TMP/nginx.log"
+# shellcheck disable=SC2086
+PATH="$TMP/certbot-bin:$PATH" apache_env install_into apache-certbot --proxy apache --http-port 28340 --https-port 28341 --local-port 28342 --local-figcraft-port 28343 --proxy-install --certbot || { cat "$TMP/apache-certbot.log"; die 'certbot flow failed'; }
+awk '/certbot certonly --apache/ {c=NR; if ($0 !~ /site_enabled=yes/) bad=1} /a2ensite/ {if (!a) a=NR} /apachectl graceful/ {if (!g) g=NR} END {exit (bad || !c || !a || !g || a > c || g > c)}' "$TMP/nginx.log" || { cat "$TMP/nginx.log"; die 'certbot ran before the HTTP site was enabled and reloaded'; }
+rm -rf /etc/letsencrypt/live/cloud.example.test
+ok 'certbot: the HTTP site is enabled and loaded before certbot certonly'
+
+# M2: administrator URL rules
+echo 'postgres://admin:adminsecret99@other.example:5432/postgres?sslmode=verify-full' >"$TMP/admin-otherhost"
+expect_fail adm-host 'must name the same host' --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-otherhost" --proxy caddy --http-port 28300 --https-port 28301
+echo 'postgres://admin:adminsecret99@db.internal.example:5432/postgres?sslmode=require' >"$TMP/admin-require"
+expect_fail adm-ssl 'sslmode=verify-full' --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-require" --proxy caddy --http-port 28300 --https-port 28301
+echo 'postgres://admin:adminsecret99@db.internal.example:5433/postgres?sslmode=verify-full' >"$TMP/admin-port"
+expect_fail adm-port 'same port' --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-port" --proxy caddy --http-port 28300 --https-port 28301
+echo 'postgres://admin:adm%40secret@db.internal.example:5432/postgres?sslmode=verify-full' >"$TMP/admin-pct"
+expect_fail adm-pct 'not percent-decoded' --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-pct" --proxy caddy --http-port 28300 --https-port 28301
+echo 'postgres://db.internal.example:5432/postgres?sslmode=verify-full' >"$TMP/admin-nouser"
+expect_fail adm-nouser 'user name and a password' --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-nouser" --proxy caddy --http-port 28300 --https-port 28301
+for f in adm-host adm-ssl adm-port adm-pct adm-nouser; do
+    if grep -F -e adminsecret99 -e adm%40secret -e other.example "$TMP/$f.log" >/dev/null; then die "$f: the administrator URL was echoed"; fi
+done
+ok 'administrator URL: same host and port as the application URL, verify-full for remote, no echo'
+
+# M3: the password never reaches an argument; it travels in a PGPASSFILE on a tmpfs
+install_into adm-run --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-url" --proxy caddy --http-port 28300 --https-port 28301 || { cat "$TMP/adm-run.log"; die 'administrator run failed'; }
+grep -F -- '--tmpfs /run/pw' "$TMP/adm-run.docker.log" >/dev/null || die 'the administrator container has no tmpfs for the password file'
+grep -F 'PGPASSFILE=/run/pw/pgpass' "$TMP/adm-run.docker.log" >/dev/null || die 'the administrator script does not use a PGPASSFILE'
+grep -F 'psql --no-psqlrc -v ON_ERROR_STOP=1 --quiet -f /run/roles.sql' "$TMP/adm-run.docker.log" >/dev/null || die 'psql command line missing'
+if grep -F -e adminsecret99 -e db.internal.example "$TMP/adm-run.docker.log" "$TMP/adm-run.log" >/dev/null; then die 'the administrator password or host is part of a docker argument or of the output'; fi
+ok 'administrator run: no password and no URL in any argument, PGPASSFILE on a tmpfs'
+
+# L1 / L2 / L3: names, loopback with verify-full, logging of the role passwords
+echo 'postgres://localhost:5432/craftcloud?sslmode=verify-full' >"$TMP/url-lo-vf"
+expect_fail l1-localhost 'cannot work from a container' --db external --database-url-file "$TMP/url-lo-vf" --proxy caddy --http-port 28300 --https-port 28301
+echo 'postgres://host.docker.internal:5432/craftcloud?sslmode=verify-full' >"$TMP/url-hdi-vf"
+install_into l1-hdi --db external --database-url-file "$TMP/url-hdi-vf" --proxy caddy --http-port 28300 --https-port 28301 || { cat "$TMP/l1-hdi.log"; die 'host.docker.internal with verify-full must be accepted'; }
+[ "$(envget l1-hdi CRAFTCLOUD_DB_TARGET)" = host.docker.internal:5432/craftcloud ] || die 'the name must be kept'
+ok 'verify-full: a loopback name is refused, host.docker.internal is kept'
+for bad in Craftcloud 1db craft-cloud postgres template1 user select 'a;b' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; do
+    echo "postgres://db.internal.example:5432/$bad?sslmode=verify-full" >"$TMP/url-name2"
+    if install_into l2-name --db external --database-url-file "$TMP/url-name2" --proxy caddy --http-port 28300 --https-port 28301; then die "database name $bad was accepted"; fi
+done
+ok 'database names: upper case, leading digit, hyphen, reserved words, system databases and 64+ characters are refused'
+roles_sql=$TMP/ext-ca/etc/external-db-roles.sql
+[ -f "$roles_sql" ] || { install_into l3-sql --db external --database-url-file "$TMP/url-ca" --proxy caddy --http-port 28300 --https-port 28301; roles_sql=$TMP/l3-sql/etc/external-db-roles.sql; }
+grep -F "SET log_statement = 'none';" "$roles_sql" >/dev/null || die 'log_statement is not switched off'
+grep -F "SET log_min_error_statement = 'panic';" "$roles_sql" >/dev/null || die 'log_min_error_statement is not switched off'
+grep -F '\if :ops_super' "$roles_sql" >/dev/null || die 'the logging switch must be skipped with a warning for non-superusers'
+grep -F "format('CREATE DATABASE %I" "$roles_sql" >/dev/null || die 'the database name must be quoted with %I'
+awk '/log_statement/ {l=NR} /ALTER ROLE/ {if (!a) a=NR} END {exit !(l && a && l < a)}' "$roles_sql" || die 'logging must be switched off before ALTER ROLE'
+ok 'role SQL: logging off before the passwords, warning path, database name quoted'
+
+# L4: rollback to a release that lacks an overlay changes nothing
+rel=$TMP/nginx-ok/opt/releases
+cp -r "$rel/0.3.0" "$rel/0.2.9"
+rm -f "$rel/0.2.9/deploy/compose/compose.local-proxy.yaml"
+printf '%s\n' "$rel/0.2.9" >"$TMP/nginx-ok/etc/previous-release"
+image_before=$(envget nginx-ok CRAFTCLOUD_IMAGE)
+link_before=$(readlink "$TMP/nginx-ok/opt/current")
+if ctl_env nginx-ok sh "$TMP/nginx-ok/opt/current/deploy/install/craftcloud-ctl" rollback >"$TMP/rollback-missing.log" 2>&1; then die 'rollback to a release without the overlay must fail'; fi
+grep -F 'has no compose.local-proxy.yaml' "$TMP/rollback-missing.log" >/dev/null || die 'rollback message missing'
+[ "$(envget nginx-ok CRAFTCLOUD_IMAGE)" = "$image_before" ] || die 'rollback changed the image setting before the check'
+[ "$(readlink "$TMP/nginx-ok/opt/current")" = "$link_before" ] || die 'rollback switched the symlink before the check'
+ok 'rollback: the target release is checked before anything changes'
+
+# L5: a leftover craftcloud-figcraft image setting is ignored
+printf 'CRAFTCLOUD_FIGCRAFT_IMAGE=craftcloud-figcraft:abc\n' >>"$TMP/nginx-ok/etc/craftcloud.env"
+ctl_env nginx-ok sh "$TMP/nginx-ok/opt/current/deploy/install/craftcloud-ctl" stop >"$TMP/l5.log" 2>&1 || die 'ctl stop failed'
+grep -F 'retired craftcloud-figcraft image' "$TMP/l5.log" >/dev/null || die 'no warning for the retired image'
+if grep -q '^CRAFTCLOUD_FIGCRAFT_IMAGE=' "$TMP/nginx-ok/etc/craftcloud.env"; then die 'the retired image setting was not removed'; fi
+ok 'CRAFTCLOUD_FIGCRAFT_IMAGE naming craftcloud-figcraft is ignored with a warning'
+
+# L8: status defaults for an environment file without the OPS-02 keys
+grep -v -e '^CRAFTCLOUD_DB=' -e '^CRAFTCLOUD_PROXY=' "$TMP/proxy-free/etc/craftcloud.env" >"$TMP/env.old" && cp "$TMP/env.old" "$TMP/proxy-free/etc/craftcloud.env"
+ctl_env proxy-free sh "$TMP/proxy-free/opt/current/deploy/install/craftcloud-ctl" status >"$TMP/l8.log" 2>&1 || die 'ctl status failed'
+grep -F 'Database: bundled; reverse proxy: caddy' "$TMP/l8.log" >/dev/null || die 'status defaults missing'
+ok 'status prints the defaults bundled and caddy'
+
+# M1: one routable network per mode
+install_into m1-extproxy --db external --database-url-file "$TMP/url-admin" --db-admin-url-file "$TMP/admin-url" --proxy nginx --local-port 28350 --local-figcraft-port 28351 || { cat "$TMP/m1-extproxy.log"; die 'external database with own proxy failed'; }
+grep -F -- 'compose.external-db.yaml' "$TMP/m1-extproxy.docker.log" | grep -F -- 'compose.external-db-proxy.yaml' >/dev/null || die 'external database with an own proxy must use the proxy network overlay'
+if grep -F -- 'compose.external-db-egress.yaml' "$TMP/m1-extproxy.docker.log" >/dev/null; then die 'dbegress must not be added next to the proxy network'; fi
+grep -F -- 'compose.external-db-egress.yaml' "$TMP/ext-ca.docker.log" >/dev/null || die 'external database with Caddy must use the egress overlay'
+ok 'external database: proxy network with an own proxy, dbegress with Caddy'
 
 echo 'ops02-config: passed'

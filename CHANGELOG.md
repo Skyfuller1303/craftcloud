@@ -16,6 +16,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and ver
 - The installer detects a PostgreSQL server on the host (`--db auto|bundled|external`, `--database-url-file`, `--db-admin-url-file`) and explains that MySQL and MariaDB are not supported. For an existing database it writes the SQL for the two roles privately and never prints credentials or the database address.
 - The installer can use your own nginx or Apache instead of Caddy (`--proxy auto|caddy|nginx|apache|none`, `--proxy-install`, `--certbot`): templates in `/etc/craftcloud/proxy`, a backup and a configuration test before any change, and a published loopback port instead of public ports. The proxy replaces `X-Forwarded-For`; CraftCloud trusts only the gateway of its own `proxy` network.
 - `cargo xtask release` also builds `craftcloud-<version>-image-<arch>.tar.zst` with a `SHA256SUMS` entry (`--no-image`, `--image-arch`); `install.sh --image-archive` and `craftcloud-ctl upgrade --image-archive` load it instead of building on the server.
+- With an external database and your own proxy the server has exactly one routable network; all routable Compose subnets are pinned. The administrator URL follows the same TLS and host rules as the database URL and its password never appears in a process argument. Apache site activation, configuration test and reload are one guarded change, and the Apache templates keep URLs out of all logs.
 
 ### Changed
 

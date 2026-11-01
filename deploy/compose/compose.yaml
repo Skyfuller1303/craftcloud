@@ -284,7 +284,10 @@ services:
 
 networks:
   # Published ports and outbound access (ACME) live here; only Caddy is attached.
-  edge: {}
+  edge:
+    ipam:
+      config:
+        - subnet: ${CRAFTCLOUD_EDGE_SUBNET:-172.29.208.0/24}
   # Caddy <-> server. `internal`: no route to the outside world.
   frontend:
     internal: true

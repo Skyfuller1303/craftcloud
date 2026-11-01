@@ -1,0 +1,19 @@
+# Routable network to an external PostgreSQL when the bundled Caddy is the proxy
+# (OPS-02). The subnet is pinned so that a PostgreSQL on this host can allow it in
+# pg_hba.conf (default 172.29.207.0/24, override with CRAFTCLOUD_DBEGRESS_SUBNET).
+services:
+  migrate:
+    networks: [dbegress]
+  server:
+    networks: [dbegress]
+  backup:
+    networks: [dbegress]
+  restore:
+    networks: [dbegress]
+
+networks:
+  # Not `internal`: the database is outside the Compose project.
+  dbegress:
+    ipam:
+      config:
+        - subnet: ${CRAFTCLOUD_DBEGRESS_SUBNET:-172.29.207.0/24}

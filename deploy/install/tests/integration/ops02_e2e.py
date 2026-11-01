@@ -39,6 +39,7 @@ class Client:
         self.source_address = (source_address, 0) if source_address else None
         self.extra_headers = extra_headers or {}
         self.token = None
+        self.last_headers = []
 
     def request(self, method, path, body=None, headers=None, timeout=300):
         connection = http.client.HTTPSConnection(
@@ -53,6 +54,7 @@ class Client:
             connection.request(method, path, body=body, headers=merged)
             response = connection.getresponse()
             data = response.read()
+            self.last_headers = response.getheaders()
             return response.status, dict(response.getheaders()), data
         finally:
             connection.close()
@@ -98,6 +100,13 @@ def run_checks(args):
     if status != 200 or b"<" not in data[:200]:
         fail(f"login page answered {status}")
     ok("the admin login page is served through the proxy")
+    for path in ("/admin/", "/api/v1/info"):
+        client.request("GET", path)
+        names = [name.lower() for name, _ in client.last_headers]
+        for header in ("x-content-type-options", "referrer-policy"):
+            if names.count(header) != 1:
+                fail(f"{path}: header {header} appears {names.count(header)} times, expected once (parity with the bundled Caddy)")
+    ok("X-Content-Type-Options and Referrer-Policy appear exactly once, as with the bundled Caddy")
     status, _, data = client.request("GET", "/health/ready")
     if status != 200:
         fail(f"/health/ready answered {status}")

@@ -13,4 +13,7 @@ services:
 networks:
   # SMTP requires an outbound route. Restrict host firewall egress to the
   # configured relay and its port; only the server joins this network.
-  smtp_egress: {}
+  smtp_egress:
+    ipam:
+      config:
+        - subnet: ${CRAFTCLOUD_SMTP_SUBNET:-172.29.209.0/24}
