@@ -58,7 +58,10 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
         since: 7,
         deferred_column: Some("head_version_id"),
     },
+    table("blob_quota_groups", 22),
     table("blobs", 8),
+    table("archive_backups", 22),
+    table("archive_backup_refs", 22),
     table("upload_sessions", 8),
     table("file_versions", 9),
     table("grants", 16),
@@ -87,6 +90,8 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
 /// - `password_reset_tokens`: single-use credentials; issue new links.
 /// - `storage_binding`: the restored store gets a fresh identity.
 /// - `maintenance_runs`: a run log that the new instance rebuilds.
+/// - `archive_gc_state`: restored databases always start with an incomplete
+///   external-backup inventory; operators must explicitly complete inventory.
 pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("sessions", 4),
     ("password_reset_tokens", 4),
@@ -94,6 +99,7 @@ pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("device_refresh_history", 15),
     ("storage_binding", 10),
     ("maintenance_runs", 10),
+    ("archive_gc_state", 22),
     ("file_locks", 16),
     ("two_factor_login_challenges", 17),
     ("outbound_emails", 19),
@@ -114,6 +120,7 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "device_refresh_history",
     "storage_binding",
     "maintenance_runs",
+    "archive_gc_state",
     "file_locks",
     "two_factor_login_challenges",
     "outbound_emails",
@@ -205,11 +212,11 @@ mod tests {
         // AC-06 adds FigCraft state at 18; AC-09 adds one-use email state at 19.
         assert_eq!(
             backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len() - 16
+            BACKUP_TABLES.len() - 19
         );
         assert_eq!(
             backup_tables_for(14).unwrap().len(),
-            BACKUP_TABLES.len() - 16
+            BACKUP_TABLES.len() - 19
         );
         assert_eq!(
             excluded_tables_for(14),
@@ -236,7 +243,7 @@ mod tests {
         assert!(!excluded_tables_for(15).contains(&"file_locks"));
         assert_eq!(
             backup_tables_for(16).unwrap().len(),
-            BACKUP_TABLES.len() - 15
+            BACKUP_TABLES.len() - 18
         );
         assert_eq!(
             excluded_tables_for(16),
@@ -301,6 +308,9 @@ mod tests {
                 < position(&backup_20, "member_app_access")
         );
         assert!(!excluded_tables_for(20).contains(&"member_app_access"));
+        assert!(position(&backup_20, "blob_quota_groups").is_none());
+        let backup_22 = backup_tables_for(22).unwrap();
+        assert!(position(&backup_22, "blob_quota_groups") < position(&backup_22, "blobs"));
         assert!(!is_backup_table("outbound_emails"));
         assert!(!is_backup_table("email_verification_tokens"));
         assert!(!is_backup_table("pending_email_changes"));

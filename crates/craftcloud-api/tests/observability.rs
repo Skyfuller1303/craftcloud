@@ -810,6 +810,11 @@ mod tests {
         assert!(h["server"]["uptime_seconds"].as_u64().is_some());
         // No backup recorded yet (see tests/backup.rs for the age after one).
         assert_eq!(h["backup"]["last_success_age_seconds"], Value::Null);
+        assert_eq!(h["archive"]["configured"], false);
+        assert_eq!(h["archive"]["provider_type"], Value::Null);
+        assert_eq!(h["archive"]["endpoint"], Value::Null);
+        assert_eq!(h["archive"]["local_bytes"], Value::Null);
+        assert_eq!(h["archive"]["last_error_code"], Value::Null);
         assert_eq!(first.headers[header::CACHE_CONTROL], "no-store");
 
         // After a maintenance run the view names it, and the run sweeps probe

@@ -724,7 +724,8 @@ mod tests {
                 "maintenance",
                 "audit",
                 "server",
-                "backup"
+                "backup",
+                "archive"
             ]
             .into_iter()
             .collect::<BTreeSet<_>>()

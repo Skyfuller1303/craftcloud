@@ -56,6 +56,9 @@ const DEFAULT_DEVICE_ABSOLUTE_DAYS: u64 = 90;
 const DEVICE_ABSOLUTE_DAYS_RANGE: (u64, u64) = (1, 365);
 const DEFAULT_VERIFY_BYTES_PER_RUN: u64 = 1024 * 1024 * 1024;
 const VERIFY_BYTES_PER_RUN_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
+const DEFAULT_ARCHIVE_AFTER: Duration = Duration::from_secs(24 * 3600);
+const DEFAULT_ARCHIVE_SFTP_PORT: u64 = 23;
+const ARCHIVE_SFTP_PORT_RANGE: (u64, u64) = (1, u16::MAX as u64);
 
 /// Keys reserved for later milestones. They are rejected explicitly instead
 /// of being silently ignored.
@@ -128,7 +131,44 @@ const SUPPORTED_KEYS: &[&str] = &[
     "GRAPH_SENDER",
     "GRAPH_SAVE_TO_SENT",
     "APP_CATALOG_FILE",
+    "ARCHIVE_STORE",
+    "ARCHIVE_AFTER",
+    "ARCHIVE_MAX_MBPS",
+    "ARCHIVE_S3_ENDPOINT",
+    "ARCHIVE_S3_REGION",
+    "ARCHIVE_S3_BUCKET",
+    "ARCHIVE_S3_PREFIX",
+    "ARCHIVE_S3_ACCESS_KEY_ID_FILE",
+    "ARCHIVE_S3_SECRET_ACCESS_KEY_FILE",
+    "ARCHIVE_SFTP_HOST",
+    "ARCHIVE_SFTP_PORT",
+    "ARCHIVE_SFTP_USER",
+    "ARCHIVE_SFTP_BASE_DIRECTORY",
+    "ARCHIVE_SFTP_PRIVATE_KEY_FILE",
+    "ARCHIVE_SFTP_KNOWN_HOSTS_FILE",
 ];
+
+/// Optional external archive provider. Credential material is loaded only by
+/// server startup and is never included in diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveSettings {
+    S3 {
+        endpoint: String,
+        region: String,
+        bucket: String,
+        prefix: Option<String>,
+        access_key_id_file: PathBuf,
+        secret_access_key_file: PathBuf,
+    },
+    Sftp {
+        host: String,
+        port: u16,
+        username: String,
+        base_directory: String,
+        private_key_file: PathBuf,
+        known_hosts_file: PathBuf,
+    },
+}
 
 /// Mail delivery settings. Secrets are read only by server startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +362,14 @@ pub struct Config {
     pub metrics_token_file: Option<PathBuf>,
     /// Optional SMTP delivery. `None` preserves link-copy mode.
     pub mail: Option<MailSettings>,
+    /// Optional external archive provider. Present settings are validated
+    /// structurally here; provider connectivity and secret contents are
+    /// checked during startup composition.
+    pub archive: Option<ArchiveSettings>,
+    /// Time a superseded blob remains local before archival.
+    pub archive_after: Duration,
+    /// Optional archive transfer bandwidth limit in megabits per second.
+    pub archive_max_mbps: Option<u64>,
 }
 
 impl Config {
@@ -479,6 +527,13 @@ impl Config {
         let secret_key_file = field(&mut errors, env, "SECRET_KEY_FILE", parse_absolute_path);
         let secret_key_old_file =
             field(&mut errors, env, "SECRET_KEY_OLD_FILE", parse_absolute_path);
+        let archive_requested = env.contains_key(&format!("{PREFIX}ARCHIVE_STORE"));
+        let archive = parse_archive(env, &mut errors);
+        let archive_after = field(&mut errors, env, "ARCHIVE_AFTER", parse_archive_after)
+            .unwrap_or(DEFAULT_ARCHIVE_AFTER);
+        let archive_max_mbps = field(&mut errors, env, "ARCHIVE_MAX_MBPS", |key, raw| {
+            parse_ranged(key, raw, (1, 100_000))
+        });
         let mail = parse_mail(env, &mut errors);
         if mail.is_some() {
             for (key, present) in [
@@ -542,6 +597,25 @@ impl Config {
                 Ok(path)
             }
         });
+        if archive_requested {
+            for (key, present) in [
+                ("DATABASE_URL_FILE", db_url_file.is_some()),
+                ("STORAGE_DIR", storage_dir.is_some()),
+                ("SECRET_KEY_FILE", secret_key_file.is_some()),
+            ] {
+                if !present {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{key}"),
+                        "required when archive storage is enabled",
+                    ));
+                }
+            }
+        } else if archive_max_mbps.is_some() {
+            errors.push(ConfigError::new(
+                &format!("{PREFIX}ARCHIVE_MAX_MBPS"),
+                "requires CRAFTCLOUD_ARCHIVE_STORE",
+            ));
+        }
         let max_file_size_bytes = field(&mut errors, env, "MAX_FILE_SIZE_BYTES", |key, raw| {
             parse_ranged(key, raw, MAX_FILE_SIZE_RANGE)
         })
@@ -744,6 +818,9 @@ impl Config {
                 metrics_addr,
                 metrics_token_file,
                 mail,
+                archive,
+                archive_after,
+                archive_max_mbps,
             })
         } else {
             Err(errors)
@@ -795,6 +872,300 @@ fn parse_figcraft(
         public_url: public_url?,
         key_file: key_file?,
     })
+}
+
+fn parse_archive(
+    env: &BTreeMap<String, String>,
+    errors: &mut Vec<ConfigError>,
+) -> Option<ArchiveSettings> {
+    let store_key = format!("{PREFIX}ARCHIVE_STORE");
+    let store = env.get(&store_key).map(|value| value.trim());
+    let s3_keys = [
+        "ARCHIVE_S3_ENDPOINT",
+        "ARCHIVE_S3_REGION",
+        "ARCHIVE_S3_BUCKET",
+        "ARCHIVE_S3_PREFIX",
+        "ARCHIVE_S3_ACCESS_KEY_ID_FILE",
+        "ARCHIVE_S3_SECRET_ACCESS_KEY_FILE",
+    ];
+    let sftp_keys = [
+        "ARCHIVE_SFTP_HOST",
+        "ARCHIVE_SFTP_PORT",
+        "ARCHIVE_SFTP_USER",
+        "ARCHIVE_SFTP_BASE_DIRECTORY",
+        "ARCHIVE_SFTP_PRIVATE_KEY_FILE",
+        "ARCHIVE_SFTP_KNOWN_HOSTS_FILE",
+    ];
+    let has_provider_fields = s3_keys
+        .iter()
+        .chain(sftp_keys.iter())
+        .any(|suffix| env.contains_key(&format!("{PREFIX}{suffix}")));
+    let Some(store) = store else {
+        if has_provider_fields {
+            for suffix in s3_keys.iter().chain(sftp_keys.iter()) {
+                if env.contains_key(&format!("{PREFIX}{suffix}")) {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{suffix}"),
+                        "requires CRAFTCLOUD_ARCHIVE_STORE",
+                    ));
+                }
+            }
+        }
+        return None;
+    };
+
+    let get = |suffix: &str| env.get(&format!("{PREFIX}{suffix}")).map(|raw| raw.trim());
+    let required = |suffix: &str, errors: &mut Vec<ConfigError>| -> Option<String> {
+        match get(suffix).filter(|value| !value.is_empty()) {
+            Some(value) => Some(value.to_owned()),
+            None => {
+                errors.push(ConfigError::new(&format!("{PREFIX}{suffix}"), "required"));
+                None
+            }
+        }
+    };
+    let secret_path = |suffix: &str, errors: &mut Vec<ConfigError>| -> Option<PathBuf> {
+        match get(suffix) {
+            Some(raw) => match parse_absolute_path(&format!("{PREFIX}{suffix}"), raw) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    errors.push(error);
+                    None
+                }
+            },
+            None => {
+                errors.push(ConfigError::new(&format!("{PREFIX}{suffix}"), "required"));
+                None
+            }
+        }
+    };
+    match store {
+        "s3" => {
+            for suffix in sftp_keys {
+                if env.contains_key(&format!("{PREFIX}{suffix}")) {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{suffix}"),
+                        "not valid with CRAFTCLOUD_ARCHIVE_STORE=s3",
+                    ));
+                }
+            }
+            let endpoint = required("ARCHIVE_S3_ENDPOINT", errors).and_then(|raw| {
+                let key = format!("{PREFIX}ARCHIVE_S3_ENDPOINT");
+                match parse_archive_endpoint(&key, &raw) {
+                    Ok(endpoint) => Some(endpoint),
+                    Err(error) => {
+                        errors.push(error);
+                        None
+                    }
+                }
+            });
+            let region = required("ARCHIVE_S3_REGION", errors);
+            let bucket = required("ARCHIVE_S3_BUCKET", errors).and_then(|bucket| {
+                if bucket.len() <= 63
+                    && bucket.len() >= 3
+                    && bucket.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'-'
+                            || byte == b'.'
+                    })
+                    && bucket
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && bucket
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    Some(bucket)
+                } else {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}ARCHIVE_S3_BUCKET"),
+                        "must be a lowercase DNS-style bucket name between 3 and 63 characters",
+                    ));
+                    None
+                }
+            });
+            let prefix = get("ARCHIVE_S3_PREFIX")
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let access_key_id_file = secret_path("ARCHIVE_S3_ACCESS_KEY_ID_FILE", errors);
+            let secret_access_key_file = secret_path("ARCHIVE_S3_SECRET_ACCESS_KEY_FILE", errors);
+            match (
+                endpoint,
+                region,
+                bucket,
+                access_key_id_file,
+                secret_access_key_file,
+            ) {
+                (
+                    Some(endpoint),
+                    Some(region),
+                    Some(bucket),
+                    Some(access_key_id_file),
+                    Some(secret_access_key_file),
+                ) => Some(ArchiveSettings::S3 {
+                    endpoint,
+                    region,
+                    bucket,
+                    prefix,
+                    access_key_id_file,
+                    secret_access_key_file,
+                }),
+                _ => None,
+            }
+        }
+        "sftp" => {
+            for suffix in s3_keys {
+                if env.contains_key(&format!("{PREFIX}{suffix}")) {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}{suffix}"),
+                        "not valid with CRAFTCLOUD_ARCHIVE_STORE=sftp",
+                    ));
+                }
+            }
+            let host = required("ARCHIVE_SFTP_HOST", errors).and_then(|host| {
+                if valid_sftp_host(&host) {
+                    Some(host)
+                } else {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}ARCHIVE_SFTP_HOST"),
+                        "must be a hostname or IP address without a port",
+                    ));
+                    None
+                }
+            });
+            let port = field(errors, env, "ARCHIVE_SFTP_PORT", |key, raw| {
+                parse_ranged(key, raw, ARCHIVE_SFTP_PORT_RANGE)
+            })
+            .unwrap_or(DEFAULT_ARCHIVE_SFTP_PORT);
+            let username = required("ARCHIVE_SFTP_USER", errors).and_then(|user| {
+                if user.chars().any(char::is_control) {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}ARCHIVE_SFTP_USER"),
+                        "must not contain control characters",
+                    ));
+                    None
+                } else {
+                    Some(user)
+                }
+            });
+            let base_directory = required("ARCHIVE_SFTP_BASE_DIRECTORY", errors).and_then(|path| {
+                if path.starts_with('/')
+                    && path != "/"
+                    && !path.chars().any(char::is_control)
+                    && !path.split('/').any(|part| matches!(part, "." | ".."))
+                {
+                    Some(path)
+                } else {
+                    errors.push(ConfigError::new(
+                        &format!("{PREFIX}ARCHIVE_SFTP_BASE_DIRECTORY"),
+                        "must be an absolute remote path without dot segments",
+                    ));
+                    None
+                }
+            });
+            let private_key_file = secret_path("ARCHIVE_SFTP_PRIVATE_KEY_FILE", errors);
+            let known_hosts_file = secret_path("ARCHIVE_SFTP_KNOWN_HOSTS_FILE", errors);
+            match (
+                host,
+                username,
+                base_directory,
+                private_key_file,
+                known_hosts_file,
+            ) {
+                (
+                    Some(host),
+                    Some(username),
+                    Some(base_directory),
+                    Some(private_key_file),
+                    Some(known_hosts_file),
+                ) => Some(ArchiveSettings::Sftp {
+                    host,
+                    port: u16::try_from(port).unwrap_or(u16::MAX),
+                    username,
+                    base_directory,
+                    private_key_file,
+                    known_hosts_file,
+                }),
+                _ => None,
+            }
+        }
+        _ => {
+            errors.push(ConfigError::new(&store_key, "expected `s3` or `sftp`"));
+            None
+        }
+    }
+}
+
+fn parse_archive_endpoint(key: &str, raw: &str) -> Result<String, ConfigError> {
+    let bad = |why: &str| Err(ConfigError::new(key, format!("{why} (value not shown)")));
+    let Ok(url) = Url::parse(raw) else {
+        return bad("must be an absolute HTTPS endpoint");
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return bad("must not contain credentials, query, or fragment");
+    }
+    let Some(host) = url.host() else {
+        return bad("must contain a host");
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(&host) => {}
+        "http" => return bad("HTTP is allowed only for loopback endpoints"),
+        _ => return bad("scheme must be HTTPS"),
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+fn valid_sftp_host(host: &str) -> bool {
+    if host.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn parse_archive_after(key: &str, raw: &str) -> Result<Duration, ConfigError> {
+    let value = raw.trim();
+    let seconds = if value == "0" {
+        0
+    } else if let Some(days) = value.strip_suffix('d') {
+        parse_ranged(key, days, (1, 90))?
+            .checked_mul(24 * 3600)
+            .ok_or_else(|| ConfigError::new(key, "duration is out of range"))?
+    } else if let Some(hours) = value.strip_suffix('h') {
+        parse_ranged(key, hours, (1, 90 * 24))?
+            .checked_mul(3600)
+            .ok_or_else(|| ConfigError::new(key, "duration is out of range"))?
+    } else {
+        return Err(ConfigError::new(
+            key,
+            "expected `0`, or a duration such as `24h` or `90d`",
+        ));
+    };
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_figcraft_url(
@@ -1438,6 +1809,135 @@ mod tests {
         assert_eq!(config.database.url_file, None);
         assert_eq!(config.database.max_connections, 10);
         assert_eq!(config.database.connect_timeout, Duration::from_secs(5));
+        assert!(config.archive.is_none());
+        assert_eq!(config.archive_after, Duration::from_secs(24 * 3600));
+        assert_eq!(config.archive_max_mbps, None);
+    }
+
+    #[test]
+    fn archive_configuration_requires_complete_secure_provider_settings() {
+        let absolute = if cfg!(windows) {
+            r"C:\run\secrets\archive"
+        } else {
+            "/run/secrets/archive"
+        };
+        let errors = errors_of(&[("CRAFTCLOUD_ARCHIVE_STORE", "s3")]);
+        for key in [
+            "CRAFTCLOUD_ARCHIVE_S3_ENDPOINT",
+            "CRAFTCLOUD_ARCHIVE_S3_REGION",
+            "CRAFTCLOUD_ARCHIVE_S3_BUCKET",
+            "CRAFTCLOUD_ARCHIVE_S3_ACCESS_KEY_ID_FILE",
+            "CRAFTCLOUD_ARCHIVE_S3_SECRET_ACCESS_KEY_FILE",
+            "CRAFTCLOUD_DATABASE_URL_FILE",
+            "CRAFTCLOUD_STORAGE_DIR",
+            "CRAFTCLOUD_SECRET_KEY_FILE",
+        ] {
+            assert!(keys(&errors).contains(&key), "missing {key}");
+        }
+
+        let valid = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_ARCHIVE_STORE", "s3"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ENDPOINT",
+                "https://objects.example.org",
+            ),
+            ("CRAFTCLOUD_ARCHIVE_S3_REGION", "eu-central-1"),
+            ("CRAFTCLOUD_ARCHIVE_S3_BUCKET", "craftcloud-archive"),
+            ("CRAFTCLOUD_ARCHIVE_S3_ACCESS_KEY_ID_FILE", absolute),
+            ("CRAFTCLOUD_ARCHIVE_S3_SECRET_ACCESS_KEY_FILE", absolute),
+            ("CRAFTCLOUD_DATABASE_URL_FILE", absolute),
+            ("CRAFTCLOUD_STORAGE_DIR", absolute),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", absolute),
+            ("CRAFTCLOUD_ARCHIVE_AFTER", "0"),
+        ]))
+        .unwrap();
+        assert!(matches!(valid.archive, Some(ArchiveSettings::S3 { .. })));
+        assert_eq!(valid.archive_after, Duration::ZERO);
+        assert_eq!(valid.archive_max_mbps, None);
+
+        let bandwidth_limit = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_ARCHIVE_STORE", "s3"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ENDPOINT",
+                "https://objects.example.org",
+            ),
+            ("CRAFTCLOUD_ARCHIVE_S3_REGION", "eu-central-1"),
+            ("CRAFTCLOUD_ARCHIVE_S3_BUCKET", "craftcloud-archive"),
+            ("CRAFTCLOUD_ARCHIVE_S3_ACCESS_KEY_ID_FILE", absolute),
+            ("CRAFTCLOUD_ARCHIVE_S3_SECRET_ACCESS_KEY_FILE", absolute),
+            ("CRAFTCLOUD_DATABASE_URL_FILE", absolute),
+            ("CRAFTCLOUD_STORAGE_DIR", absolute),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", absolute),
+            ("CRAFTCLOUD_ARCHIVE_MAX_MBPS", "100"),
+        ]))
+        .unwrap();
+        assert_eq!(bandwidth_limit.archive_max_mbps, Some(100));
+
+        for bad in ["-1", "91d", "2161h", "24", "0h"] {
+            let errors = errors_of(&[("CRAFTCLOUD_ARCHIVE_AFTER", bad)]);
+            assert!(keys(&errors).contains(&"CRAFTCLOUD_ARCHIVE_AFTER"), "{bad}");
+        }
+        let insecure = errors_of(&[
+            ("CRAFTCLOUD_ARCHIVE_STORE", "s3"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ENDPOINT",
+                "http://objects.example.org",
+            ),
+        ]);
+        assert!(keys(&insecure).contains(&"CRAFTCLOUD_ARCHIVE_S3_ENDPOINT"));
+        assert!(
+            !insecure
+                .iter()
+                .any(|error| error.message.contains("objects.example.org"))
+        );
+    }
+
+    #[test]
+    fn sftp_archive_requires_pinned_host_key_and_absolute_paths() {
+        let absolute = if cfg!(windows) {
+            r"C:\run\secrets\archive"
+        } else {
+            "/run/secrets/archive"
+        };
+        let config = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_ARCHIVE_STORE", "sftp"),
+            ("CRAFTCLOUD_ARCHIVE_SFTP_HOST", "storage.example.org"),
+            ("CRAFTCLOUD_ARCHIVE_SFTP_USER", "archive"),
+            (
+                "CRAFTCLOUD_ARCHIVE_SFTP_BASE_DIRECTORY",
+                "/craftcloud/archive",
+            ),
+            ("CRAFTCLOUD_ARCHIVE_SFTP_PRIVATE_KEY_FILE", absolute),
+            ("CRAFTCLOUD_ARCHIVE_SFTP_KNOWN_HOSTS_FILE", absolute),
+            ("CRAFTCLOUD_DATABASE_URL_FILE", absolute),
+            ("CRAFTCLOUD_STORAGE_DIR", absolute),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", absolute),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            config.archive,
+            Some(ArchiveSettings::Sftp { port: 23, .. })
+        ));
+        for invalid_host in ["storage.example.org:23", "user@storage.example.org"] {
+            let invalid = errors_of(&[
+                ("CRAFTCLOUD_ARCHIVE_STORE", "sftp"),
+                ("CRAFTCLOUD_ARCHIVE_SFTP_HOST", invalid_host),
+            ]);
+            assert!(keys(&invalid).contains(&"CRAFTCLOUD_ARCHIVE_SFTP_HOST"));
+        }
+        let bad = errors_of(&[
+            ("CRAFTCLOUD_ARCHIVE_STORE", "sftp"),
+            (
+                "CRAFTCLOUD_ARCHIVE_SFTP_BASE_DIRECTORY",
+                "/archive/../escape",
+            ),
+        ]);
+        assert!(keys(&bad).contains(&"CRAFTCLOUD_ARCHIVE_SFTP_BASE_DIRECTORY"));
+        let missing_pin = errors_of(&[
+            ("CRAFTCLOUD_ARCHIVE_STORE", "sftp"),
+            ("CRAFTCLOUD_ARCHIVE_SFTP_HOST", "storage.example.org"),
+        ]);
+        assert!(keys(&missing_pin).contains(&"CRAFTCLOUD_ARCHIVE_SFTP_KNOWN_HOSTS_FILE"));
     }
 
     #[test]

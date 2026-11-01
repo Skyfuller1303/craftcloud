@@ -111,14 +111,6 @@ async fn source_file(
     let DownloadTarget::Ready(info) = target else {
         return Err(not_found(headers));
     };
-    let Some(store) = &resolved.services.storage else {
-        return Err(unavailable(headers, "STORAGE_UNAVAILABLE"));
-    };
-    let key = ObjectKey::parse(&info.object_key).map_err(|_| internal(headers))?;
-    let mut source = store
-        .open_read(&key, None)
-        .await
-        .map_err(|_| unavailable(headers, "STORAGE_UNAVAILABLE"))?;
     if info.size_bytes < 0 || info.size_bytes as u64 > NATIVE_MAX_BYTES {
         return Err(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -127,26 +119,137 @@ async fn source_file(
             headers,
         ));
     }
+    let Some(size) = u64::try_from(info.size_bytes).ok() else {
+        return Err(internal(headers));
+    };
     let mut bytes = Vec::with_capacity(info.size_bytes as usize);
     let mut digest = Sha256::new();
-    while let Some(chunk) = source
-        .next_chunk()
-        .await
-        .map_err(|_| unavailable(headers, "STORAGE_UNAVAILABLE"))?
-    {
-        if bytes.len().saturating_add(chunk.len()) as u64 > NATIVE_MAX_BYTES {
+    if info.storage_tier == "archive" {
+        let (Some(archive), Some(crypto)) = (
+            resolved.services.archive_store.as_deref(),
+            resolved.services.archive_crypto.as_deref(),
+        ) else {
+            return Err(crate::versions::archive_unavailable(headers));
+        };
+        let (Some(raw_key), Some(raw_envelope)) = (
+            info.archive_object_key.as_deref(),
+            info.archive_wrapped_key.as_deref(),
+        ) else {
+            let _ = versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
             return Err(error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "FILE_TOO_LARGE",
-                "FigCraft documents may not exceed 64 MiB.",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_CORRUPT",
+                "The stored document failed integrity verification.",
+                headers,
+            ));
+        };
+        let (Ok(key), Ok(envelope)) = (
+            ObjectKey::parse(raw_key),
+            craftcloud_storage::WrappedDataKey::from_bytes(raw_envelope),
+        ) else {
+            let _ = versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_CORRUPT",
+                "The stored document failed integrity verification.",
+                headers,
+            ));
+        };
+        let mut source = match crate::archive_transport::open_archive_range(
+            archive,
+            crypto,
+            &key,
+            &envelope,
+            info.blob_id,
+            size,
+            None,
+        )
+        .await
+        {
+            Ok(source) => source,
+            Err(crate::archive_transport::ArchiveTransportError::Storage(_)) => {
+                return Err(crate::versions::archive_unavailable(headers));
+            }
+            Err(_) => {
+                let _ = versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "BLOB_CORRUPT",
+                    "The stored document failed integrity verification.",
+                    headers,
+                ));
+            }
+        };
+        if source.remaining() != size {
+            let _ = versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_CORRUPT",
+                "The stored document failed integrity verification.",
                 headers,
             ));
         }
-        digest.update(&chunk);
-        bytes.extend_from_slice(&chunk);
+        loop {
+            let Some(chunk) = (match source.next_chunk().await {
+                Ok(chunk) => chunk,
+                Err(crate::archive_transport::ArchiveTransportError::Storage(_)) => {
+                    return Err(crate::versions::archive_unavailable(headers));
+                }
+                Err(_) => {
+                    let _ =
+                        versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "BLOB_CORRUPT",
+                        "The stored document failed integrity verification.",
+                        headers,
+                    ));
+                }
+            }) else {
+                break;
+            };
+            if bytes.len().saturating_add(chunk.len()) as u64 > NATIVE_MAX_BYTES {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "FILE_TOO_LARGE",
+                    "FigCraft documents may not exceed 64 MiB.",
+                    headers,
+                ));
+            }
+            digest.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+    } else {
+        let Some(store) = &resolved.services.storage else {
+            return Err(unavailable(headers, "STORAGE_UNAVAILABLE"));
+        };
+        let key = ObjectKey::parse(&info.object_key).map_err(|_| internal(headers))?;
+        let mut source = store
+            .open_read(&key, None)
+            .await
+            .map_err(|_| unavailable(headers, "STORAGE_UNAVAILABLE"))?;
+        while let Some(chunk) = source
+            .next_chunk()
+            .await
+            .map_err(|_| unavailable(headers, "STORAGE_UNAVAILABLE"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) as u64 > NATIVE_MAX_BYTES {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "FILE_TOO_LARGE",
+                    "FigCraft documents may not exceed 64 MiB.",
+                    headers,
+                ));
+            }
+            digest.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
     }
     let hash = digest.finalize();
     if bytes.len() as i64 != info.size_bytes || hash.as_slice() != info.sha256 {
+        if info.storage_tier == "archive" {
+            let _ = versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+        }
         return Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BLOB_CORRUPT",

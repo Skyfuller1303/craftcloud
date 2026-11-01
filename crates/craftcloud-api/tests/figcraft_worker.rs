@@ -24,7 +24,7 @@ mod tests {
     use craftcloud_backup::{CreateOptions, RestoreOptions};
     use craftcloud_db::PgPool;
     use craftcloud_figcraft::{Access, Backend, Error, Export, Link};
-    use craftcloud_storage::LocalStore;
+    use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -258,6 +258,76 @@ mod tests {
             "unchanged export must not create duplicate versions"
         );
         assert_eq!(fixture.backend.exports.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn automatic_snapshot_reads_archived_published_version() {
+        let mut fixture = fixture().await;
+        open_live(&fixture, &fixture.owner).await;
+        let published: Uuid = sqlx::query_scalar(
+            "SELECT published_from_version_id FROM figcraft_live_files WHERE file_id=$1",
+        )
+        .bind(fixture.file)
+        .fetch_one(&fixture.env.pool)
+        .await
+        .unwrap();
+        let (archive_store, crypto) = fixture
+            .env
+            .configure_archive_figcraft(fixture.backend.clone(), "ws://figcraft.test/figcraft")
+            .await;
+        let (blob_id, local_key, size, sha256): (Uuid, String, i64, Vec<u8>) = sqlx::query_as(
+            "SELECT b.id,b.object_key,b.size_bytes,b.sha256 FROM file_versions v \
+             JOIN blobs b ON b.id=v.blob_id WHERE v.id=$1",
+        )
+        .bind(published)
+        .fetch_one(&fixture.env.pool)
+        .await
+        .unwrap();
+        let local = LocalStore::open(&fixture.env.storage_dir).await.unwrap();
+        let local_key = ObjectKey::parse(&local_key).unwrap();
+        let digest: [u8; 32] = sha256.as_slice().try_into().unwrap();
+        let archived = craftcloud_api::archive_transport::upload_verified(
+            &local,
+            archive_store.as_ref(),
+            &crypto,
+            blob_id,
+            &local_key,
+            size as u64,
+            &digest,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE blobs SET tier_state='archived',archive_object_key=$2,archive_wrapped_key=$3 WHERE id=$1",
+        )
+        .bind(blob_id)
+        .bind(archived.object_key.as_str())
+        .bind(archived.envelope.to_bytes().as_slice())
+        .execute(&fixture.env.pool)
+        .await
+        .unwrap();
+        local.delete(&local_key).await.unwrap();
+
+        fixture.backend.set_export(archive("Worker changed"));
+        fixture.env.clock.advance(Duration::from_secs(16 * 60));
+        let mut state = craftcloud_api::FigcraftWorkerState::default();
+        worker_tick(&fixture.env, &mut state).await;
+        let snapshots: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM file_versions WHERE file_id=$1 AND actor_kind='figcraft_live'",
+        )
+        .bind(fixture.file)
+        .fetch_one(&fixture.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshots, 1, "archived published source must be readable");
+        assert_eq!(fixture.backend.exports.load(Ordering::SeqCst), 1);
+        let source_tier: String = sqlx::query_scalar("SELECT tier_state FROM blobs WHERE id=$1")
+            .bind(blob_id)
+            .fetch_one(&fixture.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(source_tier, "archived");
     }
 
     #[tokio::test]

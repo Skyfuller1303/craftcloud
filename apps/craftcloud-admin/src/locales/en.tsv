@@ -6,6 +6,7 @@
 # be split into separate source texts. `npm run i18n:check` compares all catalogues.
 
 # Errors
+	Archive	Archive
 	Administration	Administration
 	Instance	Instance
 	Instance activity	Instance activity
@@ -805,3 +806,12 @@
 	Reject {domain} for {organization}	Reject {domain} for {organization}
 	Approve	Approve
 	Reject	Reject
+	Archive storage	Archive storage
+	Provider type	Provider type
+	Endpoint	Endpoint
+	Local bytes	Local bytes
+	Archive bytes	Archive bytes
+	Pending archives	Pending archives
+	Failed deletions	Failed deletions
+	Last verification	Last verification
+	Last error code	Last error code

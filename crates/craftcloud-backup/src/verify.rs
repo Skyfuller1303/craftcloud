@@ -18,10 +18,11 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::archive::{ArchiveAccess, verify_remote_refs};
 use crate::error::{BackupError, ErrorKind};
 use crate::manifest::{
     BLOB_INDEX_FILE, BLOBS_DIR, BlobEntry, MANIFEST_FILE, MANIFEST_SUM_FILE, MAX_BLOB_LINE_BYTES,
-    MAX_MANIFEST_BYTES, Manifest, TABLES_DIR, blob_file, hex, is_sha256_hex,
+    MAX_MANIFEST_BYTES, Manifest, TABLES_DIR, blob_file, hex, is_sha256_hex, parse_sha256,
 };
 
 /// Block size for hashing and copying.
@@ -40,6 +41,96 @@ pub struct VerifyReport {
     pub blobs: u64,
     /// Bytes over all blob files.
     pub blob_bytes: u64,
+}
+
+/// Verifies the local backup structure and, when archive references exist,
+/// checks every remote object plus a deterministic decrypted sample.
+pub async fn verify_with_archive(
+    dir: &Path,
+    expected_manifest_sha256: Option<&str>,
+    archive: ArchiveAccess<'_>,
+) -> Result<VerifyReport, BackupError> {
+    let verify_dir = dir.to_path_buf();
+    let expected = expected_manifest_sha256.map(str::to_owned);
+    let report = tokio::task::spawn_blocking(move || verify(&verify_dir, expected.as_deref()))
+        .await
+        .map_err(|_| BackupError::new(ErrorKind::Io, "the verification task failed"))??;
+    let mut entries = crate::blob_stream::blob_entries(dir);
+    let mut archived = false;
+    while let Some(entry) = entries.next().await? {
+        archived |= entry.archive_object_key.is_some();
+    }
+    let _ = entries.summary().ok_or_else(|| {
+        BackupError::new(ErrorKind::Io, "the blob list verification was incomplete")
+    })?;
+    if archived {
+        let backup_id = report
+            .manifest
+            .backup_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or_else(|| {
+                BackupError::new(ErrorKind::Format, "the archive backup id is invalid")
+            })?;
+        let remote = verify_remote_refs(archive, backup_id, dir).await?;
+        if Some(remote.sha256) != parse_sha256(&report.manifest.blobs.sha256)
+            || remote.count != report.manifest.blobs.count
+            || remote.total_bytes != report.manifest.blobs.total_bytes
+        {
+            return Err(integrity(
+                "the remote verification did not match the blob list",
+            ));
+        }
+    }
+    Ok(report)
+}
+
+/// Performs restore's complete read-only preflight before opening a target
+/// store or database for writes. Archived references require a provider.
+pub async fn preflight_restore_archive(
+    dir: &Path,
+    expected_manifest_sha256: Option<&str>,
+    archive: Option<ArchiveAccess<'_>>,
+) -> Result<VerifyReport, BackupError> {
+    let verify_dir = dir.to_path_buf();
+    let expected = expected_manifest_sha256.map(str::to_owned);
+    let report = tokio::task::spawn_blocking(move || verify(&verify_dir, expected.as_deref()))
+        .await
+        .map_err(|_| BackupError::new(ErrorKind::Io, "the verification task failed"))??;
+    let mut entries = crate::blob_stream::blob_entries(dir);
+    let mut archived = false;
+    while let Some(entry) = entries.next().await? {
+        archived |= entry.archive_object_key.is_some();
+    }
+    let _ = entries.summary().ok_or_else(|| {
+        BackupError::new(ErrorKind::Io, "the blob list verification was incomplete")
+    })?;
+    if archived {
+        let access = archive.ok_or_else(|| {
+            BackupError::new(
+                ErrorKind::SourceDamaged,
+                "restore of archived blobs requires the configured provider and server key",
+            )
+        })?;
+        let backup_id = report
+            .manifest
+            .backup_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or_else(|| {
+                BackupError::new(ErrorKind::Format, "the archive backup id is invalid")
+            })?;
+        let remote = verify_remote_refs(access, backup_id, dir).await?;
+        if Some(remote.sha256) != parse_sha256(&report.manifest.blobs.sha256)
+            || remote.count != report.manifest.blobs.count
+            || remote.total_bytes != report.manifest.blobs.total_bytes
+        {
+            return Err(integrity(
+                "the remote verification did not match the blob list",
+            ));
+        }
+    }
+    Ok(report)
 }
 
 pub(crate) fn integrity(message: impl Into<String>) -> BackupError {
@@ -290,27 +381,30 @@ pub fn verify(
     }
 
     // Every listed blob: ascending unique keys, size and checksum.
-    let (mut count, mut total) = (0_u64, 0_u64);
+    let (mut count, mut total, mut local_count) = (0_u64, 0_u64, 0_u64);
     let mut previous: Option<String> = None;
     for_each_blob(dir, |entry| {
         if previous.as_deref().is_some_and(|p| p >= entry.key.as_str()) {
             return Err(integrity("blobs.jsonl is not sorted or repeats a key"));
         }
         previous = Some(entry.key.clone());
-        let relative = blob_file(&entry.key);
-        require_file(dir, &relative)?;
-        let sum = sum_file(dir, &relative)?;
-        if sum.len != entry.size {
-            return Err(integrity(format!(
-                "blob {} has the wrong size (list {}, file {})",
-                entry.key, entry.size, sum.len
-            )));
-        }
-        if hex(&sum.sha256) != entry.sha256 {
-            return Err(integrity(format!(
-                "blob {} does not match its checksum",
-                entry.key
-            )));
+        if entry.local_copy {
+            let relative = blob_file(&entry.key);
+            require_file(dir, &relative)?;
+            let sum = sum_file(dir, &relative)?;
+            if sum.len != entry.size {
+                return Err(integrity(format!(
+                    "blob {} has the wrong size (list {}, file {})",
+                    entry.key, entry.size, sum.len
+                )));
+            }
+            if hex(&sum.sha256) != entry.sha256 {
+                return Err(integrity(format!(
+                    "blob {} does not match its checksum",
+                    entry.key
+                )));
+            }
+            local_count += 1;
         }
         count += 1;
         total = total
@@ -324,7 +418,7 @@ pub fn verify(
         ));
     }
 
-    check_no_extra_files(dir, &manifest, count)?;
+    check_no_extra_files(dir, &manifest, local_count)?;
     Ok(VerifyReport {
         manifest,
         manifest_sha256,
@@ -480,6 +574,9 @@ mod tests {
                 key: (*key).to_owned(),
                 size: content.len() as u64,
                 sha256: sha(content),
+                local_copy: true,
+                archive_object_key: None,
+                archive_wrapped_key: None,
             };
             list.extend(serde_json::to_vec(&entry).unwrap());
             list.push(b'\n');
@@ -508,6 +605,7 @@ mod tests {
             },
             excluded_tables: Vec::new(),
             unavailable_version_blobs: 0,
+            backup_id: Some(uuid::Uuid::new_v4().to_string()),
         };
         let bytes = manifest.to_bytes().unwrap();
         fs::write(dir.join(MANIFEST_FILE), &bytes).unwrap();

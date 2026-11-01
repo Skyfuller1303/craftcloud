@@ -57,13 +57,16 @@ mod tests {
 
     async fn put(store: &LocalStore, data: &[u8]) -> ObjectKey {
         let mut temp = store.begin_write(u64::MAX).await.unwrap();
+        let expected_key = temp.object_key().unwrap();
         for part in data.chunks(10_000) {
             temp.write(part).await.unwrap();
         }
-        store
+        let key = store
             .finalize(temp, data.len() as u64, &sha(data))
             .await
-            .unwrap()
+            .unwrap();
+        assert_eq!(key, expected_key);
+        key
     }
 
     async fn read_all(store: &LocalStore, key: &ObjectKey, range: Option<ByteRange>) -> Vec<u8> {
@@ -166,6 +169,45 @@ mod tests {
         let b = put(&store, b"same bytes").await;
         assert_ne!(a, b);
         assert_eq!(count_files(&root.path().join("objects")), 2);
+    }
+
+    #[tokio::test]
+    async fn reserved_key_is_visible_before_upload_and_never_overwritten() {
+        let (root, store) = store().await;
+        let data = b"pinned upload bytes";
+        let key = ObjectKey::generate();
+        let mut temp = store.begin_write_as(key.clone(), 1024).await.unwrap();
+        assert_eq!(temp.object_key().unwrap(), key);
+        temp.write(data).await.unwrap();
+        assert_eq!(
+            store
+                .finalize(temp, data.len() as u64, &sha(data))
+                .await
+                .unwrap(),
+            key
+        );
+
+        assert!(matches!(
+            store.begin_write_as(key.clone(), 1024).await,
+            Err(StorageError::AlreadyExists)
+        ));
+        let invalid_key = ObjectKey::parse("00000000000000000000000000000000").unwrap();
+        assert!(matches!(
+            store.begin_write_as(invalid_key, 1024).await,
+            Err(StorageError::Aborted)
+        ));
+        let different = b"replacement bytes";
+        let mut temp = store.begin_write(1024).await.unwrap();
+        temp.write(different).await.unwrap();
+        assert!(matches!(
+            store
+                .finalize_as(temp, key.clone(), different.len() as u64, &sha(different))
+                .await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(read_all(&store, &key, None).await, data);
+        assert_eq!(store.list_objects(None, 10).await.unwrap().len(), 1);
+        drop(root);
     }
 
     #[tokio::test]

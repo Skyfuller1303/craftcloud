@@ -148,7 +148,7 @@ function HealthView({ health }: { health: AdminHealth }) {
 
   const count = (value: number | null): string => (value === null ? t("Not available") : String(value));
 
-  const { components, uploads, maintenance, audit, server } = health;
+  const { components, uploads, maintenance, audit, server, archive } = health;
   const pool = components.database.pool;
   const run = maintenance.last_run;
   return (
@@ -282,6 +282,32 @@ function HealthView({ health }: { health: AdminHealth }) {
               ? t("No successful backup recorded yet.")
               : uptime(health.backup.last_success_age_seconds)}
           </dd>
+        </dl>
+      </section>
+
+      <section className="section" aria-labelledby="system-archive-title">
+        <h2 id="system-archive-title" className="section__title">
+          {t("Archive storage")}
+        </h2>
+        <dl className="facts">
+          <dt>{t("Configured")}</dt>
+          <dd>{archive.configured ? t("Yes") : t("No")}</dd>
+          <dt>{t("Provider type")}</dt>
+          <dd>{archive.provider_type ?? t("Not configured")}</dd>
+          <dt>{t("Endpoint")}</dt>
+          <dd>{archive.endpoint ?? t("Not available")}</dd>
+          <dt>{t("Local bytes")}</dt>
+          <dd>{archive.local_bytes === null ? t("Not available") : formatBytes(language, archive.local_bytes)}</dd>
+          <dt>{t("Archive bytes")}</dt>
+          <dd>{archive.archive_bytes === null ? t("Not available") : formatBytes(language, archive.archive_bytes)}</dd>
+          <dt>{t("Pending archives")}</dt>
+          <dd>{count(archive.pending_archives)}</dd>
+          <dt>{t("Failed deletions")}</dt>
+          <dd>{count(archive.failed_deletions)}</dd>
+          <dt>{t("Last verification")}</dt>
+          <dd>{archive.last_verified_at === null ? t("Not available") : formatDateTime(language, archive.last_verified_at)}</dd>
+          <dt>{t("Last error code")}</dt>
+          <dd>{archive.last_error_code ?? t("None")}</dd>
         </dl>
       </section>
       </div>

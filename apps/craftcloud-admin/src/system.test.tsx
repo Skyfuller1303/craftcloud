@@ -39,6 +39,17 @@ const HEALTH: AdminHealth = {
   audit: { dropped_events_total: 5, dropped_events_lossy: 4, dropped_events_important: 1 },
   server: { version: "1.2.3", uptime_seconds: 2 * 86400 + 3 * 3600 + 120 },
   backup: { last_success_age_seconds: null },
+  archive: {
+    configured: true,
+    provider_type: "s3",
+    endpoint: "https://objects.example.test",
+    local_bytes: 1024,
+    archive_bytes: 2048,
+    pending_archives: 2,
+    failed_deletions: 1,
+    last_verified_at: "2026-10-29T09:30:00Z",
+    last_error_code: "ARCHIVE_DELETE_FAILED",
+  },
 };
 
 async function openSystem(user: User) {
@@ -77,6 +88,9 @@ describe("system view", () => {
     expect(facts.getByText("1 of 10 in use, 3 idle")).toBeTruthy();
     expect(facts.getByText("Paired with this database")).toBeTruthy();
     expect(facts.getByText("5 GiB")).toBeTruthy();
+    expect(facts.getByText("objects.example.test", { exact: false })).toBeTruthy();
+    expect(facts.getByText("2 KiB")).toBeTruthy();
+    expect(facts.getByText("ARCHIVE_DELETE_FAILED")).toBeTruthy();
     expect(facts.getByText("3")).toBeTruthy();
     expect(facts.getByText("Succeeded")).toBeTruthy();
     expect(

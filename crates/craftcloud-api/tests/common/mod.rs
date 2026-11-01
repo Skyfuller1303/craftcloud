@@ -16,7 +16,7 @@ use craftcloud_auth::hash_password;
 use craftcloud_core::Capabilities;
 use craftcloud_db::PgPool;
 use craftcloud_db::setup::{self, NewInstance};
-use craftcloud_storage::{FaultPlan, LocalStore};
+use craftcloud_storage::{ArchiveCrypto, ArchiveStore, FaultPlan, LocalStore};
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, PgConnection};
@@ -165,10 +165,19 @@ pub struct Resp {
 
 impl Resp {
     pub fn code(&self) -> &str {
-        self.body["error"]["code"].as_str().unwrap_or("")
+        self.body
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
     }
     pub fn etag(&self) -> String {
-        self.headers[header::ETAG].to_str().unwrap().to_owned()
+        self.headers
+            .get(header::ETAG)
+            .expect("ETag missing")
+            .to_str()
+            .expect("ETag is not valid text")
+            .to_owned()
     }
 }
 
@@ -215,7 +224,12 @@ pub fn session_from(resp: &Resp) -> Session {
         .unwrap();
     Session {
         token: value.to_owned(),
-        csrf: resp.body["csrf_token"].as_str().unwrap().to_owned(),
+        csrf: resp
+            .body
+            .get("csrf_token")
+            .and_then(Value::as_str)
+            .expect("CSRF token missing")
+            .to_owned(),
     }
 }
 
@@ -336,6 +350,65 @@ impl TestEnv {
             Some(Arc::clone(&services)),
         );
         self.services = services;
+    }
+
+    pub async fn configure_archive(&mut self) -> (Arc<ArchiveStore>, Arc<ArchiveCrypto>) {
+        self.configure_archive_with_figcraft_and_pool(self.pool.clone(), None)
+            .await
+    }
+
+    pub async fn configure_archive_with_pool(
+        &mut self,
+        pool: PgPool,
+    ) -> (Arc<ArchiveStore>, Arc<ArchiveCrypto>) {
+        self.configure_archive_with_figcraft_and_pool(pool, None)
+            .await
+    }
+
+    pub async fn configure_archive_figcraft(
+        &mut self,
+        backend: Arc<dyn craftcloud_figcraft::Backend>,
+        public_url: &str,
+    ) -> (Arc<ArchiveStore>, Arc<ArchiveCrypto>) {
+        self.configure_archive_with_figcraft_and_pool(
+            self.pool.clone(),
+            Some((backend, public_url.to_owned())),
+        )
+        .await
+    }
+
+    async fn configure_archive_with_figcraft_and_pool(
+        &mut self,
+        pool: PgPool,
+        figcraft: Option<(Arc<dyn craftcloud_figcraft::Backend>, String)>,
+    ) -> (Arc<ArchiveStore>, Arc<ArchiveCrypto>) {
+        let local = LocalStore::open_with_faults(&self.storage_dir, Arc::clone(&self.faults))
+            .await
+            .unwrap();
+        let archive_dir = self.storage_dir.join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let archive = Arc::new(ArchiveStore::Local(
+            LocalStore::open(&archive_dir).await.unwrap(),
+        ));
+        let crypto = Arc::new(ArchiveCrypto::from_server_key(&[0x57; 32]).unwrap());
+        let clock: Arc<dyn Clock> = self.clock.clone();
+        let mut services = Services::new(pool, None, settings())
+            .with_clock(clock)
+            .with_metrics(Arc::clone(&self.metrics))
+            .with_two_factor_keys(Some([0x42; 32]), None)
+            .with_storage(local)
+            .with_archive(Arc::clone(&archive), Arc::clone(&crypto));
+        if let Some((backend, public_url)) = figcraft {
+            services = services.with_figcraft(backend, public_url);
+        }
+        let services = Arc::new(services);
+        self.app = router_with_shared(
+            Capabilities::development_defaults(),
+            &ApiConfig::default(),
+            Some(Arc::clone(&services)),
+        );
+        self.services = services;
+        (archive, crypto)
     }
 
     async fn build(

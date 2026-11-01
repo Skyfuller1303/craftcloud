@@ -1379,9 +1379,10 @@ paths:
         Status per component (database with pool usage, migrations, object store with binding state and free bytes
         of its volume), open and overdue upload sessions, the last maintenance run and whether an epoch conflict
         blocks destructive maintenance, the audit events dropped under load (counters of this process), server
-        version and uptime, and the age of the last successful backup (from the audit event `backup.created` written
+        version and uptime, the age of the last successful backup (from the audit event `backup.created` written
         by `craftcloud-server admin backup create`; null if there is none). Numbers, flags and error codes only: no organization, user, file or storage path. `free_bytes` is
         null when it cannot be measured (the server asks `df`; not available on Windows or in an image without it).
+        Archive provider metadata comes only from server configuration and excludes credentials; archive counters and the last verification/error are null when unavailable.
         Other callers: 403; anonymous callers: 401. Not cached.
       responses:
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
@@ -6630,7 +6631,7 @@ components:
         upload_id: {type: string, format: uuid}
     Version:
       type: object
-      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, actor_kind, created_at]
+      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, actor_kind, storage_tier, created_at]
       properties:
         id: {type: string, format: uuid}
         file_id: {type: string, format: uuid}
@@ -6642,6 +6643,7 @@ components:
         upload_id: {type: [string, 'null'], format: uuid}
         created_by: {type: string, format: uuid}
         actor_kind: {type: string, enum: [user, figcraft_live]}
+        storage_tier: {type: string, enum: [local, archive], description: Informational storage tier for the version's content.}
         created_at: {type: string, format: date-time}
     FigCraftLiveRequest:
       type: object
@@ -6704,7 +6706,7 @@ components:
       enum: [ok, degraded, down, not_configured]
     AdminHealth:
       type: object
-      required: [status, checked_at, components, uploads, maintenance, audit, server, backup]
+      required: [status, checked_at, components, uploads, maintenance, audit, server, backup, archive]
       properties:
         status: {$ref: '#/components/schemas/HealthLevel'}
         checked_at: {type: string, format: date-time}
@@ -6788,6 +6790,19 @@ components:
               minimum: 0
               description: >-
                 Seconds since the newest successful `backup.created` audit event; null if there is none or it cannot be read.
+        archive:
+          type: object
+          required: [configured, provider_type, endpoint, local_bytes, archive_bytes, pending_archives, failed_deletions, last_verified_at, last_error_code]
+          properties:
+            configured: {type: boolean}
+            provider_type: {type: [string, 'null'], description: Provider type from trusted server configuration.}
+            endpoint: {type: [string, 'null'], description: Endpoint without credentials or secret material.}
+            local_bytes: {type: [integer, 'null'], format: int64, minimum: 0}
+            archive_bytes: {type: [integer, 'null'], format: int64, minimum: 0}
+            pending_archives: {type: [integer, 'null'], format: int64, minimum: 0}
+            failed_deletions: {type: [integer, 'null'], format: int64, minimum: 0}
+            last_verified_at: {type: [string, 'null'], format: date-time}
+            last_error_code: {type: [string, 'null'], description: Bounded archive error code; no object identifiers.}
     MaintenanceStatus:
       type: object
       required: [last_run]

@@ -88,6 +88,8 @@ pub struct Blob {
     pub org_id: Uuid,
     /// Workspace.
     pub workspace_id: Uuid,
+    /// Logical quota group. Restore-created physical copies may share it.
+    pub quota_group_id: Uuid,
     /// Storage key (32 lowercase hex characters).
     pub object_key: String,
     /// Size in bytes.
@@ -442,9 +444,21 @@ impl OrgTx {
     /// Adds bytes to the committed counters of a workspace and its organization.
     pub(crate) async fn add_committed(
         &mut self,
+        quota_group_id: Uuid,
         workspace_id: Uuid,
         bytes: i64,
     ) -> Result<(), DbError> {
+        let committed_copies: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blobs WHERE org_id = $1 AND quota_group_id = $2 \
+             AND state IN ('committed', 'corrupt')",
+        )
+        .bind(self.org_id)
+        .bind(quota_group_id)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if committed_copies != 1 {
+            return Ok(());
+        }
         sqlx::query(
             "UPDATE workspaces SET committed_bytes = committed_bytes + $2              WHERE id = $1 AND org_id = $3",
         )
@@ -888,12 +902,23 @@ impl OrgTx {
             Some((_, _, true, _)) => return Ok(StoreOutcome::FileDeleted),
             _ => {}
         }
-        let blob = sqlx::query_as::<_, Blob>(
-            "INSERT INTO blobs (id, org_id, workspace_id, object_key, size_bytes, sha256, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             RETURNING id, org_id, workspace_id, object_key, size_bytes, sha256, state, created_at",
+        let blob_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO blob_quota_groups (id, org_id, workspace_id, size_bytes) \
+             VALUES ($1, $2, $3, $4)",
         )
-        .bind(Uuid::new_v4())
+        .bind(blob_id)
+        .bind(self.org_id)
+        .bind(session.workspace_id)
+        .bind(session.declared_size)
+        .execute(&mut *self.tx)
+        .await?;
+        let blob = sqlx::query_as::<_, Blob>(
+            "INSERT INTO blobs (id, org_id, workspace_id, quota_group_id, object_key, size_bytes, sha256, created_at) \
+             VALUES ($1, $2, $3, $1, $4, $5, $6, $7) \
+             RETURNING id, org_id, workspace_id, quota_group_id, object_key, size_bytes, sha256, state, created_at",
+        )
+        .bind(blob_id)
         .bind(self.org_id)
         .bind(session.workspace_id)
         .bind(object_key)
@@ -1035,8 +1060,11 @@ impl OrgTx {
                     WHERE s.workspace_id = w.id AND s.state IN {HOLDING}), 0) \
                     + COALESCE((SELECT sum(size_bytes) FROM blobs b \
                     WHERE b.workspace_id = w.id AND b.state = 'orphaned'), 0), \
-                committed_bytes = COALESCE((SELECT sum(size_bytes) FROM blobs b \
-                    WHERE b.workspace_id = w.id AND b.state IN ('committed', 'corrupt')), 0) \
+                committed_bytes = COALESCE((SELECT sum(q.size_bytes) FROM blob_quota_groups q \
+                    WHERE q.org_id = w.org_id AND q.workspace_id = w.id \
+                      AND EXISTS (SELECT 1 FROM blobs b WHERE b.quota_group_id = q.id \
+                        AND b.org_id = q.org_id AND b.workspace_id = q.workspace_id \
+                        AND b.state IN ('committed', 'corrupt'))), 0) \
              WHERE w.org_id = $1"
         ))
         .bind(self.org_id)

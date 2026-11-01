@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { ORG_A, WS_1, apiError, expectNoAxeViolations, mockFetch, renderApp } from "./test/helpers.tsx";
 import { fakeXhr } from "./test/fakeXhr.ts";
-import { FILE_1, ME, PROJECT_1, page, viewRoutes } from "./test/fixtures.ts";
+import { FILE_1, ME, PROJECT_1, page, version, viewRoutes } from "./test/fixtures.ts";
 
 type User = ReturnType<typeof userEvent.setup>;
 
@@ -127,6 +127,7 @@ describe.each(languages)("axe: dashboard views (%s)", (language) => {
       viewRoutes({
         [`POST /files/${FILE_1.id}/uploads`]: { status: 201, body: UPLOAD },
         [`DELETE /uploads/${UPLOAD.upload_id}`]: { status: 204 },
+        [`GET /files/${FILE_1.id}/versions`]: page([version(2, "head", { storage_tier: "local" }), version(1, "old", { storage_tier: "archive" })]),
       }),
     );
     const user = userEvent.setup();
@@ -140,6 +141,7 @@ describe.each(languages)("axe: dashboard views (%s)", (language) => {
     await user.click(buttons[0]!);
     await screen.findByRole("dialog");
     await screen.findAllByRole("row");
+    expect(screen.getByText(language === "de" ? "Archiv" : "Archive")).toBeTruthy();
     await expectNoAxeViolations();
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());

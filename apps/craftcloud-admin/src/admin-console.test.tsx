@@ -334,6 +334,11 @@ describe.each([["en", "Overview"], ["de", "Übersicht"]] as const)("admin screen
         audit: { dropped_events_total: 0, dropped_events_lossy: 0, dropped_events_important: 0 },
         server: { version: "1.2.3", uptime_seconds: 60 },
         backup: { last_success_age_seconds: null },
+        archive: {
+          configured: false, provider_type: null, endpoint: null, local_bytes: null,
+          archive_bytes: null, pending_archives: null, failed_deletions: null,
+          last_verified_at: null, last_error_code: null,
+        },
       } },
     }],
   ] as const;

@@ -15,6 +15,8 @@
 
 pub mod accounts;
 pub mod app_access;
+pub mod archive_intent;
+pub mod archive_recall;
 pub mod audit;
 pub mod device_sessions;
 pub mod email_outbox;

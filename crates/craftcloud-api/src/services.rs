@@ -196,6 +196,25 @@ pub struct EmailTransportStatus {
     pub last_error_code: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct ArchiveOperatorMetadata {
+    pub provider_type: String,
+    pub endpoint: Option<String>,
+}
+
+fn safe_archive_endpoint(endpoint: String) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.contains('@')
+        || endpoint.contains('?')
+        || endpoint.contains('#')
+        || endpoint.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(endpoint.to_owned())
+}
+
 pub struct Services {
     pub(crate) pool: PgPool,
     pub(crate) bootstrap: Option<BootstrapToken>,
@@ -203,6 +222,11 @@ pub struct Services {
     pub(crate) settings: AuthSettings,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) storage: Option<craftcloud_storage::LocalStore>,
+    pub(crate) archive_store: Option<Arc<craftcloud_storage::ArchiveStore>>,
+    pub(crate) archive_crypto: Option<Arc<craftcloud_storage::ArchiveCrypto>>,
+    pub(crate) archive_operator_metadata: Option<ArchiveOperatorMetadata>,
+    pub(crate) archive_after: Duration,
+    pub(crate) archive_restore_permits: Arc<Semaphore>,
     pub(crate) figcraft: Option<Arc<dyn craftcloud_figcraft::Backend>>,
     pub(crate) figcraft_public_url: Option<String>,
     pub(crate) email_delivery_enabled: bool,
@@ -290,6 +314,11 @@ impl Services {
             settings,
             clock: Arc::new(SystemClock),
             storage: None,
+            archive_store: None,
+            archive_crypto: None,
+            archive_operator_metadata: None,
+            archive_after: Duration::from_secs(24 * 60 * 60),
+            archive_restore_permits: Arc::new(Semaphore::new(2)),
             figcraft: None,
             figcraft_public_url: None,
             email_delivery_enabled: false,
@@ -377,6 +406,39 @@ impl Services {
     #[must_use]
     pub fn with_storage(mut self, store: craftcloud_storage::LocalStore) -> Self {
         self.storage = Some(store);
+        self
+    }
+
+    /// Attaches the encrypted archive provider used for archived version reads.
+    #[must_use]
+    pub fn with_archive(
+        mut self,
+        store: Arc<craftcloud_storage::ArchiveStore>,
+        crypto: Arc<craftcloud_storage::ArchiveCrypto>,
+    ) -> Self {
+        self.archive_store = Some(store);
+        self.archive_crypto = Some(crypto);
+        self
+    }
+
+    /// Adds provider metadata from trusted server configuration for the operator view.
+    #[must_use]
+    pub fn with_archive_operator_metadata(
+        mut self,
+        provider_type: String,
+        endpoint: Option<String>,
+    ) -> Self {
+        self.archive_operator_metadata = Some(ArchiveOperatorMetadata {
+            provider_type,
+            endpoint: endpoint.and_then(safe_archive_endpoint),
+        });
+        self
+    }
+
+    /// Sets the configured age threshold used by archive status counters.
+    #[must_use]
+    pub fn with_archive_after(mut self, delay: Duration) -> Self {
+        self.archive_after = delay;
         self
     }
 
@@ -663,6 +725,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_operator_endpoint_rejects_credentials_and_url_controls() {
+        for endpoint in [
+            "https://user:secret@objects.example.test",
+            "https://objects.example.test?token=secret",
+            "https://objects.example.test#secret",
+        ] {
+            assert_eq!(safe_archive_endpoint(endpoint.to_owned()), None);
+        }
+        assert_eq!(
+            safe_archive_endpoint("https://objects.example.test".to_owned()).as_deref(),
+            Some("https://objects.example.test")
+        );
+    }
 
     #[tokio::test]
     async fn permit_is_held_until_the_blocking_job_ends_even_if_the_caller_is_dropped() {

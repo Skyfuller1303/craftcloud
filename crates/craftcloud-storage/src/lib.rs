@@ -17,12 +17,22 @@
 //! This crate has no HTTP code. Uploads and downloads use it from the API
 //! crate in later milestones.
 
+mod archive_crypto;
+mod archive_store;
 mod crash;
 mod error;
 mod faults;
 mod key;
 mod local;
+mod rate_limit;
+mod s3;
+mod sftp;
 
+pub use archive_crypto::{
+    ArchiveCrypto, ArchiveCryptoError, ArchiveDataKey, ArchiveRange, WrappedDataKey, encrypted_len,
+    map_range, verify_ciphertext_len,
+};
+pub use archive_store::{ArchiveReader, ArchiveStore, ArchiveTemp};
 pub use crash::crash_point;
 #[cfg(feature = "fault-injection")]
 pub use crash::{CRASH_ENV, CRASH_POINTS, arm_crash_point_from_env};
@@ -31,6 +41,8 @@ pub use error::{StorageError, StoreSetupError, map_io_error};
 pub use faults::{FaultKind, FaultPlan};
 pub use key::{KeyError, ObjectKey};
 pub use local::{LocalStore, MARKER_FILE, MarkerInfo, ObjectReader, QUARANTINE_DIR, TempObject};
+pub use s3::{S3Config, S3Reader, S3Store, S3Temp};
+pub use sftp::{SftpConfig, SftpReader, SftpStore};
 
 use std::time::SystemTime;
 
@@ -82,6 +94,9 @@ pub struct ByteRange {
 /// Where a streamed write goes.
 #[allow(async_fn_in_trait)]
 pub trait WriteSink {
+    /// Opaque object key reserved for this upload; stable through finalization.
+    fn object_key(&self) -> Result<ObjectKey, StorageError>;
+
     /// Appends `data`. Fails with [`StorageError::TooLarge`] when the byte
     /// limit would be exceeded; after any error the writer is dead and its
     /// temporary data is already removed.
@@ -112,6 +127,15 @@ pub trait ObjectStore {
 
     /// Starts a streamed write of at most `max_bytes` bytes.
     async fn begin_write(&self, max_bytes: u64) -> Result<Self::Temp, StorageError>;
+
+    /// Starts a streamed write using a caller-reserved, server-generated UUID v4 key.
+    /// The key remains stable through finalization; an existing or stale temporary
+    /// entry under that key is never replaced.
+    async fn begin_write_as(
+        &self,
+        key: ObjectKey,
+        max_bytes: u64,
+    ) -> Result<Self::Temp, StorageError>;
 
     /// Verifies length and SHA-256 and publishes the object under a new key.
     /// On any failure the temporary object is discarded.

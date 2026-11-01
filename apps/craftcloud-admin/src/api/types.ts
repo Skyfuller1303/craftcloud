@@ -404,6 +404,7 @@ export interface FileVersion {
   upload_id: Uuid | null;
   created_by: Uuid;
   actor_kind?: "user" | "figcraft_live";
+  storage_tier?: "local" | "archive";
   created_at: string;
 }
 
@@ -462,4 +463,15 @@ export interface AdminHealth {
   };
   server: { version: string; uptime_seconds: number };
   backup: { last_success_age_seconds: number | null };
+  archive: {
+    configured: boolean;
+    provider_type: string | null;
+    endpoint: string | null;
+    local_bytes: number | null;
+    archive_bytes: number | null;
+    pending_archives: number | null;
+    failed_deletions: number | null;
+    last_verified_at: string | null;
+    last_error_code: string | null;
+  };
 }

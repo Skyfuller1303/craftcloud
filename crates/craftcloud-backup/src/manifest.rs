@@ -17,8 +17,8 @@ use crate::error::{BackupError, ErrorKind};
 
 /// Value of [`Manifest::format`].
 pub const FORMAT: &str = "craftcloud-backup";
-/// The only format version this build reads and writes.
-pub const FORMAT_VERSION: u32 = 1;
+/// The current format version. Version 1 local-only backups remain readable.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// File name of the manifest.
 pub const MANIFEST_FILE: &str = "manifest.json";
@@ -91,6 +91,20 @@ pub struct BlobEntry {
     pub size: u64,
     /// SHA-256 of the content, lowercase hex.
     pub sha256: String,
+    /// Whether plaintext bytes are included in the local blob directory.
+    /// Missing in format v1, where every blob has a local copy.
+    #[serde(default = "local_copy_default")]
+    pub local_copy: bool,
+    /// Immutable encrypted archive provider key, when one exists.
+    #[serde(default)]
+    pub archive_object_key: Option<String>,
+    /// Wrapped per-object key envelope as lowercase hex, when one exists.
+    #[serde(default)]
+    pub archive_wrapped_key: Option<String>,
+}
+
+fn local_copy_default() -> bool {
+    true
 }
 
 /// The manifest. Contains no secret: no database URL, no password, no token,
@@ -119,6 +133,10 @@ pub struct Manifest {
     /// Versions whose blob was not `committed` at snapshot time (for example
     /// `corrupt`): their bytes are not in this backup.
     pub unavailable_version_blobs: u64,
+    /// Stable identity used by durable archive-object pins.
+    /// Absent only in format v1 backups.
+    #[serde(default)]
+    pub backup_id: Option<String>,
 }
 
 /// Lowercase hex of a byte slice.
@@ -206,11 +224,16 @@ impl Manifest {
         if self.format != FORMAT {
             return Err(format_error("this directory is not a CraftCloud backup"));
         }
-        if self.format_version != FORMAT_VERSION {
+        if !matches!(self.format_version, 1 | FORMAT_VERSION) {
             return Err(format_error(format!(
-                "unsupported backup format version {} (this build reads version {FORMAT_VERSION})",
+                "unsupported backup format version {} (this build reads versions 1 and {FORMAT_VERSION})",
                 self.format_version
             )));
+        }
+        match (self.format_version, self.backup_id.as_deref()) {
+            (1, None) => {}
+            (2, Some(id)) if uuid::Uuid::parse_str(id).is_ok() => {}
+            _ => return Err(format_error("the manifest backup id is invalid")),
         }
         if !known_migrations.contains(&self.migration_version) {
             let newest = known_migrations.iter().max().copied().unwrap_or(0);
@@ -307,8 +330,61 @@ impl BlobEntry {
         {
             return Err(format_error("a line of the blob list has an invalid field"));
         }
+        match (&entry.archive_object_key, &entry.archive_wrapped_key) {
+            (None, None) => {}
+            (Some(key), Some(wrapped))
+                if is_key(key) && wrapped.len() == 240 && is_lowercase_hex(wrapped) =>
+            {
+                let bytes = decode_hex(wrapped)?;
+                let envelope =
+                    craftcloud_storage::WrappedDataKey::from_bytes(&bytes).map_err(|_| {
+                        format_error("a line of the blob list has an invalid archive envelope")
+                    })?;
+                if envelope.blob_id().to_string() != entry.id
+                    || envelope.plaintext_len() != entry.size
+                {
+                    return Err(format_error(
+                        "a line of the blob list has inconsistent archive metadata",
+                    ));
+                }
+            }
+            _ => {
+                return Err(format_error(
+                    "a line of the blob list has incomplete archive metadata",
+                ));
+            }
+        }
+        if !entry.local_copy && entry.archive_object_key.is_none() {
+            return Err(format_error(
+                "a blob without an archive reference has no backup bytes",
+            ));
+        }
         Ok(entry)
     }
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>, BackupError> {
+    if !text.len().is_multiple_of(2)
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format_error("an archive envelope is not lowercase hex"));
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for [high_byte, low_byte] in text.as_bytes().as_chunks::<2>().0 {
+        let high =
+            nibble(*high_byte).ok_or_else(|| format_error("an archive envelope is invalid"))?;
+        let low =
+            nibble(*low_byte).ok_or_else(|| format_error("an archive envelope is invalid"))?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -346,6 +422,7 @@ mod tests {
             },
             excluded_tables: vec!["sessions".to_owned()],
             unavailable_version_blobs: 0,
+            backup_id: Some("d7d6c52f-cb40-42ca-a6a8-7bf4e73db845".to_owned()),
         }
     }
 
@@ -371,8 +448,8 @@ mod tests {
                 .contains("not a CraftCloud backup")
         );
         let mut m = sample();
-        m.format_version = 2;
-        assert!(parse(&m).unwrap_err().message.contains("format version 2"));
+        m.format_version = 3;
+        assert!(parse(&m).unwrap_err().message.contains("format version 3"));
         let mut m = sample();
         m.migration_version = 15;
         let error = parse(&m).unwrap_err();

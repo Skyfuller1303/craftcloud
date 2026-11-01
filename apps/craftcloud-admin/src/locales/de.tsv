@@ -4,6 +4,7 @@
 # Escapes: \t \n \r \\ . `npm run i18n:check` meldet fehlende und überzählige Einträge.
 
 # Errors
+	Archive	Archiv
 	Administration	Verwaltung
 	Instance	Instanz
 	Instance activity	Aktivitäten der Instanz
@@ -802,3 +803,12 @@
 	Reject {domain} for {organization}	{domain} für {organization} ablehnen
 	Approve	Freigeben
 	Reject	Ablehnen
+	Archive storage	Archivspeicher
+	Provider type	Anbietertyp
+	Endpoint	Endpunkt
+	Local bytes	Bytes lokal
+	Archive bytes	Bytes im Archiv
+	Pending archives	Ausstehende Archivierungen
+	Failed deletions	Fehlgeschlagene Löschungen
+	Last verification	Letzte Prüfung
+	Last error code	Letzter Fehlercode

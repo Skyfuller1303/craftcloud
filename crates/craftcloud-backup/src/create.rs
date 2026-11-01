@@ -39,11 +39,13 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::archive::{ArchiveAccess, verify_remote_refs};
+use crate::blob_stream::blob_entries;
 use crate::error::{BackupError, ErrorKind};
 use crate::manifest::{
     BLOB_INDEX_FILE, BLOBS_DIR, BlobEntry, BlobIndex, FORMAT, FORMAT_VERSION, MANIFEST_FILE,
     MANIFEST_SUM_FILE, MAX_BLOB_LINE_BYTES, Manifest, StoreInfo, TABLES_DIR, TableEntry, blob_file,
-    hex, table_file,
+    hex, parse_sha256, table_file,
 };
 use crate::tables::{backup_tables_for, excluded_tables_for};
 
@@ -51,6 +53,17 @@ use crate::tables::{backup_tables_for, excluded_tables_for};
 const WRITE_BUFFER: usize = 256 * 1024;
 /// Rows of the blob list read from the snapshot at once.
 const BLOB_PAGE: i64 = 1000;
+/// Archive pins are inserted in bounded batches inside the maintenance lock.
+const ARCHIVE_PIN_BATCH: usize = 256;
+type BlobRow = (
+    Uuid,
+    String,
+    i64,
+    Vec<u8>,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+);
 
 /// Points of a running backup at which other work can be interleaved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +100,8 @@ pub struct CreateReport {
     pub manifest: Manifest,
     /// SHA-256 of `manifest.json`; keep a copy off the backup medium.
     pub manifest_sha256: String,
+    /// Stable id used to release archive retention only after all backup copies are deleted.
+    pub backup_id: Uuid,
     /// Rows over all tables.
     pub rows: u64,
     /// Blob files copied.
@@ -257,9 +272,23 @@ pub async fn create(
     out: &Path,
     options: &CreateOptions<'_>,
 ) -> Result<CreateReport, BackupError> {
+    create_with_archive(pool, store, out, options, None).await
+}
+
+/// Creates a backup that may reference encrypted objects in an archive store.
+/// The archive provider and crypto key are required only when the snapshot has
+/// archive references.
+pub async fn create_with_archive(
+    pool: &PgPool,
+    store: &LocalStore,
+    out: &Path,
+    options: &CreateOptions<'_>,
+    archive: Option<ArchiveAccess<'_>>,
+) -> Result<CreateReport, BackupError> {
     let started = Instant::now();
     let created_dir = prepare_output(out)?;
-    match create_inner(pool, store, out, options, started).await {
+    let backup_id = Uuid::new_v4();
+    match create_inner(pool, store, out, options, started, backup_id, archive).await {
         Ok(mut report) => {
             let event = NewEvent::new("backup.created")
                 .detail(
@@ -268,6 +297,7 @@ pub async fn create(
                 )
                 .detail("rows", Detail::Count(count(report.rows)))
                 .detail("blobs", Detail::Count(count(report.blobs)))
+                .target("archive_backup", report.backup_id)
                 .detail("bytes", Detail::Count(count(report.blob_bytes)))
                 .detail(
                     "migration",
@@ -297,6 +327,9 @@ pub async fn create(
             } else {
                 remove_own_entries(out);
             }
+            if let Err(cancel_error) = db::archive_backup_cancel(pool, backup_id).await {
+                tracing::error!(%cancel_error, backup = %backup_id, "incomplete archive backup pins remain and require inventory recovery");
+            }
             Err(error)
         }
     }
@@ -322,6 +355,8 @@ async fn create_inner(
     out: &Path,
     options: &CreateOptions<'_>,
     started: Instant,
+    backup_id: Uuid,
+    archive: Option<ArchiveAccess<'_>>,
 ) -> Result<CreateReport, BackupError> {
     craftcloud_db::migrate::verify(pool)
         .await
@@ -351,7 +386,18 @@ async fn create_inner(
     };
 
     let lock = wait_for_lock(pool, options.lock_wait).await?;
-    let result = locked(pool, store, out, options, started, store_id, epoch).await;
+    let result = locked(LockedCreate {
+        pool,
+        store,
+        out,
+        options,
+        started,
+        store_id,
+        epoch,
+        backup_id,
+        archive,
+    })
+    .await;
     if let Err(error) = lock.release().await {
         tracing::warn!(%error, "the maintenance lock could not be released explicitly; the connection is closed instead");
     }
@@ -377,15 +423,30 @@ async fn wait_for_lock(
     }
 }
 
-async fn locked(
-    pool: &PgPool,
-    store: &LocalStore,
-    out: &Path,
-    options: &CreateOptions<'_>,
+struct LockedCreate<'a, 'options, 'archive> {
+    pool: &'a PgPool,
+    store: &'a LocalStore,
+    out: &'a Path,
+    options: &'options CreateOptions<'archive>,
     started: Instant,
     store_id: Uuid,
     epoch: i64,
-) -> Result<CreateReport, BackupError> {
+    backup_id: Uuid,
+    archive: Option<ArchiveAccess<'archive>>,
+}
+
+async fn locked(context: LockedCreate<'_, '_, '_>) -> Result<CreateReport, BackupError> {
+    let LockedCreate {
+        pool,
+        store,
+        out,
+        options,
+        started,
+        store_id,
+        epoch,
+        backup_id,
+        archive,
+    } = context;
     notify(options, Phase::LockHeld).await;
     make_dir(&out.join(TABLES_DIR), "the tables directory")?;
     make_dir(&out.join(BLOBS_DIR), "the blobs directory")?;
@@ -394,12 +455,36 @@ async fn locked(
     notify(options, Phase::SnapshotTaken).await;
     let (blobs, blob_bytes) = copy_blobs(store, out).await?;
     notify(options, Phase::BlobsCopied).await;
-    if blobs != snapshot.index.count || blob_bytes != snapshot.index.total_bytes {
+    if blobs != snapshot.local_blob_count || blob_bytes != snapshot.local_blob_bytes {
         return Err(BackupError::new(
             ErrorKind::Integrity,
             "the copied blobs do not match the blob list",
         ));
     }
+
+    let references = snapshot.archive_ref_count;
+    if references > 0 {
+        let access = archive.ok_or_else(|| {
+            BackupError::new(
+                ErrorKind::SourceDamaged,
+                "archive-aware backup requires the configured archive provider and server key",
+            )
+        })?;
+        let sum = verify_remote_refs(access, backup_id, out).await?;
+        if Some(sum.sha256) != parse_sha256(&snapshot.index.sha256)
+            || sum.count != snapshot.index.count
+            || sum.total_bytes != snapshot.index.total_bytes
+        {
+            return Err(BackupError::new(
+                ErrorKind::Integrity,
+                "the archive verification did not match the blob list",
+            ));
+        }
+    }
+
+    // Pins become durable before the manifest is published. A crash here can
+    // leak retention, but cannot leave a completed backup without its archive keys.
+    let pinned_refs = register_archive_pins(pool, out, backup_id, &snapshot.index).await?;
 
     let rows = snapshot.tables.iter().map(|t| t.rows).sum();
     let manifest = Manifest {
@@ -419,6 +504,7 @@ async fn locked(
             .map(|t| (*t).to_owned())
             .collect(),
         unavailable_version_blobs: snapshot.unavailable,
+        backup_id: Some(backup_id.to_string()),
     };
     if manifest.unavailable_version_blobs > 0 {
         tracing::warn!(
@@ -436,15 +522,67 @@ async fn locked(
     )
     .await?;
     sync_dir(out).await;
+    if !db::archive_backup_complete(pool, backup_id, &digest, pinned_refs).await? {
+        return Err(BackupError::new(
+            ErrorKind::Integrity,
+            "the archive backup pins do not match the manifest",
+        ));
+    }
     Ok(CreateReport {
         manifest,
         manifest_sha256: digest,
+        backup_id,
         rows,
         blobs,
         blob_bytes,
         duration: started.elapsed(),
         audit_recorded: false,
     })
+}
+
+pub(crate) async fn register_archive_pins(
+    pool: &PgPool,
+    dir: &Path,
+    backup_id: Uuid,
+    expected: &BlobIndex,
+) -> Result<u64, BackupError> {
+    db::archive_backup_begin(pool, backup_id).await?;
+    let mut entries = blob_entries(dir);
+    let mut batch = Vec::with_capacity(ARCHIVE_PIN_BATCH);
+    let mut count = 0_u64;
+    while let Some(entry) = entries.next().await? {
+        if let Some(key) = entry.archive_object_key {
+            let blob_id = Uuid::parse_str(&entry.id)
+                .map_err(|_| BackupError::new(ErrorKind::Format, "a blob id is invalid"))?;
+            batch.push(db::ArchiveBackupRef {
+                blob_id,
+                archive_object_key: key,
+            });
+            count = count.checked_add(1).ok_or_else(|| {
+                BackupError::new(ErrorKind::Integrity, "archive reference count overflow")
+            })?;
+            if batch.len() == ARCHIVE_PIN_BATCH {
+                db::archive_backup_add_refs(pool, backup_id, &batch).await?;
+                batch.clear();
+            }
+        }
+    }
+    if !batch.is_empty() {
+        db::archive_backup_add_refs(pool, backup_id, &batch).await?;
+    }
+    let sum = entries
+        .summary()
+        .ok_or_else(|| BackupError::new(ErrorKind::Io, "the blob list was not fully read"))?;
+    if sum.count != expected.count
+        || sum.total_bytes != expected.total_bytes
+        || parse_sha256(&expected.sha256) != Some(sum.sha256)
+    {
+        return Err(BackupError::new(
+            ErrorKind::Integrity,
+            "blobs.jsonl changed while archive pins were registered",
+        ));
+    }
+    Ok(count)
 }
 
 async fn notify(options: &CreateOptions<'_>, phase: Phase) {
@@ -474,6 +612,9 @@ struct Snapshot {
     migration_version: i64,
     tables: Vec<TableEntry>,
     index: BlobIndex,
+    local_blob_count: u64,
+    local_blob_bytes: u64,
+    archive_ref_count: u64,
     unavailable: u64,
 }
 
@@ -541,12 +682,18 @@ async fn snapshot(pool: &PgPool, out: &Path) -> Result<Snapshot, BackupError> {
     .await?;
 
     let mut list = Out::create(&out.join(BLOB_INDEX_FILE), BLOB_INDEX_FILE)?;
-    let (mut blob_count, mut blob_total) = (0_u64, 0_u64);
+    let (
+        mut blob_count,
+        mut blob_total,
+        mut local_blob_count,
+        mut local_blob_bytes,
+        mut archive_ref_count,
+    ) = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
     let mut last = String::new();
     let mut previous: Option<String> = None;
     loop {
-        let page: Vec<(Uuid, String, i64, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, object_key, size_bytes, sha256 FROM blobs \
+        let page: Vec<BlobRow> = sqlx::query_as(
+            "SELECT id, object_key, size_bytes, sha256, tier_state, archive_object_key, archive_wrapped_key FROM blobs \
              WHERE state = 'committed' AND object_key COLLATE \"C\" > $1 \
              ORDER BY object_key COLLATE \"C\" LIMIT $2",
         )
@@ -554,19 +701,55 @@ async fn snapshot(pool: &PgPool, out: &Path) -> Result<Snapshot, BackupError> {
         .bind(BLOB_PAGE)
         .fetch_all(&mut *tx)
         .await?;
-        let Some((_, newest, _, _)) = page.last() else {
+        let Some((_, newest, _, _, _, _, _)) = page.last() else {
             break;
         };
         last.clone_from(newest);
-        for (id, key, size, sha256) in &page {
+        for (id, key, size, sha256, tier_state, archive_object_key, archive_wrapped_key) in &page {
             let size = u64::try_from(*size).map_err(|_| {
                 BackupError::new(ErrorKind::SourceDamaged, "a blob has a negative size")
             })?;
+            let local_copy = match tier_state.as_str() {
+                "local" => true,
+                "archived" => false,
+                "archiving" | "recalling" => {
+                    return Err(BackupError::new(
+                        ErrorKind::Busy,
+                        "an archive transition is incomplete; finish maintenance and retry the backup",
+                    ));
+                }
+                _ => {
+                    return Err(BackupError::new(
+                        ErrorKind::SourceDamaged,
+                        "a blob has an unknown storage tier",
+                    ));
+                }
+            };
+            // A local row may hold a durable archive upload intent whose
+            // provider object is not yet committed. Keep its database columns
+            // in the table snapshot, but never treat the pending key as a
+            // verified remote backup reference.
+            let (archive_object_key, archive_wrapped_key) = if local_copy {
+                (None, None)
+            } else {
+                match (archive_object_key, archive_wrapped_key) {
+                    (Some(key), Some(wrapped)) => (Some(key.clone()), Some(hex(wrapped))),
+                    _ => {
+                        return Err(BackupError::new(
+                            ErrorKind::SourceDamaged,
+                            "archived blob metadata is incomplete",
+                        ));
+                    }
+                }
+            };
             let entry = BlobEntry {
                 id: id.to_string(),
                 key: key.clone(),
                 size,
                 sha256: hex(sha256),
+                local_copy,
+                archive_object_key,
+                archive_wrapped_key,
             };
             let mut line = serde_json::to_vec(&entry).map_err(|_| {
                 BackupError::new(ErrorKind::Format, "a blob entry cannot be written")
@@ -591,6 +774,19 @@ async fn snapshot(pool: &PgPool, out: &Path) -> Result<Snapshot, BackupError> {
             blob_total = blob_total
                 .checked_add(size)
                 .ok_or_else(|| BackupError::new(ErrorKind::Integrity, "the blob sizes overflow"))?;
+            if local_copy {
+                local_blob_count = local_blob_count.checked_add(1).ok_or_else(|| {
+                    BackupError::new(ErrorKind::Integrity, "the local blob count overflow")
+                })?;
+                local_blob_bytes = local_blob_bytes.checked_add(size).ok_or_else(|| {
+                    BackupError::new(ErrorKind::Integrity, "the local blob sizes overflow")
+                })?;
+            }
+            if entry.archive_object_key.is_some() {
+                archive_ref_count = archive_ref_count.checked_add(1).ok_or_else(|| {
+                    BackupError::new(ErrorKind::Integrity, "the archive reference count overflow")
+                })?;
+            }
         }
     }
     let written = list.finish().await?;
@@ -606,6 +802,9 @@ async fn snapshot(pool: &PgPool, out: &Path) -> Result<Snapshot, BackupError> {
             total_bytes: blob_total,
             sha256: hex(&written.sha256),
         },
+        local_blob_count,
+        local_blob_bytes,
+        archive_ref_count,
         unavailable: u64::try_from(unavailable).unwrap_or(0),
     })
 }
@@ -636,9 +835,13 @@ async fn copy_blobs(store: &LocalStore, out: &Path) -> Result<(u64, u64), Backup
             ));
         }
         let entry = BlobEntry::parse_line(&line)?;
-        copy_one(store, out, &entry).await?;
-        count += 1;
-        total += entry.size;
+        if entry.local_copy {
+            copy_one(store, out, &entry).await?;
+            count += 1;
+            total = total.checked_add(entry.size).ok_or_else(|| {
+                BackupError::new(ErrorKind::Integrity, "local blob byte count overflow")
+            })?;
+        }
     }
 }
 

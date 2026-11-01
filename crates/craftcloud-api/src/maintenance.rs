@@ -187,6 +187,16 @@ pub struct StepReport {
     pub error: Option<&'static str>,
 }
 
+struct FinishBlob<'a> {
+    store: &'a LocalStore,
+    blob_id: Uuid,
+    object_key: &'a str,
+    archive_object_key: Option<&'a str>,
+    archive_delete_pending: bool,
+    now: OffsetDateTime,
+    report: &'a mut StepReport,
+}
+
 impl StepReport {
     fn add(&mut self, key: &'static str, amount: u64) {
         let slot = self.counts.entry(key).or_default();
@@ -506,6 +516,22 @@ pub async fn check_store_binding(
     }
 }
 
+/// Checks a store for an operation that must never establish a new pairing.
+/// An already-bound database is required before checking the marker, so an
+/// empty foreign directory cannot be implicitly adopted by recall or another
+/// maintenance command. A matching store may still finish the one-step marker
+/// update left by a crash after an epoch bump.
+pub async fn check_existing_store_binding(
+    pool: &PgPool,
+    store: &LocalStore,
+    now: OffsetDateTime,
+) -> Result<Binding, BindingError> {
+    if db::store_binding_epoch(pool).await?.is_none() {
+        return Ok(Binding::Mismatch(BindingMismatch::DatabaseUnbound));
+    }
+    check_store_binding(pool, store, now, true).await
+}
+
 /// What a forced rebinding found and did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rebound {
@@ -565,6 +591,7 @@ pub async fn rebind_store(
 pub struct Maintenance {
     pool: PgPool,
     store: Option<LocalStore>,
+    archive_store: Option<Arc<craftcloud_storage::ArchiveStore>>,
     clock: Arc<dyn Clock>,
     settings: MaintenanceSettings,
     /// Where the reconciliation continues its walk through the object store.
@@ -591,6 +618,7 @@ impl Maintenance {
         Self {
             pool,
             store,
+            archive_store: None,
             clock,
             settings,
             cursor: Mutex::new(None),
@@ -605,6 +633,14 @@ impl Maintenance {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<crate::Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attaches the archive provider used by garbage collection to delete
+    /// unpinned remote objects after their local copy is removed.
+    #[must_use]
+    pub fn with_archive(mut self, store: Arc<craftcloud_storage::ArchiveStore>) -> Self {
+        self.archive_store = Some(store);
         self
     }
 
@@ -1165,7 +1201,7 @@ impl Maintenance {
         let created_before = minus(ctx.now, self.settings.grace());
         let batch = self.settings.batch();
         let excluded = self.excluded("collect_blobs", ctx.now, report);
-        let deleting = db::gc_deleting(&self.pool, batch).await?;
+        let deleting = db::gc_deleting_targets(&self.pool, batch).await?;
         let candidates = db::gc_candidates(&self.pool, created_before, &excluded, batch).await?;
         if ctx.dry {
             report.add("would_resume", count_of(deleting.len()));
@@ -1173,12 +1209,21 @@ impl Maintenance {
             return Ok(());
         }
         // Finish what an earlier run (or crash) left half done.
-        for (_org_id, blob_id, object_key) in deleting {
+        for target in deleting {
             if !ctx.go() {
                 break;
             }
             report.add("resumed", 1);
-            self.finish_blob(store, report, blob_id, &object_key).await;
+            self.finish_blob(FinishBlob {
+                store,
+                blob_id: target.id,
+                object_key: &target.object_key,
+                archive_object_key: target.archive_object_key.as_deref(),
+                archive_delete_pending: target.archive_delete_pending,
+                now: ctx.now,
+                report,
+            })
+            .await;
         }
         for (org_id, blob_id) in candidates {
             if !ctx.go() {
@@ -1218,8 +1263,16 @@ impl Maintenance {
                 );
                 report.add("counter_clamped", 1);
             }
-            self.finish_blob(store, report, blob_id, &claimed.object_key)
-                .await;
+            self.finish_blob(FinishBlob {
+                store,
+                blob_id,
+                object_key: &claimed.object_key,
+                archive_object_key: claimed.archive_object_key.as_deref(),
+                archive_delete_pending: claimed.archive_object_key.is_some(),
+                now: ctx.now,
+                report,
+            })
+            .await;
         }
         Ok(())
     }
@@ -1241,13 +1294,16 @@ impl Maintenance {
     /// Phase 2: deletes the object, then the row. A failure leaves the blob
     /// `deleting`; the next run retries (on Windows an object that a download
     /// still holds open cannot be deleted).
-    async fn finish_blob(
-        &self,
-        store: &LocalStore,
-        report: &mut StepReport,
-        blob_id: Uuid,
-        object_key: &str,
-    ) {
+    async fn finish_blob(&self, item: FinishBlob<'_>) {
+        let FinishBlob {
+            store,
+            blob_id,
+            object_key,
+            archive_object_key,
+            archive_delete_pending,
+            now,
+            report,
+        } = item;
         // Crash test hook: the claim is committed, the object not deleted yet.
         craftcloud_storage::crash_point("gc-after-claim", 0);
         let Ok(key) = ObjectKey::parse(object_key) else {
@@ -1267,6 +1323,51 @@ impl Maintenance {
                 );
                 report.add("storage_errors", 1);
                 return;
+            }
+        }
+        if archive_delete_pending {
+            let Some(archive) = &self.archive_store else {
+                tracing::error!(target: "craftcloud::maintenance", blob = %blob_id, "archive object deletion is pending but no archive provider is configured");
+                report.add("archive_unavailable", 1);
+                return;
+            };
+            let Some(archive_object_key) = archive_object_key else {
+                tracing::error!(target: "craftcloud::maintenance", blob = %blob_id, "archive deletion is pending without an object key");
+                report.add("archive_errors", 1);
+                return;
+            };
+            let Ok(archive_key) = ObjectKey::parse(archive_object_key) else {
+                tracing::error!(target: "craftcloud::maintenance", blob = %blob_id, "archive object key is invalid");
+                report.add("archive_errors", 1);
+                return;
+            };
+            let delete_result = archive.delete(&archive_key).await;
+            if delete_result.is_err() && !matches!(delete_result, Err(StorageError::NotFound)) {
+                let retry_at = now.checked_add(time::Duration::minutes(5)).unwrap_or(now);
+                match db::gc_archive_delete_failed(
+                    &self.pool,
+                    blob_id,
+                    "REMOTE_DELETE_FAILED",
+                    retry_at,
+                )
+                .await
+                {
+                    Ok(true) => report.add("archive_delete_retries", 1),
+                    Ok(false) => report.add("archive_errors", 1),
+                    Err(_) => report.add("db_errors", 1),
+                }
+                return;
+            }
+            match db::gc_archive_delete_finish(&self.pool, blob_id).await {
+                Ok(true) => report.add("archive_objects_deleted", 1),
+                Ok(false) => {
+                    report.add("archive_errors", 1);
+                    return;
+                }
+                Err(_) => {
+                    report.add("db_errors", 1);
+                    return;
+                }
             }
         }
         match db::gc_finish(&self.pool, blob_id).await {

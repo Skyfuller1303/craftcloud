@@ -62,6 +62,10 @@ impl ObjectKey {
     pub(crate) fn shard2(&self) -> &str {
         self.0.get(2..4).unwrap_or("00")
     }
+
+    pub(crate) fn is_generated_uuid(&self) -> bool {
+        Uuid::parse_str(&self.0).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random))
+    }
 }
 
 impl fmt::Display for ObjectKey {

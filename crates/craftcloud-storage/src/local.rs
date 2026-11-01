@@ -333,6 +333,41 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Opens a validated, still-unpublished temporary file for a remote adapter.
+    pub(crate) async fn open_temp_read(
+        &self,
+        temp: &TempObject,
+    ) -> Result<ObjectReader, StorageError> {
+        if !temp.prepared || temp.failed || temp.finished || temp.flushed != temp.written {
+            return Err(StorageError::Aborted);
+        }
+        let path = self.layout.temp_path(&temp.id);
+        if path != temp.path {
+            return Err(unsafe_tree());
+        }
+        let meta = fs::symlink_metadata(&path).await.map_err(map_io_error)?;
+        if !meta.is_file() || is_link(&meta) {
+            return Err(unsafe_tree());
+        }
+        if meta.len() != temp.written {
+            return Err(StorageError::LengthMismatch);
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW_FLAGS)
+            .open(path)
+            .await
+            .map_err(map_io_error)?;
+        let opened_meta = file.metadata().await.map_err(map_io_error)?;
+        if !opened_meta.is_file() || is_link(&opened_meta) || opened_meta.len() != temp.written {
+            return Err(unsafe_tree());
+        }
+        Ok(ObjectReader {
+            file,
+            remaining: temp.written,
+        })
+    }
+
     /// Opens an existing published object for reading without following links.
     async fn open_object(&self, key: &ObjectKey) -> Result<(File, Metadata), StorageError> {
         let dir = self.layout.dir_of(key);
@@ -387,6 +422,7 @@ pub struct TempObject {
     limit: u64,
     failed: bool,
     finished: bool,
+    prepared: bool,
     faults: Arc<FaultPlan>,
 }
 
@@ -490,6 +526,36 @@ impl TempObject {
         result
     }
 
+    /// Flushes and validates a temporary object before a remote adapter reads it.
+    pub(crate) async fn prepare_read(
+        &mut self,
+        expected_len: u64,
+        expected_sha256: &Sha256Digest,
+    ) -> Result<(), StorageError> {
+        if self.failed || self.finished || self.prepared {
+            return Err(StorageError::Aborted);
+        }
+        if let Err(error) = self.flush().await {
+            return Err(self.die(error));
+        }
+        if self.written != expected_len {
+            return Err(self.die(StorageError::LengthMismatch));
+        }
+        let digest: Sha256Digest = self.hasher.clone().finalize().into();
+        if digest != *expected_sha256 {
+            return Err(self.die(StorageError::ChecksumMismatch));
+        }
+        self.prepared = true;
+        Ok(())
+    }
+
+    /// Leaves this validated file for later crash reconciliation.
+    pub(crate) fn preserve_for_reconciliation(&mut self) {
+        self.buffer.clear();
+        *lock_file(&self.file) = None;
+        self.finished = true;
+    }
+
     async fn push(&mut self, data: &[u8]) -> Result<(), StorageError> {
         for chunk in data.chunks(CHUNK_BYTES) {
             if self.buffer.len() + chunk.len() > CHUNK_BYTES {
@@ -504,8 +570,12 @@ impl TempObject {
 }
 
 impl WriteSink for TempObject {
+    fn object_key(&self) -> Result<ObjectKey, StorageError> {
+        ObjectKey::parse(&self.id).map_err(|_| StorageError::Aborted)
+    }
+
     async fn write(&mut self, data: &[u8]) -> Result<(), StorageError> {
-        if self.failed || self.finished {
+        if self.failed || self.finished || self.prepared {
             return Err(StorageError::Aborted);
         }
         let len = data.len() as u64;
@@ -625,6 +695,56 @@ fn temp_id_ok(id: &str) -> bool {
 
 /// Publishing under a chosen key (restore of a backup).
 impl LocalStore {
+    /// Begins a write under an already-reserved UUID v4 object key.
+    pub async fn begin_write_as(
+        &self,
+        key: ObjectKey,
+        max_bytes: u64,
+    ) -> Result<TempObject, StorageError> {
+        if !key.is_generated_uuid() {
+            return Err(StorageError::Aborted);
+        }
+        match self.open_object(&key).await {
+            Ok((file, _)) => {
+                drop(file);
+                return Err(StorageError::AlreadyExists);
+            }
+            Err(StorageError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let id = key.as_str().to_owned();
+        let path = self.layout.temp_path(&id);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path).map_err(|error| {
+            tracing::error!(path = %path.display(), error = %error, "cannot create temporary object");
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                StorageError::AlreadyExists
+            } else {
+                map_io_error(error)
+            }
+        })?;
+        Ok(TempObject {
+            file: Arc::new(Mutex::new(Some(file))),
+            path,
+            id,
+            buffer: Vec::with_capacity(CHUNK_BYTES),
+            hasher: Sha256::new(),
+            written: 0,
+            flushed: 0,
+            limit: max_bytes,
+            failed: false,
+            finished: false,
+            prepared: false,
+            faults: Arc::clone(&self.faults),
+        })
+    }
+
     /// Like [`ObjectStore::finalize`], but publishes the object under `key`
     /// instead of a fresh random one. Used when a backup is restored, so that
     /// the keys recorded in the database stay valid. Never overwrites: an
@@ -736,34 +856,15 @@ impl ObjectStore for LocalStore {
     type Reader = ObjectReader;
 
     async fn begin_write(&self, max_bytes: u64) -> Result<TempObject, StorageError> {
-        let id = Uuid::new_v4().simple().to_string();
-        let path = self.layout.temp_path(&id);
-        // Created inline (one quick syscall, no await point): a cancelled
-        // future can then never leave a file that no TempObject owns.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options.open(&path).map_err(|e| {
-            tracing::error!(path = %path.display(), error = %e, "cannot create temporary object");
-            map_io_error(e)
-        })?;
-        Ok(TempObject {
-            file: Arc::new(Mutex::new(Some(file))),
-            path,
-            id,
-            buffer: Vec::with_capacity(CHUNK_BYTES),
-            hasher: Sha256::new(),
-            written: 0,
-            flushed: 0,
-            limit: max_bytes,
-            failed: false,
-            finished: false,
-            faults: Arc::clone(&self.faults),
-        })
+        self.begin_write_as(ObjectKey::generate(), max_bytes).await
+    }
+
+    async fn begin_write_as(
+        &self,
+        key: ObjectKey,
+        max_bytes: u64,
+    ) -> Result<TempObject, StorageError> {
+        LocalStore::begin_write_as(self, key, max_bytes).await
     }
 
     async fn finalize(
@@ -772,7 +873,8 @@ impl ObjectStore for LocalStore {
         expected_len: u64,
         expected_sha256: &Sha256Digest,
     ) -> Result<ObjectKey, StorageError> {
-        self.finalize_as(temp, ObjectKey::generate(), expected_len, expected_sha256)
+        let key = temp.object_key()?;
+        self.finalize_as(temp, key, expected_len, expected_sha256)
             .await
     }
 

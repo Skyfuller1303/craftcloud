@@ -67,6 +67,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use uuid::Uuid;
 
+use crate::archive::{ArchiveAccess, verify_remote_refs};
+use crate::blob_stream::blob_entries;
+use crate::create::register_archive_pins;
 use crate::error::{BackupError, ErrorKind};
 use crate::manifest::{BlobEntry, Manifest, blob_file, hex, parse_sha256};
 use crate::tables::{backup_tables_for, excluded_tables_for};
@@ -153,6 +156,18 @@ pub async fn restore(
     dir: &Path,
     options: &RestoreOptions<'_>,
 ) -> Result<RestoreReport, BackupError> {
+    restore_with_archive(pool, store, dir, options, None).await
+}
+
+/// Restores local blobs and verifies every referenced archive object before
+/// writing. Remote references are pinned before the restored database commits.
+pub async fn restore_with_archive(
+    pool: &PgPool,
+    store: &LocalStore,
+    dir: &Path,
+    options: &RestoreOptions<'_>,
+    archive: Option<ArchiveAccess<'_>>,
+) -> Result<RestoreReport, BackupError> {
     let started = Instant::now();
 
     let (check_dir, expected) = (
@@ -171,7 +186,17 @@ pub async fn restore(
             "another restore, a backup or a maintenance run holds the lock; try again when it has finished",
         ));
     };
-    let result = restore_locked(pool, store, dir, options, verified.manifest, started).await;
+    let result = restore_locked(LockedRestore {
+        pool,
+        store,
+        dir,
+        options,
+        manifest: verified.manifest,
+        manifest_sha256: verified.manifest_sha256,
+        started,
+        archive,
+    })
+    .await;
     if let Err(error) = lock.release().await {
         tracing::warn!(%error, "the restore lock could not be released explicitly; the connection is closed instead");
     }
@@ -184,19 +209,93 @@ async fn notify(options: &RestoreOptions<'_>, phase: RestorePhase) {
     }
 }
 
-async fn restore_locked(
-    pool: &PgPool,
-    store: &LocalStore,
-    dir: &Path,
-    options: &RestoreOptions<'_>,
+struct LockedRestore<'a, 'options, 'archive> {
+    pool: &'a PgPool,
+    store: &'a LocalStore,
+    dir: &'a Path,
+    options: &'options RestoreOptions<'archive>,
     manifest: Manifest,
+    manifest_sha256: String,
     started: Instant,
-) -> Result<RestoreReport, BackupError> {
+    archive: Option<ArchiveAccess<'archive>>,
+}
+
+async fn restore_locked(context: LockedRestore<'_, '_, '_>) -> Result<RestoreReport, BackupError> {
+    let LockedRestore {
+        pool,
+        store,
+        dir,
+        options,
+        manifest,
+        manifest_sha256,
+        started,
+        archive,
+    } = context;
+    let mut entries = blob_entries(dir);
+    let mut archive_refs = 0_u64;
+    while let Some(entry) = entries.next().await? {
+        if entry.archive_object_key.is_some() {
+            archive_refs = archive_refs.checked_add(1).ok_or_else(|| {
+                BackupError::new(ErrorKind::Integrity, "archive reference count overflow")
+            })?;
+        }
+    }
+    let _ = entries.summary().ok_or_else(|| {
+        BackupError::new(ErrorKind::Io, "the archive reference scan was incomplete")
+    })?;
+    if archive_refs > 0 {
+        let access = archive.ok_or_else(|| {
+            BackupError::new(
+                ErrorKind::SourceDamaged,
+                "restore of archived blobs requires the configured archive provider and server key",
+            )
+        })?;
+        let id = manifest
+            .backup_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| {
+                BackupError::new(ErrorKind::Format, "the archive backup id is missing")
+            })?;
+        let sum = verify_remote_refs(access, id, dir).await?;
+        if Some(sum.sha256) != parse_sha256(&manifest.blobs.sha256)
+            || sum.count != manifest.blobs.count
+            || sum.total_bytes != manifest.blobs.total_bytes
+        {
+            return Err(BackupError::new(
+                ErrorKind::Integrity,
+                "the archive verification did not match the blob list",
+            ));
+        }
+    }
     ensure_store_empty(store).await?;
     prepare_database(pool, &manifest, options.runtime_role).await?;
+    if archive_refs > 0 {
+        let id = Uuid::parse_str(manifest.backup_id.as_deref().unwrap_or_default())
+            .map_err(|_| BackupError::new(ErrorKind::Format, "the archive backup id is invalid"))?;
+        if let Err(error) = register_archive_pins(pool, dir, id, &manifest.blobs).await {
+            if let Err(cancel_error) = db::archive_backup_cancel(pool, id).await {
+                tracing::error!(%cancel_error, backup = %id, "partial restore pins remain; archive GC stays closed");
+            }
+            return Err(error);
+        }
+        if !db::archive_backup_complete(pool, id, &manifest_sha256, archive_refs).await? {
+            let _ = db::archive_backup_cancel(pool, id).await;
+            return Err(BackupError::new(
+                ErrorKind::Integrity,
+                "archive pins do not match the restored manifest",
+            ));
+        }
+    }
     notify(options, RestorePhase::Verified).await;
 
-    let written = write_blobs(store, dir, &manifest).await?;
+    let written = match write_blobs(store, dir, &manifest).await {
+        Ok(written) => written,
+        Err(error) => {
+            release_restore_pins(pool, &manifest, &manifest_sha256, archive_refs).await;
+            return Err(error);
+        }
+    };
     notify(options, RestorePhase::BlobsWritten).await;
 
     // A fresh identity for the restored pair: it must not look like the
@@ -204,8 +303,15 @@ async fn restore_locked(
     let store_id = Uuid::new_v4();
     let (rows, aborted_uploads) = match load_tables(pool, store, dir, &manifest, store_id).await {
         Ok(done) => done,
-        Err(error) => {
+        Err(LoadFailure::BeforeCommit(error)) => {
             remove_blobs(store, &written).await;
+            release_restore_pins(pool, &manifest, &manifest_sha256, archive_refs).await;
+            return Err(error);
+        }
+        Err(LoadFailure::CommitOutcomeUnknown(error)) => {
+            tracing::error!(
+                "restore commit outcome is unknown; retaining marker, local objects and archive pins for operator recovery"
+            );
             return Err(error);
         }
     };
@@ -224,6 +330,33 @@ async fn restore_locked(
         store_id,
         duration: started.elapsed(),
     })
+}
+
+async fn release_restore_pins(
+    pool: &PgPool,
+    manifest: &Manifest,
+    manifest_sha256: &str,
+    archive_refs: u64,
+) {
+    if archive_refs == 0 {
+        return;
+    }
+    let Some(backup_id) = manifest
+        .backup_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+    else {
+        return;
+    };
+    match db::archive_backup_abort_restore(pool, backup_id, manifest_sha256, archive_refs).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::error!(backup = %backup_id, "restore failed and its exact archive pins could not be removed; inventory recovery is required")
+        }
+        Err(error) => {
+            tracing::error!(%error, backup = %backup_id, "restore failed and its archive pins remain; inventory recovery is required")
+        }
+    }
 }
 
 async fn ensure_store_empty(store: &LocalStore) -> Result<(), BackupError> {
@@ -321,7 +454,8 @@ async fn prepare_database(
     let names = backup_tables_for(manifest.migration_version)?
         .into_iter()
         .map(|t| t.name)
-        .chain(excluded_tables_for(manifest.migration_version));
+        .chain(excluded_tables_for(manifest.migration_version))
+        .filter(|name| *name != "archive_gc_state");
     for name in names {
         let has_rows: bool =
             sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM \"{name}\")"))
@@ -333,6 +467,18 @@ async fn prepare_database(
                 format!(
                     "the target database is not empty (table {name} has rows); a restore never overwrites data"
                 ),
+            ));
+        }
+    }
+    if manifest.migration_version >= 22 {
+        let gate: Option<bool> =
+            sqlx::query_scalar("SELECT inventory_complete FROM archive_gc_state WHERE id = true")
+                .fetch_optional(pool)
+                .await?;
+        if gate != Some(false) {
+            return Err(BackupError::new(
+                ErrorKind::TargetNotEmpty,
+                "the archive inventory gate is missing or already enabled; restore requires an empty, fail-closed archive state",
             ));
         }
     }
@@ -364,6 +510,7 @@ async fn write_blobs(
     });
 
     let mut written = Written::default();
+    let mut local_count = 0_u64;
     let mut failure: Option<BackupError> = None;
     while let Some(next) = receiver.recv().await {
         let entry = match next {
@@ -373,6 +520,9 @@ async fn write_blobs(
                 break;
             }
         };
+        if !entry.local_copy {
+            continue;
+        }
         if let Err(error) = write_one(store, dir, &entry).await {
             failure = Some(error);
             break;
@@ -394,6 +544,16 @@ async fn write_blobs(
                 break;
             }
         };
+        local_count = match local_count.checked_add(1) {
+            Some(total) => total,
+            None => {
+                failure = Some(BackupError::new(
+                    ErrorKind::Integrity,
+                    "the local blob count overflows",
+                ));
+                break;
+            }
+        };
     }
     drop(receiver);
     let produced = producer.await;
@@ -403,7 +563,7 @@ async fn write_blobs(
                 if hex(&sum.sha256) != manifest.blobs.sha256
                     || sum.count != manifest.blobs.count
                     || sum.total_bytes != manifest.blobs.total_bytes
-                    || sum.count != written.count()
+                    || local_count != written.count()
                 {
                     Some(BackupError::new(
                         ErrorKind::Integrity,
@@ -511,17 +671,56 @@ impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
 }
 
 /// One transaction: all tables, the fix-ups, the audit event, the binding.
-/// The marker file is written last before the commit and removed again if the
-/// commit fails, so the committed database and the store always agree.
+/// The marker file is written last before the commit. A commit error has an
+/// unknown outcome, so all resources are retained for operator recovery.
+enum LoadFailure {
+    BeforeCommit(BackupError),
+    CommitOutcomeUnknown(BackupError),
+}
+
+impl From<BackupError> for LoadFailure {
+    fn from(error: BackupError) -> Self {
+        Self::BeforeCommit(error)
+    }
+}
+
+impl From<sqlx::Error> for LoadFailure {
+    fn from(error: sqlx::Error) -> Self {
+        Self::BeforeCommit(BackupError::from(error))
+    }
+}
+
+impl From<craftcloud_db::DbError> for LoadFailure {
+    fn from(error: craftcloud_db::DbError) -> Self {
+        Self::BeforeCommit(BackupError::from(error))
+    }
+}
+
+impl From<craftcloud_storage::StorageError> for LoadFailure {
+    fn from(error: craftcloud_storage::StorageError) -> Self {
+        Self::BeforeCommit(BackupError::from(error))
+    }
+}
+
 async fn load_tables(
     pool: &PgPool,
     store: &LocalStore,
     dir: &Path,
     manifest: &Manifest,
     store_id: Uuid,
-) -> Result<(u64, u64), BackupError> {
+) -> Result<(u64, u64), LoadFailure> {
     let specs = backup_tables_for(manifest.migration_version)?;
     let mut tx = pool.begin().await?;
+    if manifest.migration_version >= 22 {
+        // This system gate is deliberately excluded from the backup payload.
+        // Restore always invalidates inventory in the same transaction as the
+        // restored pins, so archive GC stays closed after commit.
+        sqlx::query(
+            "UPDATE archive_gc_state SET inventory_complete = false, updated_at = now() WHERE id = true",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     let mut rows = 0_u64;
     for (spec, entry) in specs.iter().zip(&manifest.tables) {
         let target = match spec.deferred_column {
@@ -623,16 +822,11 @@ async fn load_tables(
     store
         .write_marker_info(MarkerInfo { store_id, epoch: 0 }, false)
         .await?;
-    if let Err(error) = tx.commit().await {
-        if let Err(remove) = store.remove_marker().await {
-            return Err(BackupError::new(
-                ErrorKind::Binding,
-                format!(
-                    "the restore failed to commit and the store marker file craftcloud-store.json could not be removed ({remove}): delete it before trying again"
-                ),
-            ));
-        }
-        return Err(error.into());
+    if tx.commit().await.is_err() {
+        return Err(LoadFailure::CommitOutcomeUnknown(BackupError::new(
+            ErrorKind::Database,
+            "the restore commit outcome is unknown; marker, local objects and archive pins were retained; verify the database/store pairing before retrying",
+        )));
     }
     Ok((rows, aborted))
 }

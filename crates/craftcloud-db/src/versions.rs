@@ -56,6 +56,8 @@ pub struct FileVersion {
     pub created_by_user_id: Uuid,
     /// User action or automated FigCraft Live snapshot.
     pub actor_kind: String,
+    /// Informational storage tier (`archive` only after publication commits).
+    pub storage_tier: String,
     /// When.
     pub created_at: OffsetDateTime,
 }
@@ -63,6 +65,33 @@ pub struct FileVersion {
 const COLUMNS: &str = "id, org_id, workspace_id, project_id, file_id, number, blob_id, size_bytes, \
      sha256, base_version_id, restored_from_version_id, upload_session_id, created_by_user_id, \
      created_at, actor_kind";
+const SELECT_COLUMNS: &str = "v.id, v.org_id, v.workspace_id, v.project_id, v.file_id, v.number, \
+     v.blob_id, v.size_bytes, v.sha256, v.base_version_id, v.restored_from_version_id, \
+     v.upload_session_id, v.created_by_user_id, v.created_at, v.actor_kind, \
+     CASE WHEN b.tier_state IN ('archived', 'recalling') THEN 'archive' ELSE 'local' END AS storage_tier";
+type DownloadRow = (
+    Uuid,
+    Uuid,
+    String,
+    i64,
+    Vec<u8>,
+    String,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+);
+type RestoreSourceRow = (
+    Uuid,
+    Uuid,
+    String,
+    i64,
+    Vec<u8>,
+    String,
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    String,
+);
 
 /// What a new version is made of.
 struct NewVersion<'a> {
@@ -142,6 +171,8 @@ pub enum RestoreOutcome {
     ProjectDeleted,
     /// The blob of that version failed verification before.
     BlobCorrupt,
+    /// Archive bytes must be recalled and verified locally before restoring.
+    ArchiveRecallRequired,
 }
 
 /// What a download needs, resolved under the caller's scope.
@@ -174,6 +205,12 @@ pub struct DownloadInfo {
     pub sha256: Vec<u8>,
     /// Blob state (`committed`, or `corrupt`).
     pub blob_state: String,
+    /// `local` or `archive`; intermediate archiving reads use the local copy.
+    pub storage_tier: String,
+    /// Archive object key, when an archive copy exists.
+    pub archive_object_key: Option<String>,
+    /// Wrapped per-object data key, when an archive copy exists.
+    pub archive_wrapped_key: Option<Vec<u8>>,
     /// Display name of the file (untrusted).
     pub file_name: String,
 }
@@ -190,7 +227,9 @@ pub async fn get(
     version_id: Uuid,
 ) -> Result<Option<FileVersion>, DbError> {
     Ok(sqlx::query_as::<_, FileVersion>(&format!(
-        "SELECT {COLUMNS} FROM file_versions WHERE org_id = $1 AND file_id = $2 AND id = $3"
+        "SELECT {SELECT_COLUMNS} FROM file_versions v JOIN blobs b \
+         ON b.id = v.blob_id AND b.org_id = v.org_id \
+         WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3"
     ))
     .bind(scope.org_id())
     .bind(file_id)
@@ -212,9 +251,10 @@ pub async fn list(
     before_number: Option<i64>,
 ) -> Result<Vec<FileVersion>, DbError> {
     Ok(sqlx::query_as::<_, FileVersion>(&format!(
-        "SELECT {COLUMNS} FROM file_versions \
-         WHERE org_id = $1 AND file_id = $2 AND ($3::bigint IS NULL OR number < $3) \
-         ORDER BY number DESC LIMIT $4"
+        "SELECT {SELECT_COLUMNS} FROM file_versions v JOIN blobs b \
+         ON b.id = v.blob_id AND b.org_id = v.org_id \
+         WHERE v.org_id = $1 AND v.file_id = $2 AND ($3::bigint IS NULL OR v.number < $3) \
+         ORDER BY v.number DESC LIMIT $4"
     ))
     .bind(scope.org_id())
     .bind(file_id)
@@ -278,8 +318,10 @@ pub async fn download_target(
         (None, Some(head)) => head,
         (None, None) => return Ok(DownloadTarget::NoVersion),
     };
-    let row: Option<(Uuid, Uuid, String, i64, Vec<u8>, String)> = sqlx::query_as(
-        "SELECT v.id, b.id, b.object_key, v.size_bytes, v.sha256, b.state \
+    let row: Option<DownloadRow> = sqlx::query_as(
+        "SELECT v.id, b.id, b.object_key, v.size_bytes, v.sha256, b.state, \
+                CASE WHEN b.tier_state IN ('archived', 'recalling') THEN 'archive' ELSE 'local' END, \
+                b.archive_object_key, b.archive_wrapped_key \
          FROM file_versions v JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
          WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3",
     )
@@ -289,17 +331,28 @@ pub async fn download_target(
     .fetch_optional(pool)
     .await?;
     Ok(match row {
-        Some((version_id, blob_id, object_key, size_bytes, sha256, blob_state)) => {
-            DownloadTarget::Ready(Box::new(DownloadInfo {
-                version_id,
-                blob_id,
-                object_key,
-                size_bytes,
-                sha256,
-                blob_state,
-                file_name,
-            }))
-        }
+        Some((
+            version_id,
+            blob_id,
+            object_key,
+            size_bytes,
+            sha256,
+            blob_state,
+            storage_tier,
+            archive_object_key,
+            archive_wrapped_key,
+        )) => DownloadTarget::Ready(Box::new(DownloadInfo {
+            version_id,
+            blob_id,
+            object_key,
+            size_bytes,
+            sha256,
+            blob_state,
+            storage_tier,
+            archive_object_key,
+            archive_wrapped_key,
+            file_name,
+        })),
         None => DownloadTarget::Gone,
     })
 }
@@ -375,7 +428,7 @@ impl OrgTx {
                  blob_id, size_bytes, sha256, base_version_id, restored_from_version_id, \
                  upload_session_id, created_by_user_id, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-             RETURNING {COLUMNS}"
+             RETURNING {COLUMNS}, 'local'::text AS storage_tier"
         ))
         .bind(Uuid::new_v4())
         .bind(self.org_id)
@@ -450,7 +503,8 @@ impl OrgTx {
         // preconditions say now.
         if session.state == "committed" {
             let existing = sqlx::query_as::<_, FileVersion>(&format!(
-                "SELECT {COLUMNS} FROM file_versions WHERE upload_session_id = $1"
+                "SELECT {SELECT_COLUMNS} FROM file_versions v JOIN blobs b \
+                 ON b.id = v.blob_id AND b.org_id = v.org_id WHERE v.upload_session_id = $1"
             ))
             .bind(upload_id)
             .fetch_optional(&mut *self.tx)
@@ -488,13 +542,17 @@ impl OrgTx {
         // The blob of a stored upload is `staged`. Garbage collection never
         // claims a blob of an open session; this lock-and-check keeps a version
         // from ever pointing at a blob that is being deleted, whatever happens.
-        let blob_state: Option<String> =
-            sqlx::query_scalar("SELECT state FROM blobs WHERE id = $1 AND org_id = $2 FOR UPDATE")
-                .bind(blob_id)
-                .bind(self.org_id)
-                .fetch_optional(&mut *self.tx)
-                .await?;
-        if blob_state.as_deref() != Some("staged") {
+        let blob: Option<(String, Uuid)> = sqlx::query_as(
+            "SELECT state, quota_group_id FROM blobs WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        )
+        .bind(blob_id)
+        .bind(self.org_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let Some((blob_state, quota_group_id)) = blob else {
+            return Ok(CommitOutcome::Closed(session.state));
+        };
+        if blob_state != "staged" {
             return Ok(CommitOutcome::Closed(session.state));
         }
         let version = self
@@ -528,7 +586,8 @@ impl OrgTx {
         .await?;
         // reserved -> committed, once, for workspace and organization.
         self.release(workspace_id, size).await?;
-        self.add_committed(workspace_id, size).await?;
+        self.add_committed(quota_group_id, workspace_id, size)
+            .await?;
         Ok(CommitOutcome::Committed(Box::new(version)))
     }
 
@@ -558,8 +617,8 @@ impl OrgTx {
         if file_deleted {
             return Ok(RestoreOutcome::FileDeleted);
         }
-        let old: Option<(Uuid, i64, Vec<u8>, String)> = sqlx::query_as(
-            "SELECT v.blob_id, v.size_bytes, v.sha256, b.state FROM file_versions v \
+        let old: Option<(Uuid, i64, Vec<u8>, String, String)> = sqlx::query_as(
+            "SELECT v.blob_id, v.size_bytes, v.sha256, b.state, b.tier_state FROM file_versions v \
              JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
              WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3 FOR SHARE OF b",
         )
@@ -568,7 +627,7 @@ impl OrgTx {
         .bind(version_id)
         .fetch_optional(&mut *self.tx)
         .await?;
-        let Some((blob_id, size, sha256, blob_state)) = old else {
+        let Some((blob_id, size, sha256, blob_state, tier_state)) = old else {
             return Ok(RestoreOutcome::Gone);
         };
         if !precondition.holds(head) {
@@ -578,6 +637,9 @@ impl OrgTx {
         // expected here) `deleting` blobs are refused.
         if blob_state != "committed" {
             return Ok(RestoreOutcome::BlobCorrupt);
+        }
+        if matches!(tier_state.as_str(), "archived" | "recalling") {
+            return Ok(RestoreOutcome::ArchiveRecallRequired);
         }
         let version = self
             .insert_version(
@@ -594,6 +656,144 @@ impl OrgTx {
                 now,
             )
             .await?;
+        Ok(RestoreOutcome::Restored(Box::new(version)))
+    }
+
+    /// Resolves a restore source under the same transaction and organization lock.
+    pub async fn version_restore_source(
+        &mut self,
+        scope: &OrgScope,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<DownloadTarget, DbError> {
+        self.check(scope, Action::VersionRestore)?;
+        let Some((_head, file_deleted, project_deleted, _, _)) =
+            self.file_head_locked(file_id).await?
+        else {
+            return Ok(DownloadTarget::Gone);
+        };
+        if project_deleted {
+            return Ok(DownloadTarget::ProjectDeleted);
+        }
+        if file_deleted {
+            return Ok(DownloadTarget::FileDeleted);
+        }
+        let row: Option<RestoreSourceRow> = sqlx::query_as(
+            "SELECT v.id, b.id, b.object_key, v.size_bytes, v.sha256, b.state, \
+                    CASE WHEN b.tier_state IN ('archived', 'recalling') THEN 'archive' ELSE 'local' END, \
+                    b.archive_object_key, b.archive_wrapped_key, f.name \
+             FROM file_versions v JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
+             JOIN files f ON f.org_id = v.org_id AND f.id = v.file_id \
+             WHERE v.org_id=$1 AND v.file_id=$2 AND v.id=$3 FOR SHARE OF b",
+        )
+        .bind(self.org_id)
+        .bind(file_id)
+        .bind(version_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        Ok(match row {
+            Some((
+                version_id,
+                blob_id,
+                object_key,
+                size_bytes,
+                sha256,
+                blob_state,
+                storage_tier,
+                archive_object_key,
+                archive_wrapped_key,
+                file_name,
+            )) => DownloadTarget::Ready(Box::new(DownloadInfo {
+                version_id,
+                blob_id,
+                object_key,
+                size_bytes,
+                sha256,
+                blob_state,
+                storage_tier,
+                archive_object_key,
+                archive_wrapped_key,
+                file_name,
+            })),
+            None => DownloadTarget::Gone,
+        })
+    }
+
+    /// Creates a local blob copy and a restored version for archived content.
+    /// The caller must have written and verified `object_key` locally first.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn version_restore_copy(
+        &mut self,
+        scope: &OrgScope,
+        file_id: Uuid,
+        version_id: Uuid,
+        user_id: Uuid,
+        precondition: Precondition,
+        object_key: &str,
+        now: OffsetDateTime,
+    ) -> Result<RestoreOutcome, DbError> {
+        self.check(scope, Action::VersionRestore)?;
+        let Some((head, file_deleted, project_deleted, workspace_id, project_id)) =
+            self.file_head_locked(file_id).await?
+        else {
+            return Ok(RestoreOutcome::Gone);
+        };
+        if project_deleted {
+            return Ok(RestoreOutcome::ProjectDeleted);
+        }
+        if file_deleted {
+            return Ok(RestoreOutcome::FileDeleted);
+        }
+        if !precondition.holds(head) {
+            return Ok(RestoreOutcome::PreconditionFailed { current: head });
+        }
+        let old: Option<(i64, Vec<u8>, String, Uuid)> = sqlx::query_as(
+            "SELECT v.size_bytes, v.sha256, b.state, b.quota_group_id \
+             FROM file_versions v JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
+             WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3 FOR UPDATE OF b",
+        )
+        .bind(self.org_id)
+        .bind(file_id)
+        .bind(version_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let Some((size, sha256, blob_state, quota_group_id)) = old else {
+            return Ok(RestoreOutcome::Gone);
+        };
+        if blob_state != "committed" {
+            return Ok(RestoreOutcome::BlobCorrupt);
+        }
+        let copy_blob_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO blobs (id, org_id, workspace_id, quota_group_id, object_key, size_bytes, sha256, state, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'committed', $8)",
+        )
+        .bind(copy_blob_id)
+        .bind(self.org_id)
+        .bind(workspace_id)
+        .bind(quota_group_id)
+        .bind(object_key)
+        .bind(size)
+        .bind(&sha256)
+        .bind(now)
+        .execute(&mut *self.tx)
+        .await?;
+        let version = self
+            .insert_version(
+                NewVersion {
+                    file: (workspace_id, project_id, file_id),
+                    blob_id: copy_blob_id,
+                    size,
+                    sha256: &sha256,
+                    base: head,
+                    restored_from: Some(version_id),
+                    upload_session: None,
+                },
+                user_id,
+                now,
+            )
+            .await?;
+        // The new physical blob shares the source quota group; logical usage is unchanged.
         Ok(RestoreOutcome::Restored(Box::new(version)))
     }
 }

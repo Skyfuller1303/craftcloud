@@ -302,6 +302,56 @@ mod tests {
         }
     }
 
+    async fn archive_version(
+        w: &W,
+        version_id: Uuid,
+        archive: &craftcloud_storage::ArchiveStore,
+        crypto: &craftcloud_storage::ArchiveCrypto,
+    ) -> (Uuid, String, String, Uuid) {
+        use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore};
+
+        let (blob_id, local_key, size, sha256, quota_group_id): (Uuid, String, i64, Vec<u8>, Uuid) =
+            sqlx::query_as(
+                "SELECT b.id, b.object_key, b.size_bytes, b.sha256, b.quota_group_id \
+                 FROM file_versions v JOIN blobs b ON b.id=v.blob_id WHERE v.id=$1",
+            )
+            .bind(version_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let local = LocalStore::open(&w.env.storage_dir).await.unwrap();
+        let local_key = ObjectKey::parse(&local_key).unwrap();
+        let digest: [u8; 32] = sha256.as_slice().try_into().unwrap();
+        let copy = craftcloud_api::archive_transport::upload_verified(
+            &local,
+            archive,
+            crypto,
+            blob_id,
+            &local_key,
+            size as u64,
+            &digest,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE blobs SET tier_state='archived', archive_object_key=$2, archive_wrapped_key=$3 \
+             WHERE id=$1",
+        )
+        .bind(blob_id)
+        .bind(copy.object_key.as_str())
+        .bind(copy.envelope.to_bytes().as_slice())
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        local.delete(&local_key).await.unwrap();
+        (
+            blob_id,
+            local_key.to_string(),
+            copy.object_key.to_string(),
+            quota_group_id,
+        )
+    }
+
     struct Cast {
         org: Uuid,
         ws: Uuid,
@@ -1342,6 +1392,162 @@ mod tests {
             "FILE_DELETED",
         );
         hidden(&w.download(&c.plain.1, &url, None).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn archived_download_range_restore_and_auth_fail_closed() {
+        use craftcloud_storage::{ObjectKey, ObjectStore};
+
+        let mut w = W::new().await;
+        let c = cast(&w).await;
+        let archive_data = pattern(150_000, 83);
+        let first = w.push(&c.editor.1, c.file, &archive_data).await;
+        let head_data = pattern(512, 91);
+        let head = w.push(&c.editor.1, c.file, &head_data).await;
+        let archive_pool = w
+            .env
+            .pool_with_max_connections(1, Duration::from_secs(5))
+            .await;
+        let (archive, crypto) = w.env.configure_archive_with_pool(archive_pool).await;
+        let (blob_id, local_key, archive_key, quota_group_id) =
+            archive_version(&w, first, &archive, &crypto).await;
+        let first_url = format!("/api/v1/files/{}/versions/{first}/content", c.file);
+
+        let full = w.download(&c.viewer.1, &first_url, None).await;
+        assert_eq!(full.status, StatusCode::OK, "{}", full.text);
+        assert_eq!(full.bytes, archive_data);
+        assert_eq!(
+            full.headers["repr-digest"],
+            format!(
+                "sha-256=:{}:",
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&archive_data))
+            )
+        );
+
+        let start = 65_530usize;
+        let end = 65_561usize;
+        let range = w
+            .download(
+                &c.viewer.1,
+                &first_url,
+                Some(&format!("bytes={start}-{}", end - 1)),
+            )
+            .await;
+        assert_eq!(range.status, StatusCode::PARTIAL_CONTENT, "{}", range.text);
+        assert_eq!(range.bytes, archive_data[start..end]);
+        assert_eq!(
+            range.headers["content-range"].to_str().unwrap(),
+            format!("bytes {start}-{}/{}", end - 1, archive_data.len())
+        );
+
+        let current_url = format!("/api/v1/files/{}/content", c.file);
+        let current = w.download(&c.viewer.1, &current_url, None).await;
+        assert_eq!(current.status, StatusCode::OK);
+        assert_eq!(current.bytes, head_data);
+
+        let before = w.counters().await;
+        let blobs_before = w.count("SELECT count(*) FROM blobs").await;
+        let local_before = {
+            let local = craftcloud_storage::LocalStore::open(&w.env.storage_dir)
+                .await
+                .unwrap();
+            local.list_objects(None, 20).await.unwrap().len()
+        };
+        let denied_restore = w
+            .send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{first}/restore", c.file),
+                )
+                .session(&c.viewer.1)
+                .header("If-Match", &tag(head)),
+            )
+            .await;
+        forbidden(&denied_restore);
+        assert_eq!(w.count("SELECT count(*) FROM blobs").await, blobs_before);
+        let stale = tokio::time::timeout(
+            Duration::from_secs(5),
+            w.send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{first}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(Uuid::new_v4())),
+            ),
+        )
+        .await
+        .expect("restore source lookup must reuse the open OrgTx connection");
+        assert_status(&stale, StatusCode::PRECONDITION_FAILED, "VERSION_CONFLICT");
+        assert_eq!(w.count("SELECT count(*) FROM blobs").await, blobs_before);
+        let local_after = {
+            let local = craftcloud_storage::LocalStore::open(&w.env.storage_dir)
+                .await
+                .unwrap();
+            local.list_objects(None, 20).await.unwrap().len()
+        };
+        assert_eq!(local_after, local_before, "failed CAS copy is cleaned up");
+
+        let restore = tokio::time::timeout(
+            Duration::from_secs(5),
+            w.send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{first}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(head)),
+            ),
+        )
+        .await
+        .expect("archived restore must release its first DB connection before archive I/O");
+        assert_eq!(restore.status, StatusCode::CREATED, "{}", restore.text);
+        let restored = id_of(&restore);
+        assert_eq!(
+            w.counters().await,
+            before,
+            "restore copy shares logical quota"
+        );
+        let (new_key, new_group, new_tier): (String, Uuid, String) = sqlx::query_as(
+            "SELECT b.object_key, b.quota_group_id, b.tier_state FROM file_versions v \
+             JOIN blobs b ON b.id=v.blob_id WHERE v.id=$1",
+        )
+        .bind(restored)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_ne!(new_key, local_key);
+        assert_eq!(new_group, quota_group_id);
+        assert_eq!(new_tier, "local");
+        let source_tier: String = sqlx::query_scalar("SELECT tier_state FROM blobs WHERE id=$1")
+            .bind(blob_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(source_tier, "archived");
+        let restored_bytes = w.download(&c.viewer.1, &current_url, None).await;
+        assert_eq!(restored_bytes.status, StatusCode::OK);
+        assert_eq!(restored_bytes.bytes, archive_data);
+
+        let archive_object = ObjectKey::parse(&archive_key).unwrap();
+        archive.delete(&archive_object).await.unwrap();
+        let missing_archive = w.download(&c.viewer.1, &first_url, None).await;
+        assert_status(
+            &missing_archive,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ARCHIVE_UNAVAILABLE",
+        );
+        assert_eq!(missing_archive.headers["retry-after"], "60");
+        assert_eq!(
+            w.download(&c.viewer.1, &current_url, None).await.status,
+            StatusCode::OK
+        );
+        hidden(&w.download(&c.outsider.1, &first_url, None).await);
+        assert_eq!(
+            w.download(&c.plain.1, &first_url, None).await.status,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,9 @@ mod tests {
     };
     use craftcloud_core::Capabilities;
     use craftcloud_db::PgPool;
-    use craftcloud_storage::{LocalStore, ObjectStore, WriteSink};
+    use craftcloud_storage::{
+        ArchiveCrypto, ArchiveStore, LocalStore, ObjectKey, ObjectStore, WriteSink,
+    };
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -45,6 +47,30 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+
+    /// Model a pre-0022 COPY export while preserving the old column order.
+    fn pre_archive_blob_export(out: &Path) -> String {
+        let path = out.join("tables").join("blobs.copy");
+        let current = std::fs::read_to_string(&path).unwrap();
+        let old: String = current
+            .lines()
+            .map(|line| {
+                let fields: Vec<_> = line.split('\t').collect();
+                let split = fields.len().checked_sub(20).unwrap();
+                assert_eq!(fields[split], fields[0]);
+                assert_eq!(
+                    &fields[split + 1..],
+                    &[
+                        "local", r"\N", r"\N", r"\N", r"\N", r"\N", r"\N", r"\N", "0", r"\N",
+                        r"\N", "0", r"\N", "f", r"\N", r"\N", "0", r"\N", "f"
+                    ]
+                );
+                format!("{}\n", fields[..split].join("\t"))
+            })
+            .collect();
+        std::fs::write(path, &old).unwrap();
+        old
     }
 
     fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -563,7 +589,10 @@ mod tests {
 
         // Row data: identical, table by table (the audit log gains one event).
         for spec in BACKUP_TABLES {
-            if spec.name == "audit_events" {
+            if matches!(
+                spec.name,
+                "audit_events" | "archive_backups" | "archive_backup_refs"
+            ) {
                 continue;
             }
             assert_eq!(
@@ -571,6 +600,24 @@ mod tests {
                 dump(&target.pool, spec.name).await,
                 "table {} differs",
                 spec.name
+            );
+        }
+        // The current backup registers its own retention row after the
+        // snapshot, because its manifest digest does not exist earlier. The
+        // restore must match the snapshot while older registrations remain.
+        for table in ["archive_backups", "archive_backup_refs"] {
+            let source: String = sqlx::query_scalar(&format!(
+                "SELECT COALESCE(string_agg(t::text, E'\\n' ORDER BY t::text), '') \
+                 FROM \"{table}\" t WHERE backup_id <> $1"
+            ))
+            .bind(created.backup_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                source,
+                dump(&target.pool, table).await,
+                "table {table} differs"
             );
         }
         let source_events = w.env.count("SELECT count(*) FROM audit_events").await;
@@ -928,16 +975,19 @@ mod tests {
         );
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
-            m["format_version"] = json!(2);
+            m["format_version"] = json!(3);
         });
         expect(
             &out,
             ErrorKind::Format,
-            "unsupported backup format version 2",
+            "unsupported backup format version 3",
         );
         rewrite_manifest(&out, |m| {
-            m["format_version"] = json!(1);
-            m["migration_version"] = json!(newest);
+            m["format_version"] = json!(created.manifest.format_version);
+            // Keep the schema version that produced this table list. A newer
+            // version correctly fails table-list validation before the row
+            // count integrity check below.
+            m["migration_version"] = json!(created.manifest.migration_version);
             m["tables"][0]["rows"] = json!(77);
         });
         expect(&out, ErrorKind::Integrity, "rows but the manifest says 77");
@@ -980,6 +1030,46 @@ mod tests {
     }
 
     // ---- targets that are not empty --------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn backup_waits_for_archive_transition_before_snapshotting() {
+        let w = W::new().await;
+        let dir = TempDir::new("backup-archive-refused");
+        let owner = w.user("owner").await;
+        let org = w.org("archive", owner.0).await;
+        let ws = w.ws(&owner.1, org, "main").await;
+        let project = w.project(&owner.1, ws, "P").await;
+        let file = w.file(&owner.1, project, "a.fig").await;
+        w.push(&owner.1, file, &pattern(128, 1)).await;
+        sqlx::query("UPDATE blobs SET tier_state = 'archiving', archive_claim_token = $1, archive_claimed_at = now() WHERE org_id = $2")
+            .bind(Uuid::new_v4())
+            .bind(org)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let out = dir.child("backup");
+        let error = craftcloud_backup::create(
+            &w.env.pool,
+            &w.store().await,
+            &out,
+            &CreateOptions {
+                server_version: "test",
+                // Other integration tests share the database-wide maintenance
+                // lock; wait for them so this assertion reaches archive
+                // source validation instead of racing into `Busy`.
+                lock_wait: Duration::from_secs(120),
+                on_phase: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Busy);
+        assert_eq!(
+            error.message,
+            "an archive transition is incomplete; finish maintenance and retry the backup"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
@@ -1125,6 +1215,12 @@ mod tests {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
 
+        std::fs::remove_file(out.join("tables").join("blob_quota_groups.copy")).unwrap();
+        // AC-12 backup pin tables do not exist in this historical schema.
+        for table in ["archive_backups", "archive_backup_refs"] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+        let old_blobs = pre_archive_blob_export(&out);
         let versions_path = out.join("tables").join("file_versions.copy");
         let current_versions = std::fs::read_to_string(&versions_path).unwrap();
         let old_versions: String = current_versions
@@ -1179,6 +1275,14 @@ mod tests {
         std::fs::write(&users_path, &old_users).unwrap();
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(11);
+            let blobs = m["tables"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|t| t["name"] == "blobs")
+                .unwrap();
+            blobs["bytes"] = json!(old_blobs.len());
+            blobs["sha256"] = json!(sha_hex(old_blobs.as_bytes()));
             m["tables"].as_array_mut().unwrap().retain(|t| {
                 !matches!(
                     t["name"].as_str(),
@@ -1199,6 +1303,9 @@ mod tests {
                             | "scim_group_members"
                             | "scim_group_mappings"
                             | "scim_workspace_ownership"
+                            | "blob_quota_groups"
+                            | "archive_backups"
+                            | "archive_backup_refs"
                     )
                 )
             });
@@ -1335,6 +1442,12 @@ mod tests {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
 
+        std::fs::remove_file(out.join("tables").join("blob_quota_groups.copy")).unwrap();
+        // Backup pin tables were introduced after this schema as well.
+        for table in ["archive_backups", "archive_backup_refs"] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+        let old_blobs = pre_archive_blob_export(&out);
         let org_path = out.join("tables").join("organizations.copy");
         let old_orgs: String = std::fs::read_to_string(&org_path)
             .unwrap()
@@ -1380,6 +1493,9 @@ mod tests {
                             | "scim_group_members"
                             | "scim_group_mappings"
                             | "scim_workspace_ownership"
+                            | "blob_quota_groups"
+                            | "archive_backups"
+                            | "archive_backup_refs"
                     )
                 )
             });
@@ -1396,7 +1512,11 @@ mod tests {
                 )
             });
             let tables = m["tables"].as_array_mut().unwrap();
-            for (name, text) in [("organizations", &old_orgs), ("figcraft_links", &old_links)] {
+            for (name, text) in [
+                ("organizations", &old_orgs),
+                ("figcraft_links", &old_links),
+                ("blobs", &old_blobs),
+            ] {
                 let entry = tables.iter_mut().find(|t| t["name"] == name).unwrap();
                 entry["bytes"] = json!(text.len());
                 entry["sha256"] = json!(sha_hex(text.as_bytes()));
@@ -1429,7 +1549,7 @@ mod tests {
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|m| m.version).collect::<Vec<_>>(),
-            vec![20, 21],
+            vec![20, 21, 22],
             "restore precedes both later forward migrations"
         );
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
@@ -2323,6 +2443,282 @@ mod tests {
                 .count("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
                 .await,
             0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn missing_archived_object_fails_restore_before_target_writes() {
+        let w = W::new().await;
+        let dir = TempDir::new("backup-archive-missing");
+        let (out, _) = small_backup(&w, &dir).await;
+        let crypto = ArchiveCrypto::from_server_key(&[51_u8; 32]).unwrap();
+        let mut entry: Value =
+            serde_json::from_slice(&std::fs::read(out.join("blobs.jsonl")).unwrap()).unwrap();
+        let blob_id = Uuid::parse_str(entry["id"].as_str().unwrap()).unwrap();
+        let size = entry["size"].as_u64().unwrap();
+        let (wrapped, _) = crypto.create_data_key(blob_id, size).unwrap();
+        let archive_key = Uuid::new_v4().simple().to_string();
+        entry["local_copy"] = json!(false);
+        entry["archive_object_key"] = json!(archive_key);
+        entry["archive_wrapped_key"] = json!(
+            wrapped
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let mut list = serde_json::to_vec(&entry).unwrap();
+        list.push(b'\n');
+        std::fs::write(out.join("blobs.jsonl"), &list).unwrap();
+        std::fs::remove_file(first_blob(&out)).unwrap();
+        rewrite_manifest(&out, |manifest| {
+            manifest["blobs"]["sha256"] = json!(sha_hex(&list));
+        });
+
+        craftcloud_backup::verify(&out, None).unwrap();
+        let target = Target::new().await;
+        let archive_dir = TempDir::new("backup-archive-provider");
+        let archive_local = LocalStore::open(archive_dir.path()).await.unwrap();
+        let archive_store = ArchiveStore::Local(archive_local);
+        let archive = craftcloud_backup::ArchiveAccess {
+            store: &archive_store,
+            crypto: &crypto,
+            verify_sample: 1,
+        };
+        let error = craftcloud_backup::restore_with_archive(
+            &target.pool,
+            &target.store().await,
+            &out,
+            &RestoreOptions::default(),
+            Some(archive),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::SourceDamaged, "{error}");
+        assert_eq!(
+            target
+                .count("SELECT count(*) FROM pg_tables WHERE schemaname='public'")
+                .await,
+            0
+        );
+        let store = target.store().await;
+        assert!(store.read_marker_info().await.unwrap().is_none());
+        assert!(store.list_objects(None, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn local_archive_intent_is_not_pinned_as_a_remote_backup_reference() {
+        let w = W::new().await;
+        let owner = w.user("intent-owner").await;
+        let org = w.org("intent", owner.0).await;
+        let ws = w.ws(&owner.1, org, "main").await;
+        let project = w.project(&owner.1, ws, "P").await;
+        let file = w.file(&owner.1, project, "a.fig").await;
+        let bytes = pattern(4096, 61);
+        w.push(&owner.1, file, &bytes).await;
+        let (blob_id,): (Uuid,) = sqlx::query_as("SELECT id FROM blobs WHERE state='committed'")
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let crypto = ArchiveCrypto::from_server_key(&[61_u8; 32]).unwrap();
+        let (envelope, _) = crypto.create_data_key(blob_id, bytes.len() as u64).unwrap();
+        let intent_key = Uuid::new_v4().simple().to_string();
+        sqlx::query("UPDATE blobs SET archive_object_key=$2,archive_wrapped_key=$3 WHERE id=$1")
+            .bind(blob_id)
+            .bind(&intent_key)
+            .bind(envelope.to_bytes().as_slice())
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+
+        let dir = TempDir::new("backup-local-intent");
+        let out = dir.child("backup");
+        let report = w.create_backup(&out).await.unwrap();
+        let line = std::fs::read_to_string(out.join("blobs.jsonl")).unwrap();
+        let entry: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["local_copy"], json!(true));
+        assert!(entry["archive_object_key"].is_null());
+        assert!(entry["archive_wrapped_key"].is_null());
+        let pin_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM archive_backup_refs WHERE backup_id=$1")
+                .bind(report.backup_id)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(pin_count, 0);
+        let digest: String =
+            sqlx::query_scalar("SELECT manifest_sha256 FROM archive_backups WHERE backup_id=$1")
+                .bind(report.backup_id)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(digest, report.manifest_sha256);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn archive_backup_pins_manifest_and_restores_without_local_copy() {
+        let w = W::new().await;
+        let owner = w.user("archive-owner").await;
+        let org = w.org("archive", owner.0).await;
+        let ws = w.ws(&owner.1, org, "main").await;
+        let project = w.project(&owner.1, ws, "P").await;
+        let file = w.file(&owner.1, project, "a.fig").await;
+        let plaintext = pattern(4096, 77);
+        let old_version = w.push(&owner.1, file, &plaintext).await;
+        w.push(&owner.1, file, &pattern(8192, 78)).await;
+        let blob_id: Uuid = sqlx::query_scalar("SELECT blob_id FROM file_versions WHERE id=$1")
+            .bind(old_version)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+
+        let crypto = ArchiveCrypto::from_server_key(&[77_u8; 32]).unwrap();
+        let (envelope, data_key) = crypto
+            .create_data_key(blob_id, plaintext.len() as u64)
+            .unwrap();
+        let archive_key = Uuid::new_v4().simple().to_string();
+        let archive_temp_dir = TempDir::new("archive-backup-provider");
+        let archive_local = LocalStore::open(archive_temp_dir.path()).await.unwrap();
+        let key = ObjectKey::parse(&archive_key).unwrap();
+        let mut ciphertext = Vec::new();
+        for (index, chunk) in plaintext
+            .chunks(craftcloud_storage::CHUNK_BYTES)
+            .enumerate()
+        {
+            ciphertext.extend(
+                data_key
+                    .encrypt_block(&envelope, index as u64, chunk)
+                    .unwrap(),
+            );
+        }
+        let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let mut temp = archive_local
+            .begin_write_as(key.clone(), ciphertext.len() as u64)
+            .await
+            .unwrap();
+        temp.write(&ciphertext).await.unwrap();
+        archive_local
+            .finalize(temp, ciphertext.len() as u64, &ciphertext_sha256)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE blobs SET tier_state='archived',archive_object_key=$2,archive_wrapped_key=$3,archive_verified_at=now(),archive_local_delete_pending=false WHERE id=$1")
+            .bind(blob_id)
+            .bind(&archive_key)
+            .bind(envelope.to_bytes().as_slice())
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let archive_store = ArchiveStore::Local(archive_local);
+        let archive = craftcloud_backup::ArchiveAccess {
+            store: &archive_store,
+            crypto: &crypto,
+            verify_sample: 1,
+        };
+
+        let dir = TempDir::new("archive-backup-roundtrip");
+        let out = dir.child("backup");
+        let report = craftcloud_backup::create_with_archive(
+            &w.env.pool,
+            &w.store().await,
+            &out,
+            &CreateOptions {
+                server_version: "test",
+                lock_wait: Duration::from_secs(30),
+                on_phase: None,
+            },
+            Some(archive),
+        )
+        .await
+        .unwrap();
+        let verified = craftcloud_backup::verify_with_archive(&out, None, archive)
+            .await
+            .unwrap();
+        assert_eq!(verified.manifest_sha256, report.manifest_sha256);
+        let pin: (String, String) = sqlx::query_as(
+            "SELECT b.manifest_sha256,r.archive_object_key FROM archive_backups b \
+             JOIN archive_backup_refs r ON r.backup_id=b.backup_id WHERE b.backup_id=$1",
+        )
+        .bind(report.backup_id)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(pin, (report.manifest_sha256.clone(), archive_key.clone()));
+
+        let target = Target::new().await;
+        let restored = craftcloud_backup::restore_with_archive(
+            &target.pool,
+            &target.store().await,
+            &out,
+            &RestoreOptions::default(),
+            Some(archive),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.blobs, 1, "only the local head is copied locally");
+        let restored_blob: (String, String) =
+            sqlx::query_as("SELECT tier_state,archive_object_key FROM blobs WHERE id=$1")
+                .bind(blob_id)
+                .fetch_one(&target.pool)
+                .await
+                .unwrap();
+        assert_eq!(restored_blob, ("archived".to_owned(), archive_key.clone()));
+        let restored_pin: (String, i64) = sqlx::query_as(
+            "SELECT b.manifest_sha256,count(r.backup_id) FROM archive_backups b \
+             JOIN archive_backup_refs r ON r.backup_id=b.backup_id WHERE b.backup_id=$1 \
+             GROUP BY b.backup_id",
+        )
+        .bind(report.backup_id)
+        .fetch_one(&target.pool)
+        .await
+        .unwrap();
+        assert_eq!(restored_pin, (report.manifest_sha256.clone(), 1));
+        let local_objects = target.store().await.list_objects(None, 10).await.unwrap();
+        assert_eq!(local_objects.len(), 1);
+        assert_ne!(local_objects[0].key.as_str(), archive_key);
+
+        let mismatch = craftcloud_backup::release_backup_pins(
+            &w.env.pool,
+            report.backup_id,
+            &"b".repeat(64),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch.kind, ErrorKind::Integrity);
+        std::fs::remove_dir_all(&out).unwrap();
+        assert_eq!(
+            craftcloud_backup::release_backup_pins(
+                &w.env.pool,
+                report.backup_id,
+                &report.manifest_sha256,
+                true,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn explicit_empty_inventory_opens_archive_gc_gate() {
+        let w = W::new().await;
+        assert!(
+            !craftcloud_db::maintenance::archive_gc_inventory_complete(&w.env.pool)
+                .await
+                .unwrap()
+        );
+        let report = craftcloud_backup::inventory_backups(&w.env.pool, &[], None, true)
+            .await
+            .unwrap();
+        assert_eq!((report.backups, report.archive_references), (0, 0));
+        assert!(
+            craftcloud_db::maintenance::archive_gc_inventory_complete(&w.env.pool)
+                .await
+                .unwrap()
         );
     }
 

@@ -28,7 +28,7 @@ use craftcloud_db::versions::{
     self, CommitOutcome, DownloadInfo, DownloadTarget, FileVersion, Precondition, RestoreOutcome,
 };
 use craftcloud_db::{OrgScope, files, uploads};
-use craftcloud_storage::{ByteRange, ObjectKey, ObjectStore, ReadSource, StorageError};
+use craftcloud_storage::{ByteRange, ObjectKey, ObjectStore, ReadSource, StorageError, WriteSink};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -71,6 +71,7 @@ pub(crate) fn version_json(v: &FileVersion) -> Value {
         "upload_id": v.upload_session_id.map(|id| id.to_string()),
         "created_by": v.created_by_user_id.to_string(),
         "actor_kind": v.actor_kind,
+        "storage_tier": v.storage_tier,
         "created_at": rfc3339(v.created_at),
     })
 }
@@ -462,6 +463,26 @@ pub(crate) async fn restore_version(
     let Some(version_id) = parse_id(&version_raw) else {
         return not_found(&headers);
     };
+    let source = match tx
+        .version_restore_source(&scope, resolved.id, version_id)
+        .await
+    {
+        Ok(DownloadTarget::Ready(info)) => info,
+        Ok(DownloadTarget::Gone | DownloadTarget::NoVersion) => return not_found(&headers),
+        Ok(DownloadTarget::FileDeleted) => return file_deleted(&headers),
+        Ok(DownloadTarget::ProjectDeleted) => return project_deleted(&headers),
+        Err(error) => return db_failure(&error, &headers, "restore lookup failed"),
+    };
+    if source.storage_tier == "archive" {
+        if source.blob_state != "committed" {
+            return blob_corrupt(&headers);
+        }
+        if let Err(error) = tx.commit().await {
+            return db_failure(&error, &headers, "restore failed");
+        }
+        return restore_archived_version(resolved, &headers, &session, version_id, pre, *source)
+            .await;
+    }
     let now = resolved.services.clock.now();
     match tx
         .version_restore(&scope, resolved.id, version_id, session.user_id, pre, now)
@@ -494,7 +515,244 @@ pub(crate) async fn restore_version(
         Ok(RestoreOutcome::FileDeleted) => file_deleted(&headers),
         Ok(RestoreOutcome::ProjectDeleted) => project_deleted(&headers),
         Ok(RestoreOutcome::BlobCorrupt) => blob_corrupt(&headers),
+        Ok(RestoreOutcome::ArchiveRecallRequired) => {
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ARCHIVE_UNAVAILABLE",
+                "The archived version cannot be restored right now.",
+                &headers,
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+            response
+        }
         Err(error) => db_failure(&error, &headers, "restore failed"),
+    }
+}
+
+pub(crate) fn archive_unavailable(headers: &HeaderMap) -> Response {
+    let mut response = error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ARCHIVE_UNAVAILABLE",
+        "The archived version is not available right now.",
+        headers,
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    response
+}
+
+async fn restore_archived_version(
+    resolved: Resolved,
+    headers: &HeaderMap,
+    session: &AuthenticatedSession,
+    version_id: Uuid,
+    precondition: Precondition,
+    source: DownloadInfo,
+) -> Response {
+    let services = Arc::clone(&resolved.services);
+    let Some(local) = services.storage.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "STORAGE_UNAVAILABLE",
+            "File storage is not configured on this server.",
+            headers,
+        );
+    };
+    let (Some(archive), Some(crypto)) = (
+        services.archive_store.as_deref(),
+        services.archive_crypto.as_deref(),
+    ) else {
+        return archive_unavailable(headers);
+    };
+    let Ok(_permit) = Arc::clone(&services.archive_restore_permits)
+        .acquire_owned()
+        .await
+    else {
+        return archive_unavailable(headers);
+    };
+    let (Ok(archive_key), Some(wrapped), Ok(size), Ok(digest)) = (
+        source.archive_object_key.as_deref().ok_or(()),
+        source
+            .archive_wrapped_key
+            .as_deref()
+            .and_then(|bytes| craftcloud_storage::WrappedDataKey::from_bytes(bytes).ok()),
+        u64::try_from(source.size_bytes),
+        <[u8; 32]>::try_from(source.sha256.as_slice()),
+    ) else {
+        return corrupt_response(&services, &source, headers).await;
+    };
+    let Ok(archive_key) = ObjectKey::parse(archive_key) else {
+        return corrupt_response(&services, &source, headers).await;
+    };
+    let reader = match crate::archive_transport::open_archive_range(
+        archive,
+        crypto,
+        &archive_key,
+        &wrapped,
+        source.blob_id,
+        size,
+        None,
+    )
+    .await
+    {
+        Ok(reader) => reader,
+        Err(crate::archive_transport::ArchiveTransportError::Storage(error)) => {
+            tracing::warn!(error = ?error, blob = %source.blob_id, "archive restore unavailable");
+            return archive_unavailable(headers);
+        }
+        Err(_) => return corrupt_response(&services, &source, headers).await,
+    };
+    let mut temp = match local.begin_write(size).await {
+        Ok(temp) => temp,
+        Err(error) => return local_write_error(error, headers),
+    };
+    let mut hasher = Sha256::new();
+    let mut copied = 0u64;
+    let mut reader = reader;
+    loop {
+        let chunk = match reader.next_chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(crate::archive_transport::ArchiveTransportError::Storage(error)) => {
+                tracing::warn!(error = ?error, blob = %source.blob_id, "archive restore stream unavailable");
+                local.abort(temp).await;
+                return archive_unavailable(headers);
+            }
+            Err(_) => {
+                local.abort(temp).await;
+                return corrupt_response(&services, &source, headers).await;
+            }
+        };
+        copied = match copied.checked_add(chunk.len() as u64) {
+            Some(copied) if copied <= size => copied,
+            _ => {
+                local.abort(temp).await;
+                return corrupt_response(&services, &source, headers).await;
+            }
+        };
+        hasher.update(&chunk);
+        if let Err(error) = temp.write(&chunk).await {
+            local.abort(temp).await;
+            return local_write_error(error, headers);
+        }
+    }
+    let actual: [u8; 32] = hasher.finalize().into();
+    if copied != size || actual != digest {
+        local.abort(temp).await;
+        return corrupt_response(&services, &source, headers).await;
+    }
+    let key = match local.finalize(temp, size, &digest).await {
+        Ok(key) => key,
+        Err(error) => return local_write_error(error, headers),
+    };
+    let (mut tx, scope) = match write_gate(
+        &resolved,
+        session,
+        headers,
+        Action::VersionRestore,
+        "version.restore",
+        resolved.id,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(response) => {
+            cleanup_restore_copy(local, &key, false).await;
+            return *response;
+        }
+    };
+    let now = services.clock.now();
+    let outcome = tx
+        .version_restore_copy(
+            &scope,
+            resolved.id,
+            version_id,
+            session.user_id,
+            precondition,
+            key.as_str(),
+            now,
+        )
+        .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            cleanup_restore_copy(local, &key, false).await;
+            return db_failure(&error, headers, "restore failed");
+        }
+    };
+    match outcome {
+        RestoreOutcome::Restored(version) => {
+            if let Err(error) = commit_audited(
+                tx,
+                Change::new(
+                    headers,
+                    session.user_id,
+                    "version.restore",
+                    resolved.org_id,
+                    Some(version.id),
+                )
+                .workspace(resolved.workspace_id)
+                .detail("file_id", Detail::Id(resolved.id))
+                .detail("number", Detail::Count(version.number)),
+            )
+            .await
+            {
+                // COMMIT may have succeeded while its acknowledgement was lost.
+                cleanup_restore_copy(local, &key, true).await;
+                return db_failure(&error, headers, "restore failed");
+            }
+            version_response(StatusCode::CREATED, &version)
+        }
+        RestoreOutcome::PreconditionFailed { current } => {
+            cleanup_restore_copy(local, &key, false).await;
+            precondition_failed(current, headers)
+        }
+        RestoreOutcome::Gone => {
+            cleanup_restore_copy(local, &key, false).await;
+            not_found(headers)
+        }
+        RestoreOutcome::FileDeleted => {
+            cleanup_restore_copy(local, &key, false).await;
+            file_deleted(headers)
+        }
+        RestoreOutcome::ProjectDeleted => {
+            cleanup_restore_copy(local, &key, false).await;
+            project_deleted(headers)
+        }
+        RestoreOutcome::BlobCorrupt => {
+            cleanup_restore_copy(local, &key, false).await;
+            blob_corrupt(headers)
+        }
+        RestoreOutcome::ArchiveRecallRequired => {
+            cleanup_restore_copy(local, &key, false).await;
+            archive_unavailable(headers)
+        }
+    }
+}
+
+async fn cleanup_restore_copy(
+    local: &craftcloud_storage::LocalStore,
+    key: &ObjectKey,
+    commit_may_have_succeeded: bool,
+) {
+    if !commit_may_have_succeeded {
+        let _ = local.delete(key).await;
+    }
+}
+
+fn local_write_error(error: StorageError, headers: &HeaderMap) -> Response {
+    if error.is_full() {
+        error_response(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "INSUFFICIENT_STORAGE",
+            "The server does not have enough local storage.",
+            headers,
+        )
+    } else {
+        internal(headers)
     }
 }
 
@@ -512,6 +770,35 @@ fn blob_corrupt(headers: &HeaderMap) -> Response {
 /// A body fed by a task through a small channel (bounded memory).
 pub(crate) struct ChannelBody {
     rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+enum DownloadReader {
+    Local(craftcloud_storage::ObjectReader),
+    Archive(Box<crate::archive_transport::ArchiveReader<craftcloud_storage::ArchiveReader>>),
+}
+
+enum DownloadReadError {
+    Local(StorageError),
+    Archive(crate::archive_transport::ArchiveTransportError),
+}
+
+impl DownloadReader {
+    fn remaining(&self) -> u64 {
+        match self {
+            Self::Local(reader) => reader.remaining(),
+            Self::Archive(reader) => reader.remaining(),
+        }
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, DownloadReadError> {
+        match self {
+            Self::Local(reader) => reader.next_chunk().await.map_err(DownloadReadError::Local),
+            Self::Archive(reader) => reader
+                .next_chunk()
+                .await
+                .map_err(DownloadReadError::Archive),
+        }
+    }
 }
 
 impl ChannelBody {
@@ -728,8 +1015,7 @@ async fn download(
     if info.blob_state != "committed" {
         return blob_corrupt(headers);
     }
-    let (Ok(key), Ok(size), Ok(digest)) = (
-        ObjectKey::parse(&info.object_key),
+    let (Ok(size), Ok(digest)) = (
         u64::try_from(info.size_bytes),
         <[u8; 32]>::try_from(info.sha256.as_slice()),
     ) else {
@@ -759,22 +1045,64 @@ async fn download(
         ),
         RangeSpec::Unsatisfiable => return range_not_satisfiable(size, headers),
     };
-    let reader = match store.open_read(&key, storage_range).await {
-        Ok(reader) => reader,
-        // A missing object may be a mount that is not there right now: report the
-        // storage as unavailable and mark nothing (only verified evidence marks).
-        Err(error @ (StorageError::NotFound | StorageError::RangeNotSatisfiable)) => {
-            tracing::error!(error = ?error, blob = %info.blob_id, "object not readable for download");
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "STORAGE_UNAVAILABLE",
-                "The stored data is not available right now.",
-                headers,
-            );
+    let reader = if info.storage_tier == "archive" {
+        let (Some(archive), Some(crypto)) = (
+            services.archive_store.as_deref(),
+            services.archive_crypto.as_deref(),
+        ) else {
+            return archive_unavailable(headers);
+        };
+        let (Some(raw_key), Some(raw_envelope)) = (
+            info.archive_object_key.as_deref(),
+            info.archive_wrapped_key.as_deref(),
+        ) else {
+            return corrupt_response(&services, &info, headers).await;
+        };
+        let (Ok(key), Ok(envelope)) = (
+            ObjectKey::parse(raw_key),
+            craftcloud_storage::WrappedDataKey::from_bytes(raw_envelope),
+        ) else {
+            return corrupt_response(&services, &info, headers).await;
+        };
+        match crate::archive_transport::open_archive_range(
+            archive,
+            crypto,
+            &key,
+            &envelope,
+            info.blob_id,
+            size,
+            storage_range,
+        )
+        .await
+        {
+            Ok(reader) => DownloadReader::Archive(Box::new(reader)),
+            Err(crate::archive_transport::ArchiveTransportError::Storage(error)) => {
+                tracing::warn!(error = ?error, blob = %info.blob_id, "archive object unavailable");
+                return archive_unavailable(headers);
+            }
+            Err(_) => return corrupt_response(&services, &info, headers).await,
         }
-        Err(error) => {
-            tracing::error!(error = ?error, "cannot open object for download");
-            return internal(headers);
+    } else {
+        let Ok(key) = ObjectKey::parse(&info.object_key) else {
+            return corrupt_response(&services, &info, headers).await;
+        };
+        match store.open_read(&key, storage_range).await {
+            Ok(reader) => DownloadReader::Local(reader),
+            // A missing object may be a mount that is not there right now: report the
+            // storage as unavailable and mark nothing (only verified evidence marks).
+            Err(error @ (StorageError::NotFound | StorageError::RangeNotSatisfiable)) => {
+                tracing::error!(error = ?error, blob = %info.blob_id, "object not readable for download");
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "STORAGE_UNAVAILABLE",
+                    "The stored data is not available right now.",
+                    headers,
+                );
+            }
+            Err(error) => {
+                tracing::error!(error = ?error, "cannot open object for download");
+                return internal(headers);
+            }
         }
     };
     let whole = storage_range.is_none();
@@ -783,12 +1111,12 @@ async fn download(
         return corrupt_response(&services, &info, headers).await;
     }
     let length = reader.remaining();
-    let body = if length == 0 {
+    let body = if length == 0 || is_head {
         Body::empty()
     } else {
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
         let (services, blob_id) = (Arc::clone(&services), info.blob_id);
-        tokio::spawn(stream_object(
+        tokio::spawn(stream_download_reader(
             reader,
             tx,
             whole.then_some(digest),
@@ -864,8 +1192,8 @@ async fn download(
 /// and the final chunk is withheld until it matches: on a mismatch or a short
 /// read the body ends with an error (the connection is cut), the blob is marked
 /// and nothing looks like a clean end.
-async fn stream_object(
-    mut reader: craftcloud_storage::ObjectReader,
+async fn stream_download_reader(
+    mut reader: DownloadReader,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
     verify: Option<[u8; 32]>,
     services: Arc<Services>,
@@ -913,12 +1241,20 @@ async fn stream_object(
             }
             Ok(None) => break,
             Err(error) => {
-                let truncated = matches!(
-                    &error,
-                    StorageError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof
-                );
-                tracing::error!(%error, blob = %blob_id, "download read failed");
-                if truncated && verify.is_some() {
+                let corrupt = match &error {
+                    DownloadReadError::Local(StorageError::Io(e)) => {
+                        e.kind() == std::io::ErrorKind::UnexpectedEof
+                    }
+                    DownloadReadError::Archive(
+                        crate::archive_transport::ArchiveTransportError::Integrity,
+                    )
+                    | DownloadReadError::Archive(
+                        crate::archive_transport::ArchiveTransportError::Crypto(_),
+                    ) => true,
+                    DownloadReadError::Local(_) | DownloadReadError::Archive(_) => false,
+                };
+                tracing::error!(error = ?download_read_error_name(&error), blob = %blob_id, "download read failed");
+                if corrupt {
                     let _ = versions::mark_blob_corrupt(&services.pool, blob_id).await;
                 }
                 let _ = give(&tx, Err(std::io::Error::other("read failed"))).await;
@@ -940,6 +1276,13 @@ async fn stream_object(
         if matches!(give(&tx, Ok(Bytes::from(last))).await, Ok(Ok(()))) {
             services.metrics.add_downloaded(len);
         }
+    }
+}
+
+fn download_read_error_name(error: &DownloadReadError) -> &'static str {
+    match error {
+        DownloadReadError::Local(_) => "local read failure",
+        DownloadReadError::Archive(_) => "archive read failure",
     }
 }
 
@@ -1020,5 +1363,31 @@ mod tests {
         ] {
             assert_eq!(parse_version_tag(bad), None, "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn restore_copy_survives_uncertain_commit_acknowledgement() {
+        let root = std::env::temp_dir().join(format!("craftcloud-restore-copy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let local = craftcloud_storage::LocalStore::open(&root).await.unwrap();
+        let bytes = b"restored archive payload";
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let mut temp = local.begin_write(bytes.len() as u64).await.unwrap();
+        temp.write(bytes).await.unwrap();
+        let key = local
+            .finalize(temp, bytes.len() as u64, &digest)
+            .await
+            .unwrap();
+
+        cleanup_restore_copy(&local, &key, true).await;
+        assert_eq!(local.head(&key).await.unwrap().len, bytes.len() as u64);
+        cleanup_restore_copy(&local, &key, false).await;
+        assert!(matches!(
+            local.head(&key).await,
+            Err(StorageError::NotFound)
+        ));
+
+        drop(local);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
             ]
         );
         migrate::verify(&db.pool).await.unwrap();
@@ -1884,7 +1884,7 @@ mod tests {
         assert_eq!(
             migrate::verify(&db.pool).await,
             Err(DbError::Schema(SchemaProblem::Pending(vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
             ])))
         );
 
@@ -1894,7 +1894,7 @@ mod tests {
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
             vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
             ]
         );
         migrate::verify(&db.pool).await.unwrap();
@@ -2495,7 +2495,7 @@ mod tests {
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
             vec![
-                3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
+                3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
             ]
         );
         migrate::verify(&db.pool).await.unwrap();

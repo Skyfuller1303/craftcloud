@@ -468,6 +468,18 @@ pub(crate) async fn get_health(
     } else {
         None
     };
+    let archive_status = if database_up && services.archive_operator_metadata.is_some() {
+        timeout(
+            CHECK_TIMEOUT,
+            db::archive_status(&services.pool, services.archive_after),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+    } else {
+        None
+    };
+    let archive = services.archive_operator_metadata.as_ref();
     let (dropped_lossy, dropped_important) = services.audit_budget.dropped_counts();
     let pool = &services.pool;
     let size = pool.size();
@@ -517,6 +529,17 @@ pub(crate) async fn get_health(
             "uptime_seconds": services.started.elapsed().as_secs(),
         },
         "backup": { "last_success_age_seconds": backup_age_seconds },
+        "archive": {
+            "configured": archive.is_some(),
+            "provider_type": archive.map(|metadata| metadata.provider_type.as_str()),
+            "endpoint": archive.and_then(|metadata| metadata.endpoint.as_deref()),
+            "local_bytes": archive_status.as_ref().map(|status| status.local_bytes),
+            "archive_bytes": archive_status.as_ref().map(|status| status.archive_bytes),
+            "pending_archives": archive_status.as_ref().map(|status| status.pending_archives),
+            "failed_deletions": archive_status.as_ref().map(|status| status.archive_delete_errors),
+            "last_verified_at": archive_status.as_ref().and_then(|status| status.last_verified_at.map(rfc3339)),
+            "last_error_code": archive_status.as_ref().and_then(|status| status.last_error_code.as_deref()),
+        },
     }))
     .into_response()
 }

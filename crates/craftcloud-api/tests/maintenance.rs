@@ -17,7 +17,8 @@ mod tests {
     use axum::http::StatusCode;
     use craftcloud_api::Clock;
     use craftcloud_api::maintenance::{
-        Maintenance, MaintenanceSettings, RunOptions, RunOutcome, RunReport, Trigger,
+        Binding, BindingMismatch, Maintenance, MaintenanceSettings, RunOptions, RunOutcome,
+        RunReport, Trigger, check_existing_store_binding, check_store_binding,
     };
     use craftcloud_db::maintenance as dbm;
     use craftcloud_db::members::OrgTx;
@@ -340,6 +341,56 @@ mod tests {
 
     async fn run(job: &Maintenance) -> RunReport {
         run_with(job, false).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn recall_binding_refuses_unbound_database_and_foreign_empty_store() {
+        let env = TestEnv::new().await;
+        let now = env.clock.now();
+        let bound_store = LocalStore::open(&env.storage_dir).await.unwrap();
+
+        assert!(matches!(
+            check_existing_store_binding(&env.pool, &bound_store, now)
+                .await
+                .unwrap(),
+            Binding::Mismatch(BindingMismatch::DatabaseUnbound)
+        ));
+        assert!(bound_store.read_marker_info().await.unwrap().is_none());
+
+        assert!(matches!(
+            check_store_binding(&env.pool, &bound_store, now, true)
+                .await
+                .unwrap(),
+            Binding::Created(_)
+        ));
+        let binding_before = craftcloud_db::maintenance::store_binding_epoch(&env.pool)
+            .await
+            .unwrap();
+
+        let foreign_dir = env.storage_dir.join("foreign-empty-store");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign_store = LocalStore::open(&foreign_dir).await.unwrap();
+        assert!(matches!(
+            check_existing_store_binding(&env.pool, &foreign_store, now)
+                .await
+                .unwrap(),
+            Binding::Mismatch(BindingMismatch::MarkerMissing)
+        ));
+        assert!(foreign_store.read_marker_info().await.unwrap().is_none());
+        assert!(
+            foreign_store
+                .list_objects(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            craftcloud_db::maintenance::store_binding_epoch(&env.pool)
+                .await
+                .unwrap(),
+            binding_before
+        );
     }
 
     // ---- retention purge ---------------------------------------------------------------

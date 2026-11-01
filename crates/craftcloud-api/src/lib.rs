@@ -13,6 +13,8 @@
 mod app_access;
 #[cfg(test)]
 mod app_access_tests;
+pub mod archive_transport;
+pub mod archive_worker;
 mod audit;
 mod auth;
 mod client_ip;
