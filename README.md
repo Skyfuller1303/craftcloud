@@ -1,6 +1,6 @@
 # CraftCloud — Architecture RFC and implementation briefings
 
-> **Status:** independent documentation-first proposal, **not an official storytold repository**, not deployable server software.  
+> **Status:** independent proposal with a working local prototype, **not an official storytold repository**, not production-ready server software.  
 > **Research date:** 2026-10-28.  
 > **Language:** German engineering documentation; external RFC draft in English.
 
@@ -10,7 +10,24 @@ This package is a **proposed future repository structure** consistent with docum
 
 ## Status: not production-ready, local prototype
 
-The repository now contains a minimal Rust workspace skeleton (PR-001 / CC-P01-01): `craftcloud-core` (typed capabilities), `craftcloud-api` (axum router with `GET /health/live` and `GET /api/v1/info` only), `craftcloud-server` (binary) and `xtask`. There is no authentication, database, storage or upload code. `/api/v1/info` reports `server_mode: "development-prototype"`. Do not deploy it.
+The repository contains a working Rust server (accounts, organizations, workspaces, files with versions, backups, app sign-in for the Craft apps, FigCraft live hosting), a browser admin UI with a setup wizard, a single appliance Docker image and an installer. It has only been tested locally (Docker Desktop); an acceptance run on a real Linux server is still open, and archive storage stays locked until AC-12c. `/api/v1/info` reports `server_mode: "development-prototype"`. Do not run it as a multi-tenant production service yet.
+
+## Installation on a Linux server
+
+CraftCloud runs as one image `craftcloud:<version>` (server, admin UI and FigCraft server) next to PostgreSQL 16 to 18. There is no registry: a release ships the source archive, a prebuilt image archive (`docker save`, zstd), an SBOM and `SHA256SUMS`, and the installer either loads the image archive or builds the image from source. The first test release is `0.1.0-alpha.1`. Requirements: Debian 13 or Ubuntu 24.04, Docker Engine 25 or newer, Docker Compose 2.24.4 or newer, DNS name pointing to the server, TCP 80 and 443 open.
+
+```sh
+sha256sum --check SHA256SUMS
+tar -xzf craftcloud-0.1.0-alpha.1.tar.gz
+sudo sh craftcloud-0.1.0-alpha.1/deploy/install/install.sh --non-interactive \
+  --domain cloud.example.org --acme-email admin@example.org \
+  --image-archive ./craftcloud-0.1.0-alpha.1-image-amd64.tar.zst \
+  ./craftcloud-0.1.0-alpha.1.tar.gz
+```
+
+Then open `https://cloud.example.org/admin`, complete the setup wizard and run `craftcloud-ctl setup-complete`. The default uses a bundled Caddy with automatic certificates; `--proxy nginx|apache|none` keeps an existing web server (templates for certbot setups), and a single `docker run … all-in-one` container is available for tests. Full guide (German), including database choice, backups, upgrade, rollback and e-mail: [docs/06-operations/install.md](docs/06-operations/install.md). Releases are built with `cargo xtask release <version>` from a clean checkout.
+
+## Development
 
 ```sh
 cargo build --locked -p craftcloud-server   # build the server
@@ -81,7 +98,7 @@ craftcloud/
 └── README.md
 ```
 
-> **Do not treat omitted files as finished implementation.** Only the PR-001 skeleton (see Status above) exists as code; the Docker Compose stack in `deploy/compose` is a development prototype and not a released deployment, there are no unapproved logos, and no copied upstream license texts.
+> **Do not treat omitted files as finished implementation.** The tree above is the original proposal; the actual layout is in the repository (for example `deploy/` holds Compose, installer and proxy templates instead of `packaging/`). The release is a local test prototype, there are no unapproved logos, and no copied upstream license texts.
 
 ## Sequencing
 

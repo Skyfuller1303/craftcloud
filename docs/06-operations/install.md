@@ -18,14 +18,14 @@ Für die Standardverzeichnisse benötigt der Installer Schreibrechte auf `/opt`,
 
 ## Release beziehen und prüfen
 
-Beziehen Sie `craftcloud-0.1.0.tar.gz`, `SHA256SUMS` und `craftcloud-0.1.0.cdx.json` über den vom Projektverantwortlichen freigegebenen Kanal. Eine öffentliche Release-Adresse gibt es derzeit nicht. Die SBOM enthält die Rust- und npm-Abhängigkeiten aus beiden Lockfiles; sie ersetzt keinen Schwachstellenscan und beschreibt nicht alle Betriebssystempakete der Basis-Images.
+Beziehen Sie `craftcloud-0.1.0-alpha.1.tar.gz`, `SHA256SUMS` und `craftcloud-0.1.0-alpha.1.cdx.json` über den vom Projektverantwortlichen freigegebenen Kanal. Alle Dateinamen enthalten die Version; die Beispiele verwenden die erste Testversion `0.1.0-alpha.1`, für eine andere Version ersetzen Sie sie entsprechend. Eine öffentliche Release-Adresse gibt es derzeit nicht. Die SBOM enthält die Rust- und npm-Abhängigkeiten aus beiden Lockfiles; sie ersetzt keinen Schwachstellenscan und beschreibt nicht alle Betriebssystempakete der Basis-Images.
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf craftcloud-0.1.0.tar.gz
-sudo sh craftcloud-0.1.0/deploy/install/install.sh \
+tar -xzf craftcloud-0.1.0-alpha.1.tar.gz
+sudo sh craftcloud-0.1.0-alpha.1/deploy/install/install.sh \
   --domain cloud.example.org --acme-email admin@example.org \
-  --non-interactive ./craftcloud-0.1.0.tar.gz
+  --non-interactive ./craftcloud-0.1.0-alpha.1.tar.gz
 ```
 
 Prüfen Sie die Prüfsummen vor dem Entpacken und Ausführen. Der Installer prüft das Archiv nochmals gegen die danebenliegende `SHA256SUMS`. Prüfsummen erkennen Übertragungsfehler; ein Angreifer, der Archiv und Prüfsummen austauscht, wird dadurch nicht erkannt. Beziehen Sie die Prüfsummen deshalb über einen separat vertrauenswürdigen Kanal. Die Datei `SHA256SUMS.minisign.txt` ist nur eine Vorbereitung, keine Signatur. Sobald ein Projektschlüssel existiert, kann der Herausgeber mit `minisign -Sm SHA256SUMS` signieren; Betreiber prüfen dann mit dem separat bezogenen öffentlichen Schlüssel, beispielsweise `minisign -Vm SHA256SUMS -P <public-key>`. Bis dahin darf niemand eine signierte Veröffentlichung behaupten.
@@ -45,9 +45,9 @@ Sind die Ports 80 und 443 frei und läuft auf dem Server kein nginx oder Apache,
 Läuft auf dem Server schon ein Webserver auf Port 80 und 443, darf CraftCloud nicht mit einem eigenen Caddy kollidieren. Der Installer erkennt einen laufenden nginx oder Apache (`--proxy auto`) und schlägt ihn vor; Sie können ihn auch ausdrücklich wählen:
 
 ```sh
-sudo sh craftcloud-0.1.0/deploy/install/install.sh --proxy nginx \
+sudo sh craftcloud-0.1.0-alpha.1/deploy/install/install.sh --proxy nginx \
   --domain cloud.example.org --acme-email admin@example.org \
-  --non-interactive ./craftcloud-0.1.0.tar.gz
+  --non-interactive ./craftcloud-0.1.0-alpha.1.tar.gz
 ```
 
 Mit `--proxy nginx`, `--proxy apache` oder `--proxy none` (eigener Proxy) startet **kein** Caddy. Der CraftCloud-Server veröffentlicht nur `127.0.0.1:8080` (anderer Port mit `--local-port`) und der FigCraft-Server nur `127.0.0.1:47900` (`--local-figcraft-port`). Die Ports 80 und 443 prüft der Installer dann nicht; sie gehören Ihrem Webserver.
@@ -87,7 +87,7 @@ docker run --rm -v /etc/craftcloud-run:/run/secrets:ro \
   -e CRAFTCLOUD_MIGRATE_DATABASE_URL_FILE=/run/secrets/db_owner_url \
   -e CRAFTCLOUD_DATABASE_URL_FILE=/run/secrets/db_runtime_url \
   -e CRAFTCLOUD_DATABASE_RUNTIME_ROLE=craftcloud_runtime \
-  craftcloud:0.1.0 migrate
+  craftcloud:0.1.0-alpha.1 migrate
 
 # Server und FigCraft-Server starten:
 docker run -d --name craftcloud --restart unless-stopped --stop-timeout 35 \
@@ -100,7 +100,7 @@ docker run -d --name craftcloud --restart unless-stopped --stop-timeout 35 \
   -v /etc/craftcloud-run:/run/secrets:ro \
   -v craftcloud-store:/var/lib/craftcloud/store \
   -v craftcloud-figcraft:/var/lib/craftcloud/figcraft \
-  craftcloud:0.1.0 all-in-one
+  craftcloud:0.1.0-alpha.1 all-in-one
 ```
 
 `172.17.0.1` ist das Gateway des Standard-Docker-Netzes (`docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'`); von dort kommt die Verbindung Ihres Proxys auf dem Host an. Ein vorhandener nginx oder Apache verwendet dieselbe Vorlage wie bei Weg B (mit `--local-port 8080`). Die erste Einrichtung (Bootstrap-Geheimnis `CRAFTCLOUD_BOOTSTRAP_SECRET_FILE`) beschreibt [deployment.md](deployment.md). `docker stop craftcloud` sendet SIGTERM, beide Programme beenden sich innerhalb der 35 Sekunden. Die öffentliche FigCraft-Adresse leitet der Container aus `CRAFTCLOUD_PUBLIC_URL` ab (`wss://<Domain>/figcraft/`), wenn Sie `CRAFTCLOUD_FIGCRAFT_PUBLIC_URL` nicht setzen.
@@ -124,8 +124,8 @@ Backups, `craftcloud-ctl backup` und die Wiederherstellung funktionieren unverä
 `cargo xtask release <version>` erzeugt neben dem Quellarchiv je Architektur ein Image-Archiv `craftcloud-<version>-image-amd64.tar.zst` (und `-arm64`, soweit der Builder es kann) und trägt es in `SHA256SUMS` ein. Legen Sie es neben das Quellarchiv und `SHA256SUMS`:
 
 ```sh
-sudo sh craftcloud-0.1.0/deploy/install/install.sh --non-interactive --domain cloud.example.org \
-  --image-archive ./craftcloud-0.1.0-image-amd64.tar.zst ./craftcloud-0.1.0.tar.gz
+sudo sh craftcloud-0.1.0-alpha.1/deploy/install/install.sh --non-interactive --domain cloud.example.org \
+  --image-archive ./craftcloud-0.1.0-alpha.1-image-amd64.tar.zst ./craftcloud-0.1.0-alpha.1.tar.gz
 sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl upgrade ./craftcloud-0.1.1.tar.gz \
   --image-archive ./craftcloud-0.1.1-image-amd64.tar.zst
 ```
@@ -139,8 +139,8 @@ Seit 2026-10-31 richtet der Installer den FigCraft-Begleitdienst (AC-06) standar
 Ausschalten bei der Installation:
 
 ```sh
-sudo sh craftcloud-0.1.0/deploy/install/install.sh --no-figcraft \
-  --domain cloud.example.org --non-interactive ./craftcloud-0.1.0.tar.gz
+sudo sh craftcloud-0.1.0-alpha.1/deploy/install/install.sh --no-figcraft \
+  --domain cloud.example.org --non-interactive ./craftcloud-0.1.0-alpha.1.tar.gz
 ```
 
 `CRAFTCLOUD_FIGCRAFT=disabled` in der Umgebung des Installers wirkt genauso. Der gewählte Wert steht danach in `craftcloud.env`; ein erneuter Installerlauf mit widersprechendem Schalter wird abgelehnt. Später wechseln Sie mit `craftcloud-ctl`:
@@ -427,4 +427,4 @@ Die nur auf dem Serverhost verfügbare Passwort-Wiederherstellung bleibt ein Not
 
 ## Releases lokal vorbereiten
 
-Auf einem Entwicklerrechner mit Git, der Rust-Toolchain des Projekts und Python ab 3.11 erzeugt `cargo xtask release 0.1.0` aus einem sauberen Git-Stand das Archiv, die SBOM und Prüfsummen unter `dist/`. Ungültige SemVer-Versionen sowie geänderte oder unversionierte Dateien werden abgelehnt. Die Quelldateien stammen aus `git archive`; zusätzlich enthält das Archiv `CRAFTCLOUD-RELEASE.json` mit Version und Commit. `craftcloud-server --version` zeigt die Build-Identität. Ein Tag `v0.1.0`, eine Signatur oder Veröffentlichung entstehen durch diesen Befehl nicht.
+Auf einem Entwicklerrechner mit Git, der Rust-Toolchain des Projekts und Python ab 3.11 erzeugt `cargo xtask release 0.1.0-alpha.1` aus einem sauberen Git-Stand das Archiv, die SBOM und Prüfsummen unter `dist/`. Ungültige SemVer-Versionen sowie geänderte oder unversionierte Dateien werden abgelehnt. Die Quelldateien stammen aus `git archive`; zusätzlich enthält das Archiv `CRAFTCLOUD-RELEASE.json` mit Version und Commit. `craftcloud-server --version` zeigt die Build-Identität. Ein Tag `v0.1.0`, eine Signatur oder Veröffentlichung entstehen durch diesen Befehl nicht.

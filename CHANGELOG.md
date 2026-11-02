@@ -4,7 +4,11 @@ All notable changes to CraftCloud are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow Semantic Versioning.
 
-## [0.1.0] - Unreleased
+## [Unreleased]
+
+## [0.1.0-alpha.1] - 2026-11-02
+
+First local test release (prototype, not production-ready). Includes AC-01 to AC-13 and OPS-01/OPS-02; archive storage remains locked until AC-12c.
 
 ### Added
 
