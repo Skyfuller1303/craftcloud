@@ -244,7 +244,7 @@ fn secret_string(bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, &'stati
         .map_err(|_| "mail settings are invalid")
 }
 
-async fn resolve_oauth_credential(
+fn resolve_oauth_credential(
     config: &Config,
     rows: &BTreeMap<String, Value>,
     env_locked: &std::collections::BTreeSet<String>,
@@ -358,14 +358,59 @@ pub async fn load(
     old: Option<&[u8; 32]>,
     status: TransportStatus,
 ) -> Result<Option<ConfiguredTransport>, &'static str> {
-    let env_values_locked = crate::instance_setting_environment(config);
-    let rows = instance_settings::settings(pool)
-        .await
-        .map_err(|_| "mail settings are invalid")?;
-    let db_values = rows
-        .into_iter()
-        .map(|row| (row.key, row.value))
-        .collect::<BTreeMap<_, _>>();
+    let environment = crate::instance_setting_environment(config);
+    // Environment mail never reads the database: stored values (and stored
+    // ciphertext that may not decrypt) cannot influence or break it.
+    let environment_mail = environment.1.contains("mail.transport");
+    let db_values = if environment_mail {
+        BTreeMap::new()
+    } else {
+        instance_settings::settings(pool)
+            .await
+            .map_err(|_| "mail settings are invalid")?
+            .into_iter()
+            .map(|row| (row.key, row.value))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let instance_id: Uuid = if environment_mail {
+        Uuid::nil()
+    } else {
+        sqlx::query_scalar("SELECT operator_user_id FROM instance_setup WHERE id=true")
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| "mail settings are invalid")?
+            .unwrap_or_else(Uuid::nil)
+    };
+    build(
+        config,
+        &environment,
+        &db_values,
+        instance_id,
+        current,
+        old,
+        status,
+    )
+}
+
+/// Composes the transport from environment values and stored rows. Pure so
+/// that precedence rules are testable without a database.
+fn build(
+    config: &Config,
+    environment: &(BTreeMap<String, Value>, std::collections::BTreeSet<String>),
+    db_values: &BTreeMap<String, Value>,
+    instance_id: Uuid,
+    current: Option<&[u8; 32]>,
+    old: Option<&[u8; 32]>,
+    status: TransportStatus,
+) -> Result<Option<ConfiguredTransport>, &'static str> {
+    let env_values_locked = environment;
+    // Environment mail never mixes in stored rows, whatever the caller passes.
+    let no_rows = BTreeMap::new();
+    let db_values = if environment.1.contains("mail.transport") {
+        &no_rows
+    } else {
+        db_values
+    };
     let defaults = defaults(config);
     let mut values = BTreeMap::new();
     for key in [
@@ -386,7 +431,7 @@ pub async fn load(
                 key,
                 &env_values_locked.0,
                 &env_values_locked.1,
-                &db_values,
+                db_values,
                 &defaults,
             ),
         );
@@ -395,16 +440,11 @@ pub async fn load(
     if transport == "none" {
         return Ok(None);
     }
-    let instance_id: Uuid =
-        sqlx::query_scalar("SELECT operator_user_id FROM instance_setup WHERE id=true")
-            .fetch_one(pool)
-            .await
-            .map_err(|_| "mail settings are invalid")?;
     let mail = match transport.as_str() {
         "smtp" => MailTransportConfig::Smtp(smtp_settings(
             config,
             &values,
-            &db_values,
+            db_values,
             &env_values_locked.1,
             instance_id,
             current,
@@ -413,30 +453,28 @@ pub async fn load(
         "graph" => {
             let credential = resolve_oauth_credential(
                 config,
-                &db_values,
+                db_values,
                 &env_values_locked.1,
                 instance_id,
                 current,
                 old,
-            )
-            .await?;
+            )?;
             MailTransportConfig::Graph(graph_config(&values, credential)?)
         }
         "smtp_oauth_microsoft" => {
             let credential = resolve_oauth_credential(
                 config,
-                &db_values,
+                db_values,
                 &env_values_locked.1,
                 instance_id,
                 current,
                 old,
-            )
-            .await?;
+            )?;
             MailTransportConfig::SmtpOAuth(SmtpOAuthConfig {
                 smtp: smtp_settings(
                     config,
                     &values,
-                    &db_values,
+                    db_values,
                     &env_values_locked.1,
                     instance_id,
                     current,
@@ -456,13 +494,7 @@ pub async fn load(
         "smtp_oauth_google" => {
             let username = text(&values, "mail.username").filter(|value| !value.is_empty());
             let account = if !env_values_locked.1.contains("mail.service_account") {
-                decrypt_db_secret(
-                    "mail.service_account",
-                    &db_values,
-                    instance_id,
-                    current,
-                    old,
-                )?
+                decrypt_db_secret("mail.service_account", db_values, instance_id, current, old)?
             } else {
                 None
             };
@@ -484,7 +516,7 @@ pub async fn load(
                 smtp: smtp_settings(
                     config,
                     &values,
-                    &db_values,
+                    db_values,
                     &env_values_locked.1,
                     instance_id,
                     current,
@@ -582,5 +614,232 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn secret_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("craftcloud-synthetic-{name}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn config_from(pairs: &[(&str, &str)]) -> Config {
+        let file = std::env::temp_dir().join("craftcloud-synthetic-credential");
+        let file = file.to_string_lossy().into_owned();
+        let mut env = BTreeMap::from([
+            ("CRAFTCLOUD_DATABASE_URL_FILE".to_owned(), file.clone()),
+            ("CRAFTCLOUD_SECRET_KEY_FILE".to_owned(), file),
+            (
+                "CRAFTCLOUD_PUBLIC_URL".to_owned(),
+                "https://cloud.example.test".to_owned(),
+            ),
+        ]);
+        env.extend(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+        );
+        Config::from_env_map(&env).unwrap()
+    }
+
+    type Environment = (BTreeMap<String, Value>, std::collections::BTreeSet<String>);
+
+    fn environment_of(config: &Config, names: &[&str]) -> Environment {
+        crate::instance_setting_environment_with(config, &|name| names.contains(&name))
+    }
+
+    fn encrypted_row(key: &str, plaintext: &[u8]) -> (String, Value) {
+        let ciphertext = encrypt_secret_for(
+            &[0x5a; 32],
+            Uuid::from_u128(0x1234),
+            format!("instance-setting:{key}").as_bytes(),
+            plaintext,
+        )
+        .unwrap();
+        (
+            key.to_owned(),
+            serde_json::json!({
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext)
+            }),
+        )
+    }
+
+    fn row(key: &str, value: Value) -> (String, Value) {
+        (key.to_owned(), serde_json::json!({ "value": value }))
+    }
+
+    fn graph_env(secret: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("CRAFTCLOUD_MAIL_TRANSPORT", "graph".to_owned()),
+            (
+                "CRAFTCLOUD_GRAPH_TENANT_ID",
+                "00000000-0000-0000-0000-000000000001".to_owned(),
+            ),
+            (
+                "CRAFTCLOUD_GRAPH_CLIENT_ID",
+                "00000000-0000-0000-0000-000000000002".to_owned(),
+            ),
+            ("CRAFTCLOUD_GRAPH_SENDER", "mailer@example.org".to_owned()),
+            ("CRAFTCLOUD_GRAPH_CLIENT_SECRET_FILE", secret.to_owned()),
+        ]
+    }
+
+    fn config_of(pairs: &[(&str, String)]) -> Config {
+        let borrowed = pairs
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect::<Vec<_>>();
+        config_from(&borrowed)
+    }
+    const GRAPH_NAMES: [&str; 5] = [
+        "MAIL_TRANSPORT",
+        "GRAPH_TENANT_ID",
+        "GRAPH_CLIENT_ID",
+        "GRAPH_SENDER",
+        "GRAPH_CLIENT_SECRET_FILE",
+    ];
+
+    #[test]
+    fn environment_mail_locks_every_mail_setting_and_credential() {
+        let config = config_of(&graph_env(&secret_path("graph")));
+        let (_, locked) = environment_of(&config, &GRAPH_NAMES);
+        for key in crate::mail_setting_keys() {
+            assert!(locked.contains(key), "{key} must be locked");
+        }
+        assert!(!locked.contains("retention.trash_days"));
+        // Mail not configured through the environment stays editable.
+        let (_, open) = environment_of(&config_from(&[]), &[]);
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn graph_environment_secret_ignores_database_certificate() {
+        let secret = secret_path("graph");
+        let config = config_of(&graph_env(&secret));
+        let environment = environment_of(&config, &GRAPH_NAMES);
+        // The stored certificate pair would otherwise outrank the secret file.
+        let rows = BTreeMap::from([
+            encrypted_row("mail.certificate", b"-----BEGIN CERTIFICATE-----"),
+            encrypted_row("mail.private_key", b"-----BEGIN PRIVATE KEY-----"),
+        ]);
+        let credential = resolve_oauth_credential(
+            &config,
+            &rows,
+            &environment.1,
+            Uuid::from_u128(0x1234),
+            Some(&[0x5a; 32]),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(credential, OAuthCredential::ClientSecretFile(path) if path == secret));
+    }
+
+    #[test]
+    fn environment_certificate_ignores_database_client_secret() {
+        let mut pairs = graph_env("unused");
+        pairs.retain(|(key, _)| !key.ends_with("CLIENT_SECRET_FILE"));
+        pairs.push(("CRAFTCLOUD_GRAPH_CERT_FILE", secret_path("cert")));
+        pairs.push(("CRAFTCLOUD_GRAPH_KEY_FILE", secret_path("key")));
+        let config = config_of(&pairs);
+        let mut names = GRAPH_NAMES.to_vec();
+        names.retain(|name| *name != "GRAPH_CLIENT_SECRET_FILE");
+        names.extend(["GRAPH_CERT_FILE", "GRAPH_KEY_FILE"]);
+        let environment = environment_of(&config, &names);
+        let rows = BTreeMap::from([encrypted_row("mail.client_secret", b"db client secret")]);
+        let credential = resolve_oauth_credential(
+            &config,
+            &rows,
+            &environment.1,
+            Uuid::from_u128(0x1234),
+            Some(&[0x5a; 32]),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            credential,
+            OAuthCredential::CertificateAndKeyFiles { .. }
+        ));
+    }
+
+    #[test]
+    fn undecryptable_database_secret_cannot_disable_environment_mail() {
+        let smtp = [
+            ("CRAFTCLOUD_MAIL_TRANSPORT", "smtp"),
+            ("CRAFTCLOUD_SMTP_HOST", "smtp.example.org"),
+            ("CRAFTCLOUD_SMTP_PORT", "587"),
+            ("CRAFTCLOUD_SMTP_TLS", "starttls"),
+            ("CRAFTCLOUD_SMTP_FROM", "mailer@example.org"),
+        ];
+        let config = config_from(&smtp);
+        let environment = environment_of(
+            &config,
+            &[
+                "MAIL_TRANSPORT",
+                "SMTP_HOST",
+                "SMTP_PORT",
+                "SMTP_TLS",
+                "SMTP_FROM",
+            ],
+        );
+        // Ciphertext that does not decrypt (for example after a key change)
+        // and a conflicting stored host must not matter for environment mail.
+        let rows = BTreeMap::from([
+            encrypted_row("mail.password", b"stale"),
+            row("mail.host", serde_json::json!("evil.example")),
+        ]);
+        let built = build(
+            &config,
+            &environment,
+            &rows,
+            Uuid::from_u128(0x9999),
+            Some(&[0x11; 32]),
+            None,
+            TransportStatus::default(),
+        );
+        assert!(built.unwrap().is_some());
+        // The same kind of row does break a database-configured transport.
+        let open_config = config_from(&[]);
+        let open = environment_of(&open_config, &[]);
+        let rows = BTreeMap::from([
+            row("mail.transport", serde_json::json!("smtp")),
+            row("mail.host", serde_json::json!("db.example")),
+            row("mail.port", serde_json::json!(587)),
+            row("mail.from", serde_json::json!("a@example.org")),
+            encrypted_row("mail.password", b"stale"),
+        ]);
+        assert!(
+            build(
+                &open_config,
+                &open,
+                &rows,
+                Uuid::from_u128(0x9999),
+                Some(&[0x11; 32]),
+                None,
+                TransportStatus::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn database_oauth_transport_without_stored_credential_is_reported_missing() {
+        let open_config = config_from(&[]);
+        let open = environment_of(&open_config, &[]);
+        let rows = BTreeMap::from([
+            row("mail.transport", serde_json::json!("graph")),
+            row("mail.tenant_id", serde_json::json!("tenant")),
+            row("mail.client_id", serde_json::json!("client")),
+            row("mail.sender", serde_json::json!("a@example.org")),
+        ]);
+        let result = build(
+            &open_config,
+            &open,
+            &rows,
+            Uuid::from_u128(0x1234),
+            Some(&[0x5a; 32]),
+            None,
+            TransportStatus::default(),
+        );
+        assert_eq!(result.err(), Some("mail OAuth credentials are invalid"));
     }
 }

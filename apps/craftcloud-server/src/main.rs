@@ -1964,6 +1964,11 @@ async fn run(config: Config) -> Result<(), Failure> {
     if two_factor_key.is_none() {
         tracing::warn!("two-factor setup is unavailable: current secret key is not usable");
     }
+    if config.mail.is_some() && two_factor_key.is_none() {
+        return Err(Failure::config(
+            "CRAFTCLOUD_SECRET_KEY_FILE must contain a valid AC-02 key when mail delivery is enabled",
+        ));
+    }
     let mail_status = craftcloud_mail::TransportStatus::default();
     let metrics = std::sync::Arc::new(Metrics::new());
     // Migrations are never applied implicitly: only verify the schema.
@@ -2532,7 +2537,15 @@ fn mail_message_id_domain(public_url: &str) -> String {
 fn instance_setting_environment(
     config: &Config,
 ) -> (BTreeMap<String, serde_json::Value>, BTreeSet<String>) {
-    let env_set = |name: &str| std::env::var_os(format!("CRAFTCLOUD_{name}")).is_some();
+    instance_setting_environment_with(config, &|name| {
+        std::env::var_os(format!("CRAFTCLOUD_{name}")).is_some()
+    })
+}
+
+fn instance_setting_environment_with(
+    config: &Config,
+    env_set: &dyn Fn(&str) -> bool,
+) -> (BTreeMap<String, serde_json::Value>, BTreeSet<String>) {
     let mut values = BTreeMap::new();
     let mut locked = BTreeSet::new();
     let mut public = |key: &str, envs: &[&str], value: serde_json::Value| {
@@ -2688,7 +2701,35 @@ fn instance_setting_environment(
             locked.insert(key.to_owned());
         }
     }
+    // Environment mail configuration is authoritative as a whole: every mail
+    // setting and credential is locked, so a stored database value can never
+    // be mixed into (or replace part of) the environment-defined transport.
+    if config.mail.is_some() || env_set("MAIL_TRANSPORT") {
+        locked.extend(mail_setting_keys().map(str::to_owned));
+    }
     (values, locked)
+}
+
+/// Every mail setting and credential key that environment mail locks.
+fn mail_setting_keys() -> impl Iterator<Item = &'static str> {
+    [
+        "mail.transport",
+        "mail.host",
+        "mail.port",
+        "mail.tls",
+        "mail.username",
+        "mail.from",
+        "mail.tenant_id",
+        "mail.client_id",
+        "mail.sender",
+        "mail.save_to_sent",
+        "mail.password",
+        "mail.client_secret",
+        "mail.certificate",
+        "mail.private_key",
+        "mail.service_account",
+    ]
+    .into_iter()
 }
 
 /// Resolves on Ctrl-C and, on unix, SIGTERM. If a handler cannot be

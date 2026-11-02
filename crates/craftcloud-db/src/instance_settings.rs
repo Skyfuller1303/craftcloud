@@ -8,11 +8,85 @@ use uuid::Uuid;
 use crate::DbError;
 use crate::audit::{AuditCtx, Detail, NewEvent, record_in, valid_instance_setting_value};
 
+/// Encrypted secret keys. They never appear in audit values or API responses.
+pub const SECRET_KEYS: &[&str] = &[
+    "mail.password",
+    "mail.client_secret",
+    "mail.certificate",
+    "mail.private_key",
+    "mail.service_account",
+];
+
+/// Keys that decide which remote endpoint or identity receives stored
+/// credentials. Changing any of them invalidates every stored secret.
+pub const CREDENTIAL_TARGET_KEYS: &[&str] = &[
+    "mail.transport",
+    "mail.host",
+    "mail.port",
+    "mail.tls",
+    "mail.tenant_id",
+    "mail.client_id",
+];
+
+/// After a retention period is shortened, deletion, purge and restore keep
+/// using the longer of the old and the new period for this long.
+pub const RETENTION_GRACE: time::Duration = time::Duration::hours(24);
+
 pub struct SettingMutation {
     pub key: String,
     pub key_code: &'static str,
     pub value: Option<Value>,
     pub secret: bool,
+    /// Effective value while no row is stored (default or configured
+    /// fallback). Used to detect real changes and shortened retention.
+    pub baseline: Option<Value>,
+}
+
+fn valid_retention_days(key: &str, days: u64) -> bool {
+    if key == "retention.audit_days" {
+        (30..=3650).contains(&days)
+    } else {
+        (1..=3650).contains(&days)
+    }
+}
+
+/// Effective retention in days for a stored retention row. During the grace
+/// period after a shortening this is the longer of the new and the previous
+/// period. Returns `None` when the stored value is not a valid period, so the
+/// caller can fall back to the environment or default value.
+#[must_use]
+pub fn effective_retention_days(
+    key: &str,
+    stored: &Value,
+    updated_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    let value = stored
+        .get("value")
+        .and_then(Value::as_u64)
+        .filter(|days| valid_retention_days(key, *days))?;
+    let previous = stored
+        .get("previous")
+        .and_then(Value::as_u64)
+        .filter(|days| valid_retention_days(key, *days))
+        .filter(|_| now - updated_at < RETENTION_GRACE);
+    Some(previous.map_or(value, |previous| previous.max(value)))
+}
+
+/// Effective retention days from stored rows. Invalid rows are ignored and
+/// logged by key only.
+#[must_use]
+pub fn retention_days_from_rows(
+    rows: &[InstanceSetting],
+    key: &str,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    let row = rows.iter().find(|row| row.key == key)?;
+    let days = effective_retention_days(key, &row.value, row.updated_at, now);
+    if days.is_none() {
+        tracing::warn!(setting = key, "ignoring invalid stored retention setting");
+    }
+    days
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +111,7 @@ fn rows_can_finish(rows: &[(String, String)]) -> bool {
             .find(|(id, _)| id == step)
             .map(|(_, status)| status.as_str())
     };
-    status("system_check") == Some("done")
+    matches!(status("system_check"), Some("done" | "skipped"))
         && REQUIRED_STEPS
             .iter()
             .all(|step| matches!(status(step), Some("done" | "skipped")))
@@ -240,12 +314,15 @@ pub async fn remove_setting(pool: &PgPool, key: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Applies the settings changes in one transaction and returns the secret keys
+/// that were deleted because a credential target changed.
 pub async fn update_settings_audited(
     pool: &PgPool,
     actor: Uuid,
     audit: &AuditCtx,
     changes: &[SettingMutation],
-) -> Result<(), DbError> {
+    now: OffsetDateTime,
+) -> Result<Vec<String>, DbError> {
     let mut ordered = changes.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.key.cmp(&right.key));
     let mut tx = pool.begin().await?;
@@ -254,13 +331,51 @@ pub async fn update_settings_audited(
     )
     .execute(&mut *tx)
     .await?;
-    for change in ordered {
-        let old: Option<Value> =
-            sqlx::query_scalar("SELECT value FROM instance_settings WHERE key=$1 FOR UPDATE")
-                .bind(&change.key)
-                .fetch_optional(&mut *tx)
-                .await?;
-        match &change.value {
+    let mut olds = Vec::with_capacity(ordered.len());
+    for change in &ordered {
+        let old: Option<(Value, OffsetDateTime)> = sqlx::query_as(
+            "SELECT value, updated_at FROM instance_settings WHERE key=$1 FOR UPDATE",
+        )
+        .bind(&change.key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        olds.push(old);
+    }
+    // Removing a stored target value also changes the destination (it falls
+    // back to the default), so it counts as a change too.
+    let target_changed = ordered.iter().zip(&olds).any(|(change, old)| {
+        if !CREDENTIAL_TARGET_KEYS.contains(&change.key.as_str()) {
+            return false;
+        }
+        let previous = old
+            .as_ref()
+            .and_then(|(stored, _)| stored.get("value"))
+            .or(change.baseline.as_ref())
+            .filter(|value| !value.is_null());
+        match change.value.as_ref() {
+            Some(new) => previous != new.get("value").filter(|value| !value.is_null()),
+            None => old.is_some(),
+        }
+    });
+    for (change, old) in ordered.iter().zip(&olds) {
+        let mut stored = change.value.clone();
+        if change.key.starts_with("retention.")
+            && let Some(new_days) = stored
+                .as_ref()
+                .and_then(|value| value.get("value"))
+                .and_then(Value::as_u64)
+        {
+            let old_days = old
+                .as_ref()
+                .and_then(|(value, updated_at)| {
+                    effective_retention_days(&change.key, value, *updated_at, now)
+                })
+                .or_else(|| change.baseline.as_ref().and_then(Value::as_u64));
+            if let Some(old_days) = old_days.filter(|old_days| new_days < *old_days) {
+                stored = Some(serde_json::json!({"value": new_days, "previous": old_days}));
+            }
+        }
+        match &stored {
             Some(value) => {
                 sqlx::query("INSERT INTO instance_settings(key,value,updated_by) VALUES($1,$2,$3) \
                     ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(),updated_by=EXCLUDED.updated_by")
@@ -276,17 +391,44 @@ pub async fn update_settings_audited(
         let mut event =
             NewEvent::new("instance_setting.updated").detail("key", Detail::Code(change.key_code));
         if !change.secret {
-            if let Some(value) = old.as_ref().and_then(|stored| stored.get("value")) {
+            if let Some(value) = old.as_ref().and_then(|(stored, _)| stored.get("value")) {
                 event = event.detail("old", setting_audit_detail(&change.key, value));
             }
-            if let Some(value) = change.value.as_ref().and_then(|stored| stored.get("value")) {
+            if let Some(value) = stored.as_ref().and_then(|stored| stored.get("value")) {
                 event = event.detail("new", setting_audit_detail(&change.key, value));
             }
         }
         record_in(&mut tx, audit, &event).await?;
     }
+    let mut cleared = Vec::new();
+    if target_changed {
+        for key in SECRET_KEYS {
+            if ordered
+                .iter()
+                .any(|change| change.key == *key && change.value.is_some())
+            {
+                continue;
+            }
+            let removed = sqlx::query("DELETE FROM instance_settings WHERE key=$1")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if removed > 0 {
+                record_in(
+                    &mut tx,
+                    audit,
+                    &NewEvent::new("instance_setting.secret_cleared")
+                        .detail("key", Detail::Code(key))
+                        .detail("reason", Detail::Code("credential_target_changed")),
+                )
+                .await?;
+                cleared.push((*key).to_owned());
+            }
+        }
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(cleared)
 }
 
 #[cfg(test)]
@@ -307,6 +449,38 @@ mod tests {
         assert!(rows_complete(&rows));
         rows.retain(|(step, _)| step != "invitations");
         assert!(!rows_can_finish(&rows));
+    }
+
+    #[test]
+    fn retention_grace_uses_the_longer_period_for_24_hours() {
+        let updated = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let stored = serde_json::json!({"value": 7, "previous": 30});
+        let key = "retention.trash_days";
+        assert_eq!(
+            effective_retention_days(key, &stored, updated, updated + time::Duration::hours(23)),
+            Some(30)
+        );
+        assert_eq!(
+            effective_retention_days(key, &stored, updated, updated + time::Duration::hours(24)),
+            Some(7)
+        );
+        assert_eq!(
+            effective_retention_days(key, &serde_json::json!({"value": 0}), updated, updated),
+            None
+        );
+        assert_eq!(
+            effective_retention_days(
+                "retention.audit_days",
+                &serde_json::json!({"value": 29}),
+                updated,
+                updated
+            ),
+            None
+        );
+        assert_eq!(
+            effective_retention_days(key, &serde_json::json!({"value": "x"}), updated, updated),
+            None
+        );
     }
 
     #[test]

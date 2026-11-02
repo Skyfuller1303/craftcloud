@@ -61,13 +61,7 @@ const REQUIRED_STEPS: &[&str] = &[
     "optional_services",
     "summary",
 ];
-const SECRET_KEYS: &[&str] = &[
-    "mail.password",
-    "mail.client_secret",
-    "mail.certificate",
-    "mail.private_key",
-    "mail.service_account",
-];
+const SECRET_KEYS: &[&str] = db::SECRET_KEYS;
 const SETTING_KEYS: &[&str] = &[
     "mail.transport",
     "mail.host",
@@ -156,6 +150,26 @@ fn setting_code(key: &str) -> Option<&'static str> {
 
 fn setting_requires_fresh_auth(key: &str) -> bool {
     key.starts_with("mail.")
+}
+
+fn is_retention_key(key: &str) -> bool {
+    key.starts_with("retention.")
+}
+
+/// True when the new value is shorter than the period currently in force
+/// (the stored value including a running grace period, else the default).
+fn shortens_retention(
+    key: &str,
+    new_days: u64,
+    rows: &[db::InstanceSetting],
+    now: time::OffsetDateTime,
+) -> bool {
+    let current = rows
+        .iter()
+        .find(|row| row.key == key)
+        .and_then(|row| db::effective_retention_days(key, &row.value, row.updated_at, now))
+        .or_else(|| default_setting_value(key).as_u64());
+    current.is_some_and(|current| new_days < current)
 }
 
 fn valid_setting_host(host: &str) -> bool {
@@ -421,9 +435,25 @@ pub(crate) async fn get_settings(
         Ok(s) => s,
         Err(r) => return *r,
     };
+    match get_settings_value(&services, &headers).await {
+        Ok(body) => Json(body).into_response(),
+        Err(response) => *response,
+    }
+}
+
+async fn get_settings_value(
+    services: &crate::Services,
+    headers: &HeaderMap,
+) -> Result<Value, Box<Response>> {
     let rows = match db::settings(&services.pool).await {
         Ok(rows) => rows,
-        Err(error) => return failed(&error, &headers, "instance settings lookup failed"),
+        Err(error) => {
+            return Err(Box::new(failed(
+                &error,
+                headers,
+                "instance settings lookup failed",
+            )));
+        }
     };
     let values: BTreeMap<_, _> = rows
         .iter()
@@ -465,7 +495,7 @@ pub(crate) async fn get_settings(
         settings.insert((*key).to_owned(),json!({"configured_at":if locked {Value::Null} else {stored.and_then(|v|v.get("configured_at")).cloned().unwrap_or(Value::Null)},"source":source,"locked":locked}));
     }
     let updated_at = rows.iter().map(|row| row.updated_at).max().map(rfc3339);
-    Json(json!({"settings":settings,"updated_at":updated_at})).into_response()
+    Ok(json!({"settings":settings,"updated_at":updated_at}))
 }
 
 #[derive(Deserialize, Default)]
@@ -673,6 +703,7 @@ pub(crate) async fn update_settings(
             };
             if entry.set.as_ref().is_some_and(|v| v.len() > max)
                 || (entry.set.is_some() && entry.remove == Some(true))
+                || entry.value.is_some()
             {
                 invalid.push(key.as_str());
             }
@@ -689,6 +720,23 @@ pub(crate) async fn update_settings(
     }
     if !invalid.is_empty() {
         return validation_failed(&invalid, &headers);
+    }
+    let now_time = services.clock.now();
+    if body.settings.keys().any(|key| is_retention_key(key)) {
+        let rows = match db::settings(&services.pool).await {
+            Ok(rows) => rows,
+            Err(error) => return failed(&error, &headers, "instance settings lookup failed"),
+        };
+        if body.settings.iter().any(|(key, entry)| {
+            is_retention_key(key)
+                && entry
+                    .value
+                    .as_ref()
+                    .and_then(Value::as_u64)
+                    .is_some_and(|days| shortens_retention(key, days, &rows, now_time))
+        }) {
+            requires_fresh_auth = true;
+        }
     }
     if requires_fresh_auth {
         match fresh_auth(&services, &session).await {
@@ -729,6 +777,7 @@ pub(crate) async fn update_settings(
                     key_code,
                     value: None,
                     secret: true,
+                    baseline: None,
                 });
                 continue;
             }
@@ -783,29 +832,36 @@ pub(crate) async fn update_settings(
                     key_code,
                     value: Some(value),
                     secret: true,
+                    baseline: None,
                 });
             }
         } else if let Some(value) = entry.value.take() {
             let saved = json!({"value":value});
+            let baseline = Some(default_setting_value(&key)).filter(|value| !value.is_null());
             changes.push(db::SettingMutation {
                 key,
                 key_code,
                 value: Some(saved),
                 secret: false,
+                baseline,
             });
         }
     }
-    let refresh_mail = changes.iter().any(|change| change.key.starts_with("mail."));
-    if let Err(error) = db::update_settings_audited(
+    let mut cleared = match db::update_settings_audited(
         &services.pool,
         session.user_id,
         &crate::audit::ctx(&headers, Some(session.user_id)),
         &changes,
+        now_time,
     )
     .await
     {
-        return failed(&error, &headers, "instance settings transaction failed");
-    }
+        Ok(cleared) => cleared,
+        Err(error) => return failed(&error, &headers, "instance settings transaction failed"),
+    };
+    cleared.sort();
+    let refresh_mail =
+        !cleared.is_empty() || changes.iter().any(|change| change.key.starts_with("mail."));
     if refresh_mail
         && let Some(notify) = &services.instance_settings_changed
         && !notify().await
@@ -817,7 +873,14 @@ pub(crate) async fn update_settings(
             &headers,
         );
     }
-    get_settings(State(state), headers, session).await
+    let mut response = get_settings_value(&services, &headers).await;
+    if let Ok(body) = &mut response {
+        body["credentials_cleared"] = json!(cleared);
+    }
+    match response {
+        Ok(body) => Json(body).into_response(),
+        Err(response) => *response,
+    }
 }
 
 pub(crate) async fn test_email(

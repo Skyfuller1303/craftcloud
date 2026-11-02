@@ -233,6 +233,100 @@ describe.each(languages)("setup wizard (%s)", (language, wizardTitle, systemTitl
     await screen.findByText(language === "en" ? "Test e-mail queued for delivery." : "Test-E-Mail zur Zustellung vorgemerkt.");
   });
 
+  it("asks for confirmation before shortening a retention period and saves only after it", async () => {
+    window.history.replaceState(null, "", "/admin/setup");
+    let patched: unknown[] = [];
+    const organizationRow = {
+      id: ORG_A.id, slug: ORG_A.slug, name: ORG_A.name, member_count: 1,
+      created_at: "2026-10-01T10:00:00Z", committed_bytes: 0, reserved_bytes: 0,
+      quota_bytes: null, seat_limit: null,
+    };
+    const { fetch } = mockFetch(viewRoutes({
+      "GET /admin/setup": { body: setup() },
+      "GET /admin/setup/system-check": { body: systemCheck },
+      "GET /admin/organizations": { body: { items: [organizationRow], next_cursor: null } },
+      [`GET /organizations/${ORG_A.id}/apps`]: { status: 503, body: { error: "unavailable" } },
+      "GET /admin/instance-settings": { body: instanceSettings },
+      "PATCH /admin/instance-settings": (call) => {
+        patched.push(call.body);
+        return { body: instanceSettings };
+      },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch, { language });
+    const nav = await screen.findByRole("navigation", { name: language === "en" ? "Setup steps" : "Einrichtungsschritte" });
+    await user.click(within(nav).getByRole("button", { name: /Organization basics|Organisationsgrundlagen/ }));
+    const trash = await screen.findByLabelText(language === "en" ? "Trash retention (days)" : "Aufbewahrung im Papierkorb (Tage)");
+    const save = screen.getAllByRole("button", { name: language === "en" ? "Save settings" : "Einstellungen speichern" })[0]!;
+
+    // Lengthening saves directly.
+    await user.clear(trash);
+    await user.type(trash, "60");
+    await user.click(save);
+    await waitFor(() => expect(patched).toEqual([{ settings: { "retention.trash_days": { value: 60 } } }]));
+    patched = [];
+
+    // Shortening opens the confirmation; cancelling sends nothing.
+    await user.clear(trash);
+    await user.type(trash, "7");
+    await user.click(save);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(language === "en" ? "Shorten retention period?" : "Aufbewahrungsfrist verkürzen?")).toBeTruthy();
+    expect(dialog.textContent).toContain("30 → 7");
+    await user.click(within(dialog).getByRole("button", { name: language === "en" ? "Cancel" : "Abbrechen" }));
+    expect(patched).toEqual([]);
+
+    await user.click(save);
+    const confirm = await screen.findByRole("dialog");
+    await user.click(within(confirm).getByRole("button", { name: language === "en" ? "Shorten retention" : "Frist verkürzen" }));
+    await waitFor(() => expect(patched).toEqual([{ settings: { "retention.trash_days": { value: 7 } } }]));
+  });
+
+  it("warns that a changed mail target removes saved credentials and reports the removal", async () => {
+    window.history.replaceState(null, "", "/admin/setup");
+    const editable = {
+      ...instanceSettings,
+      settings: {
+        ...instanceSettings.settings,
+        "mail.transport": { value: "smtp", source: "database", locked: false },
+        "mail.host": { value: "smtp.old.test", source: "database", locked: false },
+        "mail.port": { value: 587, source: "database", locked: false },
+        "mail.tls": { value: "starttls", source: "database", locked: false },
+        "mail.password": { configured_at: "2026-11-01T10:00:00Z", source: "database", locked: false },
+      },
+    };
+    const { fetch, calls } = mockFetch(viewRoutes({
+      "GET /admin/setup": { body: setup(false, ["account", "system_check"], ["two_factor"]) },
+      "GET /admin/instance-settings": { body: editable },
+      "PATCH /admin/instance-settings": () => ({
+        body: {
+          ...editable,
+          settings: {
+            ...editable.settings,
+            "mail.host": { value: "smtp.new.test", source: "database", locked: false },
+            "mail.password": { configured_at: null, source: "default", locked: false },
+          },
+          credentials_cleared: ["mail.password"],
+        },
+      }),
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch, { language });
+    const host = await screen.findByLabelText(language === "en" ? "SMTP host" : "SMTP-Host");
+    const hint = language === "en"
+      ? "Changing the mail server, transport or sign-in identity removes all saved credentials. Enter them again after saving."
+      : "Wenn du Mailserver, Transport oder Anmeldeidentität änderst, werden alle gespeicherten Zugangsdaten entfernt. Gib sie nach dem Speichern erneut ein.";
+    expect(screen.queryByText(hint)).toBeNull();
+    await user.clear(host);
+    await user.type(host, "smtp.new.test");
+    expect(await screen.findByText(hint)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: language === "en" ? "Save settings" : "Einstellungen speichern" }));
+    await screen.findByText(language === "en"
+      ? "Saved credentials were removed because the mail target changed. Enter the credentials again."
+      : "Gespeicherte Zugangsdaten wurden entfernt, weil sich das Mail-Ziel geändert hat. Gib die Zugangsdaten erneut ein.");
+    expect(calls.filter((call) => call.method === "PATCH").length).toBe(1);
+  });
+
   it("blocks capacity saves until organization and app settings load", async () => {
     window.history.replaceState(null, "", "/admin/setup");
     const organizationRow = {

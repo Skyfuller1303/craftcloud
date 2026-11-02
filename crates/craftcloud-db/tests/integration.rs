@@ -2519,6 +2519,84 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn upgrade_from_0022_marks_existing_installations_as_fully_set_up() {
+        let db = TestDb::new().await;
+        migrate::run_with(&db.pool, &migrator_up_to(22))
+            .await
+            .unwrap();
+        setup::complete(&db.pool, &new_instance("acme"))
+            .await
+            .unwrap();
+        migrate::run(&db.pool).await.unwrap();
+        let steps = craftcloud_db::instance_settings::setup_steps(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(steps.len(), 8);
+        for step in &steps {
+            let expected = if step.step == "summary" {
+                "done"
+            } else {
+                "skipped"
+            };
+            assert_eq!(step.status, expected, "{}", step.step);
+        }
+
+        // A fresh installation gets no pre-filled steps.
+        let fresh = migrated().await;
+        assert!(
+            craftcloud_db::instance_settings::setup_steps(&fresh.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn invalid_retention_settings_are_rejected_by_the_database() {
+        let db = migrated().await;
+        for (key, value) in [
+            ("retention.trash_days", serde_json::json!({"value": 0})),
+            ("retention.trash_days", serde_json::json!({"value": 3651})),
+            ("retention.trash_days", serde_json::json!({"value": "7"})),
+            ("retention.trash_days", serde_json::json!({"value": 1.5})),
+            ("retention.trash_days", serde_json::json!({})),
+            ("retention.audit_days", serde_json::json!({"value": 29})),
+            (
+                "retention.trash_days",
+                serde_json::json!({"value": 7, "previous": 0}),
+            ),
+        ] {
+            let error = sqlx::query("INSERT INTO instance_settings(key,value) VALUES($1,$2)")
+                .bind(key)
+                .bind(&value)
+                .execute(&db.pool)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(db_err(error), DbError::CheckViolation { .. }),
+                "{key} {value}"
+            );
+        }
+        for (key, value) in [
+            ("retention.audit_days", serde_json::json!({"value": 30})),
+            (
+                "retention.trash_days",
+                serde_json::json!({"value": 7, "previous": 30}),
+            ),
+            ("mail.host", serde_json::json!({"value": "mail.example"})),
+        ] {
+            sqlx::query("INSERT INTO instance_settings(key,value) VALUES($1,$2)")
+                .bind(key)
+                .bind(&value)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn instance_setup_is_a_singleton() {
         let db = migrated().await;
         let created = setup::complete(&db.pool, &new_instance("acme"))

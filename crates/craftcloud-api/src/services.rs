@@ -303,12 +303,12 @@ impl Services {
             return Ok(fallback);
         }
         let rows = craftcloud_db::instance_settings::settings(&self.pool).await?;
-        let days = rows
-            .iter()
-            .find(|row| row.key == "retention.trash_days")
-            .and_then(|row| row.value.get("value"))
-            .and_then(serde_json::Value::as_u64);
-        retention_duration(days, fallback)
+        let days = craftcloud_db::instance_settings::retention_days_from_rows(
+            &rows,
+            "retention.trash_days",
+            self.clock.now(),
+        );
+        Ok(retention_duration(days, fallback))
     }
 
     /// Waits until every HTTP-owned FigCraft operation releases its permit.
@@ -798,17 +798,10 @@ impl Services {
     }
 }
 
-fn retention_duration(
-    days: Option<u64>,
-    fallback: Duration,
-) -> Result<Duration, craftcloud_db::DbError> {
-    let Some(days) = days else {
-        return Ok(fallback);
-    };
-    if !(1..=3650).contains(&days) {
-        return Err(craftcloud_db::DbError::Internal);
-    }
-    Ok(Duration::from_secs(days.saturating_mul(86_400)))
+fn retention_duration(days: Option<u64>, fallback: Duration) -> Duration {
+    days.map_or(fallback, |days| {
+        Duration::from_secs(days.saturating_mul(86_400))
+    })
 }
 
 pub(crate) async fn wait_for_figcraft_jobs(permits: Arc<Semaphore>) {
@@ -846,15 +839,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trash_retention_setting_is_bounded_and_falls_back_when_unset() {
+    fn trash_retention_setting_falls_back_when_unset() {
         let fallback = Duration::from_secs(30 * 86_400);
-        assert_eq!(retention_duration(None, fallback).unwrap(), fallback);
+        assert_eq!(retention_duration(None, fallback), fallback);
         assert_eq!(
-            retention_duration(Some(60), fallback).unwrap(),
+            retention_duration(Some(60), fallback),
             Duration::from_secs(60 * 86_400)
         );
-        assert!(retention_duration(Some(0), fallback).is_err());
-        assert!(retention_duration(Some(3651), fallback).is_err());
     }
 
     #[test]

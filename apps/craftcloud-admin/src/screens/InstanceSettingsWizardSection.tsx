@@ -5,6 +5,7 @@ import { isApiError } from "../api/client.ts";
 import type { InstanceSecretSetting, InstanceSetting, InstanceSettings, InstanceSettingsPatch } from "../api/types.ts";
 import { useAuth } from "../auth.tsx";
 import { Banner } from "../components/Banner.tsx";
+import { ConfirmDialog } from "../components/Dialog.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { useI18n } from "../i18n/index.tsx";
 import type { Translate } from "../i18n/index.tsx";
@@ -42,6 +43,9 @@ const RETENTION_FIELDS: NormalField[] = [
   { name: "retention.audit_days", label: "Audit retention (days)", kind: "number", min: 30, max: 3650 },
   { name: "retention.quarantine_days", label: "Quarantine retention (days)", kind: "number", min: 1, max: 3650 },
 ];
+
+/** Settings that decide where stored credentials are sent; changing one removes them server-side. */
+const TARGET_FIELDS: FieldName[] = ["mail.transport", "mail.host", "mail.port", "mail.tls", "mail.tenant_id", "mail.client_id"];
 
 function isSecret(value: InstanceSetting | InstanceSecretSetting | undefined): value is InstanceSecretSetting {
   return value !== undefined && "configured_at" in value;
@@ -88,6 +92,8 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
   const [mailTest, setMailTest] = useState<"idle" | "sent" | "error">("idle");
+  const [cleared, setCleared] = useState(false);
+  const [shortening, setShortening] = useState<{ changes: InstanceSettingsPatch["settings"]; lines: string[] } | null>(null);
 
   async function load() {
     setError(null);
@@ -106,10 +112,11 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || settings === null) return;
-    setBusy(true);
     setError(null);
     setSaved(false);
+    setCleared(false);
     const changes: InstanceSettingsPatch["settings"] = {};
+    const shortened: string[] = [];
     const fields = section === "mail" ? MAIL_FIELDS : RETENTION_FIELDS;
     for (const field of fields) {
       const existing = settings.settings[field.name];
@@ -123,8 +130,10 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
         const max = field.max ?? 3650;
         if (!Number.isSafeInteger(numeric) || numeric < min || numeric > max) {
           setError(new Error(t("Enter a whole number from {min} to {max}.", { min: String(min), max: String(max) })));
-          setBusy(false);
           return;
+        }
+        if (field.name.startsWith("retention.") && before !== "" && numeric < Number(before)) {
+          shortened.push(`${translateFieldLabel(t, field.label)}: ${before} → ${next}`);
         }
       }
       changes[field.name] = { value: field.kind === "number" ? (next === "" ? null : Number(next)) : field.kind === "checkbox" ? next === "true" : next };
@@ -138,15 +147,29 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
         else if (value !== "") changes[field.name] = { set: value };
       }
     }
+    if (shortened.length > 0) {
+      // Shortening deletes data sooner: ask for confirmation before saving.
+      setShortening({ changes, lines: shortened });
+      return;
+    }
+    await commit(changes);
+  }
+
+  async function commit(changes: InstanceSettingsPatch["settings"]) {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
     try {
       if (Object.keys(changes).length > 0) {
         const result = await api.patchAdminInstanceSettings({ settings: changes });
         setSettings(result);
+        setCleared((result.credentials_cleared ?? []).length > 0);
       }
       setSecrets({});
       setRemoveSecrets(new Set());
       setSaved(true);
-    } catch (failure) { setError(failure); }
+      setShortening(null);
+    } catch (failure) { setError(failure); setShortening(null); }
     finally { setBusy(false); }
   }
 
@@ -167,6 +190,14 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
     const item = settings.settings[field.name];
     return item !== undefined && !isSecret(item) && !item.locked && (draft[field.name] ?? "") !== stringValue(item);
   });
+  const targetChanged = section === "mail" && TARGET_FIELDS.some((name) => {
+    const item = settings.settings[name];
+    return item !== undefined && !isSecret(item) && !item.locked && (draft[name] ?? "") !== stringValue(item);
+  });
+  const hasSavedSecrets = SECRET_FIELDS.some((field) => {
+    const item = settings.settings[field.name];
+    return isSecret(item) && item.configured_at !== null && item.locked !== true && item.source !== "environment";
+  });
   const dirtySecrets = SECRET_FIELDS.some((field) => (secrets[field.name] ?? "") !== "") || removeSecrets.size > 0;
   return <form className="form" onSubmit={(event) => void submit(event)}>
     {error !== null && <>
@@ -177,6 +208,8 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
           : <ErrorNotice error={error} />}
     </>}
     {saved && <Banner tone="good">{t("Settings saved.")}</Banner>}
+    {cleared && <Banner tone="warn">{t("Saved credentials were removed because the mail target changed. Enter the credentials again.")}</Banner>}
+    {targetChanged && hasSavedSecrets && <Banner tone="warn">{t("Changing the mail server, transport or sign-in identity removes all saved credentials. Enter them again after saving.")}</Banner>}
     {section === "mail" && <>
       <p>{t("Choose no e-mail delivery to share invitation links by hand, or configure a mail transport.")}</p>
       {fields.map((field) => {
@@ -229,5 +262,15 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
       </label>;
     })}
     <Button className="button button--primary" type="submit" isDisabled={busy}>{busy ? t("Saving…") : t("Save settings")}</Button>
+    {shortening !== null && <ConfirmDialog
+      title={t("Shorten retention period?")}
+      message={t("Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.", { periods: shortening.lines.join("; ") })}
+      confirmLabel={t("Shorten retention")}
+      danger
+      busy={busy}
+      error={error}
+      onConfirm={() => void commit(shortening.changes)}
+      onClose={() => setShortening(null)}
+    />}
   </form>;
 }

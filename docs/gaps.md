@@ -105,3 +105,10 @@ Domain ownership is decided by the instance operator (approval of each claim). A
 ## AC-13: Mehrere Instanzbetreiber
 
 Der Fortschritt des Setup-Assistenten wird serverseitig gespeichert und ist nach einer erneuten Anmeldung wieder verfügbar. Die bestehende Instanzbetreiberprüfung bindet die Rolle jedoch an das einzelne Betreiberkonto in `instance_setup`. Ein zweiter gleichzeitiger Instanzbetreiber lässt sich damit nicht einrichten oder für die gemeinsame Fortsetzung testen. Ein Modell für mehrere Instanzbetreiber erfordert eine eigene Berechtigungsentscheidung und ist nicht Teil der vorgenommenen Änderungen.
+
+## AC-13 review follow-ups
+
+- Der Zielwechsel löscht gespeicherte Mailgeheimnisse nur für die Schlüssel `mail.transport`, `mail.host`, `mail.port`, `mail.tls`, `mail.tenant_id` und `mail.client_id`. Ein Wechsel von `mail.username` oder `mail.sender` allein behält sie, weil beide weder Host noch Token-Endpunkt bestimmen.
+- Ein SMTP-Transport ohne Passwort verbindet ohne Anmeldung; der Server erzwingt für SMTP keine Anmeldung. Wer Authentifizierung verlangt, muss das Passwort nach einem Zielwechsel neu eintragen.
+- Die 24-Stunden-Karenz für verkürzte Fristen ist fest eingebaut und nicht konfigurierbar. Nach Ablauf ist die Verkürzung endgültig.
+- Eine Sicherung, die vor Migration 0023 erstellt wurde, stellt alle Assistentenschritte als erledigt wieder her (`skipped`/`done`); die Wiederherstellung des Fortschritts eines unterbrochenen Assistenten gehört nur zu Sicherungen ab Version 23.

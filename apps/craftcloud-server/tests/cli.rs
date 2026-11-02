@@ -113,6 +113,31 @@ mod tests {
     }
 
     #[test]
+    fn environment_mail_without_a_usable_secret_key_exits_2() {
+        let nowhere = std::env::temp_dir().join("craftcloud-cli-test-no-mail-key");
+        let nowhere = nowhere.to_string_lossy().into_owned();
+        let out = run(
+            &[],
+            &[
+                ("CRAFTCLOUD_DATABASE_URL_FILE", &nowhere),
+                ("CRAFTCLOUD_SECRET_KEY_FILE", &nowhere),
+                ("CRAFTCLOUD_PUBLIC_URL", "https://cloud.example.test"),
+                ("CRAFTCLOUD_MAIL_TRANSPORT", "smtp"),
+                ("CRAFTCLOUD_SMTP_HOST", "smtp.example.test"),
+                ("CRAFTCLOUD_SMTP_PORT", "587"),
+                ("CRAFTCLOUD_SMTP_TLS", "starttls"),
+                ("CRAFTCLOUD_SMTP_FROM", "mailer@example.test"),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        let message = text(&out);
+        assert!(
+            message.contains("CRAFTCLOUD_SECRET_KEY_FILE must contain a valid AC-02 key"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn unusable_storage_directory_stops_startup_with_exit_1() {
         let missing = std::env::temp_dir().join("craftcloud-cli-test-storage-missing");
         let missing = missing.to_string_lossy().into_owned();

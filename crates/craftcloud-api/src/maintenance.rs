@@ -906,46 +906,34 @@ impl Maintenance {
     async fn effective_settings(&self) -> Result<MaintenanceSettings, DbError> {
         let mut settings = self.settings.clone();
         let stored = craftcloud_db::instance_settings::settings(&self.pool).await?;
-        let days = |key: &str| -> Result<Option<u32>, DbError> {
-            let Some(value) = stored
-                .iter()
-                .find(|entry| entry.key == key)
-                .and_then(|entry| entry.value.get("value"))
-                .and_then(serde_json::Value::as_u64)
-            else {
-                return Ok(None);
-            };
-            if !(1..=3650).contains(&value) {
-                return Err(DbError::Internal);
-            }
-            u32::try_from(value)
-                .map(Some)
-                .map_err(|_| DbError::Internal)
+        let now = self.clock.now();
+        // Invalid stored values are ignored (logged by key) so that the
+        // environment or default value keeps the job running. A recently
+        // shortened period keeps its longer previous value for the grace time.
+        let days = |key: &str| {
+            craftcloud_db::instance_settings::retention_days_from_rows(&stored, key, now)
+                .and_then(|value| u32::try_from(value).ok())
         };
+        let seconds = |value: u32| Duration::from_secs(u64::from(value).saturating_mul(86_400));
         if !self.retention_environment[0]
-            && let Some(value) = days("retention.version_days")?
+            && let Some(value) = days("retention.version_days")
         {
-            settings.version_retention =
-                Duration::from_secs(u64::from(value).saturating_mul(86_400));
+            settings.version_retention = seconds(value);
         }
         if !self.retention_environment[1]
-            && let Some(value) = days("retention.trash_days")?
+            && let Some(value) = days("retention.trash_days")
         {
-            settings.trash_retention = Duration::from_secs(u64::from(value).saturating_mul(86_400));
+            settings.trash_retention = seconds(value);
         }
         if !self.retention_environment[2]
-            && let Some(value) = days("retention.audit_days")?
+            && let Some(value) = days("retention.audit_days")
         {
-            if value < 30 {
-                return Err(DbError::Internal);
-            }
             settings.audit_retention_days = value;
         }
         if !self.retention_environment[3]
-            && let Some(value) = days("retention.quarantine_days")?
+            && let Some(value) = days("retention.quarantine_days")
         {
-            settings.quarantine_retention =
-                Duration::from_secs(u64::from(value).saturating_mul(86_400));
+            settings.quarantine_retention = seconds(value);
         }
         Ok(settings)
     }
@@ -1869,6 +1857,108 @@ mod setup_retention_tests {
         .await
         .unwrap();
         assert_eq!(locked.trash_retention, baseline);
+    }
+
+    async fn effective(env: &TestEnv, locked: [bool; 4]) -> MaintenanceSettings {
+        let baseline = Duration::from_secs(30 * 86_400);
+        let settings =
+            MaintenanceSettings::new(baseline, baseline, Duration::from_secs(3600), 1024 * 1024);
+        Maintenance::new(
+            env.pool.clone(),
+            None,
+            Arc::new(crate::SystemClock),
+            settings,
+        )
+        .with_retention_environment(locked)
+        .effective_settings()
+        .await
+        .unwrap()
+    }
+
+    async fn store_retention(env: &TestEnv, key: &str, value: serde_json::Value, age_hours: i32) {
+        sqlx::query(
+            "INSERT INTO instance_settings(key,value,updated_at) \
+             VALUES($1,$2, now() - make_interval(hours => $3)) \
+             ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(age_hours)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn shortened_retention_keeps_the_longer_period_for_24_hours() {
+        let env = TestEnv::new().await;
+        let day = |days: u64| Duration::from_secs(days * 86_400);
+        // Inside the grace period purge, trim and audit cleanup keep using the
+        // old, longer periods.
+        for (key, new, previous) in [
+            ("retention.trash_days", 7, 60),
+            ("retention.version_days", 3, 45),
+            ("retention.quarantine_days", 2, 20),
+            ("retention.audit_days", 31, 400),
+        ] {
+            store_retention(&env, key, json!({"value": new, "previous": previous}), 23).await;
+        }
+        let graced = effective(&env, [false; 4]).await;
+        assert_eq!(graced.trash_retention, day(60));
+        assert_eq!(graced.version_retention, day(45));
+        assert_eq!(graced.quarantine_retention, day(20));
+        assert_eq!(graced.audit_retention_days, 400);
+
+        // After 24 hours the new, shorter periods apply.
+        for (key, new, previous) in [
+            ("retention.trash_days", 7, 60),
+            ("retention.version_days", 3, 45),
+            ("retention.quarantine_days", 2, 20),
+            ("retention.audit_days", 31, 400),
+        ] {
+            store_retention(&env, key, json!({"value": new, "previous": previous}), 25).await;
+        }
+        let expired = effective(&env, [false; 4]).await;
+        assert_eq!(expired.trash_retention, day(7));
+        assert_eq!(expired.version_retention, day(3));
+        assert_eq!(expired.quarantine_retention, day(2));
+        assert_eq!(expired.audit_retention_days, 31);
+
+        // Environment-locked values never take a stored grace value.
+        let locked = effective(&env, [true, true, true, true]).await;
+        assert_eq!(locked.trash_retention, day(30));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn invalid_stored_retention_is_ignored_and_does_not_stop_maintenance() {
+        let env = TestEnv::new().await;
+        // The database constraint rejects invalid periods, so lift it for
+        // this test to model rows written by an older or damaged installation.
+        sqlx::query(
+            "ALTER TABLE instance_settings DROP CONSTRAINT instance_settings_retention_days",
+        )
+        .execute(&env.pool)
+        .await
+        .unwrap();
+        for (key, value) in [
+            ("retention.trash_days", json!({"value": 0})),
+            ("retention.version_days", json!({"value": "seven"})),
+            ("retention.quarantine_days", json!({"value": 99999})),
+            ("retention.audit_days", json!({"value": 29})),
+        ] {
+            store_retention(&env, key, value, 100).await;
+        }
+        let settings = effective(&env, [false; 4]).await;
+        let baseline = Duration::from_secs(30 * 86_400);
+        assert_eq!(settings.trash_retention, baseline);
+        assert_eq!(settings.version_retention, baseline);
+        assert_eq!(settings.quarantine_retention, baseline);
+        assert_eq!(
+            settings.audit_retention_days,
+            craftcloud_db::audit::DEFAULT_RETENTION_DAYS
+        );
     }
 }
 

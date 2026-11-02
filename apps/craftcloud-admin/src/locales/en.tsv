@@ -946,3 +946,8 @@
 	Trash retention (days)	Trash retention (days)
 	Audit retention (days)	Audit retention (days)
 	Quarantine retention (days)	Quarantine retention (days)
+	Saved credentials were removed because the mail target changed. Enter the credentials again.	Saved credentials were removed because the mail target changed. Enter the credentials again.
+	Changing the mail server, transport or sign-in identity removes all saved credentials. Enter them again after saving.	Changing the mail server, transport or sign-in identity removes all saved credentials. Enter them again after saving.
+	Shorten retention period?	Shorten retention period?
+	Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.	Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.
+	Shorten retention	Shorten retention

@@ -85,6 +85,8 @@ export interface InstanceSecretSetting {
 export interface InstanceSettings {
   settings: Record<string, InstanceSetting | InstanceSecretSetting>;
   updated_at: string | null;
+  /** Saved secrets deleted by the last update because a credential target changed. */
+  credentials_cleared?: string[];
 }
 
 export type InstanceSettingsPatch = {

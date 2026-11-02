@@ -766,14 +766,14 @@ paths:
           csrfToken: []
         - bearerAuth: []
       summary: Change unlocked instance settings and write-only secrets
-      description: Secret payloads are never returned. Empty secret input leaves the value unchanged; use remove=true to delete. All mail configuration changes require a fresh browser session and fresh TOTP when required.
+      description: Secret payloads are never returned. Empty secret input leaves the value unchanged; use remove=true to delete. A secret key accepts only set or remove; a plain value is rejected with 422. All mail configuration changes and every shortening of a retention period require a fresh browser session and fresh TOTP when required. When the mail transport, host, port, TLS mode, Microsoft tenant or OAuth client ID changes, all stored secrets are deleted in the same transaction unless the request sets them again; the deleted keys are listed in credentials_cleared. A shortened retention period keeps the longer previous period for 24 hours. When mail is configured through the server environment, every mail setting and secret is locked (409 SETTING_LOCKED).
       requestBody:
         required: true
         content:
           application/json:
             schema: {type: object, required: [settings], properties: {settings: {type: object, additionalProperties: true}}}
       responses:
-        '200': {description: Saved settings with write-only secret metadata}
+        '200': {description: Saved settings with write-only secret metadata and the secret keys deleted because a credential target changed, content: {application/json: {schema: {type: object, required: [settings], properties: {settings: {type: object, additionalProperties: true}, updated_at: {type: [string, 'null'], format: date-time}, credentials_cleared: {type: array, items: {type: string}}}}}}}
         '400': {$ref: '#/components/responses/AmbiguousCredentials'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}

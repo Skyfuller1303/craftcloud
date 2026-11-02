@@ -943,3 +943,8 @@
 	Trash retention (days)	Aufbewahrung im Papierkorb (Tage)
 	Audit retention (days)	Aufbewahrung des Auditprotokolls (Tage)
 	Quarantine retention (days)	Aufbewahrung in Quarantäne (Tage)
+	Saved credentials were removed because the mail target changed. Enter the credentials again.	Gespeicherte Zugangsdaten wurden entfernt, weil sich das Mail-Ziel geändert hat. Gib die Zugangsdaten erneut ein.
+	Changing the mail server, transport or sign-in identity removes all saved credentials. Enter them again after saving.	Wenn du Mailserver, Transport oder Anmeldeidentität änderst, werden alle gespeicherten Zugangsdaten entfernt. Gib sie nach dem Speichern erneut ein.
+	Shorten retention period?	Aufbewahrungsfrist verkürzen?
+	Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.	Die Wartung kann Daten, die älter als die neue Frist sind, endgültig löschen: {periods}. Für 24 Stunden gilt noch die bisherige, längere Frist; danach gilt die neue Frist und gelöschte Daten lassen sich nicht wiederherstellen.
+	Shorten retention	Frist verkürzen
