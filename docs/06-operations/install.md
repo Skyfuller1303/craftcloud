@@ -153,9 +153,47 @@ sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl figcraft enable
 
 Beim **Ausschalten** werden Server und Proxy ohne FigCraft neu gestartet und die Begleitcontainer entfernt. Live-Dateien sind dann nicht verfügbar: `/api/v1/info` meldet `figcraft_live: false`, die Live-Routen antworten mit `FIGCRAFT_LIVE_UNAVAILABLE`, und die ausgegebenen persönlichen Links funktionieren nicht mehr. Beenden Sie aktive Live-Dateien vorher über „Livebetrieb beenden“, damit der letzte Stand als Version gesichert ist; Änderungen seit dem letzten Snapshot (alle 15 Minuten) bleiben nur im Volume `figcraft-data` erhalten. Dieses Volume und der Schlüssel `figcraft.key` bleiben bestehen, `craftcloud-ctl figcraft enable` startet den Begleitdienst wieder mit demselben Datenstand. Ausstehende Rechteentzüge werden erst nach dem erneuten Einschalten abgearbeitet; widerrufen Sie bei einem dauerhaften Abschalten Personen und Links vorher. Bestehende Installationen ohne die Einstellung bleiben bis zum nächsten `craftcloud-ctl upgrade` unverändert; das Upgrade trägt dann den Standard `enabled` ein, erzeugt den Schlüssel und baut den Begleitdienst (mit `figcraft disable` danach abschaltbar; wer ihn von Anfang an nicht möchte, führt vor dem Upgrade `figcraft disable` aus). Der Datenbankpool muss mit FigCraft mindestens 6 Verbindungen erlauben; der Standard 10 genügt.
 
+## Systemprüfung des Einrichtungsassistenten
+
+Die folgenden Abschnitte helfen, Hinweise der Systemprüfung einzuordnen. Die Prüfung selbst ändert weder Serverkonfiguration noch Infrastruktur. Ein Warnhinweis verhindert nicht, dass der Betreiber die Einrichtung fortsetzt.
+
+### Public URL
+
+Vergleichen Sie die öffentliche Adresse einschließlich Schema und Port mit `CRAFTCLOUD_PUBLIC_URL`. Browser und Server müssen dieselbe Origin verwenden; Pfade gehören nicht in diesen Wert.
+
+### Reverse proxy
+
+Nutzen Sie für den öffentlichen Zugriff HTTPS. Wenn ein vorgeschalteter Proxy TLS beendet, darf der Server weitergeleitete Angaben nur von den ausdrücklich konfigurierten vertrauenswürdigen Proxys übernehmen. Beachten Sie die Abschnitte zu den Proxy-Varianten oben.
+
+### PostgreSQL
+
+Prüfen Sie Version, Erreichbarkeit und Laufzeitrolle der Datenbank anhand des Abschnitts „Datenbank wählen“. Eine Warnung über eine nicht unterstützte Version erfordert eine passende Datenbankinstallation und ein geprüftes Backup vor einem Upgrade.
+
+### Storage
+
+Kontrollieren Sie den freien Platz auf dem Datenträger des konfigurierten Speicherverzeichnisses. Datenbank und Dateispeicher benötigen eigene Kapazitätsplanung und Sicherungen.
+
+### FigCraft
+
+Prüfen Sie bei aktiviertem FigCraft-Live Dienstzustand, interne Erreichbarkeit und öffentliche Adresse wie im Abschnitt „FigCraft-Live“ beschrieben. Eine konfigurierte Adresse allein beweist keine Erreichbarkeit.
+
+### Time synchronization
+
+Synchronisieren Sie Server und Datenbankhost mit einem vertrauenswürdigen Zeitdienst. Größere Abweichungen beeinträchtigen unter anderem Sitzungslaufzeiten, Zwei-Faktor-Anmeldung und Wartung.
+
+### Maintenance
+
+Prüfen Sie, ob Wartung aktiviert ist und regelmäßig erfolgreich läuft. Ohne Wartung werden unter anderem abgelaufene Daten und freizugebender Speicher nicht automatisch bereinigt.
+
+### Archive
+
+Der Assistent zeigt den Archivstatus und verweist auf die [Archiv-Betriebsanleitung](archive-storage.md). Er konfiguriert den Archivspeicher nicht; die bestehende Startsperre bleibt bis zur Freigabe von AC-12 bestehen.
+
 ## Erstes Konto und Betrieb
 
 Nach dem Image-Build, der Datenbankinitialisierung und den Migrationen wartet das Skript auf `/health/ready`. Es nennt anschließend die Setup-URL und den Pfad zur Bootstrap-Geheimnisdatei, niemals das Geheimnis. Öffnen Sie die ausgegebene URL im Browser, lesen Sie den Token nur in einer privaten lokalen Administratorsitzung und tragen Sie ihn in das Setup ein. Legen Sie Ihr Betreiberkonto, ein eigenes Passwort und die erste Organisation an. Speichern Sie den Token nicht in Tickets, Logs, Shell-Argumenten oder Bildschirmaufzeichnungen.
+
+Nach der Kontoerstellung führt der Setup-Assistent durch Systemprüfung, Zwei-Faktor-Anmeldung, E-Mail, Organisation, Arbeitsbereich, Einladungen und optionale Dienste. Der gespeicherte Fortschritt lässt sich später fortsetzen. Prüfen Sie Warnungen anhand der Hinweise zur Systemprüfung und senden Sie nach der E-Mail-Konfiguration eine Testmail. Die Oberfläche meldet zunächst das Einreihen zur Zustellung; prüfen Sie den tatsächlichen Eingang und bei Bedarf den Versandstatus. Mailänderungen benötigen eine frische Anmeldung und gegebenenfalls den eingerichteten zweiten Faktor. In der Umgebung festgelegte Werte haben Vorrang und können in der Oberfläche nicht überschrieben werden. Die Archivkonfiguration bleibt gesperrt.
 
 Nach erfolgreichem Setup ist der Token serverseitig nicht erneut verwendbar. Entfernen Sie anschließend die Bootstrap-Bereitstellung mit dem folgenden Befehl; er prüft zuerst, dass die Ersteinrichtung abgeschlossen ist, und startet den Server ohne Bootstrap-Geheimnis neu. Bis dahin erhält auch ein Host-Neustart die Möglichkeit zum Setup.
 
@@ -188,6 +226,8 @@ sudo sh /opt/craftcloud/current/deploy/install/craftcloud-ctl backup
 ```
 
 Ein Backup enthält Datenbank und Dateiinhalte als konsistenten Stand, aber nicht den Zwei-Faktor-Schlüssel; der Befehl nennt nach dem Lauf den Ort des Schlüssels (nie den Wert). Backup, `upgrade`, `rollback`, `setup-complete` und `uninstall` schließen einander über eine Sperre `/etc/craftcloud/.ctl.lock` aus (`flock` aus util-linux); ein zweiter gleichzeitiger Aufruf, auch des Timers, bricht mit einer klaren Meldung ab und wird beim nächsten Timerlauf wiederholt. Der systemd-Timer startet täglich um 03:15 in der Zeitzone des Hosts, mit zufälliger Verzögerung bis 30 Minuten. Standardmäßig bleiben die letzten sieben erfolgreichen Backups erhalten; `CRAFTCLOUD_BACKUP_KEEP` in der Konfiguration ändert die Anzahl. Kontrollieren Sie regelmäßig Timer, Exitcodes, freien Speicher und das Backup-Alter in der Betreiberansicht. Ein angelegter Timer allein beweist keine erfolgreiche Sicherung.
+
+Das Datenbankbackup enthält auch die verschlüsselten Geheimnisse der Instanzeinstellungen. Nach einer Wiederherstellung lassen sie sich nur mit demselben Serverschlüssel entschlüsseln; bewahren Sie diesen Schlüssel getrennt und geschützt auf und prüfen Sie ihn bei Restore-Proben.
 
 Kopieren Sie Backups verschlüsselt auf ein anderes System und verwahren Sie Entschlüsselungsschlüssel getrennt. Konfiguration, Geheimnisse und Caddys Zertifikatsdaten sind nicht Teil des Anwendungsbackups und benötigen ein eigenes geschütztes Sicherungskonzept. Lokale Backups schützen nicht vor Verlust des Hosts. Die Aufbewahrung ist eine Anzahl von Backups, keine garantierte Zahl von Tagen.
 

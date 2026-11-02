@@ -1223,6 +1223,10 @@ mod tests {
         for table in ["archive_backups", "archive_backup_refs"] {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
+        // AC-13 adds setup progress and instance settings at migration 23.
+        for table in ["instance_setup_steps", "instance_settings"] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
         let old_blobs = pre_archive_blob_export(&out);
         let versions_path = out.join("tables").join("file_versions.copy");
         let current_versions = std::fs::read_to_string(&versions_path).unwrap();
@@ -1309,6 +1313,8 @@ mod tests {
                             | "blob_quota_groups"
                             | "archive_backups"
                             | "archive_backup_refs"
+                            | "instance_setup_steps"
+                            | "instance_settings"
                     )
                 )
             });
@@ -1450,6 +1456,10 @@ mod tests {
         for table in ["archive_backups", "archive_backup_refs"] {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
+        // AC-13 setup/settings tables did not exist at migration 19.
+        for table in ["instance_setup_steps", "instance_settings"] {
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
         let old_blobs = pre_archive_blob_export(&out);
         let org_path = out.join("tables").join("organizations.copy");
         let old_orgs: String = std::fs::read_to_string(&org_path)
@@ -1499,6 +1509,8 @@ mod tests {
                             | "blob_quota_groups"
                             | "archive_backups"
                             | "archive_backup_refs"
+                            | "instance_setup_steps"
+                            | "instance_settings"
                     )
                 )
             });
@@ -1550,10 +1562,14 @@ mod tests {
         assert!(craftcloud_db::migrate::verify(&target.pool).await.is_err());
 
         let applied = craftcloud_db::migrate::run(&target.pool).await.unwrap();
+        let expected_later = craftcloud_db::migrate::embedded_versions()
+            .into_iter()
+            .filter(|version| *version > 19)
+            .collect::<Vec<_>>();
         assert_eq!(
             applied.iter().map(|m| m.version).collect::<Vec<_>>(),
-            vec![20, 21, 22],
-            "restore precedes both later forward migrations"
+            expected_later,
+            "restore precedes all later forward migrations"
         );
         craftcloud_db::migrate::verify(&target.pool).await.unwrap();
         let defaults: (Option<i32>, String) =

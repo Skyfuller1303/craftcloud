@@ -283,6 +283,7 @@ struct Ctx<'a> {
     /// The application clock and the database clock differ too much.
     drift: bool,
     store: StoreState,
+    settings: MaintenanceSettings,
 }
 
 impl Ctx<'_> {
@@ -594,6 +595,7 @@ pub struct Maintenance {
     archive_store: Option<Arc<craftcloud_storage::ArchiveStore>>,
     clock: Arc<dyn Clock>,
     settings: MaintenanceSettings,
+    retention_environment: [bool; 4],
     /// Where the reconciliation continues its walk through the object store.
     cursor: Mutex<Option<ObjectKey>>,
     /// Where the version retention and the drift check continue their walk
@@ -621,6 +623,7 @@ impl Maintenance {
             archive_store: None,
             clock,
             settings,
+            retention_environment: [false; 4],
             cursor: Mutex::new(None),
             trim_cursor: Mutex::new(None),
             drift_cursor: Mutex::new(None),
@@ -633,6 +636,13 @@ impl Maintenance {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<crate::Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Locks each retention value to its environment-provided server setting.
+    #[must_use]
+    pub fn with_retention_environment(mut self, locked: [bool; 4]) -> Self {
+        self.retention_environment = locked;
         self
     }
 
@@ -742,9 +752,10 @@ impl Maintenance {
         let Some(lock) = db::try_lock(&self.pool).await? else {
             return Ok(RunOutcome::Skipped);
         };
+        let settings = self.effective_settings().await?;
         let started = tokio::time::Instant::now();
         let now = self.clock.now();
-        let drift = match self.settings.max_clock_drift {
+        let drift = match settings.max_clock_drift {
             None => false,
             Some(max) => {
                 let database_now = db::db_now(&self.pool).await?;
@@ -819,10 +830,11 @@ impl Maintenance {
         let ctx = Ctx {
             now,
             dry: options.dry_run,
-            deadline: started + self.settings.max_run,
+            deadline: started + settings.max_run,
             stop,
             drift,
             store,
+            settings,
         };
         let mut report = RunReport {
             dry_run: options.dry_run,
@@ -889,6 +901,53 @@ impl Maintenance {
             tracing::warn!(target: "craftcloud::maintenance", %error, "cannot release the maintenance lock");
         }
         Ok(RunOutcome::Completed(report))
+    }
+
+    async fn effective_settings(&self) -> Result<MaintenanceSettings, DbError> {
+        let mut settings = self.settings.clone();
+        let stored = craftcloud_db::instance_settings::settings(&self.pool).await?;
+        let days = |key: &str| -> Result<Option<u32>, DbError> {
+            let Some(value) = stored
+                .iter()
+                .find(|entry| entry.key == key)
+                .and_then(|entry| entry.value.get("value"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Ok(None);
+            };
+            if !(1..=3650).contains(&value) {
+                return Err(DbError::Internal);
+            }
+            u32::try_from(value)
+                .map(Some)
+                .map_err(|_| DbError::Internal)
+        };
+        if !self.retention_environment[0]
+            && let Some(value) = days("retention.version_days")?
+        {
+            settings.version_retention =
+                Duration::from_secs(u64::from(value).saturating_mul(86_400));
+        }
+        if !self.retention_environment[1]
+            && let Some(value) = days("retention.trash_days")?
+        {
+            settings.trash_retention = Duration::from_secs(u64::from(value).saturating_mul(86_400));
+        }
+        if !self.retention_environment[2]
+            && let Some(value) = days("retention.audit_days")?
+        {
+            if value < 30 {
+                return Err(DbError::Internal);
+            }
+            settings.audit_retention_days = value;
+        }
+        if !self.retention_environment[3]
+            && let Some(value) = days("retention.quarantine_days")?
+        {
+            settings.quarantine_retention =
+                Duration::from_secs(u64::from(value).saturating_mul(86_400));
+        }
+        Ok(settings)
     }
 
     /// Raises the epoch in the database, then in the marker (in this order: a
@@ -1052,8 +1111,8 @@ impl Maintenance {
     }
 
     async fn purge_trash(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
-        let cutoff = minus(ctx.now, self.settings.trash_retention);
-        let batch = self.settings.batch();
+        let cutoff = minus(ctx.now, ctx.settings.trash_retention);
+        let batch = ctx.settings.batch();
         let excluded_files = self.excluded("purge_files", ctx.now, report);
         let excluded_projects = self.excluded("purge_projects", ctx.now, report);
         let files = db::trashed_files_due(&self.pool, cutoff, &excluded_files, batch).await?;
@@ -1153,17 +1212,12 @@ impl Maintenance {
     }
 
     async fn trim_versions(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
-        let cutoff = minus(ctx.now, self.settings.version_retention);
+        let cutoff = minus(ctx.now, ctx.settings.version_retention);
         let excluded = self.excluded("trim_versions", ctx.now, report);
         let orgs = self.next_orgs(&self.trim_cursor, !ctx.dry).await?;
-        let files = db::files_with_old_versions(
-            &self.pool,
-            cutoff,
-            &orgs,
-            &excluded,
-            self.settings.batch(),
-        )
-        .await?;
+        let files =
+            db::files_with_old_versions(&self.pool, cutoff, &orgs, &excluded, ctx.settings.batch())
+                .await?;
         if ctx.dry {
             report.add("files_with_old_versions", count_of(files.len()));
             return Ok(());
@@ -1198,8 +1252,8 @@ impl Maintenance {
             report.add("skipped_no_storage", 1);
             return Ok(());
         };
-        let created_before = minus(ctx.now, self.settings.grace());
-        let batch = self.settings.batch();
+        let created_before = minus(ctx.now, ctx.settings.grace());
+        let batch = ctx.settings.batch();
         let excluded = self.excluded("collect_blobs", ctx.now, report);
         let deleting = db::gc_deleting_targets(&self.pool, batch).await?;
         let candidates = db::gc_candidates(&self.pool, created_before, &excluded, batch).await?;
@@ -1402,7 +1456,7 @@ impl Maintenance {
             report.add("skipped_no_storage", 1);
             return Ok(());
         };
-        let old_before = minus(ctx.now, self.settings.grace());
+        let old_before = minus(ctx.now, ctx.settings.grace());
         let is_old = |modified: Option<SystemTime>| {
             modified.is_some_and(|time| OffsetDateTime::from(time) < old_before)
         };
@@ -1417,7 +1471,7 @@ impl Maintenance {
         let mut old_total = 0_usize;
         let mut strays: Vec<ObjectKey> = Vec::new();
         let mut failure = None;
-        while ctx.go() && scanned < self.settings.scan_limit {
+        while ctx.go() && scanned < ctx.settings.scan_limit {
             let items = match store.list_objects(cursor.as_ref(), page).await {
                 Ok(items) => items,
                 Err(error) => {
@@ -1525,7 +1579,7 @@ impl Maintenance {
             )
             .await;
         }
-        let purge_before = day_name(minus(ctx.now, self.settings.quarantine_retention));
+        let purge_before = day_name(minus(ctx.now, ctx.settings.quarantine_retention));
         match store.purge_quarantine(&purge_before, ctx.dry).await {
             Ok(0) => {}
             Ok(removed) => report.add(
@@ -1545,7 +1599,7 @@ impl Maintenance {
         // Temporary files of uploads that died.
         let mut after: Option<String> = None;
         let mut scanned = 0_usize;
-        while ctx.go() && scanned < self.settings.scan_limit {
+        while ctx.go() && scanned < ctx.settings.scan_limit {
             let items = match store.list_temp(after.as_deref(), page).await {
                 Ok(items) => items,
                 Err(error) => {
@@ -1588,7 +1642,7 @@ impl Maintenance {
     /// a clock drift or an epoch conflict: it deletes no stored object, and a
     /// restored older database only ever loses events that were due anyway.
     async fn purge_audit(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
-        let days = self.settings.audit_retention_days;
+        let days = ctx.settings.audit_retention_days;
         if ctx.dry {
             let due = craftcloud_db::audit::count_expired(&self.pool, days).await?;
             report.add("events_due", due);
@@ -1598,7 +1652,7 @@ impl Maintenance {
             );
             return Ok(());
         }
-        let batch = self.settings.batch();
+        let batch = ctx.settings.batch();
         for _ in 0..20 {
             if !ctx.go() {
                 break;
@@ -1639,14 +1693,14 @@ impl Maintenance {
             report.add("skipped_no_storage", 1);
             return Ok(());
         };
-        let candidates = db::verify_candidates(&self.pool, self.settings.batch()).await?;
+        let candidates = db::verify_candidates(&self.pool, ctx.settings.batch()).await?;
         let mut bytes = 0_u64;
         for (handled, blob) in candidates.into_iter().enumerate() {
             if !ctx.go() {
                 break;
             }
             // The first blob is always verified, whatever its size.
-            if handled > 0 && bytes >= self.settings.verify_bytes_per_run {
+            if handled > 0 && bytes >= ctx.settings.verify_bytes_per_run {
                 break;
             }
             let size = u64::try_from(blob.size_bytes).unwrap_or(0);
@@ -1737,7 +1791,7 @@ impl Maintenance {
             &self.pool,
             &window,
             &excluded,
-            self.settings.batch().min(100),
+            ctx.settings.batch().min(100),
         )
         .await?;
         if ctx.dry {
@@ -1772,6 +1826,49 @@ impl Maintenance {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod setup_retention_tests {
+    use super::*;
+    use crate::app_access_tests::support::TestEnv;
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn persisted_trash_retention_applies_unless_environment_locks_it() {
+        let env = TestEnv::new().await;
+        sqlx::query("INSERT INTO instance_settings(key,value) VALUES('retention.trash_days', $1)")
+            .bind(serde_json::json!({"value": 7}))
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let baseline = Duration::from_secs(30 * 86_400);
+        let settings =
+            MaintenanceSettings::new(baseline, baseline, Duration::from_secs(3600), 1024 * 1024);
+        let dynamic = Maintenance::new(
+            env.pool.clone(),
+            None,
+            Arc::new(crate::SystemClock),
+            settings.clone(),
+        )
+        .effective_settings()
+        .await
+        .unwrap();
+        assert_eq!(dynamic.trash_retention, Duration::from_secs(7 * 86_400));
+
+        let locked = Maintenance::new(
+            env.pool.clone(),
+            None,
+            Arc::new(crate::SystemClock),
+            settings,
+        )
+        .with_retention_environment([false, true, false, false])
+        .effective_settings()
+        .await
+        .unwrap();
+        assert_eq!(locked.trash_retention, baseline);
     }
 }
 

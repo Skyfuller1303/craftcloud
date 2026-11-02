@@ -5,6 +5,7 @@ import { useAuth } from "../auth.tsx";
 import { ContextSelect } from "../components/ContextSelect.tsx";
 import { ErrorNotice } from "../components/ErrorNotice.tsx";
 import { Badge } from "../components/Badge.tsx";
+import { Banner } from "../components/Banner.tsx";
 import { EmptyState } from "../components/EmptyState.tsx";
 import { Alert, Field, ScreenHeading } from "../components/forms.tsx";
 import { Preferences } from "../components/Preferences.tsx";
@@ -35,6 +36,7 @@ const AdminOverview = lazy(() => import("./OverviewScreen.tsx").then((m) => ({ d
 const AppsScreen = lazy(() => import("./AppsScreen.tsx").then((m) => ({ default: m.AppsScreen })));
 const AdminPeopleScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminPeopleScreen })));
 const AdminWorkspacesScreen = lazy(() => import("./AdminScreens.tsx").then((m) => ({ default: m.AdminWorkspacesScreen })));
+const SetupWizardScreen = lazy(() => import("./SetupWizardScreen.tsx").then((m) => ({ default: m.SetupWizardScreen })));
 
 /**
  * Dashboard sections. Settings follows with a later ticket and stays a
@@ -49,14 +51,14 @@ const CONTENT_SECTIONS = [
   "activity",
   "shared",
 ] as const;
-const ADMIN_SECTIONS = ["admin-overview", "admin-people", "admin-workspaces", "admin-apps", "admin-grants", "admin-locks", "admin-activity", "org-settings", "settings", "instance-organizations", "instance-accounts", "system"] as const;
+const ADMIN_SECTIONS = ["admin-overview", "admin-people", "admin-workspaces", "admin-apps", "admin-grants", "admin-locks", "admin-activity", "org-settings", "settings", "instance-organizations", "instance-accounts", "system", "setup"] as const;
 type Section = (typeof CONTENT_SECTIONS)[number] | (typeof ADMIN_SECTIONS)[number];
 
 function sectionFromPath(path: string): Section {
   const tail = path.replace(/\/+$/, "").split("/").at(-1) ?? "";
   if (path.includes("/workspaces/") && (tail === "members" || tail === "invitations")) return tail;
   if (path.includes("/organizations/") && tail === "activity") return "admin-activity";
-  const aliases: Record<string, Section> = { people: "admin-people", workspaces: "admin-workspaces", apps: "admin-apps", grants: "admin-grants", locks: "admin-locks", "org-settings": "org-settings", organizations: "instance-organizations", accounts: "instance-accounts", overview: "admin-overview", members: "admin-people", invitations: "admin-people", activity: "activity", settings: "settings", system: "system", projects: "projects", files: "files", shared: "shared" };
+  const aliases: Record<string, Section> = { people: "admin-people", workspaces: "admin-workspaces", apps: "admin-apps", grants: "admin-grants", locks: "admin-locks", "org-settings": "org-settings", organizations: "instance-organizations", accounts: "instance-accounts", overview: "admin-overview", members: "admin-people", invitations: "invitations", activity: "activity", settings: "settings", system: "system", setup: "setup", projects: "projects", files: "files", shared: "shared" };
   return aliases[tail] ?? "overview";
 }
 
@@ -185,6 +187,7 @@ export function Shell({
     activity: t("Activity"),
     shared: t("Shared with me"),
     system: t("System"),
+    setup: t("Setup wizard"),
     "admin-overview": t("Overview"),
     "admin-people": t("People"),
     "admin-workspaces": t("Workspaces"),
@@ -221,8 +224,8 @@ export function Shell({
     }
     if (organizations.status !== "ready") return;
     if (workspaceId !== null && (!workspaceRouteResolved || workspaces.status !== "ready" || organizationId === null)) return;
-    const route = section.startsWith("instance-") || section === "system"
-      ? `/admin/${section === "instance-organizations" ? "organizations" : section === "instance-accounts" ? "accounts" : "system"}`
+    const route = section.startsWith("instance-") || section === "system" || section === "setup"
+      ? `/admin/${section === "instance-organizations" ? "organizations" : section === "instance-accounts" ? "accounts" : section === "setup" ? "setup" : "system"}`
       : section.startsWith("admin-") || section === "org-settings"
         ? workspaceAdmin && (workspaceScopedRoute.current || !orgAdmin) && ["admin-grants", "admin-locks"].includes(section)
           ? `/admin/workspaces/${workspaceId}/${section === "admin-grants" ? "grants" : "locks"}`
@@ -250,13 +253,13 @@ export function Shell({
     workspaces.refresh();
   }, [organization?.require_two_factor, workspaces.refresh]);
   useEffect(() => {
-    if (needsTwoFactorSetup && section !== "settings" && section !== "system" && section !== "overview" && !(isOperator && section === "activity")) {
+    if (needsTwoFactorSetup && section !== "settings" && section !== "system" && section !== "setup" && section !== "overview" && !(isOperator && section === "activity")) {
       setSection("settings");
     }
   }, [isOperator, needsTwoFactorSetup, section]);
   const limitedNavigation = isGuest || organization === null;
   useEffect(() => {
-    if (isGuest && !(isOperator && (section.startsWith("instance-") || section === "system" || section === "activity")) && !["overview", "shared", "settings"].includes(section)) {
+    if (isGuest && !(isOperator && (section.startsWith("instance-") || section === "system" || section === "setup" || section === "activity")) && !["overview", "shared", "settings"].includes(section)) {
       setSection("shared");
     }
   }, [isGuest, isOperator, section]);
@@ -278,7 +281,7 @@ export function Shell({
         : !limitedNavigation,
   );
   const visibleAdminSections = ADMIN_SECTIONS.filter((key) =>
-    key === "settings" ? true : key.startsWith("instance-") || key === "system" ? isOperator :
+    key === "settings" ? true : key.startsWith("instance-") || key === "system" || key === "setup" ? isOperator :
       ["admin-grants", "admin-locks"].includes(key) ? mayAdmin : orgAdmin,
   );
   const validSection = visibleAdminSections.includes(section as (typeof ADMIN_SECTIONS)[number]) || visibleContentSections.includes(section as (typeof CONTENT_SECTIONS)[number]) || (section === "overview" && orgAdmin) || (section === "activity" && isOperator);
@@ -373,10 +376,10 @@ export function Shell({
               ))}
             </ul>
           </>}
-          {visibleAdminSections.some((key) => ["instance-organizations", "instance-accounts", "system"].includes(key)) && <>
+          {visibleAdminSections.some((key) => ["instance-organizations", "instance-accounts", "system", "setup"].includes(key)) && <>
             <h2 className="shell__nav-heading">{t("Instance")}</h2>
             <ul>
-              {visibleAdminSections.filter((key) => ["instance-organizations", "instance-accounts", "system"].includes(key)).map((key) => (
+              {visibleAdminSections.filter((key) => ["instance-organizations", "instance-accounts", "system", "setup"].includes(key)).map((key) => (
               <li key={key}>
                 <button
                   type="button"
@@ -402,6 +405,7 @@ export function Shell({
             />
           )}
           {notice !== undefined && <Alert tone="success">{notice}</Alert>}
+          {isOperator && section === "overview" && <SetupIncompleteBanner onOpen={() => setSection("setup")} />}
           {serverInfo?.feature_flags?.email_delivery === true && session.email_verified === false && <VerificationNotice />}
           {needsTwoFactorSetup && organization !== null && (
             <Alert tone="info">
@@ -469,7 +473,7 @@ export function Shell({
             isOperator ? <AdminOperatorScreen key="organizations" section="organizations" /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "instance-accounts" ? (
             isOperator ? <AdminOperatorScreen key="accounts" section="accounts" /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
-          ) : limitedNavigation && section !== "overview" && section !== "shared" && section !== "settings" && !(isOperator && (section === "system" || section === "activity")) ? (
+          ) : limitedNavigation && section !== "overview" && section !== "shared" && section !== "settings" && !(isOperator && (section === "system" || section === "setup" || section === "activity")) ? (
             <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "overview" ? (
             <dl className="facts">
@@ -538,6 +542,8 @@ export function Shell({
                 <Button className="button" onPress={() => setSection("activity")}>{t("Open activity log")}</Button>
               </section>}
             </>
+          ) : section === "setup" ? (
+            isOperator ? <SetupWizardScreen organization={organization} session={session} workspaces={workspaces.items} onSelectOrganization={setOrganizationId} onFactorChanged={refreshTwoFactor} onOpenSso={() => setSection("system")} onFinishWizard={() => setSection("system")} /> : <EmptyState>{t("This view is not available yet.")}</EmptyState>
           ) : section === "shared" ? (
             <SharedWithMeScreen organizationId={organizationId} />
           ) : (
@@ -548,6 +554,28 @@ export function Shell({
       </div>
     </div>
   );
+}
+
+function SetupIncompleteBanner({ onOpen }: { onOpen: () => void }) {
+  const { api } = useAuth();
+  const { t } = useI18n();
+  const [incomplete, setIncomplete] = useState<boolean | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void api.getAdminSetup().then(
+      (setup) => { if (live) setIncomplete(!setup.complete); },
+      () => { if (live) setIncomplete(null); },
+    );
+    return () => { live = false; };
+  }, [api]);
+  if (incomplete !== true || dismissed) return null;
+  return <Banner
+    tone="warn"
+    title={t("Setup is incomplete")}
+    actions={<Button className="button button--sm" onPress={onOpen}>{t("Continue setup")}</Button>}
+    onDismiss={() => setDismissed(true)}
+  >{t("Finish the remaining instance setup steps.")}</Banner>;
 }
 
 function OrganizationSettingsScreen({ organization, workspaces, onUpdated }: { organization: Organization; workspaces: Workspace[]; onUpdated: (updated: Organization) => void }) {

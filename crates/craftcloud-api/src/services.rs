@@ -2,9 +2,12 @@
 //! the pool, bootstrap token, session settings, clock, rate limiters and the
 //! bounded pool for CPU- and memory-heavy password hashing.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -19,6 +22,9 @@ use crate::clock::{Clock, SystemClock};
 use crate::error_response;
 use crate::observe::Metrics;
 use crate::ratelimit::{AccountGuard, GuardConfig, Reservation, WindowLimiter, ip_key};
+
+pub type InstanceSettingsReload =
+    dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync;
 
 /// Maximum number of concurrent password hash or verify operations (each uses
 /// about 19 MiB).
@@ -229,7 +235,13 @@ pub struct Services {
     pub(crate) archive_restore_permits: Arc<Semaphore>,
     pub(crate) figcraft: Option<Arc<dyn craftcloud_figcraft::Backend>>,
     pub(crate) figcraft_public_url: Option<String>,
-    pub(crate) email_delivery_enabled: bool,
+    pub(crate) figcraft_internal_url: Option<String>,
+    pub(crate) email_delivery_enabled: Arc<AtomicBool>,
+    pub(crate) instance_settings_changed: Option<Arc<InstanceSettingsReload>>,
+    pub(crate) maintenance_enabled: bool,
+    pub(crate) storage_free_bytes: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
+    pub(crate) instance_setting_overrides: BTreeMap<String, serde_json::Value>,
+    pub(crate) instance_setting_locked: BTreeSet<String>,
     pub(crate) email_transport_status: Option<Arc<dyn Fn() -> EmailTransportStatus + Send + Sync>>,
     pub(crate) figcraft_permits: Arc<Semaphore>,
     pub(crate) figcraft_job_permits: Arc<Semaphore>,
@@ -246,6 +258,7 @@ pub struct Services {
     invite_create: WindowLimiter,
     member_search: WindowLimiter,
     figcraft_ops: WindowLimiter,
+    admin_actions: WindowLimiter,
     guard: Arc<AccountGuard>,
     // Separate from login failures: management proofs share one account/address budget.
     two_factor_management_guard: Arc<AccountGuard>,
@@ -279,6 +292,25 @@ impl Drop for TwoFactorKeys {
 }
 
 impl Services {
+    pub(crate) async fn effective_trash_retention(
+        &self,
+    ) -> Result<Duration, craftcloud_db::DbError> {
+        let fallback = self.settings.trash_retention;
+        if self
+            .instance_setting_locked
+            .contains("retention.trash_days")
+        {
+            return Ok(fallback);
+        }
+        let rows = craftcloud_db::instance_settings::settings(&self.pool).await?;
+        let days = rows
+            .iter()
+            .find(|row| row.key == "retention.trash_days")
+            .and_then(|row| row.value.get("value"))
+            .and_then(serde_json::Value::as_u64);
+        retention_duration(days, fallback)
+    }
+
     /// Waits until every HTTP-owned FigCraft operation releases its permit.
     /// Call after HTTP admission has stopped and bound the wait at shutdown.
     pub async fn drain_figcraft_jobs(&self) {
@@ -321,7 +353,13 @@ impl Services {
             archive_restore_permits: Arc::new(Semaphore::new(2)),
             figcraft: None,
             figcraft_public_url: None,
-            email_delivery_enabled: false,
+            figcraft_internal_url: None,
+            email_delivery_enabled: Arc::new(AtomicBool::new(false)),
+            instance_settings_changed: None,
+            maintenance_enabled: true,
+            storage_free_bytes: None,
+            instance_setting_overrides: BTreeMap::new(),
+            instance_setting_locked: BTreeSet::new(),
             email_transport_status: None,
             figcraft_permits: Arc::new(Semaphore::new(4)),
             figcraft_job_permits: Arc::new(Semaphore::new(crate::figcraft_jobs::MAX_FIGCRAFT_JOBS)),
@@ -337,6 +375,7 @@ impl Services {
             invite_create: WindowLimiter::new(cap),
             member_search: WindowLimiter::new(cap),
             figcraft_ops: WindowLimiter::new(cap),
+            admin_actions: WindowLimiter::new(cap),
             guard,
             two_factor_management_guard,
             last_cleanup: AtomicI64::new(i64::MIN / 2),
@@ -362,8 +401,52 @@ impl Services {
 
     /// Marks email delivery active after the server validates SMTP settings.
     #[must_use]
-    pub fn with_email_delivery(mut self, enabled: bool) -> Self {
+    pub fn with_email_delivery(self, enabled: bool) -> Self {
+        self.email_delivery_enabled
+            .store(enabled, Ordering::Release);
+        self
+    }
+
+    /// Shares live delivery state with the replaceable mail worker transport.
+    #[must_use]
+    pub fn with_email_delivery_state(mut self, enabled: Arc<AtomicBool>) -> Self {
         self.email_delivery_enabled = enabled;
+        self
+    }
+
+    /// Notifies the server composition root to reload persisted instance settings.
+    #[must_use]
+    pub fn with_instance_settings_changed(mut self, notify: Arc<InstanceSettingsReload>) -> Self {
+        self.instance_settings_changed = Some(notify);
+        self
+    }
+
+    /// Sets the configured maintenance state shown by the setup system check.
+    #[must_use]
+    pub fn with_maintenance_enabled(mut self, enabled: bool) -> Self {
+        self.maintenance_enabled = enabled;
+        self
+    }
+
+    /// Supplies a safe, path-free disk capacity probe for the local store.
+    #[must_use]
+    pub fn with_storage_free_bytes(
+        mut self,
+        read: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+    ) -> Self {
+        self.storage_free_bytes = Some(read);
+        self
+    }
+
+    /// Provides sanitized environment-resolved values and locked setting names.
+    #[must_use]
+    pub fn with_instance_setting_environment(
+        mut self,
+        values: BTreeMap<String, serde_json::Value>,
+        locked: BTreeSet<String>,
+    ) -> Self {
+        self.instance_setting_overrides = values;
+        self.instance_setting_locked = locked;
         self
     }
 
@@ -377,8 +460,8 @@ impl Services {
     }
 
     /// Whether the server has an active mail transport.
-    pub(crate) const fn email_delivery_enabled(&self) -> bool {
-        self.email_delivery_enabled
+    pub(crate) fn email_delivery_enabled(&self) -> bool {
+        self.email_delivery_enabled.load(Ordering::Acquire)
     }
 
     /// Encrypts a one-use mail capability under the AC-02 key and email AAD.
@@ -451,6 +534,13 @@ impl Services {
     ) -> Self {
         self.figcraft = Some(backend);
         self.figcraft_public_url = Some(public_url);
+        self
+    }
+
+    /// Stores the configured internal WebSocket URL for the setup reachability check.
+    #[must_use]
+    pub fn with_figcraft_internal_url(mut self, internal_url: String) -> Self {
+        self.figcraft_internal_url = Some(internal_url);
         self
     }
 
@@ -560,6 +650,22 @@ impl Services {
         limiter
             .check(&ip_key(ip), self.now_secs(), limit, self.window_secs())
             .map_err(|retry| self.too_many(class.label(), retry, headers))
+    }
+
+    /// Bounded per-operator budget shared by instance administration writes.
+    pub(crate) fn rate_limit_admin(
+        &self,
+        user_id: Uuid,
+        headers: &HeaderMap,
+    ) -> Result<(), Box<Response>> {
+        self.admin_actions
+            .check(
+                &user_id.to_string(),
+                self.now_secs(),
+                60,
+                self.window_secs(),
+            )
+            .map_err(|retry| self.too_many("admin", retry, headers))
     }
 
     /// Per-user rate limit for password change attempts; counts the request.
@@ -692,6 +798,19 @@ impl Services {
     }
 }
 
+fn retention_duration(
+    days: Option<u64>,
+    fallback: Duration,
+) -> Result<Duration, craftcloud_db::DbError> {
+    let Some(days) = days else {
+        return Ok(fallback);
+    };
+    if !(1..=3650).contains(&days) {
+        return Err(craftcloud_db::DbError::Internal);
+    }
+    Ok(Duration::from_secs(days.saturating_mul(86_400)))
+}
+
 pub(crate) async fn wait_for_figcraft_jobs(permits: Arc<Semaphore>) {
     if let Ok(permit) = permits
         .acquire_many_owned(crate::figcraft_jobs::MAX_FIGCRAFT_JOBS as u32)
@@ -725,6 +844,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trash_retention_setting_is_bounded_and_falls_back_when_unset() {
+        let fallback = Duration::from_secs(30 * 86_400);
+        assert_eq!(retention_duration(None, fallback).unwrap(), fallback);
+        assert_eq!(
+            retention_duration(Some(60), fallback).unwrap(),
+            Duration::from_secs(60 * 86_400)
+        );
+        assert!(retention_duration(Some(0), fallback).is_err());
+        assert!(retention_duration(Some(3651), fallback).is_err());
+    }
 
     #[test]
     fn archive_operator_endpoint_rejects_credentials_and_url_controls() {

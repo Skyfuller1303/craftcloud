@@ -19,6 +19,8 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 
 [dev-dependencies]
+base64.workspace = true
+craftcloud-auth.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]

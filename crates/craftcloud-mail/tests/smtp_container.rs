@@ -1,6 +1,8 @@
 use craftcloud_mail::{
-    MailMessage, MailTransport, SmtpConfig, SmtpTls, SmtpTransport, TransportError,
+    MailMessage, MailTransport, MailTransportConfig, SmtpConfig, SmtpTls, SmtpTransport,
+    SwitchableTransport, TransportError, TransportStatus,
 };
+use std::sync::Arc;
 
 #[tokio::test]
 #[ignore = "requires the isolated SMTP container from smtp-container.py"]
@@ -22,7 +24,13 @@ async fn starttls_delivery_validates_certificate_and_retries_transient_failure()
         "CraftCloud <sender@example.invalid>".to_owned(),
     )
     .with_test_root_certificate_pem(ca);
-    let transport = SmtpTransport::new(&config).expect("test SMTP configuration");
+    let transport = SwitchableTransport::default();
+    transport.replace(Some(Arc::new(
+        MailTransportConfig::Smtp(config.clone())
+            .build(TransportStatus::default())
+            .expect("test SMTP configuration"),
+    )));
+    assert!(transport.is_enabled());
     let message = || MailMessage {
         recipient: "recipient@example.invalid".to_owned(),
         subject: "CraftCloud SMTP integration".to_owned(),
@@ -49,4 +57,17 @@ async fn starttls_delivery_validates_certificate_and_retries_transient_failure()
     );
     let retry = transport.send(message()).await;
     assert!(retry.is_ok(), "second delivery attempt failed: {retry:?}");
+    transport.replace(None);
+    assert!(!transport.is_enabled());
+    transport.replace(Some(Arc::new(
+        MailTransportConfig::Smtp(config)
+            .build(TransportStatus::default())
+            .expect("reloaded SMTP configuration"),
+    )));
+    assert!(transport.is_enabled());
+    let after_rebuild = transport.send(message()).await;
+    assert!(
+        after_rebuild.is_ok(),
+        "delivery after live transport rebuild failed: {after_rebuild:?}"
+    );
 }

@@ -25,6 +25,7 @@ mod error;
 pub mod figcraft;
 pub mod files;
 pub mod grants;
+pub mod instance_settings;
 pub mod invitations;
 pub mod locks;
 pub mod mail_security;

@@ -2,6 +2,8 @@ import type {
   AcceptedInvitation,
   AcceptInvitationRequest,
   AdminHealth,
+  AdminSetup,
+  AdminSetupStep,
   AdminOrganization,
   AdminUser,
   AdminDevicePage,
@@ -42,6 +44,11 @@ import type {
   SharedItem,
   SetupCompleteRequest,
   SetupCompleteResponse,
+  SetupStepId,
+  SetupStepStatus,
+  SetupSystemCheck,
+  InstanceSettings,
+  InstanceSettingsPatch,
   SetupStatus,
   RecoveryCodesResponse,
   TwoFactorSetup,
@@ -73,6 +80,12 @@ export const ENDPOINTS = {
   setupStatus: { method: "GET", path: "/setup/status" },
   serverInfo: { method: "GET", path: "/info" },
   setupComplete: { method: "POST", path: "/setup/complete" },
+  adminSetup: { method: "GET", path: "/admin/setup" },
+  adminSetupStep: { method: "PATCH", path: "/admin/setup/steps/{step}" },
+  adminSetupSystemCheck: { method: "GET", path: "/admin/setup/system-check" },
+  adminInstanceSettings: { method: "GET", path: "/admin/instance-settings" },
+  patchAdminInstanceSettings: { method: "PATCH", path: "/admin/instance-settings" },
+  testAdminInstanceEmail: { method: "POST", path: "/admin/instance-settings/email-test" },
   login: { method: "POST", path: "/auth/login" },
   oidcDiscover: { method: "POST", path: "/auth/oidc/discover" },
   oidcStart: { method: "POST", path: "/auth/oidc/start" },
@@ -339,6 +352,12 @@ export interface ApiClient {
   setupStatus(): Promise<SetupStatus>;
   serverInfo(): Promise<ServerInfo>;
   setupComplete(body: SetupCompleteRequest): Promise<SetupCompleteResponse>;
+  getAdminSetup(): Promise<AdminSetup>;
+  updateAdminSetupStep(step: SetupStepId, status: Exclude<SetupStepStatus, "pending">): Promise<AdminSetupStep>;
+  getAdminSetupSystemCheck(): Promise<SetupSystemCheck>;
+  getAdminInstanceSettings(): Promise<InstanceSettings>;
+  patchAdminInstanceSettings(body: InstanceSettingsPatch): Promise<InstanceSettings>;
+  testAdminInstanceEmail(): Promise<void>;
   login(body: LoginRequest): Promise<LoginResponse>;
   discoverOidc(email: string): Promise<{ organization_id: string | null }>;
   startOidc(organizationId: string): Promise<{ authorization_url: string }>;
@@ -612,6 +631,12 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     sendTestEmail: () => call(ENDPOINTS.sendTestEmail, { body: {} }),
     resendInvitation: (orgId, invitationId) => call(ENDPOINTS.resendInvitation, { params: { org_id: orgId, invitation_id: invitationId }, body: {} }),
     setupComplete: (body) => call(ENDPOINTS.setupComplete, { body, anonymous: true }),
+    getAdminSetup: () => call(ENDPOINTS.adminSetup),
+    updateAdminSetupStep: (step, status) => call(ENDPOINTS.adminSetupStep, { params: { step }, body: { status } }),
+    getAdminSetupSystemCheck: () => call(ENDPOINTS.adminSetupSystemCheck),
+    getAdminInstanceSettings: () => call(ENDPOINTS.adminInstanceSettings),
+    patchAdminInstanceSettings: (body) => call(ENDPOINTS.patchAdminInstanceSettings, { body }),
+    testAdminInstanceEmail: () => call(ENDPOINTS.testAdminInstanceEmail, { body: {} }),
     async login(body) {
       const result = await call<LoginResponse>(ENDPOINTS.login, { body, anonymous: true });
       csrfToken = result.csrf_token;

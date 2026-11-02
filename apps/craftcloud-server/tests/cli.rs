@@ -10,6 +10,7 @@ mod tests {
     use std::str::FromStr;
     use std::time::{Duration, Instant};
 
+    use craftcloud_db::migrate::embedded_versions;
     use sqlx::postgres::PgConnectOptions;
     use sqlx::{Connection, PgConnection};
 
@@ -291,7 +292,10 @@ mod tests {
         assert!(text(&out).contains("applied migration 20"));
         assert!(text(&out).contains("applied migration 21"));
         assert!(text(&out).contains("applied migration 22"));
-        assert!(text(&out).contains("applied 22 migration(s)"));
+        assert!(text(&out).contains(&format!(
+            "applied {} migration(s)",
+            embedded_versions().len()
+        )));
         fx.assert_no_password(&out);
         let out = run(&["migrate"], &env);
         assert_eq!(out.status.code(), Some(0));

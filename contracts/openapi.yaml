@@ -689,6 +689,117 @@ paths:
         '429': {$ref: '#/components/responses/RateLimited'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/setup:
+    get:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      summary: Read instance setup progress (instance operator only)
+      responses:
+        '200': {description: Wizard progress and first organization, content: {application/json: {schema: {type: object, required: [organization, steps, complete], properties: {organization: {type: [object, 'null']}, steps: {type: array, items: {type: object, required: [id, status, updated_at, updated_by]}}, complete: {type: boolean}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/setup/steps/{step}:
+    patch:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Mark a setup step done or skipped (instance operator only)
+      parameters:
+        - in: path
+          name: step
+          required: true
+          schema: {type: string, enum: [system_check, two_factor, email_delivery, organization, workspace_project, invitations, optional_services, summary]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [status], properties: {status: {type: string, enum: [done, skipped]}}}
+      responses:
+        '200': {description: Stored progress state}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/setup/system-check:
+    get:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      summary: Read setup system checks (instance operator only)
+      responses:
+        '200': {description: Current checks, content: {application/json: {schema: {type: object, required: [checked_at, items], properties: {checked_at: {type: string, format: date-time}, items: {type: array, items: {type: object, required: [id, status, message, docs_path]}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/instance-settings:
+    get:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      summary: Read effective instance settings; write-only secrets expose metadata only
+      responses:
+        '200': {description: Settings with source and lock state, content: {application/json: {schema: {type: object, required: [settings], properties: {settings: {type: object, additionalProperties: true}, updated_at: {type: [string, 'null'], format: date-time}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Change unlocked instance settings and write-only secrets
+      description: Secret payloads are never returned. Empty secret input leaves the value unchanged; use remove=true to delete. All mail configuration changes require a fresh browser session and fresh TOTP when required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [settings], properties: {settings: {type: object, additionalProperties: true}}}
+      responses:
+        '200': {description: Saved settings with write-only secret metadata}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMediaType'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /admin/instance-settings/email-test:
+    post:
+      tags: [Admin]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Queue a test message to the operator's own address
+      responses:
+        '202': {description: Test message queued}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /admin/users/email-verification:
     post:
       tags: [Admin]

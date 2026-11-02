@@ -20,6 +20,7 @@
 .field__input:not(:disabled):hover { border-color: var(--ink); }
 .field__input[readonly] { border-color: var(--line); }
 .field__input[aria-invalid="true"] { border-color: var(--bad); }
+.field__input--multiline { height: auto; min-height: calc(var(--control-height) * 6); padding: var(--space-2) var(--space-3); resize: vertical; }
 .field__hint { color: var(--muted); font-size: var(--text-small); line-height: 1.45; }
 .field__error { color: var(--bad); font-size: var(--text-small); }
 .field__error::before { content: ""; display: inline-block; width: 6px; height: 6px; margin: 0 var(--space-2) 1px 0; background: var(--bad); }

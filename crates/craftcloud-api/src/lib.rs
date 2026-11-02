@@ -12,7 +12,7 @@
 
 mod app_access;
 #[cfg(test)]
-mod app_access_tests;
+pub(crate) mod app_access_tests;
 pub mod archive_transport;
 pub mod archive_worker;
 mod audit;
@@ -32,6 +32,9 @@ mod locks;
 pub mod maintenance;
 mod observe;
 mod oidc;
+mod setup_wizard;
+#[cfg(test)]
+mod setup_wizard_tests;
 #[cfg(test)]
 extern crate self as craftcloud_api;
 mod oidc_provider;
@@ -244,6 +247,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/admin/users/email-verification", &["POST"]),
     ("/api/v1/admin/email-delivery", &["GET"]),
     ("/api/v1/admin/email-delivery/test", &["POST"]),
+    ("/api/v1/admin/setup", &["GET"]),
+    ("/api/v1/admin/setup/steps/{step}", &["PATCH"]),
+    ("/api/v1/admin/setup/system-check", &["GET"]),
+    ("/api/v1/admin/instance-settings", &["GET", "PATCH"]),
+    ("/api/v1/admin/instance-settings/email-test", &["POST"]),
     ("/api/v1/admin/users/{user_id}/devices", &["GET"]),
     (
         "/api/v1/admin/users/{user_id}/devices/{device_ref}",
@@ -654,6 +662,23 @@ pub fn router_with_shared(
         )
         .route("/api/v1/admin/email-delivery", get(email::status))
         .route("/api/v1/admin/email-delivery/test", post(email::test_email))
+        .route("/api/v1/admin/setup", get(setup_wizard::status))
+        .route(
+            "/api/v1/admin/setup/steps/{step}",
+            patch(setup_wizard::update_step),
+        )
+        .route(
+            "/api/v1/admin/setup/system-check",
+            get(setup_wizard::system_check),
+        )
+        .route(
+            "/api/v1/admin/instance-settings",
+            get(setup_wizard::get_settings).patch(setup_wizard::update_settings),
+        )
+        .route(
+            "/api/v1/admin/instance-settings/email-test",
+            post(setup_wizard::test_email),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state.clone());

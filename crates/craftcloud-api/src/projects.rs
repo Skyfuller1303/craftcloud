@@ -946,7 +946,12 @@ pub(crate) async fn restore_project(
         Err(response) => return *response,
     };
     let now = resolved.services.clock.now();
-    let retention = resolved.services.settings.trash_retention;
+    let retention = match resolved.services.effective_trash_retention().await {
+        Ok(retention) => retention,
+        Err(error) => {
+            return db_failure(&error, &headers, "project restore retention lookup failed");
+        }
+    };
     match tx
         .project_restore(&scope, resolved.id, session.user_id, now, retention)
         .await

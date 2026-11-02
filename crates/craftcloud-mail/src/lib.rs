@@ -10,6 +10,7 @@ pub use oauth::{
     TransportStatusSnapshot,
 };
 pub use smtp::{
-    Delivery, MailMessage, MailTransport, SmtpConfig, SmtpTls, SmtpTransport, TransportError,
+    Delivery, MailMessage, MailTransport, SmtpConfig, SmtpTls, SmtpTransport, SwitchableTransport,
+    TransportError,
 };
 pub use templates::{RenderedMail, render};

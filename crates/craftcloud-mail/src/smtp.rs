@@ -1,4 +1,6 @@
 use std::fmt;
+use std::future::Future;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use lettre::message::{Mailbox, MultiPart, SinglePart, header::ContentType};
@@ -49,6 +51,20 @@ impl SmtpConfig {
             #[cfg(feature = "test-util")]
             test_root_certificate_pem: None,
         }
+    }
+
+    /// Creates SMTP settings with a secret already held in zeroizing memory.
+    pub fn new_with_password(
+        host: String,
+        port: u16,
+        tls: SmtpTls,
+        username: Option<String>,
+        password: Option<Zeroizing<String>>,
+        from: String,
+    ) -> Self {
+        let mut config = Self::new(host, port, tls, username, None, from);
+        config.password = password;
+        config
     }
 
     /// Adds a custom trust root for isolated TLS integration tests.
@@ -185,6 +201,54 @@ pub trait MailTransport: Send + Sync {
     fn uses_smtp(&self) -> bool {
         true
     }
+
+    /// Whether the transport is currently configured and may consume queue entries.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+}
+
+/// Atomically replaceable mail transport. Requests already in flight retain
+/// their original transport; later requests see the replacement.
+#[derive(Default)]
+pub struct SwitchableTransport {
+    current: RwLock<Option<Arc<crate::ConfiguredTransport>>>,
+}
+
+impl SwitchableTransport {
+    pub fn replace(&self, transport: Option<Arc<crate::ConfiguredTransport>>) {
+        if let Ok(mut current) = self.current.write() {
+            *current = transport;
+        }
+    }
+
+    fn current(&self) -> Option<Arc<crate::ConfiguredTransport>> {
+        self.current.read().ok()?.clone()
+    }
+}
+
+impl MailTransport for SwitchableTransport {
+    fn send(
+        &self,
+        message: MailMessage,
+    ) -> impl Future<Output = Result<Delivery, TransportError>> + Send {
+        let current = self.current();
+        async move {
+            match current {
+                Some(transport) => transport.send(message).await,
+                None => Err(TransportError::Transient),
+            }
+        }
+    }
+
+    fn uses_smtp(&self) -> bool {
+        self.current()
+            .is_some_and(|transport| transport.uses_smtp())
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.current().is_some()
+    }
 }
 
 pub struct SmtpTransport {
@@ -269,6 +333,7 @@ impl MailTransport for SmtpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MailTransportConfig, TransportStatus};
 
     #[test]
     fn debug_output_redacts_relay_credentials_and_addresses() {
@@ -285,5 +350,27 @@ mod tests {
         assert!(!debug.contains("private-user"));
         assert!(!debug.contains("private-password"));
         assert!(!debug.contains("private@example.invalid"));
+    }
+
+    #[test]
+    fn switchable_transport_tracks_live_configuration_rebuilds() {
+        let transport = SwitchableTransport::default();
+        assert!(!transport.is_enabled());
+        let config = SmtpConfig::new(
+            "127.0.0.1".to_owned(),
+            2525,
+            SmtpTls::StartTls,
+            None,
+            None,
+            "operator@example.invalid".to_owned(),
+        );
+        let configured = MailTransportConfig::Smtp(config)
+            .build(TransportStatus::default())
+            .unwrap();
+        transport.replace(Some(Arc::new(configured)));
+        assert!(transport.is_enabled());
+        assert!(transport.uses_smtp());
+        transport.replace(None);
+        assert!(!transport.is_enabled());
     }
 }

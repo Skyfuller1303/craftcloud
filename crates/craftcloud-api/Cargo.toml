@@ -34,6 +34,7 @@ tower-http = { workspace = true, features = ["request-id", "limit", "trace", "se
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 time.workspace = true
+tungstenite.workspace = true
 
 [dev-dependencies]
 reqwest = { version = "=0.12.23", default-features = false, features = ["json"] }
@@ -55,7 +56,6 @@ serde_yaml_ng = "0.10"
 figcraft-collab.workspace = true
 figcraft-doc.workspace = true
 figcraft-format.workspace = true
-tungstenite.workspace = true
 zip.workspace = true
 
 [lints]

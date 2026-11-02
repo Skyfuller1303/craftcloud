@@ -11,12 +11,15 @@
 //! [`record`] / [`record_aggregated`] and the caller treats a failure as
 //! best-effort (log and continue).
 //!
-//! **Data minimisation (ADR-0016).** An event holds identifiers, a stable
-//! action code, enum-like result codes and `details`. `details` can only be
-//! built from [`Detail`] values (ids, `&'static str` codes, counters, flags),
-//! so there is no way to put an e-mail address, a name, a token or file
-//! content into an event without changing this type. No IP address or user
-//! agent is stored.
+//! **Data minimisation (ADR-0016).** Events hold identifiers, stable action
+//! codes, enum-like result codes and allowlisted details. Instance-setting
+//! audit events additionally retain old/new scalar values for a fixed set of
+//! non-secret fields, including configured mail addresses and usernames, so
+//! operators can see the exact configuration change. Those values are bounded
+//! and checked by setting key and type. Secrets, tokens, passwords, file
+//! content, IP addresses and user agents are not stored. This limited retention
+//! of mail identity fields is a deliberate AC-13 exception to the earlier rule
+//! against recording e-mail addresses.
 //!
 //! **Append-only.** Database triggers (migration 0011) reject `UPDATE`
 //! (except the counter of an aggregated row), `DELETE` (except through
@@ -82,7 +85,8 @@ impl AuditResult {
 }
 
 /// A value allowed in an event's `details`: identifiers, fixed codes,
-/// counters and flags only. There is deliberately no free-text variant.
+/// counters, flags and strictly validated non-secret setting scalars. There
+/// is deliberately no general free-text variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Detail {
     /// An identifier.
@@ -97,6 +101,8 @@ pub enum Detail {
     Count(i64),
     /// A flag.
     Flag(bool),
+    /// A scalar from a fixed allowlist of non-secret instance settings.
+    InstanceSetting { key: String, value: Value },
     /// The opaque `ds_<hex>` reference of a device session: a domain-separated
     /// SHA-256 digest, never the session identifier itself.
     DeviceRef([u8; 32]),
@@ -250,6 +256,16 @@ impl<'a> NewEvent<'a> {
                 }
                 Detail::Count(n) => Value::Number(Number::from(*n)),
                 Detail::Flag(flag) => Value::Bool(*flag),
+                Detail::InstanceSetting { key, value }
+                    if valid_instance_setting_value(key, value) =>
+                {
+                    value.clone()
+                }
+                Detail::InstanceSetting { .. } => {
+                    return Err(DbError::CheckViolation {
+                        constraint: Some("audit_events_instance_setting".to_owned()),
+                    });
+                }
                 Detail::DeviceRef(digest) => {
                     use std::fmt::Write as _;
                     let mut text = String::with_capacity(67);
@@ -264,6 +280,58 @@ impl<'a> NewEvent<'a> {
         }
         Ok(Value::Object(map).to_string())
     }
+}
+
+pub(crate) fn valid_instance_setting_value(key: &str, value: &Value) -> bool {
+    match key {
+        "mail.transport" => value.as_str().is_some_and(|v| {
+            matches!(
+                v,
+                "none" | "smtp" | "graph" | "smtp_oauth_microsoft" | "smtp_oauth_google"
+            )
+        }),
+        "mail.tls" => value
+            .as_str()
+            .is_some_and(|v| matches!(v, "starttls" | "implicit")),
+        "mail.port" => value.as_u64().is_some_and(|v| (1..=65535).contains(&v)),
+        "mail.save_to_sent" => value.is_boolean(),
+        "retention.version_days" | "retention.trash_days" | "retention.quarantine_days" => {
+            value.as_u64().is_some_and(|v| (1..=3650).contains(&v))
+        }
+        "retention.audit_days" => value.as_u64().is_some_and(|v| (30..=3650).contains(&v)),
+        "mail.host" => value.as_str().is_some_and(valid_setting_host),
+        "mail.username" | "mail.from" | "mail.tenant_id" | "mail.client_id" | "mail.sender" => {
+            value
+                .as_str()
+                .is_some_and(|v| v.len() <= 320 && !v.chars().any(char::is_control))
+        }
+        _ => false,
+    }
+}
+
+fn valid_setting_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() || host.chars().any(char::is_control)
+    {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 fn valid_endpoint_host(host: &str) -> bool {
@@ -715,5 +783,47 @@ mod endpoint_host_tests {
             Detail::EndpointHost("user@host.test".into()),
         );
         assert!(invalid.details_json().is_err());
+    }
+
+    #[test]
+    fn instance_setting_audit_values_are_key_and_type_limited() {
+        let event = NewEvent::new("instance_setting.updated")
+            .detail(
+                "old",
+                Detail::InstanceSetting {
+                    key: "mail.transport".into(),
+                    value: Value::String("smtp".into()),
+                },
+            )
+            .detail(
+                "new",
+                Detail::InstanceSetting {
+                    key: "mail.transport".into(),
+                    value: Value::String("graph".into()),
+                },
+            );
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.details_json().unwrap()).unwrap(),
+            serde_json::json!({"old": "smtp", "new": "graph"})
+        );
+        let invalid = NewEvent::new("instance_setting.updated").detail(
+            "new",
+            Detail::InstanceSetting {
+                key: "mail.transport".into(),
+                value: Value::String("smtp://user:secret@host".into()),
+            },
+        );
+        assert!(invalid.details_json().is_err());
+        let uppercase_host = NewEvent::new("instance_setting.updated").detail(
+            "new",
+            Detail::InstanceSetting {
+                key: "mail.host".into(),
+                value: Value::String("Mail.Example.COM".into()),
+            },
+        );
+        assert_eq!(
+            uppercase_host.details_json().unwrap(),
+            r#"{"new":"Mail.Example.COM"}"#
+        );
     }
 }

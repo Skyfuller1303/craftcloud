@@ -258,7 +258,7 @@ describe.each(languages)("axe: system view (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    await user.click(within(nav).getAllByRole("button").at(-1)!);
+    await user.click(within(nav).getByRole("button", { name: "System" }));
     await waitFor(() => expect(document.querySelectorAll("dl.facts").length).toBeGreaterThan(3));
     await expectNoAxeViolations();
 
@@ -283,7 +283,7 @@ describe.each(languages)("axe: system view (%s)", (language) => {
     const user = userEvent.setup();
     renderApp(fetch, { language });
     const nav = await screen.findByRole("navigation");
-    const system = within(nav).getAllByRole("button").at(-1)!;
+    const system = within(nav).getByRole("button", { name: "System" });
     system.focus();
     await user.keyboard("{Enter}");
     await waitFor(() => expect(document.querySelectorAll("dl.facts").length).toBeGreaterThan(3));

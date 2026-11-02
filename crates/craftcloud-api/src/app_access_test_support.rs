@@ -127,6 +127,17 @@ impl TestEnv {
         )
         .await
     }
+
+    pub fn router_with_services(&self, services: Services) -> Router {
+        router_with_shared(
+            Capabilities::development_defaults(),
+            &ApiConfig {
+                trusted_proxies: vec!["127.0.0.0/8".parse().unwrap()],
+                ..ApiConfig::default()
+            },
+            Some(Arc::new(services)),
+        )
+    }
 }
 
 impl Drop for TestEnv {
@@ -155,7 +166,7 @@ impl Drop for TestEnv {
     }
 }
 
-fn settings() -> AuthSettings {
+pub(crate) fn settings() -> AuthSettings {
     AuthSettings {
         public_url: Some("https://cloud.test".to_owned()),
         public_origin: Some("https://cloud.test".to_owned()),

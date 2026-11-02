@@ -30,6 +30,67 @@ export interface SetupCompleteResponse {
   organization_id: Uuid;
 }
 
+export type SetupStepId =
+  | "account"
+  | "system_check"
+  | "two_factor"
+  | "email_delivery"
+  | "organization"
+  | "workspace_project"
+  | "invitations"
+  | "optional_services"
+  | "summary";
+
+export type SetupStepStatus = "pending" | "done" | "skipped";
+
+export interface AdminSetupStep {
+  id: SetupStepId;
+  status: SetupStepStatus;
+  updated_at: string | null;
+  updated_by: Uuid | null;
+}
+
+export interface AdminSetup {
+  organization: Pick<Organization, "id" | "name" | "slug"> | null;
+  steps: AdminSetupStep[];
+  complete: boolean;
+}
+
+export type SetupCheckStatus = "ok" | "warning" | "error" | "not_configured";
+
+export interface SetupSystemCheck {
+  checked_at: string;
+  items: {
+    id: string;
+    status: SetupCheckStatus;
+    message: string;
+    docs_path: string;
+  }[];
+}
+
+export type InstanceSettingSource = "environment" | "database" | "default";
+
+export interface InstanceSetting<T = string | number | boolean | null> {
+  value: T;
+  source: InstanceSettingSource;
+  locked: boolean;
+}
+
+export interface InstanceSecretSetting {
+  configured_at: string | null;
+  source?: InstanceSettingSource;
+  locked?: boolean;
+}
+
+export interface InstanceSettings {
+  settings: Record<string, InstanceSetting | InstanceSecretSetting>;
+  updated_at: string | null;
+}
+
+export type InstanceSettingsPatch = {
+  settings: Record<string, { value: string | number | boolean | null } | { set: string } | { remove: true }>;
+};
+
 export interface LoginRequest {
   email: string;
   password: string;

@@ -35,6 +35,10 @@ pub async fn run(
             sleep_or_stop(&mut stop, Duration::from_secs(5)).await;
             continue;
         }
+        if !transport.is_enabled() {
+            sleep_or_stop(&mut stop, Duration::from_secs(2)).await;
+            continue;
+        }
         let lease_until =
             now + time::Duration::seconds(i64::try_from(CLAIM_LEASE.as_secs()).unwrap_or(60));
         let claims =

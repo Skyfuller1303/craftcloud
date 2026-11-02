@@ -32,9 +32,14 @@ pub struct OAuthConfig {
 #[derive(Clone)]
 pub enum OAuthCredential {
     ClientSecretFile(String),
+    ClientSecret(Zeroizing<String>),
     CertificateAndKeyFiles {
         certificate_file: String,
         key_file: String,
+    },
+    CertificateAndKey {
+        certificate_pem: Zeroizing<Vec<u8>>,
+        key_pem: Zeroizing<Vec<u8>>,
     },
 }
 
@@ -50,6 +55,10 @@ pub enum OAuthProvider {
     Microsoft(OAuthConfig),
     Google {
         service_account_file: String,
+        sender: String,
+    },
+    GoogleServiceAccount {
+        service_account_json: Zeroizing<Vec<u8>>,
         sender: String,
     },
 }
@@ -85,6 +94,17 @@ pub struct TransportStatusSnapshot {
 impl TransportStatus {
     pub fn snapshot(&self) -> TransportStatusSnapshot {
         self.0.read().map(|s| s.clone()).unwrap_or_default()
+    }
+    pub fn configuration_error(&self) {
+        self.set_error("invalid_settings");
+    }
+    pub fn disable(&self) {
+        if let Ok(mut s) = self.0.write() {
+            s.active_transport.clear();
+            s.sender.clear();
+            s.certificate_expires_unix = None;
+            s.last_safe_error = None;
+        }
     }
     fn set_error(&self, code: &'static str) {
         if let Ok(mut s) = self.0.write() {
@@ -192,8 +212,22 @@ enum TokenKind {
 }
 #[derive(Clone)]
 struct GoogleConfig {
-    service_account_file: String,
+    service_account: GoogleServiceAccount,
     sender: String,
+}
+#[derive(Clone)]
+enum GoogleServiceAccount {
+    File(String),
+    Inline(Zeroizing<Vec<u8>>),
+}
+
+fn google_service_account(
+    source: &GoogleServiceAccount,
+) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    match source {
+        GoogleServiceAccount::File(path) => read_secret(path),
+        GoogleServiceAccount::Inline(bytes) => Ok(Zeroizing::new(bytes.to_vec())),
+    }
 }
 
 fn mailbox_address(value: &str) -> Result<String, TransportError> {
@@ -210,6 +244,11 @@ fn preflight_oauth(config: &OAuthConfig, status: &TransportStatus) -> Result<(),
             match std::str::from_utf8(&secret) {
                 Ok(text) if !text.trim().is_empty() => {}
                 _ => return Err(TransportError::Permanent),
+            }
+        }
+        OAuthCredential::ClientSecret(secret) => {
+            if secret.trim().is_empty() || secret.len() as u64 > MAX_SECRET_BYTES {
+                return Err(TransportError::Permanent);
             }
         }
         OAuthCredential::CertificateAndKeyFiles {
@@ -236,6 +275,34 @@ fn preflight_oauth(config: &OAuthConfig, status: &TransportStatus) -> Result<(),
                 status,
             )?;
         }
+        OAuthCredential::CertificateAndKey {
+            certificate_pem,
+            key_pem,
+        } => {
+            if certificate_pem.len() as u64 > MAX_SECRET_BYTES
+                || key_pem.len() as u64 > MAX_SECRET_BYTES
+            {
+                return Err(TransportError::Permanent);
+            }
+            let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem)
+                .map_err(|_| TransportError::Permanent)?;
+            let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&pem.contents)
+                .map_err(|_| TransportError::Permanent)?;
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let expiry = cert.validity().not_after.timestamp();
+            if now < cert.validity().not_before.timestamp() || now >= expiry {
+                return Err(TransportError::Permanent);
+            }
+            EncodingKey::from_rsa_pem(key_pem).map_err(|_| TransportError::Permanent)?;
+            let endpoint = format!("{GRAPH_TOKEN}/{}/oauth2/v2.0/token", config.tenant_id);
+            let _ = microsoft_certificate_assertion_from_bytes(
+                config,
+                certificate_pem,
+                key_pem,
+                &endpoint,
+                status,
+            )?;
+        }
     }
     Ok(())
 }
@@ -248,18 +315,30 @@ fn preflight_smtp_oauth(
         OAuthProvider::Google {
             service_account_file,
             sender,
-        } => {
-            let data = read_secret(service_account_file)?;
-            let account: ServiceAccount =
-                serde_json::from_slice(&data).map_err(|_| TransportError::Permanent)?;
-            if !valid_bare_mailbox(sender) || !valid_bare_mailbox(&account.client_email) {
-                return Err(TransportError::Permanent);
-            }
-            let key = Zeroizing::new(account.private_key.clone());
-            EncodingKey::from_rsa_pem(key.as_bytes()).map_err(|_| TransportError::Permanent)?;
-            Ok(())
-        }
+        } => check_google_account(
+            &google_service_account(&GoogleServiceAccount::File(service_account_file.clone()))?,
+            sender,
+        ),
+        OAuthProvider::GoogleServiceAccount {
+            service_account_json,
+            sender,
+        } => check_google_account(service_account_json, sender),
+    }?;
+    Ok(())
+}
+
+fn check_google_account(data: &[u8], sender: &str) -> Result<(), TransportError> {
+    if data.len() as u64 > MAX_SECRET_BYTES {
+        return Err(TransportError::Permanent);
     }
+    let account: ServiceAccount =
+        serde_json::from_slice(data).map_err(|_| TransportError::Permanent)?;
+    if !valid_bare_mailbox(sender) || !valid_bare_mailbox(&account.client_email) {
+        return Err(TransportError::Permanent);
+    }
+    let key = Zeroizing::new(account.private_key.clone());
+    EncodingKey::from_rsa_pem(key.as_bytes()).map_err(|_| TransportError::Permanent)?;
+    Ok(())
 }
 
 impl TokenProvider {
@@ -549,12 +628,42 @@ fn microsoft_form(
             form.push(("client_secret".into(), secret.to_owned()));
             form.push(("scope".into(), scope.into()));
         }
+        OAuthCredential::ClientSecret(secret) => {
+            if secret.trim().is_empty() || secret.len() as u64 > MAX_SECRET_BYTES {
+                return Err(TransportError::Permanent);
+            }
+            form.push(("client_secret".into(), secret.to_string()));
+            form.push(("scope".into(), scope.into()));
+        }
         OAuthCredential::CertificateAndKeyFiles {
             certificate_file,
             key_file,
         } => {
             let assertion =
                 microsoft_certificate_assertion(c, certificate_file, key_file, &endpoint, status)?;
+            form.push(("scope".into(), scope.into()));
+            form.push((
+                "client_assertion_type".into(),
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+            ));
+            form.push(("client_assertion".into(), assertion));
+        }
+        OAuthCredential::CertificateAndKey {
+            certificate_pem,
+            key_pem,
+        } => {
+            if certificate_pem.len() as u64 > MAX_SECRET_BYTES
+                || key_pem.len() as u64 > MAX_SECRET_BYTES
+            {
+                return Err(TransportError::Permanent);
+            }
+            let assertion = microsoft_certificate_assertion_from_bytes(
+                c,
+                certificate_pem,
+                key_pem,
+                &endpoint,
+                status,
+            )?;
             form.push(("scope".into(), scope.into()));
             form.push((
                 "client_assertion_type".into(),
@@ -584,10 +693,20 @@ fn microsoft_certificate_assertion(
     endpoint: &str,
     status: &TransportStatus,
 ) -> Result<String, TransportError> {
-    use x509_parser::{pem::parse_x509_pem, prelude::FromDer};
     let cert_pem = read_secret(certificate_file)?;
     let key_pem = read_secret(key_file)?;
-    let (_, pem) = parse_x509_pem(&cert_pem).map_err(|_| TransportError::Permanent)?;
+    microsoft_certificate_assertion_from_bytes(c, &cert_pem, &key_pem, endpoint, status)
+}
+
+fn microsoft_certificate_assertion_from_bytes(
+    c: &OAuthConfig,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    endpoint: &str,
+    status: &TransportStatus,
+) -> Result<String, TransportError> {
+    use x509_parser::{pem::parse_x509_pem, prelude::FromDer};
+    let (_, pem) = parse_x509_pem(cert_pem).map_err(|_| TransportError::Permanent)?;
     let (remaining, cert) = x509_parser::certificate::X509Certificate::from_der(&pem.contents)
         .map_err(|_| TransportError::Permanent)?;
     if !remaining.is_empty() {
@@ -601,7 +720,7 @@ fn microsoft_certificate_assertion(
     }
     status.set_certificate_expiry(Some(not_after));
     let public_key = cert.public_key().subject_public_key.data.as_ref();
-    let key = EncodingKey::from_rsa_pem(&key_pem).map_err(|_| TransportError::Permanent)?;
+    let key = EncodingKey::from_rsa_pem(key_pem).map_err(|_| TransportError::Permanent)?;
     let mut header = Header::new(Algorithm::PS256);
     header.typ = Some("JWT".into());
     header.x5t_s256 = Some(URL_SAFE_NO_PAD.encode(Sha256::digest(&pem.contents)));
@@ -650,7 +769,7 @@ struct GoogleClaims<'a> {
     exp: i64,
 }
 fn google_form(c: &GoogleConfig) -> Result<(String, Vec<(String, String)>), TransportError> {
-    let data = read_secret(&c.service_account_file)?;
+    let data = google_service_account(&c.service_account)?;
     let sa: ServiceAccount =
         serde_json::from_slice(&data).map_err(|_| TransportError::Permanent)?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -841,7 +960,22 @@ impl SmtpOAuthTransport {
                 }
                 TokenProvider::google(
                     GoogleConfig {
-                        service_account_file: service_account_file.clone(),
+                        service_account: GoogleServiceAccount::File(service_account_file.clone()),
+                        sender: sender.clone(),
+                    },
+                    status.clone(),
+                )?
+            }
+            OAuthProvider::GoogleServiceAccount {
+                service_account_json,
+                sender,
+            } => {
+                if !sender.eq_ignore_ascii_case(&from_addr) {
+                    return Err(TransportError::Permanent);
+                }
+                TokenProvider::google(
+                    GoogleConfig {
+                        service_account: GoogleServiceAccount::Inline(service_account_json.clone()),
                         sender: sender.clone(),
                     },
                     status.clone(),

@@ -4,10 +4,16 @@ GET /api/v1/admin/audit/export auth=cookie|bearer req=- ok=- codes=200,400,401,4
 GET /api/v1/admin/email-delivery auth=cookie|bearer req=- ok=EmailDeliveryStatus codes=200,400,401,403,500,503
 POST /api/v1/admin/email-delivery/test auth=cookie+csrf|bearer req=- ok=EmailRequestResponse codes=202,400,401,403,429,500,503
 GET /api/v1/admin/health auth=cookie|bearer req=- ok=AdminHealth codes=200,400,401,403,500,503
+GET /api/v1/admin/instance-settings auth=cookie|bearer req=- ok=- codes=200,401,403,500,503
+PATCH /api/v1/admin/instance-settings auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,409,413,415,422,429,500,503
+POST /api/v1/admin/instance-settings/email-test auth=cookie+csrf|bearer req=- ok=- codes=202,400,401,403,429,500,503
 GET /api/v1/admin/maintenance auth=cookie|bearer req=- ok=MaintenanceStatus codes=200,400,401,403,500,503
 GET /api/v1/admin/organizations auth=cookie|bearer req=- ok=OrganizationSummaryPage codes=200,400,401,403,422,500,503
 PUT /api/v1/admin/organizations/{org_id}/quota auth=cookie+csrf|bearer req=QuotaRequest ok=QuotaResponse codes=200,400,401,403,404,413,415,422,500,503
 PATCH /api/v1/admin/organizations/{org_id}/seats auth=cookie|bearer req=- ok=SeatLimitResponse codes=200,400,401,403,404,422,500,503
+GET /api/v1/admin/setup auth=cookie|bearer req=- ok=- codes=200,401,403,500,503
+PATCH /api/v1/admin/setup/steps/{step} auth=cookie+csrf|bearer req=- ok=- codes=200,400,401,403,404,409,413,415,422,429,500,503
+GET /api/v1/admin/setup/system-check auth=cookie|bearer req=- ok=- codes=200,401,403,500,503
 GET /api/v1/admin/sso auth=cookie|bearer req=- ok=InstanceSsoPolicy codes=200,400,401,403,404,409,413,422,429,500,503
 PUT /api/v1/admin/sso auth=cookie+csrf|bearer req=InstanceSsoPolicy ok=InstanceSsoPolicy codes=200,400,401,403,404,409,413,422,429,500,503
 GET /api/v1/admin/sso/domain-claims auth=cookie|bearer req=- ok=SsoDomainClaimList codes=200,400,401,403,404,409,413,422,429,500,503

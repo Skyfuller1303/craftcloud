@@ -1367,6 +1367,8 @@ dependencies = [
 name = "craftcloud-backup"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
+ "craftcloud-auth",
  "craftcloud-db",
  "craftcloud-storage",
  "serde",

@@ -397,12 +397,12 @@ mod tests {
 
     #[test]
     fn embedded_migrations_are_ordered_and_complete() {
-        // Migration 19 adds email delivery state and one-use verification records.
-        // Migration 20 adds seat limits and app assignments; 22 adds archive tiers.
+        // Migration 19 adds email delivery state, 20 adds app access, 22 adds
+        // archive tiers and 23 adds instance setup/settings tables.
         assert_eq!(
             embedded_versions(),
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
             ]
         );
     }
@@ -419,6 +419,7 @@ mod tests {
         assert_eq!(migrator_up_to(20).iter().count(), 20);
         assert_eq!(migrator_up_to(21).iter().count(), 21);
         assert_eq!(migrator_up_to(22).iter().count(), 22);
-        assert_eq!(migrator_up_to(99).iter().count(), 22);
+        assert_eq!(migrator_up_to(23).iter().count(), 23);
+        assert_eq!(migrator_up_to(99).iter().count(), 23);
     }
 }

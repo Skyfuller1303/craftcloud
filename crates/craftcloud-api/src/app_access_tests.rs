@@ -1,7 +1,7 @@
 //! AC-11 HTTP checks for app access and seats. Requires PostgreSQL.
 
 #[path = "app_access_test_support.rs"]
-mod support;
+pub(crate) mod support;
 
 #[cfg(test)]
 mod tests {

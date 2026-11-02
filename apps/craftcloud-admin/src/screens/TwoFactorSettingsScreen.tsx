@@ -32,10 +32,12 @@ export function TwoFactorSettingsScreen({
   organization,
   onOrganizationUpdated,
   onFactorChanged,
+  headingId,
 }: {
   organization: Organization | null;
   onOrganizationUpdated: (organization: Organization) => void;
   onFactorChanged: (enabled: boolean) => void;
+  headingId?: string;
 }) {
   const { t } = useI18n();
   const { api } = useAuth();
@@ -181,8 +183,13 @@ export function TwoFactorSettingsScreen({
 
   return (
     <div className="stack">
-      <section className="section" aria-labelledby="two-factor-title">
-        <h2 id="two-factor-title" className="section__title">{t("Two-factor authentication")}</h2>
+      <section
+        className="section"
+        {...(headingId === undefined
+          ? { "aria-labelledby": "two-factor-title" }
+          : { "aria-label": t("Two-factor settings") })}
+      >
+        {headingId === undefined && <h2 id="two-factor-title" className="section__title">{t("Two-factor authentication")}</h2>}
         {status.state === "loading" && <p role="status" className="muted">{t("Loading two-factor status…")}</p>}
         {status.state === "error" && <ErrorNotice error={status.error} onRetry={() => setAttempt((value) => value + 1)} />}
         {status.state === "ready" && (

@@ -812,3 +812,134 @@
 	Failed deletions	Fehlgeschlagene Löschungen
 	Last verification	Letzte Prüfung
 	Last error code	Letzter Fehlercode
+	Setup wizard	Setup-Assistent
+	Setup is incomplete	Einrichtung unvollständig
+	Continue setup	Einrichtung fortsetzen
+	Finish the remaining instance setup steps.	Schließe die übrigen Einrichtungsschritte der Instanz ab.
+	Loading setup progress…	Einrichtungsfortschritt wird geladen…
+	Continue the first-run setup. Progress is saved for every instance operator.	Führe die Ersteinrichtung fort. Der Fortschritt wird für alle Instanzbetreiber gespeichert.
+	Setup progress	Einrichtungsfortschritt
+	{done} of {total} steps resolved	{done} von {total} Schritten erledigt
+	Setup steps	Einrichtungsschritte
+	Operator account	Betreiberkonto
+	System check	Systemprüfung
+	Organization basics	Organisationsgrundlagen
+	First workspace and project	Erster Workspace und erstes Projekt
+	Optional services	Optionale Dienste
+	Summary	Zusammenfassung
+	Pending	Offen
+	Complete	Erledigt
+	Skipped	Übersprungen
+	Skip step	Schritt überspringen
+	Mark complete	Als erledigt markieren
+	Checking system requirements…	Systemanforderungen werden geprüft…
+	Public URL	Öffentliche URL
+	HTTPS connection	HTTPS-Verbindung
+	PostgreSQL version	PostgreSQL-Version
+	Free storage space	Freier Speicherplatz
+	FigCraft service	FigCraft-Dienst
+	Database clock	Datenbankuhr
+	Scheduled maintenance	Geplante Wartung
+	Unknown status	Unbekannter Status
+	Warning	Warnung
+	Error	Fehler
+	Installation guide section: {section}	Abschnitt in der Installationsanleitung: {section}
+	Host, software and network	Host, Software und Netzwerk
+	Public URL and server configuration	Öffentliche URL und Serverkonfiguration
+	HTTPS proxy	HTTPS-Proxy
+	Database selection	Datenbankauswahl
+	First-run setup	Ersteinrichtung
+	The configured public URL matches this browser address.	Die konfigurierte öffentliche URL stimmt mit dieser Browseradresse überein.
+	The configured public URL does not match this browser address.	Die konfigurierte öffentliche URL stimmt nicht mit dieser Browseradresse überein.
+	Set the public URL in the server configuration file.	Lege die öffentliche URL in der Serverkonfigurationsdatei fest.
+	The connection uses HTTPS.	Die Verbindung verwendet HTTPS.
+	The server could not verify that the connection uses HTTPS.	Der Server konnte HTTPS für diese Verbindung nicht bestätigen.
+	The connection does not use HTTPS.	Die Verbindung verwendet kein HTTPS.
+	The PostgreSQL version is supported.	Die PostgreSQL-Version wird unterstützt.
+	The PostgreSQL version is not supported.	Die PostgreSQL-Version wird nicht unterstützt.
+	The PostgreSQL version could not be checked.	Die PostgreSQL-Version konnte nicht geprüft werden.
+	The storage directory has sufficient free space.	Im Speicherverzeichnis ist genügend Speicherplatz frei.
+	The storage directory has little free space.	Im Speicherverzeichnis ist nur wenig Speicherplatz frei.
+	Free storage space could not be checked.	Der freie Speicherplatz konnte nicht geprüft werden.
+	FigCraft is not configured.	FigCraft ist nicht konfiguriert.
+	The server and database clocks are synchronized.	Server- und Datenbankuhr sind synchronisiert.
+	The server and database clocks differ.	Server- und Datenbankuhr weichen voneinander ab.
+	Scheduled maintenance is enabled.	Die geplante Wartung ist aktiviert.
+	Scheduled maintenance is disabled.	Die geplante Wartung ist deaktiviert.
+	Archive storage is not configured.	Der Archivspeicher ist nicht konfiguriert.
+	No explanation is available for this check.	Für diese Prüfung liegt keine Erklärung vor.
+	Setup is complete. Review any skipped steps below.	Die Einrichtung ist abgeschlossen. Unten findest du übersprungene Schritte.
+	Setup is not complete yet. Return to pending steps to continue.	Die Einrichtung ist noch nicht abgeschlossen. Kehre zu offenen Schritten zurück.
+	The first operator account and organization were created during the one-time setup.	Das erste Betreiberkonto und die Organisation wurden bei der einmaligen Einrichtung erstellt.
+	Protect the instance operator account with an authenticator app and recovery codes.	Schütze das Instanzbetreiberkonto mit einer Authenticator-App und Wiederherstellungscodes.
+	Configure e-mail delivery or choose to share invitation links by hand.	Richte den E-Mail-Versand ein oder teile Einladungslinks von Hand.
+	Set organization seats, storage quota, app access, and instance retention periods.	Lege Plätze, Speicherkontingent, App-Zugriff und Aufbewahrungsfristen der Instanz fest.
+	Invite people to the organization. If e-mail is not configured, copy and share invitation links.	Lade Personen in die Organisation ein. Wenn kein E-Mail-Versand eingerichtet ist, kopiere und teile Einladungslinks.
+	Company sign-in and archive storage are optional. Archive configuration stays in the server configuration file.	Firmenanmeldung und Archivspeicher sind optional. Die Archivkonfiguration bleibt in der Serverkonfigurationsdatei.
+	Open single sign-on settings	Einstellungen für einmalige Anmeldung öffnen
+	This step is complete.	Dieser Schritt ist abgeschlossen.
+	Continue setup using the available CraftCloud controls.	Führe die Einrichtung mit den verfügbaren CraftCloud-Steuerelementen fort.
+	Workspace created.	Workspace erstellt.
+	Project created.	Projekt erstellt.
+	Select the first organization to create a workspace.	Wähle die erste Organisation aus, um einen Workspace zu erstellen.
+	Create first workspace	Ersten Workspace erstellen
+	Workspace address name	Workspace-Adressname
+	Create first project	Erstes Projekt erstellen
+	Select a workspace	Workspace auswählen
+	Organization capacity and app access	Organisationskapazität und App-Zugriff
+	Storage quota in bytes	Speicherkontingent in Bytes
+	App access mode	App-Zugriffsmodus
+	All apps	Alle Apps
+	Assigned apps only	Nur zugewiesene Apps
+	Save organization settings	Organisationseinstellungen speichern
+	Loading instance settings…	Instanzeinstellungen werden geladen…
+	Sign in again to change this sensitive setting, then retry.	Melde dich erneut an, um diese sicherheitsrelevante Einstellung zu ändern, und versuche es dann erneut.
+	Sign in again with your two-factor authentication, then retry.	Melde dich erneut mit deiner Zwei-Faktor-Anmeldung an und versuche es dann erneut.
+	Choose no e-mail delivery to share invitation links by hand, or configure a mail transport.	Wähle keinen E-Mail-Versand, um Einladungslinks von Hand zu teilen, oder richte einen Mailtransport ein.
+	Mail transport	Mailtransport
+	SMTP host	SMTP-Host
+	SMTP port	SMTP-Port
+	SMTP encryption	SMTP-Verschlüsselung
+	SMTP username	SMTP-Benutzername
+	From address	Absenderadresse
+	Microsoft tenant ID	Microsoft-Tenant-ID
+	OAuth client ID	OAuth-Client-ID
+	Graph sender	Graph-Absender
+	Save sent messages to Sent Items	Gesendete Nachrichten in „Gesendete Elemente“ speichern
+	SMTP password	SMTP-Passwort
+	OAuth client secret	OAuth-Client-Secret
+	OAuth certificate	OAuth-Zertifikat
+	OAuth private key	OAuth-Privatschlüssel
+	Google service account	Google-Dienstkonto
+	Set by the configuration file.	In der Konfigurationsdatei festgelegt.
+	Secret configured; last set {date}.	Geheimnis eingerichtet; zuletzt geändert am {date}.
+	No secret configured.	Kein Geheimnis eingerichtet.
+	Secret will be removed	Geheimnis wird entfernt
+	Remove saved secret	Gespeichertes Geheimnis entfernen
+	Send test e-mail	Test-E-Mail senden
+	Test e-mail queued for delivery.	Test-E-Mail zur Zustellung vorgemerkt.
+	These values control instance maintenance and retention.	Diese Werte steuern Wartung und Aufbewahrung der Instanz.
+	Save settings	Einstellungen speichern
+	Settings saved.	Einstellungen gespeichert.
+	Enter a valid non-negative whole number. Seats must be greater than zero.	Gib eine gültige ganze Zahl ab null ein. Das Platzlimit muss größer als null sein.
+	Finish	Fertigstellen
+	Save settings before sending a test e-mail.	Speichere die Einstellungen, bevor du eine Test-E-Mail sendest.
+	Loading archive status…	Archivstatus wird geladen…
+	Archive storage status	Archivspeicherstatus
+	Archive storage settings remain in the server configuration file.	Einstellungen für den Archivspeicher bleiben in der Serverkonfigurationsdatei.
+	Enter a whole number from {min} to {max}.	Gib eine ganze Zahl von {min} bis {max} ein.
+	Secret is set by the configuration file.	Das Geheimnis ist in der Konfigurationsdatei festgelegt.
+	Two-factor settings	Einstellungen für Zwei-Faktor-Anmeldung
+	The request origin could not be verified against the configured public URL.	Der Ursprung der Anfrage konnte nicht mit der konfigurierten öffentlichen URL abgeglichen werden.
+	FigCraft is configured, but its availability has not been verified.	FigCraft ist konfiguriert, seine Verfügbarkeit wurde jedoch nicht überprüft.
+	Archive storage is configured, but its availability has not been verified. This status is shown for reference only.	Der Archivspeicher ist konfiguriert, seine Verfügbarkeit wurde jedoch nicht überprüft. Der Status dient nur zur Anzeige.
+	Organization settings could not be loaded.	Organisationseinstellungen konnten nicht geladen werden.
+	Loading organization settings…	Organisationseinstellungen werden geladen…
+	The FigCraft WebSocket service is reachable.	Der FigCraft-WebSocket-Dienst ist erreichbar.
+	The FigCraft WebSocket service could not be reached.	Der FigCraft-WebSocket-Dienst konnte nicht erreicht werden.
+	The FigCraft WebSocket service rejected the handshake.	Der FigCraft-WebSocket-Dienst hat den Handshake abgelehnt.
+	The FigCraft WebSocket handshake could not be completed.	Der FigCraft-WebSocket-Handshake konnte nicht abgeschlossen werden.
+	Version retention (days)	Aufbewahrung von Versionen (Tage)
+	Trash retention (days)	Aufbewahrung im Papierkorb (Tage)
+	Audit retention (days)	Aufbewahrung des Auditprotokolls (Tage)
+	Quarantine retention (days)	Aufbewahrung in Quarantäne (Tage)

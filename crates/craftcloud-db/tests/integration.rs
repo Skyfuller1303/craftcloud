@@ -947,9 +947,7 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
-            ]
+            migrate::embedded_versions()
         );
         migrate::verify(&db.pool).await.unwrap();
     }
@@ -1860,16 +1858,17 @@ mod tests {
         let other = db.extra_pool().await;
         let (a, b) = tokio::join!(migrate::run(&db.pool), migrate::run(&other));
         let (a, b) = (a.unwrap(), b.unwrap());
+        let migration_count = migrate::embedded_versions().len();
         assert_eq!(
             a.len() + b.len(),
-            22,
+            migration_count,
             "each migration applied exactly once in total"
         );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(count, 22);
+        assert_eq!(count, i64::try_from(migration_count).unwrap());
         migrate::verify(&db.pool).await.unwrap();
     }
 
@@ -1881,11 +1880,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
+        let pending = migrate::embedded_versions()
+            .into_iter()
+            .filter(|version| *version > 1)
+            .collect();
         assert_eq!(
             migrate::verify(&db.pool).await,
-            Err(DbError::Schema(SchemaProblem::Pending(vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
-            ])))
+            Err(DbError::Schema(SchemaProblem::Pending(pending)))
         );
 
         let (scope, owner) = legacy_org(&db.pool, "acme").await;
@@ -1893,9 +1894,10 @@ mod tests {
         let second = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             second.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![
-                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
-            ]
+            migrate::embedded_versions()
+                .into_iter()
+                .filter(|version| *version > 1)
+                .collect::<Vec<_>>()
         );
         migrate::verify(&db.pool).await.unwrap();
 
@@ -2494,9 +2496,10 @@ mod tests {
         let applied = migrate::run(&db.pool).await.unwrap();
         assert_eq!(
             applied.iter().map(|a| a.version).collect::<Vec<_>>(),
-            vec![
-                3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
-            ]
+            migrate::embedded_versions()
+                .into_iter()
+                .filter(|version| *version > 2)
+                .collect::<Vec<_>>()
         );
         migrate::verify(&db.pool).await.unwrap();
         let ws = workspaces::get(&db.pool, &scope, ws_id)

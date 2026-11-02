@@ -101,3 +101,7 @@ AC-10 also leaves a browser organization chooser for ambiguous shared login doma
 ## AC-10 review follow-ups
 
 Domain ownership is decided by the instance operator (approval of each claim). Automated proof of control of the domain, such as a DNS TXT challenge checked by CraftCloud, is a possible later option and is not implemented. The approval screen lists pending claims only; a history view of decisions is available through the audit log.
+
+## AC-13: Mehrere Instanzbetreiber
+
+Der Fortschritt des Setup-Assistenten wird serverseitig gespeichert und ist nach einer erneuten Anmeldung wieder verfügbar. Die bestehende Instanzbetreiberprüfung bindet die Rolle jedoch an das einzelne Betreiberkonto in `instance_setup`. Ein zweiter gleichzeitiger Instanzbetreiber lässt sich damit nicht einrichten oder für die gemeinsame Fortsetzung testen. Ein Modell für mehrere Instanzbetreiber erfordert eine eigene Berechtigungsentscheidung und ist nicht Teil der vorgenommenen Änderungen.

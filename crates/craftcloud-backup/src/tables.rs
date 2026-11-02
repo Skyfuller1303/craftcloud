@@ -52,6 +52,8 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("member_app_access", 20),
     table("workspace_members", 2),
     table("instance_setup", 3),
+    table("instance_setup_steps", 23),
+    table("instance_settings", 23),
     table("projects", 7),
     TableSpec {
         name: "files",
@@ -210,14 +212,30 @@ mod tests {
         // AC-03 adds grants at 16; AC-02 adds factor state and ephemeral
         // challenges at 17.
         // AC-06 adds FigCraft state at 18; AC-09 adds one-use email state at 19.
-        assert_eq!(
-            backup_tables_for(MIN_BACKUP_MIGRATION).unwrap().len(),
-            BACKUP_TABLES.len() - 19
-        );
-        assert_eq!(
-            backup_tables_for(14).unwrap().len(),
-            BACKUP_TABLES.len() - 19
-        );
+        let through_14 = [
+            "users",
+            "organizations",
+            "workspaces",
+            "invitations",
+            "organization_members",
+            "workspace_members",
+            "instance_setup",
+            "projects",
+            "files",
+            "blobs",
+            "upload_sessions",
+            "file_versions",
+            "audit_events",
+        ];
+        let names_at = |version| {
+            backup_tables_for(version)
+                .unwrap()
+                .iter()
+                .map(|table| table.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names_at(MIN_BACKUP_MIGRATION), through_14);
+        assert_eq!(names_at(14), through_14);
         assert_eq!(
             excluded_tables_for(14),
             [
@@ -241,10 +259,23 @@ mod tests {
         );
         assert!(excluded_tables_for(15).contains(&"device_sessions"));
         assert!(!excluded_tables_for(15).contains(&"file_locks"));
-        assert_eq!(
-            backup_tables_for(16).unwrap().len(),
-            BACKUP_TABLES.len() - 18
-        );
+        let through_16 = [
+            "users",
+            "organizations",
+            "workspaces",
+            "invitations",
+            "organization_members",
+            "workspace_members",
+            "instance_setup",
+            "projects",
+            "files",
+            "blobs",
+            "upload_sessions",
+            "file_versions",
+            "grants",
+            "audit_events",
+        ];
+        assert_eq!(names_at(16), through_16);
         assert_eq!(
             excluded_tables_for(16),
             [
@@ -311,6 +342,16 @@ mod tests {
         assert!(position(&backup_20, "blob_quota_groups").is_none());
         let backup_22 = backup_tables_for(22).unwrap();
         assert!(position(&backup_22, "blob_quota_groups") < position(&backup_22, "blobs"));
+        let backup_23 = backup_tables_for(23).unwrap();
+        assert!(
+            position(&backup_23, "instance_setup") < position(&backup_23, "instance_setup_steps")
+        );
+        assert!(
+            position(&backup_23, "instance_setup_steps")
+                < position(&backup_23, "instance_settings")
+        );
+        assert!(position(&backup_23, "instance_setup_steps").is_some());
+        assert!(position(&backup_23, "instance_settings").is_some());
         assert!(!is_backup_table("outbound_emails"));
         assert!(!is_backup_table("email_verification_tokens"));
         assert!(!is_backup_table("pending_email_changes"));

@@ -12,7 +12,7 @@
 mod admin_ui;
 mod config;
 mod healthcheck;
-mod mail_setup;
+mod mail_settings;
 mod mail_worker;
 mod roles;
 mod secret;
@@ -20,7 +20,9 @@ mod server;
 mod supervisor;
 
 use base64::Engine;
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1074,6 +1076,7 @@ fn load_two_factor_key(path: Option<&std::path::PathBuf>) -> Option<[u8; 32]> {
 struct LoadedFigcraft {
     client: std::sync::Arc<dyn craftcloud_figcraft::Backend>,
     public_url: String,
+    internal_url: String,
 }
 
 fn load_figcraft(
@@ -1099,6 +1102,7 @@ fn load_figcraft(
     Ok(Some(LoadedFigcraft {
         client: std::sync::Arc::new(client),
         public_url: settings.public_url.clone(),
+        internal_url: settings.internal_url.clone(),
     }))
 }
 
@@ -1847,7 +1851,13 @@ async fn maintenance_once(config: &Config, dry_run: bool) -> Result<(), Failure>
         store,
         std::sync::Arc::new(SystemClock),
         maintenance_settings(config),
-    );
+    )
+    .with_retention_environment([
+        std::env::var_os("CRAFTCLOUD_VERSION_RETENTION_DAYS").is_some(),
+        std::env::var_os("CRAFTCLOUD_TRASH_RETENTION_DAYS").is_some(),
+        std::env::var_os("CRAFTCLOUD_AUDIT_RETENTION_DAYS").is_some(),
+        std::env::var_os("CRAFTCLOUD_QUARANTINE_DAYS").is_some(),
+    ]);
     let (_keep_alive, stop) = watch::channel(false);
     let outcome = job
         .run_once(
@@ -1955,18 +1965,6 @@ async fn run(config: Config) -> Result<(), Failure> {
         tracing::warn!("two-factor setup is unavailable: current secret key is not usable");
     }
     let mail_status = craftcloud_mail::TransportStatus::default();
-    let mail_transport = if let Some(settings) = &config.mail {
-        if two_factor_key.is_none() {
-            return Err(Failure::config(
-                "CRAFTCLOUD_SECRET_KEY_FILE must contain a valid AC-02 key when mail delivery is enabled",
-            ));
-        }
-        Some(std::sync::Arc::new(
-            mail_setup::build(settings, mail_status.clone()).map_err(Failure::config)?,
-        ))
-    } else {
-        None
-    };
     let metrics = std::sync::Arc::new(Metrics::new());
     // Migrations are never applied implicitly: only verify the schema.
     let pool = connect_database(&config.database).await?;
@@ -2015,6 +2013,86 @@ async fn run(config: Config) -> Result<(), Failure> {
         tracing::warn!(
             "no database configured (CRAFTCLOUD_DATABASE_URL_FILE unset); running in prototype mode"
         );
+    }
+    let mail_transport = std::sync::Arc::new(craftcloud_mail::SwitchableTransport::default());
+    let email_delivery_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mail_reload_tx, mut mail_reload_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<bool>>();
+    if let (Some(pool), Some(key)) = (&pool, two_factor_key) {
+        match mail_settings::load(
+            pool,
+            &config,
+            Some(&key),
+            two_factor_old_key.as_ref(),
+            mail_status.clone(),
+        )
+        .await
+        {
+            Ok(transport) => {
+                if transport.is_none() {
+                    mail_status.disable();
+                }
+                email_delivery_enabled.store(
+                    transport
+                        .as_ref()
+                        .is_some_and(craftcloud_mail::MailTransport::is_enabled),
+                    std::sync::atomic::Ordering::Release,
+                );
+                mail_transport.replace(transport.map(std::sync::Arc::new));
+            }
+            Err(_) => {
+                mail_status.disable();
+                mail_status.configuration_error();
+                tracing::error!("mail configuration is invalid; delivery disabled");
+            }
+        }
+    } else if config.mail.is_some() {
+        mail_status.configuration_error();
+        tracing::error!(
+            "mail configuration requires a database and a valid secret key; delivery disabled"
+        );
+    }
+    if let Some(pool) = pool.clone() {
+        let transport = std::sync::Arc::clone(&mail_transport);
+        let enabled = std::sync::Arc::clone(&email_delivery_enabled);
+        let config = config.clone();
+        let status = mail_status.clone();
+        tokio::spawn(async move {
+            while let Some(reply) = mail_reload_rx.recv().await {
+                let result = match two_factor_key {
+                    Some(key) => {
+                        mail_settings::load(
+                            &pool,
+                            &config,
+                            Some(&key),
+                            two_factor_old_key.as_ref(),
+                            status.clone(),
+                        )
+                        .await
+                    }
+                    None => Err("mail settings are invalid"),
+                };
+                let success = match result {
+                    Ok(next) => {
+                        if next.is_none() {
+                            status.disable();
+                        }
+                        enabled.store(next.is_some(), std::sync::atomic::Ordering::Release);
+                        transport.replace(next.map(std::sync::Arc::new));
+                        true
+                    }
+                    Err(_) => {
+                        transport.replace(None);
+                        enabled.store(false, std::sync::atomic::Ordering::Release);
+                        status.disable();
+                        status.configuration_error();
+                        tracing::error!("mail settings reload failed; delivery disabled");
+                        false
+                    }
+                };
+                let _ = reply.send(success);
+            }
+        });
     }
 
     // The object store is validated at startup when configured; storage
@@ -2128,6 +2206,12 @@ async fn run(config: Config) -> Result<(), Failure> {
                 std::sync::Arc::new(SystemClock),
                 maintenance_settings(&config),
             )
+            .with_retention_environment([
+                std::env::var_os("CRAFTCLOUD_VERSION_RETENTION_DAYS").is_some(),
+                std::env::var_os("CRAFTCLOUD_TRASH_RETENTION_DAYS").is_some(),
+                std::env::var_os("CRAFTCLOUD_AUDIT_RETENTION_DAYS").is_some(),
+                std::env::var_os("CRAFTCLOUD_QUARANTINE_DAYS").is_some(),
+            ])
             .with_metrics(std::sync::Arc::clone(&metrics));
             let job = match (&archive_parts, archive_worker_storage_allowed) {
                 (Some((store, _)), true) => job.with_archive(std::sync::Arc::clone(store)),
@@ -2140,9 +2224,31 @@ async fn run(config: Config) -> Result<(), Failure> {
             tokio::spawn(std::sync::Arc::new(job).run_loop(config.maintenance_interval, stop_rx))
         });
     let services = pool.as_ref().map(|pool| {
+        let (setting_values, setting_locked) = instance_setting_environment(&config);
+        let storage_path = config.storage_dir.clone();
         let services = Services::new(pool.clone(), bootstrap, auth_settings)
+            .with_maintenance_enabled(config.maintenance_enabled)
+            .with_storage_free_bytes(std::sync::Arc::new(move || {
+                storage_path
+                    .as_deref()
+                    .and_then(|path| fs2::available_space(path).ok())
+            }))
+            .with_instance_setting_environment(setting_values, setting_locked)
             .with_two_factor_keys(two_factor_key, two_factor_old_key)
-            .with_email_delivery(config.mail.is_some())
+            .with_email_delivery_state(std::sync::Arc::clone(&email_delivery_enabled))
+            .with_instance_settings_changed(std::sync::Arc::new({
+                let reload = mail_reload_tx.clone();
+                move || {
+                    let reload = reload.clone();
+                    Box::pin(async move {
+                        let (reply, result) = tokio::sync::oneshot::channel();
+                        if reload.send(reply).is_err() {
+                            return false;
+                        }
+                        result.await.unwrap_or(false)
+                    })
+                }
+            }))
             .with_email_transport_status(std::sync::Arc::new({
                 let status = mail_status.clone();
                 move || {
@@ -2192,7 +2298,9 @@ async fn run(config: Config) -> Result<(), Failure> {
             _ => services,
         };
         let services = match figcraft {
-            Some(loaded) => services.with_figcraft(loaded.client, loaded.public_url),
+            Some(loaded) => services
+                .with_figcraft(loaded.client, loaded.public_url)
+                .with_figcraft_internal_url(loaded.internal_url),
             None => services,
         };
         std::sync::Arc::new(if store_refused {
@@ -2218,15 +2326,15 @@ async fn run(config: Config) -> Result<(), Failure> {
             stop_maintenance.subscribe(),
         ))
     });
-    let mail_task = match (&pool, &mail_transport, two_factor_key) {
-        (Some(pool), Some(transport), Some(key)) => {
+    let mail_task = match (&pool, two_factor_key) {
+        (Some(pool), Some(key)) => {
             let public_url = config.public_url.as_deref().unwrap_or_default();
             let domain = mail_message_id_domain(public_url);
             tracing::info!("mail delivery worker enabled");
             let public_url = config.public_url.clone().unwrap_or_default();
             Some(tokio::spawn(mail_worker::run(
                 pool.clone(),
-                std::sync::Arc::clone(transport),
+                std::sync::Arc::clone(&mail_transport),
                 key,
                 two_factor_old_key,
                 public_url,
@@ -2419,6 +2527,168 @@ fn mail_message_id_domain(public_url: &str) -> String {
         Some(url::Host::Domain(domain)) => domain,
         None => "craftcloud.invalid".to_owned(),
     }
+}
+
+fn instance_setting_environment(
+    config: &Config,
+) -> (BTreeMap<String, serde_json::Value>, BTreeSet<String>) {
+    let env_set = |name: &str| std::env::var_os(format!("CRAFTCLOUD_{name}")).is_some();
+    let mut values = BTreeMap::new();
+    let mut locked = BTreeSet::new();
+    let mut public = |key: &str, envs: &[&str], value: serde_json::Value| {
+        if envs.iter().any(|name| env_set(name)) {
+            locked.insert(key.to_owned());
+            values.insert(key.to_owned(), value);
+        }
+    };
+    let transport = config
+        .mail
+        .as_ref()
+        .map(|mail| match mail {
+            config::MailSettings::Smtp { .. } => "smtp",
+            config::MailSettings::Graph { .. } => "graph",
+            config::MailSettings::SmtpOAuthMicrosoft { .. } => "smtp_oauth_microsoft",
+            config::MailSettings::SmtpOAuthGoogle { .. } => "smtp_oauth_google",
+        })
+        .unwrap_or("none");
+    public("mail.transport", &["MAIL_TRANSPORT"], json!(transport));
+    if let Some(mail) = &config.mail {
+        let (host, port, tls, username, from) = match mail {
+            config::MailSettings::Smtp {
+                host,
+                port,
+                tls,
+                username,
+                from,
+                ..
+            } => (
+                Some(host),
+                Some(port),
+                Some(tls),
+                username.as_ref(),
+                Some(from),
+            ),
+            config::MailSettings::SmtpOAuthGoogle {
+                host,
+                port,
+                tls,
+                username,
+                from,
+                ..
+            } => (
+                Some(host),
+                Some(port),
+                Some(tls),
+                Some(username),
+                Some(from),
+            ),
+            config::MailSettings::SmtpOAuthMicrosoft {
+                host,
+                port,
+                tls,
+                username,
+                from,
+                ..
+            } => (
+                Some(host),
+                Some(port),
+                Some(tls),
+                Some(username),
+                Some(from),
+            ),
+            config::MailSettings::Graph { .. } => (None, None, None, None, None),
+        };
+        public("mail.host", &["SMTP_HOST"], json!(host));
+        public("mail.port", &["SMTP_PORT"], json!(port));
+        public(
+            "mail.tls",
+            &["SMTP_TLS"],
+            json!(tls.map(|v| match v {
+                craftcloud_mail::SmtpTls::StartTls => "starttls",
+                craftcloud_mail::SmtpTls::ImplicitTls => "implicit",
+            })),
+        );
+        public("mail.username", &["SMTP_USERNAME"], json!(username));
+        public("mail.from", &["SMTP_FROM"], json!(from));
+        match mail {
+            config::MailSettings::Graph {
+                tenant_id,
+                client_id,
+                sender,
+                save_to_sent,
+                ..
+            } => {
+                public("mail.tenant_id", &["GRAPH_TENANT_ID"], json!(tenant_id));
+                public("mail.client_id", &["GRAPH_CLIENT_ID"], json!(client_id));
+                public("mail.sender", &["GRAPH_SENDER"], json!(sender));
+                public(
+                    "mail.save_to_sent",
+                    &["GRAPH_SAVE_TO_SENT"],
+                    json!(save_to_sent),
+                );
+            }
+            config::MailSettings::SmtpOAuthMicrosoft {
+                tenant_id,
+                client_id,
+                ..
+            } => {
+                public(
+                    "mail.tenant_id",
+                    &["SMTP_OAUTH_TENANT_ID"],
+                    json!(tenant_id),
+                );
+                public(
+                    "mail.client_id",
+                    &["SMTP_OAUTH_CLIENT_ID"],
+                    json!(client_id),
+                );
+            }
+            _ => {}
+        }
+    }
+    public(
+        "retention.version_days",
+        &["VERSION_RETENTION_DAYS"],
+        json!(config.version_retention.as_secs() / 86_400),
+    );
+    public(
+        "retention.trash_days",
+        &["TRASH_RETENTION_DAYS"],
+        json!(config.trash_retention.as_secs() / 86_400),
+    );
+    public(
+        "retention.audit_days",
+        &["AUDIT_RETENTION_DAYS"],
+        json!(config.audit_retention_days),
+    );
+    public(
+        "retention.quarantine_days",
+        &["QUARANTINE_DAYS"],
+        json!(config.quarantine_retention.as_secs() / 86_400),
+    );
+    drop(public);
+    let secret_envs: [(&str, &[&str]); 5] = [
+        ("mail.password", &["SMTP_PASSWORD_FILE"]),
+        (
+            "mail.client_secret",
+            &["SMTP_OAUTH_CLIENT_SECRET_FILE", "GRAPH_CLIENT_SECRET_FILE"],
+        ),
+        (
+            "mail.certificate",
+            &["SMTP_OAUTH_CERT_FILE", "GRAPH_CERT_FILE"],
+        ),
+        (
+            "mail.private_key",
+            &["SMTP_OAUTH_KEY_FILE", "GRAPH_KEY_FILE"],
+        ),
+        ("mail.service_account", &["SMTP_OAUTH_SERVICE_ACCOUNT_FILE"]),
+    ];
+    for (key, envs) in secret_envs {
+        if envs.iter().any(|name| env_set(name)) {
+            locked.insert(key.to_owned());
+        }
+    }
+    (values, locked)
 }
 
 /// Resolves on Ctrl-C and, on unix, SIGTERM. If a handler cannot be

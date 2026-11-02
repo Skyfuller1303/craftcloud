@@ -815,3 +815,134 @@
 	Failed deletions	Failed deletions
 	Last verification	Last verification
 	Last error code	Last error code
+	Setup wizard	Setup wizard
+	Setup is incomplete	Setup is incomplete
+	Continue setup	Continue setup
+	Finish the remaining instance setup steps.	Finish the remaining instance setup steps.
+	Loading setup progress…	Loading setup progress…
+	Continue the first-run setup. Progress is saved for every instance operator.	Continue the first-run setup. Progress is saved for every instance operator.
+	Setup progress	Setup progress
+	{done} of {total} steps resolved	{done} of {total} steps resolved
+	Setup steps	Setup steps
+	Operator account	Operator account
+	System check	System check
+	Organization basics	Organization basics
+	First workspace and project	First workspace and project
+	Optional services	Optional services
+	Summary	Summary
+	Pending	Pending
+	Complete	Complete
+	Skipped	Skipped
+	Skip step	Skip step
+	Mark complete	Mark complete
+	Checking system requirements…	Checking system requirements…
+	Public URL	Public URL
+	HTTPS connection	HTTPS connection
+	PostgreSQL version	PostgreSQL version
+	Free storage space	Free storage space
+	FigCraft service	FigCraft service
+	Database clock	Database clock
+	Scheduled maintenance	Scheduled maintenance
+	Unknown status	Unknown status
+	Warning	Warning
+	Error	Error
+	Installation guide section: {section}	Installation guide section: {section}
+	Host, software and network	Host, software and network
+	Public URL and server configuration	Public URL and server configuration
+	HTTPS proxy	HTTPS proxy
+	Database selection	Database selection
+	First-run setup	First-run setup
+	The configured public URL matches this browser address.	The configured public URL matches this browser address.
+	The configured public URL does not match this browser address.	The configured public URL does not match this browser address.
+	Set the public URL in the server configuration file.	Set the public URL in the server configuration file.
+	The connection uses HTTPS.	The connection uses HTTPS.
+	The server could not verify that the connection uses HTTPS.	The server could not verify that the connection uses HTTPS.
+	The connection does not use HTTPS.	The connection does not use HTTPS.
+	The PostgreSQL version is supported.	The PostgreSQL version is supported.
+	The PostgreSQL version is not supported.	The PostgreSQL version is not supported.
+	The PostgreSQL version could not be checked.	The PostgreSQL version could not be checked.
+	The storage directory has sufficient free space.	The storage directory has sufficient free space.
+	The storage directory has little free space.	The storage directory has little free space.
+	Free storage space could not be checked.	Free storage space could not be checked.
+	FigCraft is not configured.	FigCraft is not configured.
+	The server and database clocks are synchronized.	The server and database clocks are synchronized.
+	The server and database clocks differ.	The server and database clocks differ.
+	Scheduled maintenance is enabled.	Scheduled maintenance is enabled.
+	Scheduled maintenance is disabled.	Scheduled maintenance is disabled.
+	Archive storage is not configured.	Archive storage is not configured.
+	No explanation is available for this check.	No explanation is available for this check.
+	Setup is complete. Review any skipped steps below.	Setup is complete. Review any skipped steps below.
+	Setup is not complete yet. Return to pending steps to continue.	Setup is not complete yet. Return to pending steps to continue.
+	The first operator account and organization were created during the one-time setup.	The first operator account and organization were created during the one-time setup.
+	Protect the instance operator account with an authenticator app and recovery codes.	Protect the instance operator account with an authenticator app and recovery codes.
+	Configure e-mail delivery or choose to share invitation links by hand.	Configure e-mail delivery or choose to share invitation links by hand.
+	Set organization seats, storage quota, app access, and instance retention periods.	Set organization seats, storage quota, app access, and instance retention periods.
+	Invite people to the organization. If e-mail is not configured, copy and share invitation links.	Invite people to the organization. If e-mail is not configured, copy and share invitation links.
+	Company sign-in and archive storage are optional. Archive configuration stays in the server configuration file.	Company sign-in and archive storage are optional. Archive configuration stays in the server configuration file.
+	Open single sign-on settings	Open single sign-on settings
+	This step is complete.	This step is complete.
+	Continue setup using the available CraftCloud controls.	Continue setup using the available CraftCloud controls.
+	Workspace created.	Workspace created.
+	Project created.	Project created.
+	Select the first organization to create a workspace.	Select the first organization to create a workspace.
+	Create first workspace	Create first workspace
+	Workspace address name	Workspace address name
+	Create first project	Create first project
+	Select a workspace	Select a workspace
+	Organization capacity and app access	Organization capacity and app access
+	Storage quota in bytes	Storage quota in bytes
+	App access mode	App access mode
+	All apps	All apps
+	Assigned apps only	Assigned apps only
+	Save organization settings	Save organization settings
+	Loading instance settings…	Loading instance settings…
+	Sign in again to change this sensitive setting, then retry.	Sign in again to change this sensitive setting, then retry.
+	Sign in again with your two-factor authentication, then retry.	Sign in again with your two-factor authentication, then retry.
+	Choose no e-mail delivery to share invitation links by hand, or configure a mail transport.	Choose no e-mail delivery to share invitation links by hand, or configure a mail transport.
+	Mail transport	Mail transport
+	SMTP host	SMTP host
+	SMTP port	SMTP port
+	SMTP encryption	SMTP encryption
+	SMTP username	SMTP username
+	From address	From address
+	Microsoft tenant ID	Microsoft tenant ID
+	OAuth client ID	OAuth client ID
+	Graph sender	Graph sender
+	Save sent messages to Sent Items	Save sent messages to Sent Items
+	SMTP password	SMTP password
+	OAuth client secret	OAuth client secret
+	OAuth certificate	OAuth certificate
+	OAuth private key	OAuth private key
+	Google service account	Google service account
+	Set by the configuration file.	Set by the configuration file.
+	Secret configured; last set {date}.	Secret configured; last set {date}.
+	No secret configured.	No secret configured.
+	Secret will be removed	Secret will be removed
+	Remove saved secret	Remove saved secret
+	Send test e-mail	Send test e-mail
+	Test e-mail queued for delivery.	Test e-mail queued for delivery.
+	These values control instance maintenance and retention.	These values control instance maintenance and retention.
+	Save settings	Save settings
+	Settings saved.	Settings saved.
+	Enter a valid non-negative whole number. Seats must be greater than zero.	Enter a valid non-negative whole number. Seats must be greater than zero.
+	Finish	Finish
+	Save settings before sending a test e-mail.	Save settings before sending a test e-mail.
+	Loading archive status…	Loading archive status…
+	Archive storage status	Archive storage status
+	Archive storage settings remain in the server configuration file.	Archive storage settings remain in the server configuration file.
+	Enter a whole number from {min} to {max}.	Enter a whole number from {min} to {max}.
+	Secret is set by the configuration file.	Secret is set by the configuration file.
+	Two-factor settings	Two-factor settings
+	The request origin could not be verified against the configured public URL.	The request origin could not be verified against the configured public URL.
+	FigCraft is configured, but its availability has not been verified.	FigCraft is configured, but its availability has not been verified.
+	Archive storage is configured, but its availability has not been verified. This status is shown for reference only.	Archive storage is configured, but its availability has not been verified. This status is shown for reference only.
+	Organization settings could not be loaded.	Organization settings could not be loaded.
+	Loading organization settings…	Loading organization settings…
+	The FigCraft WebSocket service is reachable.	The FigCraft WebSocket service is reachable.
+	The FigCraft WebSocket service could not be reached.	The FigCraft WebSocket service could not be reached.
+	The FigCraft WebSocket service rejected the handshake.	The FigCraft WebSocket service rejected the handshake.
+	The FigCraft WebSocket handshake could not be completed.	The FigCraft WebSocket handshake could not be completed.
+	Version retention (days)	Version retention (days)
+	Trash retention (days)	Trash retention (days)
+	Audit retention (days)	Audit retention (days)
+	Quarantine retention (days)	Quarantine retention (days)

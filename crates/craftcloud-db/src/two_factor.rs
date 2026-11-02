@@ -110,7 +110,7 @@ pub async fn complete_browser_login_with_email(
         return Ok(LoginOutcome::Rejected);
     }
     let id = Uuid::new_v4();
-    let inserted = sqlx::query("INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at) VALUES($1,$2,$3,$4,$4,$5)")
+    let inserted = sqlx::query("INSERT INTO sessions(id,user_id,token_hash,created_at,last_seen_at,absolute_expires_at,mfa_verified_at) VALUES($1,$2,$3,$4,$4,$5,$4)")
         .bind(id).bind(user_id).bind(new.token_hash.as_slice()).bind(new.now).bind(new.absolute_expires_at).execute(&mut *tx).await?.rows_affected() == 1;
     if !inserted {
         return Ok(LoginOutcome::Rejected);
