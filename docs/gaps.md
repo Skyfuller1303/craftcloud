@@ -4,6 +4,8 @@
 
 Die Aktivierung des externen Archivs bleibt gesperrt. Ein Folgeauftrag bearbeitet fortsetzbare Integritätsprüfungen, Audit und Absturzsicherheit; die erforderlichen Live-Provider- und Ende-zu-Ende-Nachweise stehen noch aus. Der konkrete Stand und etwaige weitere Abweichungen stehen im Folgebericht zu AC-12 und in [ADR-0028](09-decisions/adr-0028-storage-tiers.md).
 
+Vor der Freischaltung (Folgeauftrag AC-12c) müssen außerdem die Funde des Reviews vom 2. November 2026 behoben sein: Schlüsselrotation des Serverschlüssels macht archivierte Versionen bisher unlesbar (keine Schlüssel-ID, kein Rückfall auf `CRAFTCLOUD_SECRET_KEY_OLD_FILE`); Schlüssel- und Konfigurationsfehler markieren Blobs bisher dauerhaft als beschädigt; das Staging-Verzeichnis liegt außerhalb des Store-Volumes und scheitert am schreibgeschützten Container-Dateisystem; die Startprüfung ohne Archiv berücksichtigt keine zurückgeholten Blobs mit Archivobjekt; Datenschlüssel und Nonces sollen aus `getrandom` statt aus UUIDs stammen.
+
 ## AC-09b: Graph und SMTP mit OAuth
 
 Graph und XOAUTH2 für Microsoft sowie Google ergänzen die bestehende Mailwarteschlange ohne Migration. Die Operatoransicht erhält Transport, Absender, Zertifikatsablauf und kontrollierten Fehlercode. Produktions-Tenantberechtigungen und die tatsächliche Postfachzustellung bleiben Betreiberprüfungen; insbesondere darf kein globaler Entra-Grant die Exchange-Postfachbeschränkung umgehen. Nationale Clouds, interaktive delegierte Anmeldung und Gmail-API bleiben außerhalb des Umfangs. Prüfstatus und dokumentierte Abweichungen stehen im AC-09b-Bericht.

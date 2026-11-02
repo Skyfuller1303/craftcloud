@@ -2551,13 +2551,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(pin_count, 0);
-        let digest: String =
-            sqlx::query_scalar("SELECT manifest_sha256 FROM archive_backups WHERE backup_id=$1")
+        // A backup without archive references registers no pin row at all.
+        let backups: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM archive_backups WHERE backup_id=$1")
                 .bind(report.backup_id)
                 .fetch_one(&w.env.pool)
                 .await
                 .unwrap();
-        assert_eq!(digest, report.manifest_sha256);
+        assert_eq!(backups, 0);
     }
 
     #[tokio::test]

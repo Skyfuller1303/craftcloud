@@ -280,7 +280,6 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 digest: digest.clone(),
             })
         }
-        [one] => Err(format!("unknown argument {one:?}")),
         [one] => Err(format!(
             "unknown argument {one:?}; roles: {}",
             roles::ROLE_LIST
@@ -1590,6 +1589,14 @@ async fn archive_runtime(config: &Config) -> Result<Option<ArchiveRuntime>, Fail
 
     if config.archive.is_none() && test_archive_root.is_none() {
         return Ok(None);
+    }
+    // Same fail-closed rule as `run`: until the archive is released, no command
+    // may connect to a provider or create archive staging data.
+    #[cfg(not(feature = "fault-injection"))]
+    if config.archive.is_some() {
+        return Err(Failure::config(
+            "CRAFTCLOUD_ARCHIVE_STORE is not available in this build",
+        ));
     }
     let mut server_key = load_two_factor_key(config.secret_key_file.as_ref()).ok_or_else(|| {
         Failure::config(

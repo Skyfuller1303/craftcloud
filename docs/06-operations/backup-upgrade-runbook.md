@@ -206,3 +206,10 @@ Gemessener Umfang: **kleine Datenmenge (unter 30 MiB), lokale Platte, ein Entwic
 - Keine Verschlüsselung, Signatur, Kompression oder Aufbewahrung durch das Werkzeug; keine inkrementellen oder differenziellen Backups; kein Point-in-Time-Recovery über WAL.
 - Das Backup ist vollständig, nicht dateiweise: Es gibt keinen Restore einzelner Organisationen oder Dateien.
 - Der Backup-Prozess nutzt die Datenbankverbindung des Servers (Runtime-Rolle, Leserechte auf alle Tabellen); wer den Befehl ausführen kann, kann alle Daten lesen: Zugriff auf den Host, den Docker-Socket und die Secrets ist die Autorität.
+
+## Hinweise zu Migration 22 (AC-12)
+
+- Migration 22 schreibt jede Zeile der Tabelle `blobs` neu und prüft neue Fremdschlüssel und CHECK-Bedingungen unter exklusiver Sperre. Die Dauer wächst mit der Zahl der Blobs; `migrate` deshalb im Wartungsfenster bei gestopptem Server ausführen.
+- Schlägt beim Wiederherstellen der abschließende Datenbank-Commit fehl, bleiben Marker und kopierte Blobs im Store erhalten, weil der Ausgang des Commits nicht sicher bekannt ist. Vor einem neuen Versuch prüfen, ob die Datenbank die Wiederherstellung enthält; wenn nicht, das Store-Verzeichnis leeren und erneut wiederherstellen.
+- Downloads mit `Range`-Anfrage markieren eine lokal verkürzte Datei jetzt ebenfalls als beschädigt, wie bisher schon vollständige Downloads.
+

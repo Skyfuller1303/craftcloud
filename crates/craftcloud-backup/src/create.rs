@@ -484,7 +484,12 @@ async fn locked(context: LockedCreate<'_, '_, '_>) -> Result<CreateReport, Backu
 
     // Pins become durable before the manifest is published. A crash here can
     // leak retention, but cannot leave a completed backup without its archive keys.
-    let pinned_refs = register_archive_pins(pool, out, backup_id, &snapshot.index).await?;
+    // A backup without archive references needs no pins and leaves no rows behind.
+    let pinned_refs = if references > 0 {
+        register_archive_pins(pool, out, backup_id, &snapshot.index).await?
+    } else {
+        0
+    };
 
     let rows = snapshot.tables.iter().map(|t| t.rows).sum();
     let manifest = Manifest {
@@ -522,7 +527,8 @@ async fn locked(context: LockedCreate<'_, '_, '_>) -> Result<CreateReport, Backu
     )
     .await?;
     sync_dir(out).await;
-    if !db::archive_backup_complete(pool, backup_id, &digest, pinned_refs).await? {
+    if references > 0 && !db::archive_backup_complete(pool, backup_id, &digest, pinned_refs).await?
+    {
         return Err(BackupError::new(
             ErrorKind::Integrity,
             "the archive backup pins do not match the manifest",
