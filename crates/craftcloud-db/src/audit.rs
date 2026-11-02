@@ -83,12 +83,16 @@ impl AuditResult {
 
 /// A value allowed in an event's `details`: identifiers, fixed codes,
 /// counters and flags only. There is deliberately no free-text variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Detail {
     /// An identifier.
     Id(Uuid),
     /// A code chosen by the program (a role, a state), never user input.
     Code(&'static str),
+    /// Canonical hostname or IP address, without credentials, port or path.
+    EndpointHost(String),
+    /// SHA-256 fingerprint used to compare redacted configuration snapshots.
+    Fingerprint([u8; 32]),
     /// A counter or size.
     Count(i64),
     /// A flag.
@@ -228,6 +232,22 @@ impl<'a> NewEvent<'a> {
             let value = match value {
                 Detail::Id(id) => Value::String(id.to_string()),
                 Detail::Code(code) => Value::String((*code).to_owned()),
+                Detail::EndpointHost(host) if valid_endpoint_host(host) => {
+                    Value::String(host.clone())
+                }
+                Detail::EndpointHost(_) => {
+                    return Err(DbError::CheckViolation {
+                        constraint: Some("audit_events_endpoint_host".to_owned()),
+                    });
+                }
+                Detail::Fingerprint(digest) => {
+                    use std::fmt::Write as _;
+                    let mut text = String::with_capacity(64);
+                    for byte in digest {
+                        let _ = write!(text, "{byte:02x}");
+                    }
+                    Value::String(text)
+                }
                 Detail::Count(n) => Value::Number(Number::from(*n)),
                 Detail::Flag(flag) => Value::Bool(*flag),
                 Detail::DeviceRef(digest) => {
@@ -244,6 +264,34 @@ impl<'a> NewEvent<'a> {
         }
         Ok(Value::Object(map).to_string())
     }
+}
+
+fn valid_endpoint_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() || host.chars().any(char::is_control)
+    {
+        return false;
+    }
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return address.to_string() == host;
+    }
+    if host != host.to_ascii_lowercase() {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 const INSERT_COLUMNS: &str = "id, org_id, actor_id, action, target_type, target_id, workspace_id, \
@@ -634,4 +682,38 @@ pub async fn latest_success_at(
     .bind(action)
     .fetch_one(pool)
     .await?)
+}
+
+#[cfg(test)]
+mod endpoint_host_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_host_accepts_canonical_hosts_and_rejects_url_components() {
+        for host in ["archive.example.test", "127.0.0.1", "2001:db8::1"] {
+            assert!(valid_endpoint_host(host), "{host}");
+        }
+        for host in [
+            "user@archive.example.test",
+            "archive.example.test:443",
+            "archive.example.test/path",
+            "archive.example.test\r\nsecret",
+            &"a".repeat(254),
+        ] {
+            assert!(!valid_endpoint_host(host), "{host:?}");
+        }
+        let event = NewEvent::new("archive.configuration.enabled").detail(
+            "endpoint_host",
+            Detail::EndpointHost("archive.example.test".into()),
+        );
+        assert_eq!(
+            event.details_json().unwrap(),
+            r#"{"endpoint_host":"archive.example.test"}"#
+        );
+        let invalid = NewEvent::new("archive.configuration.enabled").detail(
+            "endpoint_host",
+            Detail::EndpointHost("user@host.test".into()),
+        );
+        assert!(invalid.details_json().is_err());
+    }
 }

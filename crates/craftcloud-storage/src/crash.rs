@@ -28,12 +28,36 @@ pub const CRASH_ENV: &str = "CC_FAULT_ABORT_AT";
 ///   the response was not sent yet.
 /// - `gc-after-claim`: a garbage-collection claim (`deleting`) is committed,
 ///   the object is not deleted yet.
+/// - `archive-after-intent`: the archive worker persisted its immutable key and
+///   envelope, then entered archive transport.
+/// - `archive-upload-started`, `archive-upload-mid-stream`,
+///   `archive-upload-published`, `archive-upload-verified`: transport stages.
+/// - `archive-db-committed`: verified archive reference committed, local copy
+///   remains.
+/// - `archive-local-deleted`: local bytes removed, pending-delete state remains.
+/// - `archive-recall-claimed`, `archive-recall-download-started`,
+///   `archive-recall-download-complete`, `archive-recall-local-written`,
+///   `archive-recall-verified`, `archive-recall-committed`: operator recall
+///   stages. Recall never deletes the archive object.
 #[cfg(feature = "fault-injection")]
-pub const CRASH_POINTS: [&str; 4] = [
+pub const CRASH_POINTS: [&str; 17] = [
     "upload-mid-stream",
     "upload-before-record",
     "version-after-commit",
     "gc-after-claim",
+    "archive-after-intent",
+    "archive-upload-started",
+    "archive-upload-mid-stream",
+    "archive-upload-published",
+    "archive-upload-verified",
+    "archive-db-committed",
+    "archive-local-deleted",
+    "archive-recall-claimed",
+    "archive-recall-download-started",
+    "archive-recall-download-complete",
+    "archive-recall-local-written",
+    "archive-recall-verified",
+    "archive-recall-committed",
 ];
 
 #[cfg(feature = "fault-injection")]

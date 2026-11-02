@@ -180,6 +180,9 @@ pub async fn upload_intent_verified<S: ObjectStore>(
     size: u64,
     expected_sha256: &[u8; 32],
 ) -> Result<VerifiedArchive, ArchiveTransportError> {
+    // In the worker path this is reached only after the immutable destination
+    // key and wrapped key have committed to the database.
+    craftcloud_storage::crash_point("archive-after-intent", 0);
     match archive.head(archive_key).await {
         Ok(_) => {
             verify_archive(
@@ -250,6 +253,7 @@ pub async fn upload_intent_verified<S: ObjectStore>(
         }
         Err(error) => return Err(error.into()),
     };
+    craftcloud_storage::crash_point("archive-upload-started", 0);
     if !matches!(temp.object_key(), Ok(ref key) if key == archive_key) {
         archive.abort(temp).await;
         return Err(ArchiveTransportError::Integrity);
@@ -274,6 +278,7 @@ pub async fn upload_intent_verified<S: ObjectStore>(
             let encrypted = data_key.encrypt_block(envelope, index, &bytes)?;
             cipher_hash.update(&encrypted);
             temp.write(&encrypted).await?;
+            craftcloud_storage::crash_point("archive-upload-mid-stream", temp.bytes_written());
             Ok::<(), ArchiveTransportError>(())
         }
         .await;
@@ -295,7 +300,9 @@ pub async fn upload_intent_verified<S: ObjectStore>(
     }
     let cipher_sha = cipher_hash.finalize().into();
     match archive.finalize(temp, cipher_len, &cipher_sha).await {
-        Ok(published) if published == *archive_key => {}
+        Ok(published) if published == *archive_key => {
+            craftcloud_storage::crash_point("archive-upload-published", cipher_len);
+        }
         Ok(_) => return Err(ArchiveTransportError::Integrity),
         Err(publish_error) => {
             match verify_archive(
@@ -328,6 +335,7 @@ pub async fn upload_intent_verified<S: ObjectStore>(
         expected_sha256,
     )
     .await?;
+    craftcloud_storage::crash_point("archive-upload-verified", cipher_len);
     Ok(VerifiedArchive {
         object_key: archive_key.clone(),
         envelope: envelope.clone(),

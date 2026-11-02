@@ -27,6 +27,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant, SystemTime};
 
+    use base64::Engine;
+    use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore, ReadSource, WrappedDataKey};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use sqlx::postgres::PgConnectOptions;
@@ -40,6 +42,23 @@ mod tests {
     const IO_TIMEOUT: Duration = Duration::from_secs(60);
     /// Crash points compare against bytes flushed to the `.part` file.
     const MID_STREAM_BYTES: u64 = 256 * 1024;
+
+    fn write_archive_test_key(path: &Path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).unwrap();
+        file.write_all(
+            base64::engine::general_purpose::STANDARD
+                .encode([0x42; 32])
+                .as_bytes(),
+        )
+        .unwrap();
+    }
 
     fn unique() -> String {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -309,6 +328,29 @@ mod tests {
             (status, text)
         }
 
+        fn archive_recall_process(
+            &self,
+            archive_dir: &Path,
+            archive_key_file: &Path,
+            abort_at: Option<&str>,
+        ) -> (ExitStatus, String) {
+            let archive_dir = archive_dir.to_string_lossy().into_owned();
+            let archive_key_file = archive_key_file.to_string_lossy().into_owned();
+            let mut env = vec![
+                ("CC_FAULT_ARCHIVE_LOCAL_DIR", archive_dir.as_str()),
+                ("CRAFTCLOUD_SECRET_KEY_FILE", archive_key_file.as_str()),
+            ];
+            if let Some(point) = abort_at {
+                env.push(("CC_FAULT_ABORT_AT", point));
+            }
+            let (mut cmd, log) = self.command(&["archive", "recall"], &env);
+            let mut child = cmd.spawn().unwrap();
+            let status = wait_for_exit(&mut child, DEATH_TIMEOUT)
+                .unwrap_or_else(|| panic!("archive recall process timed out"));
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            (status, text)
+        }
+
         /// One maintenance run that must succeed; returns its report.
         fn maintenance(&self) -> String {
             let (status, text) = self.cli(&["admin", "maintenance", "--once"], None);
@@ -440,6 +482,108 @@ mod tests {
         }
         #[cfg(windows)]
         assert_eq!(code.map(|c| c as u32), Some(0xC000_0409), "{status}");
+    }
+
+    fn archive_worker_child(
+        fixture: &Fixture,
+        archive_dir: &Path,
+        archive_key_file: &Path,
+        abort_at: Option<&str>,
+    ) -> std::process::Output {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "tests::archive_worker_crash_child",
+            "--nocapture",
+        ]);
+        command.env("CC_FAULT_ARCHIVE_CHILD", "1");
+        command.env("CC_FAULT_ARCHIVE_DB_FILE", &fixture.secret_path);
+        command.env("CC_FAULT_ARCHIVE_STORAGE_DIR", &fixture.storage);
+        command.env("CC_FAULT_ARCHIVE_LOCAL_DIR", archive_dir);
+        command.env("CC_FAULT_ARCHIVE_KEY_FILE", archive_key_file);
+        if let Some(point) = abort_at {
+            command.env("CC_FAULT_ABORT_AT", point);
+        } else {
+            command.env_remove("CC_FAULT_ABORT_AT");
+        }
+        command.output().unwrap()
+    }
+
+    fn assert_archive_bytes(
+        fixture: &Fixture,
+        version_id: &str,
+        archive_dir: &Path,
+        expected: &[u8],
+    ) {
+        let row: (uuid::Uuid, String, Vec<u8>, i64, Vec<u8>) = fixture
+            .rt
+            .block_on(async {
+                sqlx::query_as(
+                    "SELECT b.id, b.archive_object_key, b.archive_wrapped_key, b.size_bytes, b.sha256 \
+                     FROM blobs b JOIN file_versions v ON v.blob_id=b.id WHERE v.id=$1",
+                )
+                .bind(uuid::Uuid::parse_str(version_id).unwrap())
+                .fetch_one(&fixture.pool)
+                .await
+            })
+            .unwrap();
+        let (blob_id, key_text, wrapped, size, digest) = row;
+        assert_eq!(size, expected.len() as i64);
+        assert_eq!(digest.as_slice(), Sha256::digest(expected).as_slice());
+        let archive = fixture.rt.block_on(LocalStore::open(archive_dir)).unwrap();
+        let key = ObjectKey::parse(&key_text).unwrap();
+        let envelope = WrappedDataKey::from_bytes(&wrapped).unwrap();
+        let crypto = craftcloud_storage::ArchiveCrypto::from_server_key(&[0x42; 32]).unwrap();
+        let mut reader = fixture
+            .rt
+            .block_on(craftcloud_api::archive_transport::open_archive_range(
+                &archive,
+                &crypto,
+                &key,
+                &envelope,
+                blob_id,
+                u64::try_from(size).unwrap(),
+                None,
+            ))
+            .unwrap();
+        let actual = fixture.rt.block_on(async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = reader.next_chunk().await.unwrap() {
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+        });
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_local_version_bytes(fixture: &Fixture, version_id: &str, expected: &[u8]) {
+        let (key_text, digest): (String, Vec<u8>) = fixture
+            .rt
+            .block_on(async {
+                sqlx::query_as(
+                    "SELECT b.object_key, b.sha256 FROM blobs b \
+                     JOIN file_versions v ON v.blob_id=b.id WHERE v.id=$1",
+                )
+                .bind(uuid::Uuid::parse_str(version_id).unwrap())
+                .fetch_one(&fixture.pool)
+                .await
+            })
+            .unwrap();
+        assert_eq!(digest.as_slice(), Sha256::digest(expected).as_slice());
+        let local = fixture
+            .rt
+            .block_on(LocalStore::open(&fixture.storage))
+            .unwrap();
+        let key = ObjectKey::parse(&key_text).unwrap();
+        let mut reader = fixture.rt.block_on(local.open_read(&key, None)).unwrap();
+        let actual = fixture.rt.block_on(async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = reader.next_chunk().await.unwrap() {
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+        });
+        assert_eq!(actual, expected);
     }
 
     // ---- minimal HTTP client -------------------------------------------------------
@@ -765,11 +909,15 @@ mod tests {
         /// Builds the baseline with a normal server; `then` can add more work
         /// before that server is stopped.
         fn new(then: impl FnOnce(&Fixture, &Api, &str)) -> Self {
+            Self::new_with_first_size(1000, then)
+        }
+
+        fn new_with_first_size(first_size: usize, then: impl FnOnce(&Fixture, &Api, &str)) -> Self {
             let fx = Fixture::new();
             let server = fx.serve(None);
             let api = Api::login(server.port);
             let file = make_file(&api, &fx.op_id);
-            let v1_data = pattern(1000, 1);
+            let v1_data = pattern(first_size, 1);
             let v1 = api.publish(&file, &v1_data, ("If-None-Match", "*"));
             let baseline_objects = fx.objects();
             assert_eq!(baseline_objects.len(), 1, "{baseline_objects:?}");
@@ -1151,5 +1299,254 @@ mod tests {
         assert!(fx.temps().is_empty());
         assert_eq!(world.assert_every_version_complete(&api), 1);
         server.kill();
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn archive_transport_process_crashes_resume_without_losing_version_bytes() {
+        for (point, published, state, local_count, delete_pending) in [
+            ("archive-after-intent", false, "archiving", 2, false),
+            ("archive-upload-started", false, "archiving", 2, false),
+            (
+                "archive-upload-mid-stream:65536",
+                false,
+                "archiving",
+                2,
+                false,
+            ),
+            ("archive-upload-published", true, "archiving", 2, false),
+            ("archive-upload-verified", true, "archiving", 2, false),
+            ("archive-db-committed", true, "archived", 2, true),
+            ("archive-local-deleted", true, "archived", 1, true),
+        ] {
+            let world = World::new_with_first_size(256 * 1024 + 7, |fixture, api, file| {
+                let second_data = pattern(1024 * 1024 + 7, 23);
+                let version = tag(&fixture.text(&format!(
+                    "SELECT head_version_id::text FROM files WHERE id='{file}'"
+                )));
+                api.publish(file, &second_data, ("If-Match", version.as_str()));
+            });
+            let fx = &world.fx;
+            let archive_dir = fx.root.join(format!("archive-{}", unique()));
+            std::fs::create_dir_all(&archive_dir).unwrap();
+            let archive_key_file = fx.root.join(format!("archive-key-{}", unique()));
+            write_archive_test_key(&archive_key_file);
+            let old_blob = fx.text(&format!(
+                "SELECT blob_id::text FROM file_versions WHERE id='{}'",
+                world.v1
+            ));
+            let head_version = fx.text(&format!(
+                "SELECT head_version_id::text FROM files WHERE id='{}'",
+                world.file
+            ));
+
+            let child = archive_worker_child(fx, &archive_dir, &archive_key_file, Some(point));
+            assert!(
+                !child.status.success(),
+                "crash point {point} was not reached; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr),
+            );
+            assert_aborted(child.status, &String::from_utf8_lossy(&child.stderr));
+            assert_eq!(
+                fx.text(&format!(
+                    "SELECT tier_state FROM blobs WHERE id='{old_blob}'"
+                )),
+                state,
+                "point={point}"
+            );
+            assert_eq!(
+                fx.scalar(&format!(
+                    "SELECT archive_local_delete_pending::int::bigint FROM blobs WHERE id='{old_blob}'"
+                )),
+                if delete_pending { 1 } else { 0 },
+                "wrong delete-pending state at {point}"
+            );
+            assert_eq!(
+                fx.scalar(&format!(
+                    "SELECT (archive_object_key IS NOT NULL)::int::bigint FROM blobs WHERE id='{old_blob}'"
+                )),
+                1,
+                "durable intent missing at {point}"
+            );
+            assert_eq!(
+                files_below(&fx.storage.join("objects")).len(),
+                local_count,
+                "local versions must survive {point}"
+            );
+            assert_local_version_bytes(fx, &head_version, &pattern(1024 * 1024 + 7, 23));
+            assert_eq!(
+                files_below(&archive_dir.join("objects")).len(),
+                if published { 1 } else { 0 },
+                "unexpected published archive object at {point}"
+            );
+
+            // A pre-commit crash needs the stale-claim lease to expire. A
+            // committed archive uses its durable pending-delete queue directly.
+            if state == "archiving" {
+                fx.exec(&format!(
+                    "UPDATE blobs SET archive_claimed_at=now()-interval '16 minutes' WHERE id='{old_blob}'"
+                ));
+            }
+            let resumed = archive_worker_child(fx, &archive_dir, &archive_key_file, None);
+            assert!(
+                resumed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&resumed.stderr)
+            );
+            assert_eq!(
+                fx.text(&format!(
+                    "SELECT tier_state FROM blobs WHERE id='{old_blob}'"
+                )),
+                "archived",
+                "recovery failed after {point}"
+            );
+            assert_eq!(
+                fx.scalar(&format!(
+                    "SELECT archive_local_delete_pending::int::bigint FROM blobs WHERE id='{old_blob}'"
+                )),
+                0,
+                "cleanup state remains pending after {point}"
+            );
+            assert_eq!(
+                files_below(&fx.storage.join("objects")).len(),
+                1,
+                "new head must remain local after {point}"
+            );
+            assert_archive_bytes(fx, &world.v1, &archive_dir, &world.v1_data);
+            assert_local_version_bytes(fx, &head_version, &pattern(1024 * 1024 + 7, 23));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn archive_recall_process_crashes_resume_without_releasing_archive_object() {
+        for point in [
+            "archive-recall-claimed",
+            "archive-recall-download-started",
+            "archive-recall-download-complete",
+            "archive-recall-local-written",
+            "archive-recall-verified",
+            "archive-recall-committed",
+        ] {
+            let world = World::new_with_first_size(256 * 1024 + 7, |fixture, api, file| {
+                let second_data = pattern(1024 * 1024 + 7, 29);
+                let version = tag(&fixture.text(&format!(
+                    "SELECT head_version_id::text FROM files WHERE id='{file}'"
+                )));
+                api.publish(file, &second_data, ("If-Match", version.as_str()));
+            });
+            let fx = &world.fx;
+            let archive_dir = fx.root.join(format!("recall-archive-{}", unique()));
+            std::fs::create_dir_all(&archive_dir).unwrap();
+            let archive_key_file = fx.root.join(format!("recall-key-{}", unique()));
+            write_archive_test_key(&archive_key_file);
+            let archived = archive_worker_child(fx, &archive_dir, &archive_key_file, None);
+            assert!(
+                archived.status.success(),
+                "{}",
+                String::from_utf8_lossy(&archived.stderr)
+            );
+            let old_blob = fx.text(&format!(
+                "SELECT blob_id::text FROM file_versions WHERE id='{}'",
+                world.v1
+            ));
+            let head_version = fx.text(&format!(
+                "SELECT head_version_id::text FROM files WHERE id='{}'",
+                world.file
+            ));
+            assert_eq!(
+                fx.text(&format!(
+                    "SELECT tier_state FROM blobs WHERE id='{old_blob}'"
+                )),
+                "archived"
+            );
+            assert_eq!(files_below(&archive_dir.join("objects")).len(), 1);
+            assert!(!files_below(&fx.storage.join("objects")).is_empty());
+
+            let (status, log) =
+                fx.archive_recall_process(&archive_dir, &archive_key_file, Some(point));
+            assert_aborted(status, &log);
+            let state = fx.text(&format!(
+                "SELECT tier_state FROM blobs WHERE id='{old_blob}'"
+            ));
+            assert_eq!(
+                state,
+                if point == "archive-recall-committed" {
+                    "local"
+                } else {
+                    "recalling"
+                },
+                "{point}"
+            );
+            if state == "recalling" {
+                fx.exec(&format!(
+                    "UPDATE blobs SET archive_claimed_at=now()-interval '16 minutes' WHERE id='{old_blob}'"
+                ));
+            }
+
+            let (status, log) = fx.archive_recall_process(&archive_dir, &archive_key_file, None);
+            assert!(status.success(), "{log}");
+            assert_eq!(
+                fx.text(&format!(
+                    "SELECT tier_state FROM blobs WHERE id='{old_blob}'"
+                )),
+                "local",
+                "recovery failed after {point}"
+            );
+            assert_local_version_bytes(fx, &world.v1, &world.v1_data);
+            assert_local_version_bytes(fx, &head_version, &pattern(1024 * 1024 + 7, 29));
+            assert_eq!(
+                files_below(&archive_dir.join("objects")).len(),
+                1,
+                "operator recall must retain archive object after {point}"
+            );
+        }
+    }
+
+    /// Child test process: one real worker run, armed to abort at a named
+    /// archive transport boundary. No database setup occurs in the child.
+    #[test]
+    fn archive_worker_crash_child() {
+        if std::env::var_os("CC_FAULT_ARCHIVE_CHILD").is_none() {
+            return;
+        }
+        craftcloud_storage::arm_crash_point_from_env().unwrap();
+        let database_file = std::env::var("CC_FAULT_ARCHIVE_DB_FILE").unwrap();
+        let local_dir = std::env::var("CC_FAULT_ARCHIVE_STORAGE_DIR").unwrap();
+        let archive_dir = std::env::var("CC_FAULT_ARCHIVE_LOCAL_DIR").unwrap();
+        let archive_key_file = std::env::var("CC_FAULT_ARCHIVE_KEY_FILE").unwrap();
+        let database_url = std::fs::read_to_string(database_file).unwrap();
+        let key_text = std::fs::read_to_string(archive_key_file).unwrap();
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(key_text.trim())
+            .unwrap();
+        let key: [u8; 32] = key.try_into().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = craftcloud_db::connect(database_url.trim(), 5, Duration::from_secs(20))
+                .await
+                .unwrap();
+            let local = LocalStore::open(std::path::Path::new(&local_dir))
+                .await
+                .unwrap();
+            let archive = LocalStore::open(std::path::Path::new(&archive_dir))
+                .await
+                .unwrap();
+            let crypto = craftcloud_storage::ArchiveCrypto::from_server_key(&key).unwrap();
+            craftcloud_api::archive_worker::archive_batch(
+                &pool,
+                &local,
+                &archive,
+                &crypto,
+                time::OffsetDateTime::now_utc(),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        });
     }
 }

@@ -57,6 +57,8 @@ const DEVICE_ABSOLUTE_DAYS_RANGE: (u64, u64) = (1, 365);
 const DEFAULT_VERIFY_BYTES_PER_RUN: u64 = 1024 * 1024 * 1024;
 const VERIFY_BYTES_PER_RUN_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 const DEFAULT_ARCHIVE_AFTER: Duration = Duration::from_secs(24 * 3600);
+const DEFAULT_ARCHIVE_VERIFY_BYTES_PER_RUN: u64 = 4 * 1024 * 1024;
+const DEFAULT_ARCHIVE_VERIFY_SECONDS_PER_RUN: u64 = 5;
 const DEFAULT_ARCHIVE_SFTP_PORT: u64 = 23;
 const ARCHIVE_SFTP_PORT_RANGE: (u64, u64) = (1, u16::MAX as u64);
 
@@ -134,6 +136,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "ARCHIVE_STORE",
     "ARCHIVE_AFTER",
     "ARCHIVE_MAX_MBPS",
+    "ARCHIVE_VERIFY_BYTES_PER_RUN",
+    "ARCHIVE_VERIFY_SECONDS_PER_RUN",
     "ARCHIVE_S3_ENDPOINT",
     "ARCHIVE_S3_REGION",
     "ARCHIVE_S3_BUCKET",
@@ -168,6 +172,37 @@ pub enum ArchiveSettings {
         private_key_file: PathBuf,
         known_hosts_file: PathBuf,
     },
+}
+
+impl ArchiveSettings {
+    /// Returns only the provider code and canonical endpoint host for audit
+    /// records. Credentials, ports, paths, buckets and prefixes are omitted.
+    pub fn audit_endpoint(&self) -> (&'static str, String) {
+        match self {
+            Self::S3 { endpoint, .. } => {
+                let host = Url::parse(endpoint)
+                    .ok()
+                    .and_then(|url| {
+                        url.host().map(|host| match host {
+                            Host::Domain(domain) => {
+                                domain.trim_end_matches('.').to_ascii_lowercase()
+                            }
+                            Host::Ipv4(address) => address.to_string(),
+                            Host::Ipv6(address) => address.to_string(),
+                        })
+                    })
+                    .unwrap_or_default();
+                ("s3", host)
+            }
+            Self::Sftp { host, .. } => {
+                let canonical = host.parse::<IpAddr>().map_or_else(
+                    |_| host.trim_end_matches('.').to_ascii_lowercase(),
+                    |ip| ip.to_string(),
+                );
+                ("sftp", canonical)
+            }
+        }
+    }
 }
 
 /// Mail delivery settings. Secrets are read only by server startup.
@@ -370,6 +405,10 @@ pub struct Config {
     pub archive_after: Duration,
     /// Optional archive transfer bandwidth limit in megabits per second.
     pub archive_max_mbps: Option<u64>,
+    /// Maximum plaintext bytes authenticated during one archive verification.
+    pub archive_verify_bytes_per_run: u64,
+    /// Maximum time spent authenticating archive blocks during one run.
+    pub archive_verify_time_per_run: Duration,
 }
 
 impl Config {
@@ -534,6 +573,20 @@ impl Config {
         let archive_max_mbps = field(&mut errors, env, "ARCHIVE_MAX_MBPS", |key, raw| {
             parse_ranged(key, raw, (1, 100_000))
         });
+        let archive_verify_bytes_per_run = field(
+            &mut errors,
+            env,
+            "ARCHIVE_VERIFY_BYTES_PER_RUN",
+            |key, raw| parse_ranged(key, raw, (64 * 1024, 1024 * 1024 * 1024)),
+        )
+        .unwrap_or(DEFAULT_ARCHIVE_VERIFY_BYTES_PER_RUN);
+        let archive_verify_seconds_per_run = field(
+            &mut errors,
+            env,
+            "ARCHIVE_VERIFY_SECONDS_PER_RUN",
+            |key, raw| parse_ranged(key, raw, (1, 30)),
+        )
+        .unwrap_or(DEFAULT_ARCHIVE_VERIFY_SECONDS_PER_RUN);
         let mail = parse_mail(env, &mut errors);
         if mail.is_some() {
             for (key, present) in [
@@ -821,6 +874,8 @@ impl Config {
                 archive,
                 archive_after,
                 archive_max_mbps,
+                archive_verify_bytes_per_run,
+                archive_verify_time_per_run: Duration::from_secs(archive_verify_seconds_per_run),
             })
         } else {
             Err(errors)
@@ -1812,6 +1867,33 @@ mod tests {
         assert!(config.archive.is_none());
         assert_eq!(config.archive_after, Duration::from_secs(24 * 3600));
         assert_eq!(config.archive_max_mbps, None);
+        assert_eq!(config.archive_verify_bytes_per_run, 4 * 1024 * 1024);
+        assert_eq!(config.archive_verify_time_per_run, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn archive_verify_budget_is_bounded_and_configurable() {
+        let config = Config::from_env_map(&env(&[
+            ("CRAFTCLOUD_ARCHIVE_VERIFY_BYTES_PER_RUN", "65536"),
+            ("CRAFTCLOUD_ARCHIVE_VERIFY_SECONDS_PER_RUN", "12"),
+        ]))
+        .unwrap();
+        assert_eq!(config.archive_verify_bytes_per_run, 65_536);
+        assert_eq!(config.archive_verify_time_per_run, Duration::from_secs(12));
+        assert!(
+            keys(&errors_of(&[(
+                "CRAFTCLOUD_ARCHIVE_VERIFY_BYTES_PER_RUN",
+                "65535"
+            )]))
+            .contains(&"CRAFTCLOUD_ARCHIVE_VERIFY_BYTES_PER_RUN")
+        );
+        assert!(
+            keys(&errors_of(&[(
+                "CRAFTCLOUD_ARCHIVE_VERIFY_SECONDS_PER_RUN",
+                "31"
+            )]))
+            .contains(&"CRAFTCLOUD_ARCHIVE_VERIFY_SECONDS_PER_RUN")
+        );
     }
 
     #[test]
@@ -1852,6 +1934,18 @@ mod tests {
         ]))
         .unwrap();
         assert!(matches!(valid.archive, Some(ArchiveSettings::S3 { .. })));
+        assert_eq!(
+            valid.archive.as_ref().unwrap().audit_endpoint(),
+            ("s3", "objects.example.org".to_owned())
+        );
+        let mut dns_root = valid.archive.clone().unwrap();
+        if let ArchiveSettings::S3 { endpoint, .. } = &mut dns_root {
+            *endpoint = "https://objects.example.org./".to_owned();
+        }
+        assert_eq!(
+            dns_root.audit_endpoint(),
+            ("s3", "objects.example.org".to_owned())
+        );
         assert_eq!(valid.archive_after, Duration::ZERO);
         assert_eq!(valid.archive_max_mbps, None);
 
@@ -1914,6 +2008,10 @@ mod tests {
             ("CRAFTCLOUD_SECRET_KEY_FILE", absolute),
         ]))
         .unwrap();
+        assert_eq!(
+            config.archive.as_ref().unwrap().audit_endpoint(),
+            ("sftp", "storage.example.org".to_owned())
+        );
         assert!(matches!(
             config.archive,
             Some(ArchiveSettings::Sftp { port: 23, .. })

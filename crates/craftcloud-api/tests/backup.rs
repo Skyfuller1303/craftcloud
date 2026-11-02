@@ -57,13 +57,16 @@ mod tests {
             .lines()
             .map(|line| {
                 let fields: Vec<_> = line.split('\t').collect();
-                let split = fields.len().checked_sub(20).unwrap();
+                // Keep quota_group_id, then remove all 24 AC-12 columns added
+                // by migration 0022, including the durable verification fields.
+                let split = fields.len().checked_sub(25).unwrap();
                 assert_eq!(fields[split], fields[0]);
                 assert_eq!(
                     &fields[split + 1..],
                     &[
                         "local", r"\N", r"\N", r"\N", r"\N", r"\N", r"\N", r"\N", "0", r"\N",
-                        r"\N", "0", r"\N", "f", r"\N", r"\N", "0", r"\N", "f"
+                        r"\N", "0", r"\N", r"\N", r"\N", "0", r"\N", "0", "f", r"\N", r"\N", "0",
+                        r"\N", "f"
                     ]
                 );
                 format!("{}\n", fields[..split].join("\t"))

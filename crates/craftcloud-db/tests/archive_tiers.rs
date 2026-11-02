@@ -187,6 +187,25 @@ async fn seed_file(pool: &PgPool, now: OffsetDateTime) -> (Uuid, Uuid, Uuid) {
     (org_id, file_id, blob_id)
 }
 
+async fn claim_and_save_no_progress(
+    pool: &PgPool,
+    expected: Uuid,
+    now: OffsetDateTime,
+    offset: i64,
+) {
+    let candidate =
+        maintenance::archive_verify_claim(pool, now, now - time::Duration::minutes(15), now)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(candidate.id, expected);
+    assert!(
+        maintenance::archive_verify_progress(pool, &candidate, offset, false, now)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL: cargo xtask db-test"]
 async fn archive_claims_are_tenant_scoped_due_non_head_and_gc_delete_is_retryable() {
@@ -573,6 +592,16 @@ async fn interrupted_recall_is_reclaimed_with_a_new_fencing_token() {
     let (org_id, _, blob_id) = seed_file(&db.pool, now).await;
     sqlx::query("UPDATE blobs SET tier_state='archived', archive_object_key='opaque', archive_wrapped_key=$2 WHERE id=$1")
         .bind(blob_id).bind([9_u8; 48].as_slice()).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE blobs SET archive_verified_at=NULL WHERE id=$1")
+        .bind(blob_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let verify_claim =
+        maintenance::archive_verify_claim(&db.pool, now, now - time::Duration::minutes(15), now)
+            .await
+            .unwrap()
+            .unwrap();
     let old_token = Uuid::new_v4();
     let new_token = Uuid::new_v4();
     let mut tx = OrgTx::begin(&db.pool, org_id).await.unwrap().unwrap();
@@ -614,6 +643,207 @@ async fn interrupted_recall_is_reclaimed_with_a_new_fencing_token() {
             .unwrap()
     );
     tx.commit().await.unwrap();
+    let (verify_token, verify_offset): (Option<Uuid>, i64) = sqlx::query_as(
+        "SELECT archive_verify_claim_token, archive_verify_offset FROM blobs WHERE id=$1",
+    )
+    .bind(blob_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(verify_token, None);
+    assert_eq!(verify_offset, 0);
+    assert!(
+        !maintenance::archive_verify_progress(&db.pool, &verify_claim, 75, false, now)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn archive_verification_claim_blocks_gc_then_releases_after_progress() {
+    let db = TestDb::new().await;
+    let now = OffsetDateTime::now_utc();
+    let (org_id, _, existing_blob) = seed_file(&db.pool, now).await;
+    let workspace_id: Uuid = sqlx::query_scalar("SELECT workspace_id FROM blobs WHERE id=$1")
+        .bind(existing_blob)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let blob_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO blobs(id,org_id,workspace_id,object_key,size_bytes,sha256,state,tier_state,\
+         archive_object_key,archive_wrapped_key,created_at) \
+         VALUES($1,$2,$3,$4,100,$5,'committed','archived','opaque',$6,$7)",
+    )
+    .bind(blob_id)
+    .bind(org_id)
+    .bind(workspace_id)
+    .bind(Uuid::new_v4().simple().to_string())
+    .bind([8_u8; 32].as_slice())
+    .bind([9_u8; 48].as_slice())
+    .bind(now - time::Duration::days(5))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE archive_gc_state SET inventory_complete=true WHERE id=true")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let candidate =
+        maintenance::archive_verify_claim(&db.pool, now, now - time::Duration::minutes(15), now)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(candidate.id, blob_id);
+    assert!(
+        !maintenance::gc_candidates(&db.pool, now, &[], 10)
+            .await
+            .unwrap()
+            .contains(&(org_id, blob_id))
+    );
+    let mut tx = OrgTx::begin(&db.pool, org_id).await.unwrap().unwrap();
+    assert_eq!(
+        tx.maint_gc_claim(blob_id, now).await.unwrap(),
+        GcClaim::Skipped
+    );
+    tx.commit().await.unwrap();
+
+    assert!(
+        maintenance::archive_verify_progress(&db.pool, &candidate, 64, false, now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        maintenance::gc_candidates(&db.pool, now, &[], 10)
+            .await
+            .unwrap()
+            .contains(&(org_id, blob_id))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn archive_verify_no_progress_rotates_and_surfaces_without_clearing_integrity_error() {
+    let db = TestDb::new().await;
+    let now = OffsetDateTime::now_utc();
+    let (org_id, _, existing_blob) = seed_file(&db.pool, now).await;
+    let workspace_id: Uuid = sqlx::query_scalar("SELECT workspace_id FROM blobs WHERE id=$1")
+        .bind(existing_blob)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    for (blob_id, suffix, created_at) in [
+        (first, "first", now - time::Duration::days(6)),
+        (second, "second", now - time::Duration::days(5)),
+    ] {
+        sqlx::query(
+            "INSERT INTO blobs(id,org_id,workspace_id,object_key,size_bytes,sha256,state,tier_state,\
+             archive_object_key,archive_wrapped_key,created_at) \
+             VALUES($1,$2,$3,$4,100,$5,'committed','archived',$6,$7,$8)",
+        ).bind(blob_id).bind(org_id).bind(workspace_id).bind(Uuid::new_v4().simple().to_string())
+            .bind([8_u8; 32].as_slice()).bind(format!("opaque-{suffix}"))
+            .bind([9_u8; 48].as_slice()).bind(created_at)
+            .execute(&db.pool).await.unwrap();
+    }
+    claim_and_save_no_progress(&db.pool, first, now, 0).await;
+    claim_and_save_no_progress(&db.pool, second, now + time::Duration::seconds(1), 0).await;
+    claim_and_save_no_progress(&db.pool, first, now + time::Duration::seconds(2), 0).await;
+    claim_and_save_no_progress(&db.pool, second, now + time::Duration::seconds(3), 0).await;
+    claim_and_save_no_progress(&db.pool, first, now + time::Duration::seconds(4), 0).await;
+
+    let (error, attempts): (Option<String>, i32) = sqlx::query_as(
+        "SELECT archive_error_code, archive_verify_no_progress_attempts FROM blobs WHERE id=$1",
+    )
+    .bind(first)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(error.as_deref(), Some("ARCHIVE_VERIFY_NO_PROGRESS"));
+    assert_eq!(attempts, 3);
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action='archive.verification_failed' \
+         AND target_id=$1",
+    )
+    .bind(first)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+
+    sqlx::query("UPDATE blobs SET archive_verified_at=$2 WHERE id=$1")
+        .bind(second)
+        .bind(now + time::Duration::hours(1))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE blobs SET archive_error_code='ARCHIVE_INTEGRITY_FAILED' WHERE id=$1")
+        .bind(first)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let candidate = maintenance::archive_verify_claim(
+        &db.pool,
+        now + time::Duration::seconds(5),
+        now - time::Duration::minutes(10),
+        now + time::Duration::seconds(5),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(candidate.id, first);
+    assert!(
+        maintenance::archive_verify_progress(
+            &db.pool,
+            &candidate,
+            64,
+            false,
+            now + time::Duration::seconds(5),
+        )
+        .await
+        .unwrap()
+    );
+    let (error, attempts): (Option<String>, i32) = sqlx::query_as(
+        "SELECT archive_error_code, archive_verify_no_progress_attempts FROM blobs WHERE id=$1",
+    )
+    .bind(first)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(error.as_deref(), Some("ARCHIVE_INTEGRITY_FAILED"));
+    assert_eq!(attempts, 0);
+
+    let candidate = maintenance::archive_verify_claim(
+        &db.pool,
+        now + time::Duration::seconds(6),
+        now - time::Duration::minutes(9),
+        now + time::Duration::seconds(6),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(candidate.id, first);
+    assert!(
+        maintenance::archive_verify_progress(
+            &db.pool,
+            &candidate,
+            100,
+            true,
+            now + time::Duration::seconds(6),
+        )
+        .await
+        .unwrap()
+    );
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT archive_error_code FROM blobs WHERE id=$1")
+            .bind(first)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(error, None);
 }
 
 #[tokio::test]

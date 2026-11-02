@@ -23,6 +23,7 @@ base64.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 fs2.workspace = true
+sqlx.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "process"] }
 axum.workspace = true
 tracing.workspace = true
@@ -45,7 +46,6 @@ required-features = ["fault-injection"]
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
-sqlx.workspace = true
 
 [lints]
 workspace = true

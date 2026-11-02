@@ -456,6 +456,106 @@ async fn archive_status(config: &Config) -> Result<(), Failure> {
     Ok(())
 }
 
+async fn audit_archive_configuration(
+    pool: &craftcloud_db::PgPool,
+    config: &Config,
+) -> Result<(), Failure> {
+    let current = config.archive.as_ref().map(|settings| {
+        let (provider, host) = settings.audit_endpoint();
+        let fingerprint: [u8; 32] = Sha256::digest(format!("{settings:?}").as_bytes()).into();
+        (provider, host, fingerprint)
+    });
+    let previous = sqlx::query_as::<_, (bool, Option<String>, Option<String>, Option<String>)>(
+        "SELECT (details->>'configured')::boolean, details->>'provider', \
+                details->>'endpoint_host', details->>'fingerprint' \
+         FROM audit_events WHERE action LIKE 'archive.configuration.%' \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| Failure::runtime("cannot read previous archive configuration audit"))?;
+
+    let transition = match (&previous, &current) {
+        (None, Some(_)) => Some(("archive.configuration.enabled", true)),
+        (Some((false, ..)), Some(_)) => Some(("archive.configuration.enabled", true)),
+        (Some((true, _, _, old)), Some((_, _, fingerprint)))
+            if old.as_deref() != Some(hex_digest(fingerprint).as_str()) =>
+        {
+            Some(("archive.configuration.changed", true))
+        }
+        (Some((true, ..)), None) => Some(("archive.configuration.disabled", false)),
+        _ => None,
+    };
+    if let Some((action, configured)) = transition {
+        let (provider, host, fingerprint) = match (&current, &previous) {
+            (Some((provider, host, fingerprint)), _) => (*provider, host.clone(), *fingerprint),
+            (None, Some((_, Some(provider), Some(host), Some(fingerprint)))) => (
+                provider.as_str(),
+                host.clone(),
+                parse_hex_digest(fingerprint)
+                    .ok_or_else(|| Failure::runtime("previous archive audit is invalid"))?,
+            ),
+            _ => ("none", String::new(), [0; 32]),
+        };
+        let mut event = craftcloud_db::audit::NewEvent::new(action)
+            .detail("configured", craftcloud_db::audit::Detail::Flag(configured))
+            .detail(
+                "provider",
+                craftcloud_db::audit::Detail::Code(match provider {
+                    "s3" => "s3",
+                    "sftp" => "sftp",
+                    "local_test" => "local_test",
+                    _ => "none",
+                }),
+            )
+            .detail(
+                "fingerprint",
+                craftcloud_db::audit::Detail::Fingerprint(fingerprint),
+            );
+        if !host.is_empty() {
+            event = event.detail(
+                "endpoint_host",
+                craftcloud_db::audit::Detail::EndpointHost(host),
+            );
+        }
+        craftcloud_db::audit::record(pool, &craftcloud_db::audit::AuditCtx::system(), &event)
+            .await
+            .map_err(|_| Failure::runtime("cannot write archive configuration audit"))?;
+    }
+    Ok(())
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn parse_hex_digest(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut digest = [0; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
+fn archive_audit_endpoint(config: &Config) -> Option<(&'static str, String)> {
+    if let Some(settings) = &config.archive {
+        return Some(settings.audit_endpoint());
+    }
+    #[cfg(feature = "fault-injection")]
+    if std::env::var_os("CC_FAULT_ARCHIVE_LOCAL_DIR").is_some() {
+        return Some(("local_test", "localhost".to_owned()));
+    }
+    None
+}
+
 async fn archive_recall(config: &Config, org_id: Option<uuid::Uuid>) -> Result<(), Failure> {
     let Some(pool) = connect_database(&config.database).await? else {
         return Err(Failure::config(
@@ -467,6 +567,8 @@ async fn archive_recall(config: &Config, org_id: Option<uuid::Uuid>) -> Result<(
         .map_err(|_| Failure::runtime("cannot verify database schema for archive recall"))?;
     let archive = archive_runtime(config)
         .await?
+        .ok_or_else(|| Failure::config("archive recall requires a configured archive provider"))?;
+    let (audit_provider, audit_endpoint_host) = archive_audit_endpoint(config)
         .ok_or_else(|| Failure::config("archive recall requires a configured archive provider"))?;
     let store_dir = config
         .storage_dir
@@ -544,6 +646,8 @@ async fn archive_recall(config: &Config, org_id: Option<uuid::Uuid>) -> Result<(
                 local: &local,
                 archive: &archive.store,
                 crypto: &archive.crypto,
+                audit_provider,
+                audit_endpoint_host: audit_endpoint_host.clone(),
                 org_id: candidate.org_id,
                 blob_id: candidate.blob_id,
                 now,
@@ -560,10 +664,43 @@ async fn archive_recall(config: &Config, org_id: Option<uuid::Uuid>) -> Result<(
             })?;
         }
     }
+    let mut recall_event = craftcloud_db::audit::NewEvent::new("archive.recall.operator")
+        .result(if failed == 0 {
+            craftcloud_db::audit::AuditResult::Success
+        } else {
+            craftcloud_db::audit::AuditResult::Failed
+        })
+        .detail(
+            "provider",
+            craftcloud_db::audit::Detail::Code(audit_provider),
+        )
+        .detail(
+            "endpoint_host",
+            craftcloud_db::audit::Detail::EndpointHost(audit_endpoint_host),
+        )
+        .detail(
+            "recalled",
+            craftcloud_db::audit::Detail::Count(i64::try_from(recalled).unwrap_or(i64::MAX)),
+        )
+        .detail(
+            "failed",
+            craftcloud_db::audit::Detail::Count(i64::try_from(failed).unwrap_or(i64::MAX)),
+        );
+    if let Some(org_id) = org_id {
+        recall_event = recall_event.detail("org_id", craftcloud_db::audit::Detail::Id(org_id));
+    }
+    let audit_result = craftcloud_db::audit::record(
+        &pool,
+        &craftcloud_db::audit::AuditCtx::system(),
+        &recall_event,
+    )
+    .await;
     lock.release()
         .await
         .map_err(|_| Failure::runtime("cannot release archive maintenance lock"))?;
     pool.close().await;
+    audit_result
+        .map_err(|_| Failure::runtime("archive recall completed but audit recording failed"))?;
     println!("recalled={recalled}");
     println!("failed={failed}");
     Ok(())
@@ -574,6 +711,8 @@ struct RecallItem<'a> {
     local: &'a craftcloud_storage::LocalStore,
     archive: &'a craftcloud_storage::ArchiveStore,
     crypto: &'a craftcloud_storage::ArchiveCrypto,
+    audit_provider: &'static str,
+    audit_endpoint_host: String,
     org_id: uuid::Uuid,
     blob_id: uuid::Uuid,
     now: time::OffsetDateTime,
@@ -586,6 +725,8 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
         local,
         archive,
         crypto,
+        audit_provider,
+        audit_endpoint_host,
         org_id,
         blob_id,
         now,
@@ -609,6 +750,7 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
         return Ok(false);
     };
     tx.commit().await.map_err(|_| ())?;
+    craftcloud_storage::crash_point("archive-recall-claimed", 0);
 
     let result = async {
         let local_key = craftcloud_storage::ObjectKey::parse(&claim.object_key).map_err(|_| ())?;
@@ -644,6 +786,7 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
             .open_read(&archive_key, None)
             .await
             .map_err(|_| ())?;
+        craftcloud_storage::crash_point("archive-recall-download-started", 0);
         remove_stale_recall_temp(local, &local_key).await?;
         let mut temp = local
             .begin_write_as(local_key.clone(), plaintext_len)
@@ -683,14 +826,17 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
         if !pending.is_empty() || reader.remaining() != 0 || offset != plaintext_len {
             return Err(());
         }
-        local
-            .finalize_as(temp, local_key, plaintext_len, &expected_sha)
-            .await
-            .map_err(|_| ())?;
+        craftcloud_storage::crash_point("archive-recall-download-complete", offset);
         let actual: craftcloud_storage::Sha256Digest = hasher.finalize().into();
         if actual != expected_sha {
             return Err(());
         }
+        craftcloud_storage::crash_point("archive-recall-verified", plaintext_len);
+        local
+            .finalize_as(temp, local_key, plaintext_len, &expected_sha)
+            .await
+            .map_err(|_| ())?;
+        craftcloud_storage::crash_point("archive-recall-local-written", plaintext_len);
         Ok(())
     }
     .await;
@@ -716,6 +862,14 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
                 craftcloud_db::audit::NewEvent::new("archive.recall")
                     .target("blob", blob_id)
                     .detail(
+                        "provider",
+                        craftcloud_db::audit::Detail::Code(audit_provider),
+                    )
+                    .detail(
+                        "endpoint_host",
+                        craftcloud_db::audit::Detail::EndpointHost(audit_endpoint_host.clone()),
+                    )
+                    .detail(
                         "bytes",
                         craftcloud_db::audit::Detail::Count(claim.size_bytes),
                     ),
@@ -723,6 +877,7 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
             .await
             .map_err(|_| ())?;
             tx.commit().await.map_err(|_| ())?;
+            craftcloud_storage::crash_point("archive-recall-committed", 0);
             Ok(true)
         }
         Err(()) => {
@@ -743,6 +898,14 @@ async fn recall_one(item: RecallItem<'_>) -> Result<bool, ()> {
                     craftcloud_db::audit::NewEvent::new("archive.recall")
                         .result(craftcloud_db::audit::AuditResult::Failed)
                         .target("blob", blob_id)
+                        .detail(
+                            "provider",
+                            craftcloud_db::audit::Detail::Code(audit_provider),
+                        )
+                        .detail(
+                            "endpoint_host",
+                            craftcloud_db::audit::Detail::EndpointHost(audit_endpoint_host.clone()),
+                        )
                         .detail(
                             "bytes",
                             craftcloud_db::audit::Detail::Count(claim.size_bytes),
@@ -1378,6 +1541,26 @@ async fn backup_release(config: &Config, backup_id: &str, digest: &str) -> Resul
     let references = craftcloud_backup::release_backup_pins(&pool, backup_id, digest, true)
         .await
         .map_err(backup_failure)?;
+    let mut event = craftcloud_db::audit::NewEvent::new("backup.archive_references.release")
+        .target("backup", backup_id)
+        .detail(
+            "references",
+            craftcloud_db::audit::Detail::Count(i64::try_from(references).unwrap_or(i64::MAX)),
+        );
+    if let Some(settings) = &config.archive {
+        let (provider, host) = settings.audit_endpoint();
+        event = event
+            .detail("provider", craftcloud_db::audit::Detail::Code(provider))
+            .detail(
+                "endpoint_host",
+                craftcloud_db::audit::Detail::EndpointHost(host),
+            );
+    }
+    craftcloud_db::audit::record(&pool, &craftcloud_db::audit::AuditCtx::system(), &event)
+        .await
+        .map_err(|_| {
+            Failure::runtime("backup references were released but audit recording failed")
+        })?;
     pool.close().await;
     println!("released {references} archive reference pin(s) for backup {backup_id}");
     Ok(())
@@ -1399,9 +1582,15 @@ impl ArchiveRuntime {
 }
 
 async fn archive_runtime(config: &Config) -> Result<Option<ArchiveRuntime>, Failure> {
-    let Some(settings) = &config.archive else {
+    #[cfg(feature = "fault-injection")]
+    let test_archive_root =
+        std::env::var_os("CC_FAULT_ARCHIVE_LOCAL_DIR").map(std::path::PathBuf::from);
+    #[cfg(not(feature = "fault-injection"))]
+    let test_archive_root: Option<std::path::PathBuf> = None;
+
+    if config.archive.is_none() && test_archive_root.is_none() {
         return Ok(None);
-    };
+    }
     let mut server_key = load_two_factor_key(config.secret_key_file.as_ref()).ok_or_else(|| {
         Failure::config(
             "archive operations require a valid CRAFTCLOUD_SECRET_KEY_FILE with a Base64 32-byte key",
@@ -1410,6 +1599,25 @@ async fn archive_runtime(config: &Config) -> Result<Option<ArchiveRuntime>, Fail
     let crypto = craftcloud_storage::ArchiveCrypto::from_server_key(&server_key)
         .map_err(|_| Failure::config("CRAFTCLOUD_SECRET_KEY_FILE cannot derive the archive key"))?;
     server_key.zeroize();
+
+    if let Some(root) = test_archive_root {
+        if !root.is_absolute() {
+            return Err(Failure::config(
+                "CC_FAULT_ARCHIVE_LOCAL_DIR must be an absolute test directory",
+            ));
+        }
+        let store = craftcloud_storage::LocalStore::open(&root)
+            .await
+            .map_err(|_| Failure::runtime("cannot open the test archive directory"))?;
+        return Ok(Some(ArchiveRuntime {
+            store: craftcloud_storage::ArchiveStore::Local(store),
+            crypto,
+        }));
+    }
+
+    let Some(settings) = &config.archive else {
+        return Ok(None);
+    };
 
     let storage_dir = config.storage_dir.as_ref().ok_or_else(|| {
         Failure::config("archive operations require CRAFTCLOUD_STORAGE_DIR for persistent staging")
@@ -1687,7 +1895,16 @@ async fn run(config: Config) -> Result<(), Failure> {
     // Fail closed until the archive provider and worker are connected to all
     // download, backup, restore and maintenance paths. Ignoring this setting
     // would falsely report a working archive to the operator.
-    if std::env::var_os("CRAFTCLOUD_ARCHIVE_STORE").is_some() {
+    if std::env::var_os("CRAFTCLOUD_ARCHIVE_STORE").is_some() || {
+        #[cfg(feature = "fault-injection")]
+        {
+            std::env::var_os("CC_FAULT_ARCHIVE_LOCAL_DIR").is_some()
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            false
+        }
+    } {
         return Err(Failure::config(
             "CRAFTCLOUD_ARCHIVE_STORE is not available in this build",
         ));
@@ -1815,6 +2032,9 @@ async fn run(config: Config) -> Result<(), Failure> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|err| Failure::runtime(format!("cannot bind {}: {err}", config.bind)))?;
+    if let Some(pool) = &pool {
+        audit_archive_configuration(pool, &config).await?;
+    }
     tracing::warn!(
         address = %config.bind,
         "starting CraftCloud development prototype (not production-ready; no authentication)"
@@ -2022,6 +2242,10 @@ async fn run(config: Config) -> Result<(), Failure> {
                 .maintenance_interval
                 .max(std::time::Duration::from_secs(1));
             let archive_after = config.archive_after;
+            let verify_budget = craftcloud_api::archive_worker::ArchiveVerifyBudget {
+                max_bytes: config.archive_verify_bytes_per_run,
+                max_time: config.archive_verify_time_per_run,
+            };
             tracing::info!(
                 interval_secs = interval.as_secs(),
                 archive_after_secs = archive_after.as_secs(),
@@ -2036,13 +2260,14 @@ async fn run(config: Config) -> Result<(), Failure> {
                             }
                         }
                         () = tokio::time::sleep(interval) => {
-                            match craftcloud_api::archive_worker::archive_batch(
+                            match craftcloud_api::archive_worker::archive_batch_with_verify_budget(
                                 &pool,
                                 &local,
                                 archive_store.as_ref(),
                                 crypto.as_ref(),
                                 time::OffsetDateTime::now_utc(),
                                 archive_after,
+                                verify_budget,
                             ).await {
                                 Ok(batch) if batch.attempted > 0 || batch.archived > 0 || batch.retried > 0 => {
                                     tracing::info!(attempted = batch.attempted, archived = batch.archived, retried = batch.retried, "archive batch completed");

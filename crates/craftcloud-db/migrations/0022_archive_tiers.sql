@@ -59,6 +59,11 @@ ALTER TABLE blobs
     ADD COLUMN archive_local_delete_error_at timestamptz NULL,
     ADD COLUMN archive_local_delete_attempts integer NOT NULL DEFAULT 0,
     ADD COLUMN archive_verified_at timestamptz NULL,
+    ADD COLUMN archive_verify_claim_token uuid NULL,
+    ADD COLUMN archive_verify_claimed_at timestamptz NULL,
+    ADD COLUMN archive_verify_offset bigint NOT NULL DEFAULT 0,
+    ADD COLUMN archive_verify_attempted_at timestamptz NULL,
+    ADD COLUMN archive_verify_no_progress_attempts integer NOT NULL DEFAULT 0,
     ADD COLUMN archive_local_delete_pending boolean NOT NULL DEFAULT false,
     ADD COLUMN archive_delete_error_code text NULL,
     ADD COLUMN archive_delete_error_at timestamptz NULL,
@@ -74,6 +79,10 @@ ALTER TABLE blobs
                    AND archive_claimed_at IS NOT NULL)),
     ADD CONSTRAINT blobs_archive_claim_pair
         CHECK ((archive_claim_token IS NULL) = (archive_claimed_at IS NULL)),
+    ADD CONSTRAINT blobs_archive_verify_claim_pair
+        CHECK ((archive_verify_claim_token IS NULL) = (archive_verify_claimed_at IS NULL)),
+    ADD CONSTRAINT blobs_archive_verify_offset_nonnegative CHECK (archive_verify_offset >= 0),
+    ADD CONSTRAINT blobs_archive_verify_attempts_nonnegative CHECK (archive_verify_no_progress_attempts >= 0),
     ADD CONSTRAINT blobs_archive_metadata_consistent
         CHECK (tier_state <> 'archived' OR
                (archive_object_key IS NOT NULL AND archive_wrapped_key IS NOT NULL)),
@@ -100,6 +109,9 @@ CREATE INDEX blobs_archive_candidates_idx
 CREATE INDEX blobs_archive_recovery_idx
     ON blobs (archive_claimed_at, created_at, id)
     WHERE tier_state IN ('archiving', 'recalling');
+CREATE INDEX blobs_archive_verify_candidates_idx
+    ON blobs (archive_verify_attempted_at NULLS FIRST, archive_verified_at NULLS FIRST, created_at, id)
+    WHERE state = 'committed' AND tier_state = 'archived';
 CREATE INDEX blobs_archive_delete_retry_idx
     ON blobs (archive_delete_next_attempt_at NULLS FIRST, created_at, id)
     WHERE state = 'deleting' AND archive_object_key IS NOT NULL;

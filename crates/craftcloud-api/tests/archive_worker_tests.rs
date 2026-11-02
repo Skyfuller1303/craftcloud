@@ -9,7 +9,9 @@ use common::TestEnv;
 use craftcloud_api::archive_transport::{
     ArchiveTransportError, upload_intent_verified, upload_verified,
 };
-use craftcloud_api::archive_worker::{ArchiveBatch, archive_batch};
+use craftcloud_api::archive_worker::{
+    ArchiveBatch, ArchiveVerifyBudget, archive_batch, archive_batch_with_verify_budget,
+};
 use craftcloud_db::maintenance::{self, ArchiveFinish};
 use craftcloud_storage::{
     ArchiveCrypto, LocalStore, ObjectHead, ObjectInfo, ObjectKey, ObjectStore, ReadSource,
@@ -132,6 +134,21 @@ async fn fixture(
     now: OffsetDateTime,
     old_digest_override: Option<[u8; 32]>,
 ) -> Fixture {
+    fixture_with_old_bytes(
+        env,
+        now,
+        b"superseded private design bytes",
+        old_digest_override,
+    )
+    .await
+}
+
+async fn fixture_with_old_bytes(
+    env: &TestEnv,
+    now: OffsetDateTime,
+    old_bytes: &[u8],
+    old_digest_override: Option<[u8; 32]>,
+) -> Fixture {
     let local = LocalStore::open(&env.storage_dir).await.unwrap();
     let org_id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug='operator-org'")
         .fetch_one(&env.pool)
@@ -169,7 +186,6 @@ async fn fixture(
         .await
         .unwrap();
 
-    let old_bytes = b"superseded private design bytes";
     let head_bytes = b"current local head bytes";
     let old_key = put(&local, old_bytes).await;
     let head_key = put(&local, head_bytes).await;
@@ -182,7 +198,7 @@ async fn fixture(
         (
             old_blob,
             &old_key,
-            old_bytes.as_slice(),
+            old_bytes,
             old_hash,
             now - time::Duration::days(2),
         ),
@@ -214,7 +230,7 @@ async fn fixture(
             1_i64,
             old_blob,
             old_hash,
-            old_bytes.as_slice(),
+            old_bytes,
             None,
             now - time::Duration::days(2),
         ),
@@ -290,6 +306,199 @@ async fn archive_store() -> (LocalStore, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("cc-ac12-archive-{}", Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     (LocalStore::open(&dir).await.unwrap(), dir)
+}
+
+fn archive_object_path(root: &std::path::Path, key: &ObjectKey) -> PathBuf {
+    let value = key.as_str();
+    root.join("objects")
+        .join(&value[..2])
+        .join(&value[2..4])
+        .join(value)
+}
+
+async fn large_archived_fixture(
+    env: &TestEnv,
+    now: OffsetDateTime,
+) -> (Fixture, LocalStore, PathBuf, ArchiveCrypto) {
+    let bytes = vec![0x5a; 256 * 1024];
+    let fixture = fixture_with_old_bytes(env, now, &bytes, None).await;
+    let local = LocalStore::open(&env.storage_dir).await.unwrap();
+    let (archive, archive_dir) = archive_store().await;
+    let crypto = ArchiveCrypto::from_server_key(&[19; 32]).unwrap();
+    archive_batch_with_verify_budget(
+        &env.pool,
+        &local,
+        &archive,
+        &crypto,
+        now,
+        Duration::ZERO,
+        ArchiveVerifyBudget {
+            max_bytes: 64 * 1024,
+            max_time: Duration::from_secs(5),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE blobs SET archive_verified_at=NULL WHERE id=$1")
+        .bind(fixture.old_blob)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    archive_batch_with_verify_budget(
+        &env.pool,
+        &local,
+        &archive,
+        &crypto,
+        now + time::Duration::seconds(1),
+        Duration::ZERO,
+        ArchiveVerifyBudget {
+            max_bytes: 64 * 1024,
+            max_time: Duration::from_secs(5),
+        },
+    )
+    .await
+    .unwrap();
+    (fixture, archive, archive_dir, crypto)
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn large_archive_verification_resumes_across_bounded_runs() {
+    let env = TestEnv::new().await;
+    let now = OffsetDateTime::now_utc();
+    let (fixture, archive, archive_dir, crypto) = large_archived_fixture(&env, now).await;
+    let budget = ArchiveVerifyBudget {
+        max_bytes: 64 * 1024,
+        max_time: Duration::from_secs(5),
+    };
+    let mut offset: i64 = sqlx::query_scalar("SELECT archive_verify_offset FROM blobs WHERE id=$1")
+        .bind(fixture.old_blob)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(offset, 64 * 1024);
+    let claim: Option<Uuid> =
+        sqlx::query_scalar("SELECT archive_verify_claim_token FROM blobs WHERE id=$1")
+            .bind(fixture.old_blob)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(claim, None);
+    for run in 1..4 {
+        archive_batch_with_verify_budget(
+            &env.pool,
+            &LocalStore::open(&env.storage_dir).await.unwrap(),
+            &archive,
+            &crypto,
+            now + time::Duration::seconds(run),
+            Duration::ZERO,
+            budget,
+        )
+        .await
+        .unwrap();
+        let next: i64 = sqlx::query_scalar("SELECT archive_verify_offset FROM blobs WHERE id=$1")
+            .bind(fixture.old_blob)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert!(next > offset || (run == 3 && next == 0));
+        offset = next;
+    }
+    let (verified_at, error): (Option<OffsetDateTime>, Option<String>) =
+        sqlx::query_as("SELECT archive_verified_at, archive_error_code FROM blobs WHERE id=$1")
+            .bind(fixture.old_blob)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert!(verified_at.is_some());
+    assert_eq!(error, None);
+    drop(archive);
+    std::fs::remove_dir_all(archive_dir).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn empty_archive_verification_accepts_the_authenticated_empty_block() {
+    let env = TestEnv::new().await;
+    let now = OffsetDateTime::now_utc();
+    let fixture = fixture_with_old_bytes(&env, now, b"", None).await;
+    let local = LocalStore::open(&env.storage_dir).await.unwrap();
+    let (archive, archive_dir) = archive_store().await;
+    let crypto = ArchiveCrypto::from_server_key(&[19; 32]).unwrap();
+    archive_batch(&env.pool, &local, &archive, &crypto, now, Duration::ZERO)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE blobs SET archive_verified_at=NULL WHERE id=$1")
+        .bind(fixture.old_blob)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    archive_batch(
+        &env.pool,
+        &local,
+        &archive,
+        &crypto,
+        now + time::Duration::seconds(1),
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let (offset, error, verified_at): (i64, Option<String>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT archive_verify_offset, archive_error_code, archive_verified_at FROM blobs WHERE id=$1",
+    ).bind(fixture.old_blob).fetch_one(&env.pool).await.unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(error, None);
+    assert!(verified_at.is_some());
+    drop(archive);
+    std::fs::remove_dir_all(archive_dir).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn resumed_archive_verification_detects_a_manipulated_block() {
+    let env = TestEnv::new().await;
+    let now = OffsetDateTime::now_utc();
+    let (fixture, archive, archive_dir, crypto) = large_archived_fixture(&env, now).await;
+    let archive_key: String =
+        sqlx::query_scalar("SELECT archive_object_key FROM blobs WHERE id=$1")
+            .bind(fixture.old_blob)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    let key = ObjectKey::parse(&archive_key).unwrap();
+    let path = archive_object_path(&archive_dir, &key);
+    let mut ciphertext = std::fs::read(&path).unwrap();
+    let block_offset = craftcloud_storage::CHUNK_BYTES + 16;
+    ciphertext[block_offset] ^= 1;
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    std::fs::write(path, ciphertext).unwrap();
+    archive_batch_with_verify_budget(
+        &env.pool,
+        &LocalStore::open(&env.storage_dir).await.unwrap(),
+        &archive,
+        &crypto,
+        now + time::Duration::seconds(1),
+        Duration::ZERO,
+        ArchiveVerifyBudget {
+            max_bytes: 64 * 1024,
+            max_time: Duration::from_secs(5),
+        },
+    )
+    .await
+    .unwrap();
+    let (offset, error): (i64, Option<String>) =
+        sqlx::query_as("SELECT archive_verify_offset, archive_error_code FROM blobs WHERE id=$1")
+            .bind(fixture.old_blob)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(error.as_deref(), Some("ARCHIVE_INTEGRITY_FAILED"));
+    drop(archive);
+    std::fs::remove_dir_all(archive_dir).unwrap();
 }
 
 #[tokio::test]

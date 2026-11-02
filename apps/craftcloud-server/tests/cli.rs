@@ -1218,4 +1218,80 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn failed_archive_start_does_not_audit_configuration_as_activated() {
+        let fixture = Fixture::new();
+        let database_secret = fixture.secret();
+        let storage = std::env::temp_dir().join(format!("craftcloud-archive-audit-{}", nanos()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let storage = storage.to_string_lossy().into_owned();
+        assert_eq!(
+            run(
+                &["migrate"],
+                &[("CRAFTCLOUD_DATABASE_URL_FILE", database_secret.as_str())]
+            )
+            .status
+            .code(),
+            Some(0)
+        );
+        let archive_env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", database_secret.as_str()),
+            ("CRAFTCLOUD_STORAGE_DIR", storage.as_str()),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", database_secret.as_str()),
+            ("CRAFTCLOUD_ARCHIVE_STORE", "s3"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ENDPOINT",
+                "https://objects.example.test/private",
+            ),
+            ("CRAFTCLOUD_ARCHIVE_S3_REGION", "eu-central-1"),
+            ("CRAFTCLOUD_ARCHIVE_S3_BUCKET", "archive-one"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ACCESS_KEY_ID_FILE",
+                database_secret.as_str(),
+            ),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_SECRET_ACCESS_KEY_FILE",
+                database_secret.as_str(),
+            ),
+        ];
+        let first = run(&[], &archive_env);
+        assert_eq!(first.status.code(), Some(2), "{}", text(&first));
+        let changed_env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", database_secret.as_str()),
+            ("CRAFTCLOUD_STORAGE_DIR", storage.as_str()),
+            ("CRAFTCLOUD_SECRET_KEY_FILE", database_secret.as_str()),
+            ("CRAFTCLOUD_ARCHIVE_STORE", "s3"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ENDPOINT",
+                "https://objects.example.test/private",
+            ),
+            ("CRAFTCLOUD_ARCHIVE_S3_REGION", "eu-central-1"),
+            ("CRAFTCLOUD_ARCHIVE_S3_BUCKET", "archive-two"),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_ACCESS_KEY_ID_FILE",
+                database_secret.as_str(),
+            ),
+            (
+                "CRAFTCLOUD_ARCHIVE_S3_SECRET_ACCESS_KEY_FILE",
+                database_secret.as_str(),
+            ),
+        ];
+        let changed = run(&[], &changed_env);
+        assert_eq!(changed.status.code(), Some(2), "{}", text(&changed));
+        let missing_admin = std::env::temp_dir()
+            .join(format!("craftcloud-missing-admin-{}", nanos()))
+            .to_string_lossy()
+            .into_owned();
+        let disabled_env = [
+            ("CRAFTCLOUD_DATABASE_URL_FILE", database_secret.as_str()),
+            ("CRAFTCLOUD_ADMIN_DIR", missing_admin.as_str()),
+        ];
+        let disabled = run(&[], &disabled_env);
+        assert_eq!(disabled.status.code(), Some(2), "{}", text(&disabled));
+        assert_eq!(fixture.scalar("SELECT count(*)::text FROM audit_events WHERE action LIKE 'archive.configuration.%'"), "0");
+        assert_eq!(fixture.scalar("SELECT count(*)::text FROM audit_events WHERE details::text LIKE '%private%' OR details::text LIKE '%archive-one%' OR details::text LIKE '%CRAFTCLOUD_%'"), "0");
+        let _ = std::fs::remove_dir_all(storage);
+    }
 }

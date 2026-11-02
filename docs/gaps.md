@@ -1,5 +1,9 @@
 # Ranked gaps — documentation-first RFC
 
+## AC-12: Externes Versionsarchiv
+
+Die Aktivierung des externen Archivs bleibt gesperrt. Ein Folgeauftrag bearbeitet fortsetzbare Integritätsprüfungen, Audit und Absturzsicherheit; die erforderlichen Live-Provider- und Ende-zu-Ende-Nachweise stehen noch aus. Der konkrete Stand und etwaige weitere Abweichungen stehen im Folgebericht zu AC-12 und in [ADR-0028](09-decisions/adr-0028-storage-tiers.md).
+
 ## AC-09b: Graph und SMTP mit OAuth
 
 Graph und XOAUTH2 für Microsoft sowie Google ergänzen die bestehende Mailwarteschlange ohne Migration. Die Operatoransicht erhält Transport, Absender, Zertifikatsablauf und kontrollierten Fehlercode. Produktions-Tenantberechtigungen und die tatsächliche Postfachzustellung bleiben Betreiberprüfungen; insbesondere darf kein globaler Entra-Grant die Exchange-Postfachbeschränkung umgehen. Nationale Clouds, interaktive delegierte Anmeldung und Gmail-API bleiben außerhalb des Umfangs. Prüfstatus und dokumentierte Abweichungen stehen im AC-09b-Bericht.

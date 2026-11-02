@@ -1273,7 +1273,10 @@ impl OrgTx {
     ) -> Result<bool, DbError> {
         let done = sqlx::query(
             "UPDATE blobs SET tier_state = 'local', archive_claim_token = NULL, \
-                 archive_claimed_at = NULL, archive_error_code = NULL, archive_error_at = NULL, \
+                 archive_claimed_at = NULL, archive_verify_claim_token = NULL, \
+                 archive_verify_claimed_at = NULL, archive_verify_offset = 0, \
+                 archive_verify_attempted_at = NULL, archive_verify_no_progress_attempts = 0, \
+                 archive_error_code = NULL, archive_error_at = NULL, \
                  archive_next_attempt_at = NULL, archive_verified_at = $4, \
                  archive_local_delete_pending = false \
              WHERE id = $1 AND org_id = $2 AND tier_state = 'recalling' \
@@ -1354,6 +1357,7 @@ pub async fn gc_candidates(
         "SELECT b.org_id, b.id FROM blobs b \
          WHERE b.state IN ('orphaned', 'committed', 'corrupt') AND b.created_at < $1 \
            AND b.tier_state NOT IN ('archiving', 'recalling') AND b.archive_claim_token IS NULL \
+           AND b.archive_verify_claim_token IS NULL \
            AND (b.archive_object_key IS NULL OR ( \
                 COALESCE((SELECT inventory_complete FROM archive_gc_state WHERE id), false) \
                 AND NOT EXISTS (SELECT 1 FROM archive_backup_refs r \
@@ -1612,7 +1616,7 @@ impl OrgTx {
             "SELECT object_key, archive_object_key, size_bytes, workspace_id, state, quota_group_id FROM blobs \
              WHERE id = $1 AND org_id = $2 AND state IN ('orphaned', 'committed', 'corrupt') \
                AND created_at < $3 AND tier_state NOT IN ('archiving', 'recalling') \
-               AND archive_claim_token IS NULL FOR UPDATE SKIP LOCKED",
+               AND archive_claim_token IS NULL AND archive_verify_claim_token IS NULL FOR UPDATE SKIP LOCKED",
         )
         .bind(blob_id)
         .bind(self.org_id)
@@ -1755,22 +1759,170 @@ pub struct ArchiveVerifyCandidate {
     pub size_bytes: i64,
     /// Recorded plaintext SHA-256.
     pub sha256: Vec<u8>,
+    /// Plaintext offset through authenticated blocks already checked.
+    pub verified_offset: i64,
+    /// Fencing token for this verification run.
+    pub claim_token: Uuid,
 }
 
-/// Archived blobs verified longest ago (never verified first).
-pub async fn archive_verify_candidates(
+/// Claims one archived blob for a bounded verification run. Stale claims can
+/// be resumed from their durable block offset; each run receives a new token.
+pub async fn archive_verify_claim(
     pool: &PgPool,
-    limit: i64,
-) -> Result<Vec<ArchiveVerifyCandidate>, DbError> {
-    Ok(sqlx::query_as(
-        "SELECT id, archive_object_key, archive_wrapped_key, size_bytes, sha256 \
-         FROM blobs WHERE state = 'committed' AND tier_state = 'archived' \
-           AND archive_object_key IS NOT NULL AND archive_wrapped_key IS NOT NULL \
-         ORDER BY archive_verified_at NULLS FIRST, created_at, id LIMIT $1",
+    now: OffsetDateTime,
+    stale_before: OffsetDateTime,
+    due_before: OffsetDateTime,
+) -> Result<Option<ArchiveVerifyCandidate>, DbError> {
+    let token = Uuid::new_v4();
+    let row = sqlx::query_as(
+        "WITH candidate AS (SELECT id FROM blobs WHERE state = 'committed' \
+           AND tier_state = 'archived' AND archive_object_key IS NOT NULL \
+           AND archive_wrapped_key IS NOT NULL \
+           AND (archive_verified_at IS NULL OR archive_verified_at <= $3) \
+           AND (archive_verify_claimed_at IS NULL OR archive_verify_claimed_at <= $2) \
+           ORDER BY archive_verify_attempted_at NULLS FIRST, archive_verified_at NULLS FIRST, created_at, id \
+           LIMIT 1 FOR UPDATE SKIP LOCKED) \
+         UPDATE blobs b SET archive_verify_claim_token = $4, archive_verify_claimed_at = $1, \
+           archive_verify_attempted_at = $1 \
+         FROM candidate c WHERE b.id = c.id \
+         RETURNING b.id, b.archive_object_key, b.archive_wrapped_key, b.size_bytes, \
+           b.sha256, b.archive_verify_offset AS verified_offset, \
+           b.archive_verify_claim_token AS claim_token",
     )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?)
+    .bind(now)
+    .bind(stale_before)
+    .bind(due_before)
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Saves progress only for the current verification lease, then releases it.
+/// A completed pass records successful verification and resets its offset.
+pub async fn archive_verify_progress(
+    pool: &PgPool,
+    candidate: &ArchiveVerifyCandidate,
+    offset: i64,
+    complete: bool,
+    now: OffsetDateTime,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    type VerifyState = (Uuid, i64, Option<String>, Option<OffsetDateTime>, i32);
+    let current: Option<VerifyState> = sqlx::query_as(
+        "SELECT org_id, archive_verify_offset, archive_error_code, archive_error_at, \
+               archive_verify_no_progress_attempts FROM blobs \
+             WHERE id = $1 AND state = 'committed' AND tier_state = 'archived' \
+               AND archive_verify_claim_token = $2 AND archive_verify_claimed_at > $3 FOR UPDATE",
+    )
+    .bind(candidate.id)
+    .bind(candidate.claim_token)
+    .bind(now - time::Duration::minutes(15))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((org_id, previous_offset, previous_error, previous_error_at, previous_attempts)) =
+        current
+    else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    let no_progress_attempts = if complete || offset != previous_offset {
+        0
+    } else {
+        previous_attempts.saturating_add(1)
+    };
+    let report_no_progress = !complete && previous_error.is_none() && no_progress_attempts >= 3;
+    let error_code = if complete {
+        None
+    } else if report_no_progress {
+        Some("ARCHIVE_VERIFY_NO_PROGRESS".to_owned())
+    } else {
+        previous_error.clone()
+    };
+    let error_at = if complete {
+        None
+    } else if report_no_progress {
+        Some(now)
+    } else {
+        previous_error_at
+    };
+    sqlx::query(
+        "UPDATE blobs SET archive_verified_at = CASE WHEN $4 THEN GREATEST( \
+             $5, COALESCE(archive_verified_at, $5) + interval '1 microsecond') \
+             ELSE archive_verified_at END, archive_error_code = $6, archive_error_at = $7, \
+           archive_verify_no_progress_attempts = $8, \
+           archive_verify_claim_token = NULL, archive_verify_claimed_at = NULL, \
+           archive_verify_offset = CASE WHEN $4 THEN 0 ELSE $3 END \
+         WHERE id = $1 AND archive_verify_claim_token = $2",
+    )
+    .bind(candidate.id)
+    .bind(candidate.claim_token)
+    .bind(offset)
+    .bind(complete)
+    .bind(now)
+    .bind(&error_code)
+    .bind(error_at)
+    .bind(no_progress_attempts)
+    .execute(&mut *tx)
+    .await?;
+    if report_no_progress {
+        let event = NewEvent::new("archive.verification_failed")
+            .org(org_id)
+            .target("blob", candidate.id)
+            .result(crate::audit::AuditResult::Failed)
+            .detail("error_code", Detail::Code("ARCHIVE_VERIFY_NO_PROGRESS"));
+        crate::audit::record_in(&mut tx, &AuditCtx::system(), &event).await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Releases a failed verification lease, resets partial progress, and records
+/// a bounded operator-visible error code.
+pub async fn archive_verify_failed(
+    pool: &PgPool,
+    candidate: &ArchiveVerifyCandidate,
+    error_code: &'static str,
+    now: OffsetDateTime,
+) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    let current: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT org_id, archive_error_code FROM blobs WHERE id = $1 \
+         AND state = 'committed' AND tier_state = 'archived' \
+         AND archive_verify_claim_token = $2 FOR UPDATE",
+    )
+    .bind(candidate.id)
+    .bind(candidate.claim_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((org_id, previous_error)) = current else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    sqlx::query(
+        "UPDATE blobs SET archive_verify_offset = 0, archive_verify_claim_token = NULL, \
+           archive_verify_claimed_at = NULL, archive_verify_attempted_at = $4, \
+           archive_verify_no_progress_attempts = 0, archive_verified_at = GREATEST( \
+             $4, COALESCE(archive_verified_at, $4) + interval '1 microsecond'), \
+           archive_error_code = $3, archive_error_at = $4 \
+         WHERE id = $1 AND archive_verify_claim_token = $2",
+    )
+    .bind(candidate.id)
+    .bind(candidate.claim_token)
+    .bind(error_code)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    if previous_error.as_deref() != Some(error_code) {
+        let event = NewEvent::new("archive.verification_failed")
+            .org(org_id)
+            .target("blob", candidate.id)
+            .result(crate::audit::AuditResult::Failed)
+            .detail("error_code", Detail::Code(error_code));
+        crate::audit::record_in(&mut tx, &AuditCtx::system(), &event).await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Records an archive verification. Error codes are bounded machine values and

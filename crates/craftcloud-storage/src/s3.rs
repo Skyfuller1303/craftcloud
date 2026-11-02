@@ -403,10 +403,7 @@ impl ObjectStore for S3Store {
             .await
         {
             Ok(_) => return Err(StorageError::AlreadyExists),
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_not_found()) => {}
+            Err(error) if is_s3_not_found(&error) => {}
             Err(_) => return Err(s3_io_error()),
         }
         self.staging
@@ -529,10 +526,7 @@ impl ObjectStore for S3Store {
             .send()
             .await
             .map_err(|error| {
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_not_found())
-                {
+                if is_s3_not_found(&error) {
                     StorageError::NotFound
                 } else {
                     s3_io_error()
@@ -604,10 +598,7 @@ impl ObjectStore for S3Store {
             .send()
             .await
             .map_err(|error| {
-                if error
-                    .as_service_error()
-                    .is_some_and(|service| service.is_not_found())
-                {
+                if is_s3_not_found(&error) {
                     StorageError::NotFound
                 } else {
                     s3_io_error()
@@ -778,6 +769,12 @@ impl ReadSource for S3Reader {
 
 fn map_s3_error<E>(_error: E) -> StorageError {
     s3_io_error()
+}
+
+fn is_s3_not_found<E>(error: &aws_sdk_s3::error::SdkError<E>) -> bool {
+    error
+        .raw_response()
+        .is_some_and(|response| response.status().as_u16() == 404)
 }
 
 fn should_delete_unverified_publication(reserved: bool) -> bool {
