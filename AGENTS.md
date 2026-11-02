@@ -5,7 +5,7 @@ Read `README.md`, `docs/README.md`, `docs/01-repository/upstream-comparison.md`,
 ## Non-negotiables (proposed and based on visible Craft conventions)
 
 1. **Local-first**: a Craft app always works without a CraftCloud login. Network errors cannot corrupt or prevent opening local files.
-2. **No unsupported ownership or licensing claims**: this repository blueprint is a proposal. Do not copy code from restricted `artcraft-services`. MIT OR Apache-2.0 requires maintainer agreement; never invent permission for names/logos.
+2. **License and rights boundaries**: original CraftCloud code is MIT OR Apache-2.0; do not copy code from restricted `artcraft-services`. The license does not grant permission for names, logos, trademarks, or assets.
 3. **Never crash on bad input**: no panicking code paths in production, no `unsafe`, bounded parsing, checked arithmetic, no secrets in logs. Tests must cover each error and abuse case.
 4. **Data boundaries**: client -> transport -> authentication -> authorization -> application domain -> persistence/storage. Never let the web UI decide access rights; every request and background job rechecks tenant/object scope.
 5. **Security by default**: no unauthenticated public admin; deny-by-default; protect bootstrap; TLS at trusted proxy; CSRF/session cookie policy; hash credentials/tokens using appropriate modern schemes; protect SSRF/path traversal and tenant isolation.

@@ -22,7 +22,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-# No `license` field on purpose: the license is undecided (ADR-0008).
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 craftcloud-core = { path = "crates/craftcloud-core" }

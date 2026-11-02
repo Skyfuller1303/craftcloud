@@ -6,7 +6,11 @@
 
 CraftCloud is an **optional, local-first, self-hostable** account, organization, workspace, file and project service for the Craft App Suite. Local applications must remain usable without account, network access, or the CraftCloud service.
 
-This package is a **proposed future repository structure** consistent with documented patterns from `storytold/figcraft`, `storytold/wordcraft`, `storytold/gridcraft`, `storytold/filmcraft`, `storytold/photocraft`, `storytold/vectorcraft`, `storytold/craft-launcher`, `storytold/craft-libs`, `storytold/craft-ai-integrations`, and `storytold/artcraft-services`. It neither claims maintainers' endorsement nor copies their code. Before publishing, confirm brand permission, ownership, copyright and licensing.
+This package is a **proposed future repository structure** consistent with documented patterns from `storytold/figcraft`, `storytold/wordcraft`, `storytold/gridcraft`, `storytold/filmcraft`, `storytold/photocraft`, `storytold/vectorcraft`, `storytold/craft-launcher`, `storytold/craft-libs`, `storytold/craft-ai-integrations`, and `storytold/artcraft-services`. It neither claims maintainers' endorsement nor copies their code. Confirm repository ownership, brand permission and rights to third-party content separately.
+
+## License
+
+Original CraftCloud code is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This license does not grant permission to use CraftCloud or other parties' names, logos, trademarks, or assets. Third-party components remain under their respective licenses; see [license, trademarks and dependencies](docs/01-repository/license-trademarks-and-dependencies.md).
 
 ## Status: not production-ready, local prototype
 
@@ -98,7 +102,7 @@ craftcloud/
 └── README.md
 ```
 
-> **Do not treat omitted files as finished implementation.** The tree above is the original proposal; the actual layout is in the repository (for example `deploy/` holds Compose, installer and proxy templates instead of `packaging/`). The release is a local test prototype, there are no unapproved logos, and no copied upstream license texts.
+> **Do not treat omitted files as finished implementation.** The tree above is the original proposal; the actual layout is in the repository (for example `deploy/` holds Compose, installer and proxy templates instead of `packaging/`). The release is a local test prototype, and there are no unapproved logos.
 
 ## Sequencing
 
@@ -107,7 +111,6 @@ craftcloud/
 ## Core decisions pending approval
 
 - Whether project belongs inside `storytold` or starts as independent community RFC.
-- Licensing: propose MIT OR Apache-2.0 **only if rightsholders accept**; no re-use of restricted `artcraft-services` source.
 - Which UI stack: a React/TS web admin is pragmatic for a separate server product, but **not** the Rust-only `craft-launcher` pattern; do not move React into the Launcher.
 - Database: PostgreSQL as first production target; SQLite only if separately designed and tested, not a silent promise.
 - Namespace: `craftcloud-*` for packages is a recommendation, not upstream policy.

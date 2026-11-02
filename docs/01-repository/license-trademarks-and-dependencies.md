@@ -5,9 +5,9 @@
 - Craft Launcher, FigCraft, craft-libs, craft-ai-integrations: öffentlich dual MIT/Apache-2.0 ausgewiesen.
 - `artcraft-services`: spezielle `ArtCraft License (WIP)` mit Verwertungsbeschränkungen; **kein** unverändert übernehmbares MIT/Apache-Backend.
 
-## Vorgeschlagene Regel
+## Lizenz für CraftCloud-Code
 
-Für neue, selbst geschriebene CraftCloud-Bestandteile könnte MIT OR Apache-2.0 passen, wenn Rechteinhaber und Maintainer zustimmen. Dieses Paket verteilt bewusst keine unautorisierte LICENSE-Datei. Übernahme von Snippets, APIs, Designs, Logos, Fonts, Datenbank-/Auth-Code oder Marken muss einzeln geprüft werden. Interfaces können nach üblichen Interoperabilitätsgrundsätzen eigenständig beschrieben werden, aber rechtliche Prüfung ersetzt dies nicht.
+Neu entwickelter CraftCloud-Code steht unter MIT OR Apache-2.0, nach Wahl des Nutzers. Siehe [LICENSE-MIT](../../LICENSE-MIT), [LICENSE-APACHE](../../LICENSE-APACHE) und [ADR-0008](../09-decisions/adr-0008-licensing.md). Diese Lizenzen erteilen keine Rechte an Namen, Logos, Marken oder Assets Dritter. Übernahme von Snippets, APIs, Designs, Logos, Fonts, Datenbank-/Auth-Code oder Marken muss einzeln geprüft werden. Interfaces können nach üblichen Interoperabilitätsgrundsätzen eigenständig beschrieben werden, aber rechtliche Prüfung ersetzt dies nicht.
 
 ## Dependencies
 
@@ -19,7 +19,7 @@ Vor Aufnahme: Lizenz kompatibel? Aktiv gewartet? Security advisories? Minimale F
 
 ## Exit-Kriterien
 
-- Gewünschte Repo/Trademark-Nutzung freigegeben.
-- Lizenzdateien inklusive vollständigem offiziellen Text durch Berechtigte hinzugefügt.
+- Repository-Eigentum und Markennutzung bleiben separat zu klären.
+- Lizenzdateien mit vollständigem Lizenztext sind vorhanden.
 - Dependency Inventory, SPDX-Review und Third-Party Notices vorbereitet.
 - Security/Kontaktverantwortliche benannt.

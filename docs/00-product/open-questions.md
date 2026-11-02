@@ -4,7 +4,7 @@
 |---|---|---|---|
 | D01 | Eigene Repo unter `storytold` oder zunächst Community-Repo? | RFC im übergreifenden ArtCraft-Issue; Repo nur mit Maintainer-Akzeptanz | Maintainer, Phase 0 |
 | D02 | Name `CraftCloud` und Produkt-Branding frei? | Arbeitstitel; keine Logos/Markenassets | Rechteinhaber, Phase 0 |
-| D03 | Lizenz? | Neu entwickelter Code ggf. MIT OR Apache-2.0; schriftlich freigeben | Rechteinhaber, Phase 0 |
+| D03 | Lizenz? | Für unabhängig entwickelten CraftCloud-Code entschieden: MIT OR Apache-2.0; Repository-Eigentum, Branding und Drittinhalte bleiben separat | ADR-0008; Rechteinhaber/Maintainer für offene Rechtefragen |
 | D04 | `craftrules` Standards verfügbar? | Zugriff erfragen; dokumentierte öffentlich sichtbare Regeln vorläufig anwenden | Maintainer, Phase 0 |
 | D05 | Hat ein offizieller Hosted-Service Vorrang? | Shared API, konfigurierbare Endpoint-URL, keine Host-Bindung | Produktteam, Phase 0 |
 | D06 | Erstintegration? | Kleine Datei-Open/Save-Integration in nur einer App, nicht sofort FigCraft-Live-Collab | App-Maintainer, Phase 1/4 |
