@@ -187,6 +187,7 @@ export const ENDPOINTS = {
   listVersions: { method: "GET", path: "/files/{file_id}/versions" },
   commitVersion: { method: "POST", path: "/files/{file_id}/versions" },
   restoreVersion: { method: "POST", path: "/files/{file_id}/versions/{version_id}/restore" },
+  pinVersion: { method: "PATCH", path: "/files/{file_id}/versions/{version_id}" },
   downloadHead: { method: "GET", path: "/files/{file_id}/content" },
   downloadVersion: { method: "GET", path: "/files/{file_id}/versions/{version_id}/content" },
   acquireFileLock: { method: "POST", path: "/files/{file_id}/lock" },
@@ -499,6 +500,7 @@ export interface ApiClient {
     versionId: string,
     expectedHeadVersionId: string,
   ): Promise<FileVersion>;
+  pinVersion(fileId: string, versionId: string, pinned: boolean): Promise<FileVersion>;
   /** URL for a plain link or `<a download>`; the browser streams the body, the page never holds it. */
   downloadUrl(fileId: string, versionId?: string): string;
   acquireFileLock(fileId: string, clientId: string, takeover?: boolean): Promise<FileLock>;
@@ -961,6 +963,8 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         params: { file_id: fileId, version_id: versionId },
         headers: { "If-Match": etag.content(expectedHeadVersionId) },
       }),
+    pinVersion: (fileId, versionId, pinned) =>
+      call(ENDPOINTS.pinVersion, { params: { file_id: fileId, version_id: versionId }, body: { pinned } }),
     downloadUrl: (fileId, versionId) =>
       versionId === undefined
         ? API_BASE + expandPath(ENDPOINTS.downloadHead.path, { file_id: fileId })

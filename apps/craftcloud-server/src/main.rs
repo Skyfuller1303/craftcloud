@@ -55,7 +55,7 @@ const GIT_COMMIT: &str = match option_env!("CRAFTCLOUD_COMMIT") {
     None => "unknown",
 };
 
-const USAGE: &str = "usage: craftcloud-server [serve | figcraft | all-in-one | backup <args> | restore <dir> | migrate | healthcheck | archive status | archive recall [--org <uuid>] | admin issue-password-reset --email <address> | admin user reset-2fa <email> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>] | admin backup inventory --confirm-complete <dir>... | admin backup release --id <uuid> --manifest-sha256 <hex> --confirm-deleted]\n\
+const USAGE: &str = "usage: craftcloud-server [serve | figcraft | all-in-one | backup <args> | restore <dir> | migrate | healthcheck | archive status | archive recall [--org <uuid>] | admin issue-password-reset --email <address> | admin user reset-2fa <email> | admin set-org-owner --org <slug> --email <address> | admin maintenance --once [--dry-run] | admin storage-bind --force | admin storage rechunk (--file <uuid> | --all) [--dry-run] | admin backup create --out <dir> | admin backup verify <dir> [--manifest-sha256 <hex>] | admin backup restore <dir> [--manifest-sha256 <hex>] | admin backup inventory --confirm-complete <dir>... | admin backup release --id <uuid> --manifest-sha256 <hex> --confirm-deleted]\n\
     \n\
     (no argument), serve                   start the HTTP server\n\
     figcraft                               run the bundled FigCraft server in place of this process\n\
@@ -72,6 +72,8 @@ const USAGE: &str = "usage: craftcloud-server [serve | figcraft | all-in-one | b
     admin maintenance --once [--dry-run]   run the maintenance job once (retention purge, blob garbage collection,\n\
                                            reconciliation, verification) and print counts; --dry-run changes nothing
     admin storage-bind --force             deliberately (re)bind this database and CRAFTCLOUD_STORAGE_DIR to each other\n\
+    admin storage rechunk (--file UUID | --all) [--dry-run]\n\
+                                           safely convert committed whole versions to local chunks; dry run changes nothing\n\
     admin backup create --out DIR          consistent backup of the database and all committed blobs into the new or empty DIR\n\
     admin backup verify DIR                check every checksum of a backup (needs no database; --manifest-sha256 pins the manifest)\n\
     admin backup restore DIR               load a verified backup into an EMPTY database and an EMPTY CRAFTCLOUD_STORAGE_DIR\n\
@@ -124,17 +126,45 @@ enum Command {
     Figcraft,
     AllInOne,
     ArchiveStatus,
-    ArchiveRecall { org_id: Option<uuid::Uuid> },
-    IssuePasswordReset { email: String },
-    ResetTwoFactor { email: String },
-    SetOrgOwner { org: String, email: String },
-    Maintenance { dry_run: bool },
+    ArchiveRecall {
+        org_id: Option<uuid::Uuid>,
+    },
+    IssuePasswordReset {
+        email: String,
+    },
+    ResetTwoFactor {
+        email: String,
+    },
+    SetOrgOwner {
+        org: String,
+        email: String,
+    },
+    Maintenance {
+        dry_run: bool,
+    },
     StorageBind,
-    BackupCreate { out: String },
-    BackupVerify { dir: String, digest: Option<String> },
-    BackupRestore { dir: String, digest: Option<String> },
-    BackupInventory { dirs: Vec<String> },
-    BackupRelease { backup_id: String, digest: String },
+    StorageRechunk {
+        file_id: Option<uuid::Uuid>,
+        dry_run: bool,
+    },
+    BackupCreate {
+        out: String,
+    },
+    BackupVerify {
+        dir: String,
+        digest: Option<String>,
+    },
+    BackupRestore {
+        dir: String,
+        digest: Option<String>,
+    },
+    BackupInventory {
+        dirs: Vec<String>,
+    },
+    BackupRelease {
+        backup_id: String,
+        digest: String,
+    },
     Help,
     Version,
 }
@@ -207,6 +237,56 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             if admin == "admin" && action == "storage-bind" && force == "--force" =>
         {
             Ok(Command::StorageBind)
+        }
+        [admin, storage, rechunk, flag, raw_id, dry]
+            if admin == "admin"
+                && storage == "storage"
+                && rechunk == "rechunk"
+                && flag == "--file"
+                && dry == "--dry-run" =>
+        {
+            let file_id = uuid::Uuid::parse_str(raw_id)
+                .map_err(|_| "admin storage rechunk --file requires a valid UUID".to_owned())?;
+            Ok(Command::StorageRechunk {
+                file_id: Some(file_id),
+                dry_run: true,
+            })
+        }
+        [admin, storage, rechunk, flag, raw_id]
+            if admin == "admin"
+                && storage == "storage"
+                && rechunk == "rechunk"
+                && flag == "--file" =>
+        {
+            let file_id = uuid::Uuid::parse_str(raw_id)
+                .map_err(|_| "admin storage rechunk --file requires a valid UUID".to_owned())?;
+            Ok(Command::StorageRechunk {
+                file_id: Some(file_id),
+                dry_run: false,
+            })
+        }
+        [admin, storage, rechunk, all, dry]
+            if admin == "admin"
+                && storage == "storage"
+                && rechunk == "rechunk"
+                && all == "--all"
+                && dry == "--dry-run" =>
+        {
+            Ok(Command::StorageRechunk {
+                file_id: None,
+                dry_run: true,
+            })
+        }
+        [admin, storage, rechunk, all]
+            if admin == "admin"
+                && storage == "storage"
+                && rechunk == "rechunk"
+                && all == "--all" =>
+        {
+            Ok(Command::StorageRechunk {
+                file_id: None,
+                dry_run: false,
+            })
         }
         [admin, backup, create, flag, out]
             if admin == "admin" && backup == "backup" && create == "create" && flag == "--out" =>
@@ -400,6 +480,13 @@ async fn async_main() -> ExitCode {
         Command::SetOrgOwner { org, email } => set_org_owner(&config, &org, &email).await,
         Command::Maintenance { dry_run } => maintenance_once(&config, dry_run).await,
         Command::StorageBind => storage_bind(&config).await,
+        Command::StorageRechunk { file_id, dry_run } => {
+            if dry_run {
+                storage_rechunk_dry_run(&config, file_id).await
+            } else {
+                storage_rechunk_apply(&config, file_id).await
+            }
+        }
         Command::BackupCreate { out } => backup_create(&config, &out).await,
         Command::BackupRestore { dir, digest } => {
             backup_restore(&config, &dir, digest.as_deref()).await
@@ -1284,6 +1371,14 @@ fn maintenance_settings(config: &Config) -> MaintenanceSettings {
     );
     settings.quarantine_retention = config.quarantine_retention;
     settings.audit_retention_days = config.audit_retention_days;
+    settings.version_thinning = craftcloud_db::maintenance::VersionThinningPolicy {
+        retention_days: u32::try_from(config.version_retention.as_secs() / 86_400)
+            .unwrap_or(u32::MAX),
+        keep_all_hours: config.version_keep_all_hours,
+        daily_days: config.version_daily_days,
+        weekly_weeks: config.version_weekly_weeks,
+        max_per_file: config.version_max_per_file,
+    };
     settings
 }
 
@@ -1327,6 +1422,108 @@ async fn storage_bind(config: &Config) -> Result<(), Failure> {
         old_marker = %show(bound.old_marker),
         new = %bound.new,
         "audit"
+    );
+    pool.close().await;
+    Ok(())
+}
+
+/// Reports committed whole versions selected for rechunking without writes.
+async fn storage_rechunk_dry_run(
+    config: &Config,
+    file_id: Option<uuid::Uuid>,
+) -> Result<(), Failure> {
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "storage rechunk requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let (whole_versions, chunked_versions, logical_bytes) =
+        craftcloud_db::rechunk::inventory(&pool, file_id)
+            .await
+            .map_err(|_| Failure::runtime("cannot read rechunk preview from the database"))?;
+    println!(
+        "dry_run=true file={} whole_versions={} already_chunked_versions={} logical_bytes={} changed=false",
+        file_id.map_or_else(|| "all".to_owned(), |id| id.to_string()),
+        whole_versions,
+        chunked_versions,
+        logical_bytes
+    );
+    Ok(())
+}
+
+async fn storage_rechunk_apply(
+    config: &Config,
+    file_id: Option<uuid::Uuid>,
+) -> Result<(), Failure> {
+    let Some(pool) = connect_database(&config.database).await? else {
+        return Err(Failure::config(
+            "storage rechunk requires CRAFTCLOUD_DATABASE_URL_FILE to be set",
+        ));
+    };
+    craftcloud_db::migrate::verify(&pool)
+        .await
+        .map_err(|err| Failure::runtime(format!("{err}; run `craftcloud-server migrate` first")))?;
+    let store_dir = config.storage_dir.as_ref().ok_or_else(|| {
+        Failure::config("storage rechunk requires CRAFTCLOUD_STORAGE_DIR to be set")
+    })?;
+    let local = craftcloud_storage::LocalStore::open(store_dir)
+        .await
+        .map_err(|_| Failure::runtime("cannot open local object storage for rechunk"))?;
+    match check_existing_store_binding(&pool, &local, time::OffsetDateTime::now_utc()).await {
+        Ok(Binding::Matches(_)) => {}
+        Ok(_) | Err(_) => {
+            return Err(Failure::runtime(
+                "storage rechunk requires the existing database and local store binding to match",
+            ));
+        }
+    }
+    let archive = archive_runtime(config).await?;
+    let mut key = load_two_factor_key(config.secret_key_file.as_ref()).ok_or_else(|| {
+        Failure::config(
+            "storage rechunk requires a valid CRAFTCLOUD_SECRET_KEY_FILE with a Base64 32-byte key",
+        )
+    })?;
+    let mut identity_keys = Vec::new();
+    if let Some(derived) = craftcloud_storage::derive_chunk_key(&key) {
+        identity_keys.push(derived);
+    }
+    key.zeroize();
+    if let Some(mut old_key) = load_two_factor_key(config.secret_key_old_file.as_ref()) {
+        if let Some(derived) = craftcloud_storage::derive_chunk_key(&old_key) {
+            identity_keys.push(derived);
+        }
+        old_key.zeroize();
+    }
+    let archive_access = archive
+        .as_ref()
+        .map(|runtime| craftcloud_api::rechunk::RechunkArchive {
+            store: &runtime.store,
+            crypto: &runtime.crypto,
+        });
+    let result = craftcloud_api::rechunk::run(
+        &pool,
+        &local,
+        file_id,
+        false,
+        &identity_keys,
+        archive_access,
+    )
+    .await
+    .map_err(Failure::runtime);
+    identity_keys.zeroize();
+    let report = result?;
+    println!(
+        "dry_run=false file={} whole_versions={} already_chunked_versions={} converted_blobs={} converted_versions={} logical_bytes={} changed={}",
+        file_id.map_or_else(|| "all".to_owned(), |id| id.to_string()),
+        report.whole_versions,
+        report.already_chunked_versions,
+        report.converted_blobs,
+        report.converted_versions,
+        report.logical_bytes,
+        report.converted_blobs > 0,
     );
     pool.close().await;
     Ok(())
@@ -1858,6 +2055,12 @@ async fn maintenance_once(config: &Config, dry_run: bool) -> Result<(), Failure>
         std::env::var_os("CRAFTCLOUD_AUDIT_RETENTION_DAYS").is_some(),
         std::env::var_os("CRAFTCLOUD_QUARANTINE_DAYS").is_some(),
     ]);
+    let job = job.with_version_setting_environment([
+        std::env::var_os("CRAFTCLOUD_VERSIONS_KEEP_ALL_HOURS").is_some(),
+        std::env::var_os("CRAFTCLOUD_VERSIONS_DAILY_DAYS").is_some(),
+        std::env::var_os("CRAFTCLOUD_VERSIONS_WEEKLY_WEEKS").is_some(),
+        std::env::var_os("CRAFTCLOUD_VERSIONS_MAX_PER_FILE").is_some(),
+    ]);
     let (_keep_alive, stop) = watch::channel(false);
     let outcome = job
         .run_once(
@@ -2216,6 +2419,12 @@ async fn run(config: Config) -> Result<(), Failure> {
                 std::env::var_os("CRAFTCLOUD_TRASH_RETENTION_DAYS").is_some(),
                 std::env::var_os("CRAFTCLOUD_AUDIT_RETENTION_DAYS").is_some(),
                 std::env::var_os("CRAFTCLOUD_QUARANTINE_DAYS").is_some(),
+            ])
+            .with_version_setting_environment([
+                std::env::var_os("CRAFTCLOUD_VERSIONS_KEEP_ALL_HOURS").is_some(),
+                std::env::var_os("CRAFTCLOUD_VERSIONS_DAILY_DAYS").is_some(),
+                std::env::var_os("CRAFTCLOUD_VERSIONS_WEEKLY_WEEKS").is_some(),
+                std::env::var_os("CRAFTCLOUD_VERSIONS_MAX_PER_FILE").is_some(),
             ])
             .with_metrics(std::sync::Arc::clone(&metrics));
             let job = match (&archive_parts, archive_worker_storage_allowed) {
@@ -2679,6 +2888,26 @@ fn instance_setting_environment_with(
         &["QUARANTINE_DAYS"],
         json!(config.quarantine_retention.as_secs() / 86_400),
     );
+    public(
+        "versions.keep_all_hours",
+        &["VERSIONS_KEEP_ALL_HOURS"],
+        json!(config.version_keep_all_hours),
+    );
+    public(
+        "versions.daily_days",
+        &["VERSIONS_DAILY_DAYS"],
+        json!(config.version_daily_days),
+    );
+    public(
+        "versions.weekly_weeks",
+        &["VERSIONS_WEEKLY_WEEKS"],
+        json!(config.version_weekly_weeks),
+    );
+    public(
+        "versions.max_per_file",
+        &["VERSIONS_MAX_PER_FILE"],
+        json!(config.version_max_per_file),
+    );
     drop(public);
     let secret_envs: [(&str, &[&str]); 5] = [
         ("mail.password", &["SMTP_PASSWORD_FILE"]),
@@ -2966,6 +3195,45 @@ mod tests {
             &["admin", "backup", "wipe", "/b/1"][..],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn storage_rechunk_requires_an_explicit_target_and_accepts_dry_run() {
+        let file_id = uuid::Uuid::new_v4();
+        assert!(matches!(
+            parse_args(&args(&["admin", "storage", "rechunk", "--file", &file_id.to_string(), "--dry-run"])),
+            Ok(Command::StorageRechunk { file_id: Some(id), dry_run: true }) if id == file_id
+        ));
+        assert!(matches!(
+            parse_args(&args(&["admin", "storage", "rechunk", "--file", &file_id.to_string()])),
+            Ok(Command::StorageRechunk { file_id: Some(id), dry_run: false }) if id == file_id
+        ));
+        assert!(matches!(
+            parse_args(&args(&[
+                "admin",
+                "storage",
+                "rechunk",
+                "--all",
+                "--dry-run"
+            ])),
+            Ok(Command::StorageRechunk {
+                file_id: None,
+                dry_run: true
+            })
+        ));
+        assert!(matches!(
+            parse_args(&args(&["admin", "storage", "rechunk", "--all"])),
+            Ok(Command::StorageRechunk {
+                file_id: None,
+                dry_run: false
+            })
+        ));
+        for bad in [
+            vec!["admin", "storage", "rechunk", "--file", "bad", "--dry-run"],
+            vec!["admin", "storage", "rechunk", "--all", "--force"],
+        ] {
+            assert!(parse_args(&args(&bad)).is_err(), "{bad:?}");
         }
     }
 

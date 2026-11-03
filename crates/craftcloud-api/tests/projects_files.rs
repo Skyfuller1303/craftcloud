@@ -443,6 +443,45 @@ mod tests {
         assert_eq!(committed.status, StatusCode::CREATED, "{}", committed.text);
     }
 
+    async fn upload_next_bytes(w: &W, actor: &Session, file: Uuid, bytes: &[u8]) {
+        let base: String =
+            sqlx::query_scalar("SELECT head_version_id::text FROM files WHERE id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        let sha256 = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let created = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/uploads"))
+                .session(actor)
+                .json(json!({"size_bytes":bytes.len(),"sha256":sha256})),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let upload = created.body["upload_id"].as_str().unwrap().to_owned();
+        let stored = call(
+            &w.env.app,
+            Req::new("PUT", &format!("/api/v1/uploads/{upload}/content"))
+                .session(actor)
+                .body(axum::body::Body::from(bytes.to_vec())),
+        )
+        .await;
+        assert_eq!(stored.status, StatusCode::OK, "{}", stored.text);
+        let committed = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/versions"))
+                .session(actor)
+                .header("If-Match", &format!("\"version:{base}\""))
+                .json(json!({"upload_id":upload})),
+        )
+        .await;
+        assert_eq!(committed.status, StatusCode::CREATED, "{}", committed.text);
+    }
+
     fn hidden(resp: &Resp) {
         assert_status(resp, StatusCode::NOT_FOUND, "NOT_FOUND");
     }
@@ -1790,6 +1829,91 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(final_state, "live");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn figcraft_publish_reads_chunked_native_source() {
+        let mut w = W::new().await;
+        let (archive, crypto) = w
+            .env
+            .configure_archive_figcraft(Arc::new(FakeFigcraft), "ws://figcraft.test/figcraft")
+            .await;
+        let c = cast(&w).await;
+        let project = w.project_id(&c.owner.1, c.ws, "Chunked live source").await;
+        let file = w.file_id(&c.owner.1, project, "chunked.figcraft").await;
+        let source: Vec<u8> = (0..12 * 1024 * 1024)
+            .map(|i| ((i * 31 + 17) % 251) as u8)
+            .collect();
+        upload_bytes(&w, &c.owner.1, file, &source).await;
+        let layout: String = sqlx::query_scalar(
+            "SELECT b.layout FROM files f JOIN blobs b ON b.id=(SELECT blob_id FROM file_versions WHERE id=f.head_version_id) WHERE f.id=$1",
+        )
+        .bind(file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(layout, "chunked");
+
+        let published = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live")).session(&c.owner.1),
+        )
+        .await;
+        assert_eq!(published.status, StatusCode::OK, "{}", published.text);
+        assert!(published.body["join_url"].as_str().is_some());
+        sqlx::query("UPDATE figcraft_live_files SET state='republish' WHERE file_id=$1")
+            .bind(file)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let mut changed = source.clone();
+        let start = changed.len() / 2;
+        let count = changed.len() / 100;
+        changed[start..start + count].fill(0x6b);
+        upload_next_bytes(&w, &c.owner.1, file, &changed).await;
+        w.env.clock.advance(Duration::from_secs(1));
+        let published_version: Uuid = sqlx::query_scalar(
+            "SELECT published_from_version_id FROM figcraft_live_files WHERE file_id=$1",
+        )
+        .bind(file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let local = craftcloud_storage::LocalStore::open(&w.env.storage_dir)
+            .await
+            .unwrap();
+        let archived = craftcloud_api::archive_worker::archive_batch(
+            &w.env.pool,
+            &local,
+            archive.as_ref(),
+            crypto.as_ref(),
+            w.env.clock.now(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(archived.archived > 0);
+        let archived_old_chunks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+             WHERE vc.version_id=$1 AND c.storage_tier='archive'",
+        )
+        .bind(published_version)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(archived_old_chunks > 0);
+        sqlx::query("UPDATE figcraft_live_files SET state='live' WHERE file_id=$1")
+            .bind(file)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let snapshot = call(
+            &w.env.app,
+            Req::new("POST", &format!("/api/v1/files/{file}/live/snapshot")).session(&c.owner.1),
+        )
+        .await;
+        assert!(snapshot.status.is_success(), "{}", snapshot.text);
     }
 
     #[tokio::test]

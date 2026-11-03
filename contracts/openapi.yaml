@@ -766,7 +766,7 @@ paths:
           csrfToken: []
         - bearerAuth: []
       summary: Change unlocked instance settings and write-only secrets
-      description: Secret payloads are never returned. Empty secret input leaves the value unchanged; use remove=true to delete. A secret key accepts only set or remove; a plain value is rejected with 422. All mail configuration changes and every shortening of a retention period require a fresh browser session and fresh TOTP when required. When the mail transport, host, port, TLS mode, Microsoft tenant or OAuth client ID changes, all stored secrets are deleted in the same transaction unless the request sets them again; the deleted keys are listed in credentials_cleared. A shortened retention period keeps the longer previous period for 24 hours. When mail is configured through the server environment, every mail setting and secret is locked (409 SETTING_LOCKED).
+      description: Secret payloads are never returned. Empty secret input leaves the value unchanged; use remove=true to delete. A secret key accepts only set or remove; a plain value is rejected with 422. All mail configuration changes and every shortening of a retention or version-thinning setting require a fresh browser session and fresh TOTP when required. When the mail transport, host, port, TLS mode, Microsoft tenant or OAuth client ID changes, all stored secrets are deleted in the same transaction unless the request sets them again; the deleted keys are listed in credentials_cleared. A shortened retention or thinning setting keeps its previous, more protective value for 24 hours. When a setting is configured through the server environment, that setting is locked (409 SETTING_LOCKED).
       requestBody:
         required: true
         content:
@@ -1781,13 +1781,14 @@ paths:
                   server_version: {type: string, example: '0.0.0'}
                   feature_flags:
                     type: object
-                    required: [device_login, two_factor, grants, locks, figcraft_live]
+                    required: [device_login, two_factor, grants, locks, figcraft_live, chunked_upload]
                     properties:
                       device_login: {type: boolean}
                       two_factor: {type: boolean}
                       grants: {type: boolean}
                       locks: {type: boolean}
                       figcraft_live: {type: boolean}
+                      chunked_upload: {type: boolean, description: True only when a server identity key and local object store are available}
                   limits:
                     type: object
                     required: [max_file_size, block_size]
@@ -2547,7 +2548,13 @@ paths:
         - bearerAuth: []
       summary: Create an upload session and reserve its quota (organization owner/admin, workspace admin and editor)
       description: >-
-        Declares size and SHA-256 of the content that will follow with `PUT /uploads/{upload_id}/content`. Reserves
+        Declares size and SHA-256 of the content that will follow with `PUT /uploads/{upload_id}/content`. Optionally
+        selects chunked mode with an ordered manifest; only missing ordinals are sent to `PUT /uploads/{upload_id}/chunks/{ordinal}`.
+        The manifest has at most 32,768 entries and 4 MiB JSON. Each block is at most 4 MiB; every non-final block is at
+        least 256 KiB. The offsets are cumulative and the declared block lengths must sum exactly to `size_bytes`.
+        Reused ordinals are only those with locally present bytes that passed SHA-256 verification. Archived, unavailable
+        or corrupt bytes are reported missing so the client can supply them. The response includes `mode: chunked` and
+        `missing_chunks` as zero-based ordinals. Reserves
         the size against the workspace and organization quota (413 QUOTA_EXCEEDED; the message never names other
         workspaces) and checks the maximum file size of the server (413 PAYLOAD_TOO_LARGE). At most 10 open sessions per
         user and 200 per organization (409 UPLOAD_LIMIT). The session expires after `CRAFTCLOUD_UPLOAD_TTL_HOURS` (default
@@ -2718,6 +2725,44 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /uploads/{upload_id}/chunks/{ordinal}:
+    parameters:
+      - {$ref: '#/components/parameters/UploadId'}
+      - name: ordinal
+        in: path
+        required: true
+        schema: {type: integer, minimum: 0, maximum: 32767}
+    put:
+      tags: [Uploads]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Stream one declared missing chunk
+      description: >-
+        Raw block bytes, streamed with bounded memory. The server checks the manifest ordinal, exact length and
+        plaintext SHA-256, then protects the resulting file-scoped chunk from GC and archive movement for the
+        lifetime of the session. Repeating the same correct PUT is idempotent. Other-file content is never queried.
+        Rights, current membership, login session, expiry, CSRF and application access are checked on every request;
+        non-visible sessions answer 404. A whole-file PUT on this session answers 409 UPLOAD_MODE_MISMATCH.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary, maxLength: 4194304}
+      responses:
+        '204': {description: The block is stored or was already stored}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '408': {description: REQUEST_TIMEOUT while the block body stalled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '409': {description: UPLOAD_CLOSED, UPLOAD_CHANGED or UPLOAD_MODE_MISMATCH, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '410': {description: UPLOAD_EXPIRED, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422': {description: LENGTH_MISMATCH or CHECKSUM_MISMATCH, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /organizations/{org_id}/usage:
@@ -3057,6 +3102,31 @@ paths:
               schema: {$ref: '#/components/schemas/Version'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      tags: [Versions]
+      security:
+        - cookieAuth: []
+          csrfToken: []
+        - bearerAuth: []
+      summary: Protect or unprotect a version from automatic thinning (editor and better)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PinVersionRequest'}
+      responses:
+        '200':
+          description: Updated version
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Version'}
+        '400': {$ref: '#/components/responses/AmbiguousCredentials'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/ForbiddenOrCsrf'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/BodyInvalid'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
   /files/{file_id}/versions/{version_id}/restore:
@@ -6682,6 +6752,19 @@ components:
       properties:
         size_bytes: {type: integer, minimum: 0, description: Exact size of the content that will be sent}
         sha256: {type: string, pattern: '^[0-9a-fA-F]{64}$', description: Hex SHA-256 of the content}
+        mode: {type: string, enum: [chunked], description: Selects optional block-by-block upload; absent keeps the legacy whole-file route}
+        chunks:
+          type: array
+          maxItems: 32768
+          description: Ordered plaintext block sizes and SHA-256 values; required with mode chunked, absent for legacy uploads; total size must equal size_bytes.
+          items: {$ref: '#/components/schemas/CreateUploadChunk'}
+    CreateUploadChunk:
+      type: object
+      additionalProperties: false
+      required: [size_bytes, sha256]
+      properties:
+        size_bytes: {type: integer, minimum: 1, maximum: 4194304}
+        sha256: {type: string, pattern: '^[0-9a-fA-F]{64}$'}
     Upload:
       type: object
       required: [upload_id, file_id, project_id, workspace_id, state, size_bytes, sha256, max_bytes, created_by, created_at, expires_at]
@@ -6697,6 +6780,8 @@ components:
         created_by: {type: string, format: uuid}
         created_at: {type: string, format: date-time}
         expires_at: {type: string, format: date-time}
+        mode: {type: string, enum: [chunked]}
+        missing_chunks: {type: array, maxItems: 32768, items: {type: integer, minimum: 0, maximum: 32767}, description: Zero-based ordinals whose verified local bytes are not available}
     QuotaRequest:
       type: object
       additionalProperties: false
@@ -6710,20 +6795,22 @@ components:
         quota_bytes: {type: [integer, 'null'], minimum: 0}
     UsageEntry:
       type: object
-      required: [quota_bytes, reserved_bytes, committed_bytes]
+      required: [quota_bytes, reserved_bytes, committed_bytes, physical_bytes]
       properties:
         quota_bytes: {type: [integer, 'null'], minimum: 0}
         reserved_bytes: {type: integer, minimum: 0}
         committed_bytes: {type: integer, minimum: 0}
+        physical_bytes: {type: integer, minimum: 0, description: Accounted bytes of whole objects and file-scoped chunks}
     WorkspaceUsageEntry:
       type: object
-      required: [workspace_id, effective_limit_bytes, quota_bytes, reserved_bytes, committed_bytes]
+      required: [workspace_id, effective_limit_bytes, quota_bytes, reserved_bytes, committed_bytes, physical_bytes]
       properties:
         workspace_id: {type: string, format: uuid}
         effective_limit_bytes: {type: [integer, 'null'], minimum: 0, description: The smaller of the workspace and the organization quota; null when neither is set}
         quota_bytes: {type: [integer, 'null'], minimum: 0}
         reserved_bytes: {type: integer, minimum: 0}
         committed_bytes: {type: integer, minimum: 0}
+        physical_bytes: {type: integer, minimum: 0, description: Accounted bytes of whole objects and file-scoped chunks}
     UsagePage:
       type: object
       required: [organization, workspaces, next_cursor]
@@ -6740,9 +6827,15 @@ components:
       required: [upload_id]
       properties:
         upload_id: {type: string, format: uuid}
+    PinVersionRequest:
+      type: object
+      additionalProperties: false
+      required: [pinned]
+      properties:
+        pinned: {type: boolean}
     Version:
       type: object
-      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, actor_kind, storage_tier, created_at]
+      required: [id, file_id, number, size_bytes, sha256, base_version_id, restored_from_version_id, upload_id, created_by, actor_kind, storage_tier, created_at, pinned]
       properties:
         id: {type: string, format: uuid}
         file_id: {type: string, format: uuid}
@@ -6756,6 +6849,7 @@ components:
         actor_kind: {type: string, enum: [user, figcraft_live]}
         storage_tier: {type: string, enum: [local, archive], description: Informational storage tier for the version's content.}
         created_at: {type: string, format: date-time}
+        pinned: {type: boolean, description: Protected from automatic version thinning.}
     FigCraftLiveRequest:
       type: object
       additionalProperties: false

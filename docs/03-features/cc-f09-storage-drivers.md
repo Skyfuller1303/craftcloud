@@ -1,11 +1,25 @@
 # CC-F09 — Speicheradapter Local FS und S3
 
+> **Ergänzung AC-15 (2026-11-03):** Der lokale Prototyp ergänzt dateigebundene Block-Deduplizierung. Die folgenden ursprünglichen P2-Angaben beschreiben den Stand vor diesem Ausbau; der aktuelle Speichervertrag steht im Abschnitt „Dateigebundene Blöcke“ und in [ADR-0032](../09-decisions/adr-0032-per-file-chunk-dedup.md). Die unabhängige Prüfung und die vollständigen Abnahmeläufe gehören weiterhin zur Freigabe.
+
 > **Status:** lokaler Dateisystem-Adapter umgesetzt (PR-009, Review offen): Crate `craftcloud-storage` mit Trait `ObjectStore` und `LocalStore` (zufällige Server-Schlüssel, Schreiben über temporäre Objekte mit Byte-Limit und SHA-256, atomares Veröffentlichen per Hard-Link ohne Überschreiben, Schreiben über den Blocking-Pool (Schreibfehler erscheinen sofort, nicht verzögert), Range-Lesen in 64-KiB-Blöcken, Auflisten für die Abstimmung, Symlink-Abwehr, typisierte Fehler inkl. `Full`) samt Fehlerinjektion. Keine HTTP-Routen (Upload/Download folgen mit CC-F07/CC-P02-05). Nicht umgesetzt: S3-Adapter, Deduplizierung (bewusst nie), fortsetzbare Uploads. Ursprünglich: geplantes Feature-Briefing. **Zielphase:** P2 (Files & Versioning). **Priorität:** MVP/Blocker.  
 > **Abhängigkeiten:** Grundarchitektur (`docs/02-architecture/system.md`), Berechtigungsmatrix (`docs/05-security/permission-matrix.md`) und API-Konventionen (`docs/02-architecture/api-conventions.md`).
 
 ## Problem und Nutzen
 
-Storage-Interface bietet write-temp, finalize-immutable, read-range/stream, head, delete-if-unreferenced, enumerate/check-integrity. Erste Implementierung Local FS auf gemountetem Docker-Volume; S3-kompatibel folgt als eigener Adapter. Object key ist opaque servergeneriert, keine Kundendateinamen oder Tenant-Namen im Pfad. Dedup erst nach Datenschutzprüfung, vorrangig nur innerhalb eines Tenant.
+Storage-Interface bietet write-temp, finalize-immutable, read-range/stream, head, delete-if-unreferenced, enumerate/check-integrity. Erste Implementierung Local FS auf gemountetem Docker-Volume; S3-kompatibel folgt als eigener Adapter. Object key ist opaque servergeneriert, keine Kundendateinamen oder Tenant-Namen im Pfad. Deduplizierung ist ausschließlich innerhalb derselben `file_id` zulässig; auch zwei Dateien derselben Organisation erhalten getrennte Kennungen und Objekte.
+
+## Dateigebundene Blöcke
+
+Das Speicherformat v1 verwendet FastCDC v2020 mit mindestens 256 KiB, einer Zielgröße von 1 MiB und höchstens 4 MiB je Block; nur der letzte Block darf kleiner sein. Die Blockkennung ist HMAC-SHA-256 mit getrennt abgeleitetem Serverschlüssel, versioniertem Zweck, Datei-ID und Klartext-SHA-256. Der Server berechnet und prüft die Klartext-Prüfsumme selbst. Clients erhalten dadurch kein Existenzorakel für andere Dateien. Zufällige Objektschlüssel bleiben unabhängig von den Kennungen.
+
+`blobs.layout` unterscheidet unveränderte vollständige Objekte (`whole`) von logischen Versionen mit geordnetem Blockmanifest (`chunked`). Alte Daten werden nicht durch eine Migration automatisch umgeschrieben. Ohne konfigurierten Serverschlüssel verwendet ein herkömmlicher Upload weiterhin vollständige Objekte. Mit Schlüssel zerlegt Phase A den verifizierten Upload serverseitig und behält nur neue Blöcke; währenddessen werden eine vollständige Stagingkopie und Blockkandidaten benötigt. Der endgültige Speicherbedarf kann deshalb erheblich kleiner als der vorübergehende Platzbedarf sein.
+
+Dateigröße, Gesamt-SHA-256, Quoten, `ETag`, `Repr-Digest`, `Content-Length` und Range-Verhalten behalten ihre bisherigen Bedeutungen. Quoten zählen logische Versionen nach dem bestehenden Modell. Die zusätzliche Admin-Angabe `physical_bytes` summiert die Objektlängen der vollständigen Objekte und der eindeutigen Blöcke einschließlich noch nicht bereinigter Zustände; Dateisystem- und Verschlüsselungs-Overhead gehören nicht zu diesem Zähler.
+
+Versionslöschung entfernt nur Manifestreferenzen. GC beansprucht einen Block erst, wenn weder Version noch Upload oder Backup ihn benötigt, und hält die Löschabsicht bis zum bestätigten Entfernen fest. Archivierung darf nur alte, ausschließlich historische Blöcke auslagern; vom Head benötigte Blöcke bleiben lokal. Das Archiv wird vor dem Entfernen der lokalen Kopie verschlüsselt geschrieben und verifiziert. Ein Restore einer alten Version stellt ihre Blöcke vor dem neuen Head lokal bereit.
+
+Backupformat v3 enthält zusätzlich die physischen Blöcke sowie Versions- und Zuordnungsindizes. Prüfung und Restore validieren Blockdigests, Reihenfolge, Offsets, Gesamtgröße und zusammengesetztes SHA-256; Archivobjekte behalten dauerhafte Backup-Pins. Die Formate v1 und v2 bleiben lesbar. Details für Betreiber stehen in [deployment.md](../06-operations/deployment.md).
 
 ## Detaillierter Funktionsumfang und technische Umsetzung
 

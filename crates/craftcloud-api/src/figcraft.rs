@@ -124,7 +124,97 @@ async fn source_file(
     };
     let mut bytes = Vec::with_capacity(info.size_bytes as usize);
     let mut digest = Sha256::new();
-    if info.storage_tier == "archive" {
+    if info.layout == "chunked" {
+        let (Some(store), Ok(size)) = (
+            resolved.services.storage.as_ref(),
+            u64::try_from(info.size_bytes),
+        ) else {
+            return Err(internal(headers));
+        };
+        let chunks =
+            versions::download_chunks(&resolved.services.pool, scope, resolved.id, info.version_id)
+                .await
+                .map_err(|e| db_failure(&e, headers, "FigCraft chunk lookup failed"))?;
+        let mut reader = match crate::versions::ChunkedReader::new(
+            store.clone(),
+            chunks,
+            size,
+            0,
+            size,
+            resolved.services.archive_store.clone(),
+            resolved.services.archive_crypto.clone(),
+        )
+        .await
+        {
+            Ok(reader) => reader,
+            Err(crate::versions::ChunkOpenError::ArchiveUnavailable) => {
+                return Err(crate::versions::archive_unavailable(headers));
+            }
+            Err(crate::versions::ChunkOpenError::Local(
+                craftcloud_storage::StorageError::NotFound,
+            )) => return Err(unavailable(headers, "STORAGE_UNAVAILABLE")),
+            Err(crate::versions::ChunkOpenError::Local(_)) => return Err(internal(headers)),
+            Err(crate::versions::ChunkOpenError::Integrity) => {
+                let _ = versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "BLOB_CORRUPT",
+                    "The stored document failed integrity verification.",
+                    headers,
+                ));
+            }
+        };
+        loop {
+            let chunk = match reader.next_chunk().await {
+                Ok(chunk) => chunk,
+                Err(crate::versions::DownloadReadError::Chunked(
+                    craftcloud_storage::StorageError::NotFound,
+                )) => return Err(unavailable(headers, "STORAGE_UNAVAILABLE")),
+                Err(crate::versions::DownloadReadError::Chunked(
+                    craftcloud_storage::StorageError::ChecksumMismatch
+                    | craftcloud_storage::StorageError::LengthMismatch
+                    | craftcloud_storage::StorageError::TooLarge,
+                )) => {
+                    let _ =
+                        versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "BLOB_CORRUPT",
+                        "The stored document failed integrity verification.",
+                        headers,
+                    ));
+                }
+                Err(crate::versions::DownloadReadError::Archive(
+                    crate::archive_transport::ArchiveTransportError::Storage(_),
+                )) => return Err(crate::versions::archive_unavailable(headers)),
+                Err(crate::versions::DownloadReadError::Archive(_)) => {
+                    let _ =
+                        versions::mark_blob_corrupt(&resolved.services.pool, info.blob_id).await;
+                    return Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "BLOB_CORRUPT",
+                        "The stored document failed integrity verification.",
+                        headers,
+                    ));
+                }
+                Err(crate::versions::DownloadReadError::Chunked(_))
+                | Err(crate::versions::DownloadReadError::Local(_)) => {
+                    return Err(unavailable(headers, "STORAGE_UNAVAILABLE"));
+                }
+            };
+            let Some(chunk) = chunk else { break };
+            if bytes.len().saturating_add(chunk.len()) as u64 > NATIVE_MAX_BYTES {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "FILE_TOO_LARGE",
+                    "FigCraft documents may not exceed 64 MiB.",
+                    headers,
+                ));
+            }
+            digest.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+    } else if info.storage_tier == "archive" {
         let (Some(archive), Some(crypto)) = (
             resolved.services.archive_store.as_deref(),
             resolved.services.archive_crypto.as_deref(),

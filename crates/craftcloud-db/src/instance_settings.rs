@@ -89,6 +89,58 @@ pub fn retention_days_from_rows(
     days
 }
 
+fn valid_version_setting(key: &str, value: u64) -> bool {
+    match key {
+        "versions.keep_all_hours" => value <= 168,
+        "versions.daily_days" => value <= 90,
+        "versions.weekly_weeks" => value <= 52,
+        "versions.max_per_file" => value == 0 || (2..=10_000).contains(&value),
+        _ => false,
+    }
+}
+
+/// Effective value for a thinning setting, including the 24-hour grace after
+/// the setting was shortened.
+#[must_use]
+pub fn effective_version_setting(
+    key: &str,
+    stored: &Value,
+    updated_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    let value = stored
+        .get("value")
+        .and_then(Value::as_u64)
+        .filter(|value| valid_version_setting(key, *value))?;
+    let previous = stored
+        .get("previous")
+        .and_then(Value::as_u64)
+        .filter(|previous| valid_version_setting(key, *previous))
+        .filter(|_| now - updated_at < RETENTION_GRACE);
+    Some(previous.map_or(value, |previous| {
+        if key == "versions.max_per_file" && previous == 0 {
+            0
+        } else {
+            previous.max(value)
+        }
+    }))
+}
+
+/// Reads a valid thinning setting from stored rows.
+#[must_use]
+pub fn version_setting_from_rows(
+    rows: &[InstanceSetting],
+    key: &str,
+    now: OffsetDateTime,
+) -> Option<u64> {
+    let row = rows.iter().find(|row| row.key == key)?;
+    let value = effective_version_setting(key, &row.value, row.updated_at, now);
+    if value.is_none() {
+        tracing::warn!(setting = key, "ignoring invalid stored version setting");
+    }
+    value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepUpdateError {
     Db(DbError),
@@ -359,7 +411,7 @@ pub async fn update_settings_audited(
     });
     for (change, old) in ordered.iter().zip(&olds) {
         let mut stored = change.value.clone();
-        if change.key.starts_with("retention.")
+        if (change.key.starts_with("retention.") || change.key.starts_with("versions."))
             && let Some(new_days) = stored
                 .as_ref()
                 .and_then(|value| value.get("value"))
@@ -368,10 +420,22 @@ pub async fn update_settings_audited(
             let old_days = old
                 .as_ref()
                 .and_then(|(value, updated_at)| {
-                    effective_retention_days(&change.key, value, *updated_at, now)
+                    if change.key.starts_with("versions.") {
+                        effective_version_setting(&change.key, value, *updated_at, now)
+                    } else {
+                        effective_retention_days(&change.key, value, *updated_at, now)
+                    }
                 })
                 .or_else(|| change.baseline.as_ref().and_then(Value::as_u64));
-            if let Some(old_days) = old_days.filter(|old_days| new_days < *old_days) {
+            let shortened = old_days.is_some_and(|old_days| {
+                if change.key == "versions.max_per_file" {
+                    old_days == 0 && new_days > 0
+                        || old_days > 0 && new_days > 0 && new_days < old_days
+                } else {
+                    new_days < old_days
+                }
+            });
+            if shortened && let Some(old_days) = old_days {
                 stored = Some(serde_json::json!({"value": new_days, "previous": old_days}));
             }
         }
@@ -480,6 +544,30 @@ mod tests {
         assert_eq!(
             effective_retention_days(key, &serde_json::json!({"value": "x"}), updated, updated),
             None
+        );
+    }
+
+    #[test]
+    fn thinning_grace_preserves_unlimited_cap_until_expiry() {
+        let updated = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let stored = serde_json::json!({"value": 100, "previous": 0});
+        assert_eq!(
+            effective_version_setting(
+                "versions.max_per_file",
+                &stored,
+                updated,
+                updated + time::Duration::hours(23)
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            effective_version_setting(
+                "versions.max_per_file",
+                &stored,
+                updated,
+                updated + time::Duration::hours(24)
+            ),
+            Some(100)
         );
     }
 

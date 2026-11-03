@@ -77,6 +77,9 @@ Alle Projekt- und Dateiaktionen entscheiden anhand der Rollen im Workspace des P
 | Projekt anlegen / umbenennen | 404 | 403 | ja | ja | ja |
 | Projekt in den Papierkorb / wiederherstellen | 404 | 403 | 403 | ja | ja |
 | Datei anlegen / umbenennen / in den Papierkorb / wiederherstellen | 404 | 403 | ja | ja | ja |
+| Version anheften oder lösen (`PATCH /files/{id}/versions/{version_id}`, `VersionPin`) | 404 | 403 | 403 | ja | ja |
+
+Anheften schützt die Version vor automatischer Ausdünnung und wird als `version.pin` bzw. `version.unpin` protokolliert. Die API prüft die Bearbeitungsberechtigung serverseitig; die Admin-Oberfläche ist keine Sicherheitsgrenze.
 
 Ein Projekt im Papierkorb ist schreibgeschützt (Dateien lesbar, Schreibaktionen 409 `PROJECT_DELETED`). Wiederherstellen ist nur innerhalb des Aufbewahrungsfensters möglich (410 `RETENTION_EXPIRED`). Quelle: ADR-0013 Punkt 8, ADR-0014.
 

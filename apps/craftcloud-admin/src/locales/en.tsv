@@ -951,3 +951,14 @@
 	Shorten retention period?	Shorten retention period?
 	Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.	Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.
 	Shorten retention	Shorten retention
+	Keep all versions (hours)	Keep all versions (hours)
+	Daily version samples (days)	Daily version samples (days)
+	Weekly version samples (weeks)	Weekly version samples (weeks)
+	Maximum unpinned versions per file	Maximum unpinned versions per file
+	With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.	With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.
+	Keep	Keep
+	Unpin	Unpin
+	Pin version {number}	Pin version {number}
+	Unpin version {number}	Unpin version {number}
+	Version {number} will be kept.	Version {number} will be kept.
+	Version {number} will no longer be kept.	Version {number} will no longer be kept.

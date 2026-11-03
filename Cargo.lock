@@ -1386,6 +1386,7 @@ name = "craftcloud-client"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "fastcdc",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1535,6 +1536,7 @@ dependencies = [
  "aws-smithy-http-client",
  "chacha20poly1305",
  "craftcloud-storage",
+ "fastcdc",
  "futures-util",
  "hmac 0.12.1",
  "libc",
@@ -2443,6 +2445,12 @@ dependencies = [
  "event-listener",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "fastcdc"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a71061d097bfa9a5a4d2efdec57990d9a88745020b365191d37e48541a1628f2"
 
 [[package]]
 name = "fastrand"

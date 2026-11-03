@@ -52,9 +52,10 @@ use craftcloud_db::maintenance::{self as db, GcClaim, VerifyResult};
 use craftcloud_db::members::OrgTx;
 use craftcloud_db::{DbError, PgPool};
 use craftcloud_storage::{
-    LocalStore, MarkerInfo, ObjectInfo, ObjectKey, ObjectStore, StorageError,
+    ArchiveStore, LocalStore, MarkerInfo, ObjectInfo, ObjectKey, ObjectStore, StorageError,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -63,6 +64,69 @@ use crate::orgs::{db_failure, operator_gate, rfc3339};
 use crate::responses::unavailable;
 use crate::session::AuthenticatedSession;
 use crate::{ApiState, Clock};
+
+enum ChunkVerificationError {
+    Missing,
+    Integrity,
+    Storage,
+}
+
+async fn verify_chunked_candidate(
+    store: &LocalStore,
+    chunks: &[craftcloud_db::versions::DownloadChunk],
+    size_bytes: i64,
+    sha256: &[u8],
+) -> Result<(), ChunkVerificationError> {
+    let (Ok(size), Ok(expected)) = (u64::try_from(size_bytes), <[u8; 32]>::try_from(sha256)) else {
+        return Err(ChunkVerificationError::Integrity);
+    };
+    let mut reader = match crate::versions::ChunkedReader::new(
+        store.clone(),
+        chunks.to_vec(),
+        size,
+        0,
+        size,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(reader) => reader,
+        Err(crate::versions::ChunkOpenError::Integrity) => {
+            return Err(ChunkVerificationError::Integrity);
+        }
+        Err(crate::versions::ChunkOpenError::Local(StorageError::NotFound)) => {
+            return Err(ChunkVerificationError::Missing);
+        }
+        Err(_) => return Err(ChunkVerificationError::Storage),
+    };
+    let mut digest = Sha256::new();
+    let mut read = 0u64;
+    loop {
+        match reader.next_chunk().await {
+            Ok(Some(chunk)) => {
+                read = read
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(ChunkVerificationError::Integrity)?;
+                digest.update(&chunk);
+            }
+            Ok(None) => break,
+            Err(crate::versions::DownloadReadError::Chunked(StorageError::NotFound)) => {
+                return Err(ChunkVerificationError::Missing);
+            }
+            Err(crate::versions::DownloadReadError::Chunked(
+                StorageError::ChecksumMismatch
+                | StorageError::LengthMismatch
+                | StorageError::TooLarge,
+            )) => return Err(ChunkVerificationError::Integrity),
+            Err(_) => return Err(ChunkVerificationError::Storage),
+        }
+    }
+    if read != size || <[u8; 32]>::from(digest.finalize()) != expected {
+        return Err(ChunkVerificationError::Integrity);
+    }
+    Ok(())
+}
 
 /// Extra time on top of the upload TTL before an object or blob without
 /// owner is considered abandoned.
@@ -92,6 +156,8 @@ pub struct MaintenanceSettings {
     pub trash_retention: Duration,
     /// How long a superseded version stays after its successor was created.
     pub version_retention: Duration,
+    /// Version thinning policy, overridden by instance settings unless locked by env.
+    pub version_thinning: db::VersionThinningPolicy,
     /// Lifetime of an upload session; the grace period for blobs and stray
     /// objects is this plus one hour.
     pub upload_ttl: Duration,
@@ -129,6 +195,14 @@ impl MaintenanceSettings {
         Self {
             trash_retention,
             version_retention,
+            version_thinning: db::VersionThinningPolicy {
+                retention_days: u32::try_from(version_retention.as_secs() / 86_400)
+                    .unwrap_or(u32::MAX),
+                keep_all_hours: 24,
+                daily_days: 7,
+                weekly_weeks: 4,
+                max_per_file: 0,
+            },
             upload_ttl,
             batch_size: 500,
             verify_bytes_per_run,
@@ -596,11 +670,14 @@ pub struct Maintenance {
     clock: Arc<dyn Clock>,
     settings: MaintenanceSettings,
     retention_environment: [bool; 4],
+    version_setting_environment: [bool; 4],
     /// Where the reconciliation continues its walk through the object store.
     cursor: Mutex<Option<ObjectKey>>,
-    /// Where the version retention and the drift check continue their walk
-    /// through the organizations.
+    /// Where the legacy retention and drift steps continue their walk through
+    /// organizations.
     trim_cursor: Mutex<Option<Uuid>>,
+    /// Where the current version-thinning scan continues its global file walk.
+    thin_cursor: Mutex<Option<(Uuid, Uuid)>>,
     drift_cursor: Mutex<Option<Uuid>>,
     /// Items that failed recently (left out of the next selections).
     failed: Mutex<FailedItems>,
@@ -624,8 +701,10 @@ impl Maintenance {
             clock,
             settings,
             retention_environment: [false; 4],
+            version_setting_environment: [false; 4],
             cursor: Mutex::new(None),
             trim_cursor: Mutex::new(None),
+            thin_cursor: Mutex::new(None),
             drift_cursor: Mutex::new(None),
             failed: Mutex::new(FailedItems::default()),
             metrics: None,
@@ -643,6 +722,11 @@ impl Maintenance {
     #[must_use]
     pub fn with_retention_environment(mut self, locked: [bool; 4]) -> Self {
         self.retention_environment = locked;
+        self
+    }
+
+    pub fn with_version_setting_environment(mut self, locked: [bool; 4]) -> Self {
+        self.version_setting_environment = locked;
         self
     }
 
@@ -935,6 +1019,40 @@ impl Maintenance {
         {
             settings.quarantine_retention = seconds(value);
         }
+        settings.version_thinning.retention_days =
+            u32::try_from(settings.version_retention.as_secs() / 86_400).unwrap_or(u32::MAX);
+        let keys = [
+            "versions.keep_all_hours",
+            "versions.daily_days",
+            "versions.weekly_weeks",
+            "versions.max_per_file",
+        ];
+        let mut values = [
+            settings.version_thinning.keep_all_hours,
+            settings.version_thinning.daily_days,
+            settings.version_thinning.weekly_weeks,
+            settings.version_thinning.max_per_file,
+        ];
+        for ((key, locked), current) in keys
+            .iter()
+            .zip(&self.version_setting_environment)
+            .zip(&mut values)
+        {
+            if !locked
+                && let Some(value) =
+                    craftcloud_db::instance_settings::version_setting_from_rows(&stored, key, now)
+                && let Ok(value) = u32::try_from(value)
+            {
+                *current = value;
+            }
+        }
+        settings.version_thinning = db::VersionThinningPolicy {
+            retention_days: settings.version_thinning.retention_days,
+            keep_all_hours: values[0],
+            daily_days: values[1],
+            weekly_weeks: values[2],
+            max_per_file: values[3],
+        };
         Ok(settings)
     }
 
@@ -1189,36 +1307,96 @@ impl Maintenance {
         &self,
         org_id: Uuid,
         file_id: Uuid,
-        cutoff: OffsetDateTime,
+        policy: db::VersionThinningPolicy,
+        now: OffsetDateTime,
+        dry_run: bool,
     ) -> Result<u64, DbError> {
         let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
             return Ok(0);
         };
-        let deleted = tx.maint_trim_versions(file_id, cutoff).await?;
+        let deleted = tx
+            .maint_trim_versions(file_id, policy, now, dry_run)
+            .await?;
         tx.commit().await?;
         Ok(deleted)
     }
 
     async fn trim_versions(&self, ctx: &Ctx<'_>, report: &mut StepReport) -> Result<(), DbError> {
-        let cutoff = minus(ctx.now, ctx.settings.version_retention);
         let excluded = self.excluded("trim_versions", ctx.now, report);
-        let orgs = self.next_orgs(&self.trim_cursor, !ctx.dry).await?;
-        let files =
-            db::files_with_old_versions(&self.pool, cutoff, &orgs, &excluded, ctx.settings.batch())
+        let policy = ctx.settings.version_thinning;
+        let legacy = policy.keep_all_hours == 0
+            && policy.daily_days == 0
+            && policy.weekly_weeks == 0
+            && policy.max_per_file == 0;
+        let files = if legacy {
+            let orgs = self.next_orgs(&self.trim_cursor, !ctx.dry).await?;
+            db::files_with_old_versions(
+                &self.pool,
+                minus(ctx.now, ctx.settings.version_retention),
+                &orgs,
+                &excluded,
+                ctx.settings.batch(),
+            )
+            .await?
+        } else {
+            let after = *self
+                .thin_cursor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut files =
+                db::files_with_versions_to_thin(&self.pool, after, &excluded, ctx.settings.batch())
+                    .await?;
+            if files.is_empty() && after.is_some() {
+                // A completed keyset pass wraps to the first file. Dry runs
+                // use the wrapped page without changing the live cursor.
+                files = db::files_with_versions_to_thin(
+                    &self.pool,
+                    None,
+                    &excluded,
+                    ctx.settings.batch(),
+                )
                 .await?;
-        if ctx.dry {
-            report.add("files_with_old_versions", count_of(files.len()));
-            return Ok(());
-        }
+                if !ctx.dry {
+                    *self
+                        .thin_cursor
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
+                }
+            }
+            files
+        };
         for (org_id, file_id) in files {
             if !ctx.go() {
                 break;
             }
-            match self.trim_item(org_id, file_id, cutoff).await {
+            match self
+                .trim_item(
+                    org_id,
+                    file_id,
+                    ctx.settings.version_thinning,
+                    ctx.now,
+                    ctx.dry,
+                )
+                .await
+            {
                 Ok(0) => {}
                 Ok(deleted) => {
-                    report.add("trimmed_files", 1);
-                    report.add("deleted_versions", deleted);
+                    report.add(
+                        if ctx.dry {
+                            "files_with_versions_to_thin"
+                        } else {
+                            "trimmed_files"
+                        },
+                        1,
+                    );
+                    report.add(
+                        if ctx.dry {
+                            "versions_thinned_due"
+                        } else {
+                            "deleted_versions"
+                        },
+                        deleted,
+                    );
                 }
                 Err(error) => self.fail_item(
                     ctx,
@@ -1228,6 +1406,12 @@ impl Maintenance {
                     file_id,
                     &error,
                 ),
+            }
+            if !legacy && !ctx.dry {
+                *self
+                    .thin_cursor
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some((org_id, file_id));
             }
         }
         Ok(())
@@ -1245,10 +1429,63 @@ impl Maintenance {
         let excluded = self.excluded("collect_blobs", ctx.now, report);
         let deleting = db::gc_deleting_targets(&self.pool, batch).await?;
         let candidates = db::gc_candidates(&self.pool, created_before, &excluded, batch).await?;
+        let deleting_chunks = db::gc_deleting_chunks(&self.pool, batch).await?;
+        let chunk_candidates = db::gc_chunk_candidates(&self.pool, created_before, batch).await?;
         if ctx.dry {
             report.add("would_resume", count_of(deleting.len()));
             report.add("candidates", count_of(candidates.len()));
+            report.add("chunk_would_resume", count_of(deleting_chunks.len()));
+            report.add("chunk_candidates", count_of(chunk_candidates.len()));
             return Ok(());
+        }
+        for target in deleting_chunks {
+            if !ctx.go() {
+                break;
+            }
+            self.finish_chunk(
+                target.org_id,
+                target.id,
+                &target.object_key,
+                target.archive_object_key.as_deref(),
+                store,
+                self.archive_store.as_deref(),
+                report,
+            )
+            .await;
+        }
+        for (org_id, chunk_id) in chunk_candidates {
+            if !ctx.go() {
+                break;
+            }
+            let Some(claim) = self
+                .claim_chunk_item(org_id, chunk_id, created_before)
+                .await
+                .unwrap_or_else(|error| {
+                    self.fail_item(
+                        ctx,
+                        "collect_blobs",
+                        report,
+                        "claiming a chunk",
+                        chunk_id,
+                        &error,
+                    );
+                    None
+                })
+            else {
+                report.add("chunk_skipped", 1);
+                continue;
+            };
+            report.add("chunks_claimed", 1);
+            self.finish_chunk(
+                org_id,
+                chunk_id,
+                &claim.object_key,
+                claim.archive_object_key.as_deref(),
+                store,
+                self.archive_store.as_deref(),
+                report,
+            )
+            .await;
         }
         // Finish what an earlier run (or crash) left half done.
         for target in deleting {
@@ -1317,6 +1554,82 @@ impl Maintenance {
             .await;
         }
         Ok(())
+    }
+
+    async fn claim_chunk_item(
+        &self,
+        org_id: Uuid,
+        chunk_id: Uuid,
+        created_before: OffsetDateTime,
+    ) -> Result<Option<db::ChunkGcClaim>, DbError> {
+        let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+            return Ok(None);
+        };
+        let claim = tx.maint_chunk_gc_claim(chunk_id, created_before).await?;
+        tx.commit().await?;
+        Ok(claim)
+    }
+
+    // Chunk cleanup needs the same explicit claim data and storage providers
+    // as finish_blob; retain this narrow lifecycle boundary.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_chunk(
+        &self,
+        org_id: Uuid,
+        chunk_id: Uuid,
+        object_key: &str,
+        archive_object_key: Option<&str>,
+        store: &LocalStore,
+        archive: Option<&ArchiveStore>,
+        report: &mut StepReport,
+    ) {
+        craftcloud_storage::crash_point("gc-chunk-after-claim", 0);
+        let Ok(key) = ObjectKey::parse(object_key) else {
+            tracing::error!(target: "craftcloud::maintenance", chunk = %chunk_id, "chunk has an invalid object key");
+            report.add("chunk_invalid_records", 1);
+            return;
+        };
+        match store.delete(&key).await {
+            Ok(()) => report.add("chunk_objects_deleted", 1),
+            Err(StorageError::NotFound) => report.add("chunk_objects_already_gone", 1),
+            Err(error) => {
+                tracing::warn!(target: "craftcloud::maintenance", chunk = %chunk_id, %error, "chunk object deletion failed; claim stays for retry");
+                report.add("chunk_storage_errors", 1);
+                return;
+            }
+        }
+        if let Some(raw_archive_key) = archive_object_key {
+            let Some(archive) = archive else {
+                report.add("chunk_archive_unavailable", 1);
+                return;
+            };
+            let Ok(archive_key) = ObjectKey::parse(raw_archive_key) else {
+                report.add("chunk_invalid_records", 1);
+                return;
+            };
+            match archive.delete(&archive_key).await {
+                Ok(()) | Err(StorageError::NotFound) => {}
+                Err(error) => {
+                    tracing::warn!(target: "craftcloud::maintenance", chunk = %chunk_id, %error, "archived chunk deletion failed; claim stays for retry");
+                    report.add("chunk_archive_errors", 1);
+                    return;
+                }
+            }
+        }
+        let result: Result<bool, craftcloud_db::DbError> = async {
+            let Some(mut tx) = OrgTx::begin(&self.pool, org_id).await? else {
+                return Ok(false);
+            };
+            let removed = tx.maint_chunk_gc_finish(chunk_id).await?;
+            tx.commit().await?;
+            Ok(removed)
+        }
+        .await;
+        match result {
+            Ok(true) => report.add("chunks_deleted", 1),
+            Ok(false) => report.add("chunk_skipped", 1),
+            Err(_) => report.add("chunk_db_errors", 1),
+        }
     }
 
     async fn claim_item(
@@ -1697,22 +2010,58 @@ impl Maintenance {
                 report.add("would_verify", 1);
                 continue;
             }
-            let (Ok(key), Ok(sha)) = (
-                ObjectKey::parse(&blob.object_key),
-                <[u8; 32]>::try_from(blob.sha256.as_slice()),
-            ) else {
-                tracing::error!(target: "craftcloud::maintenance", blob = %blob.id, "blob record is malformed");
-                report.add("invalid_records", 1);
-                continue;
-            };
-            let result = match store.verify(&key, &sha).await {
-                Ok(()) => VerifyResult::Intact,
-                Err(StorageError::ChecksumMismatch) => VerifyResult::Mismatch,
-                Err(StorageError::NotFound) => VerifyResult::Missing,
-                Err(error) => {
-                    tracing::warn!(target: "craftcloud::maintenance", blob = %blob.id, %error, "blob could not be read for verification");
-                    report.add("storage_errors", 1);
+            let result = if blob.layout == "chunked" {
+                let (Some(file_id), Some(version_id)) = (blob.file_id, blob.version_id) else {
+                    tracing::error!(target: "craftcloud::maintenance", blob = %blob.id, "chunked blob has no version mapping");
+                    report.add("invalid_records", 1);
                     continue;
+                };
+                let chunks =
+                    match db::verify_candidate_chunks(&self.pool, blob.id, file_id, version_id)
+                        .await
+                    {
+                        Ok(chunks) => chunks,
+                        Err(error) => {
+                            self.fail_item(
+                                ctx,
+                                "verify_blobs",
+                                report,
+                                "loading a chunk manifest",
+                                blob.id,
+                                &error,
+                            );
+                            continue;
+                        }
+                    };
+                match verify_chunked_candidate(store, &chunks, blob.size_bytes, &blob.sha256).await
+                {
+                    Ok(()) => VerifyResult::Intact,
+                    Err(ChunkVerificationError::Missing) => VerifyResult::Missing,
+                    Err(ChunkVerificationError::Integrity) => VerifyResult::Mismatch,
+                    Err(ChunkVerificationError::Storage) => {
+                        tracing::warn!(target: "craftcloud::maintenance", blob = %blob.id, "chunked blob could not be read for verification");
+                        report.add("storage_errors", 1);
+                        continue;
+                    }
+                }
+            } else {
+                let (Ok(key), Ok(sha)) = (
+                    ObjectKey::parse(&blob.object_key),
+                    <[u8; 32]>::try_from(blob.sha256.as_slice()),
+                ) else {
+                    tracing::error!(target: "craftcloud::maintenance", blob = %blob.id, "blob record is malformed");
+                    report.add("invalid_records", 1);
+                    continue;
+                };
+                match store.verify(&key, &sha).await {
+                    Ok(()) => VerifyResult::Intact,
+                    Err(StorageError::ChecksumMismatch) => VerifyResult::Mismatch,
+                    Err(StorageError::NotFound) => VerifyResult::Missing,
+                    Err(error) => {
+                        tracing::warn!(target: "craftcloud::maintenance", blob = %blob.id, %error, "blob could not be read for verification");
+                        report.add("storage_errors", 1);
+                        continue;
+                    }
                 }
             };
             let recorded = match db::record_verification(&self.pool, blob.id, result, ctx.now).await
@@ -1904,11 +2253,27 @@ mod setup_retention_tests {
         ] {
             store_retention(&env, key, json!({"value": new, "previous": previous}), 23).await;
         }
+        store_retention(
+            &env,
+            "versions.keep_all_hours",
+            json!({"value": 2, "previous": 24}),
+            23,
+        )
+        .await;
+        store_retention(
+            &env,
+            "versions.max_per_file",
+            json!({"value": 100, "previous": 0}),
+            23,
+        )
+        .await;
         let graced = effective(&env, [false; 4]).await;
         assert_eq!(graced.trash_retention, day(60));
         assert_eq!(graced.version_retention, day(45));
         assert_eq!(graced.quarantine_retention, day(20));
         assert_eq!(graced.audit_retention_days, 400);
+        assert_eq!(graced.version_thinning.keep_all_hours, 24);
+        assert_eq!(graced.version_thinning.max_per_file, 0);
 
         // After 24 hours the new, shorter periods apply.
         for (key, new, previous) in [
@@ -1919,15 +2284,34 @@ mod setup_retention_tests {
         ] {
             store_retention(&env, key, json!({"value": new, "previous": previous}), 25).await;
         }
+        store_retention(
+            &env,
+            "versions.keep_all_hours",
+            json!({"value": 2, "previous": 24}),
+            25,
+        )
+        .await;
+        store_retention(
+            &env,
+            "versions.max_per_file",
+            json!({"value": 100, "previous": 0}),
+            25,
+        )
+        .await;
         let expired = effective(&env, [false; 4]).await;
         assert_eq!(expired.trash_retention, day(7));
         assert_eq!(expired.version_retention, day(3));
         assert_eq!(expired.quarantine_retention, day(2));
         assert_eq!(expired.audit_retention_days, 31);
+        assert_eq!(expired.version_thinning.keep_all_hours, 2);
+        assert_eq!(expired.version_thinning.max_per_file, 100);
 
         // Environment-locked values never take a stored grace value.
         let locked = effective(&env, [true, true, true, true]).await;
         assert_eq!(locked.trash_retention, day(30));
+        // Let the test runtime return pooled connections before the synchronous
+        // fixture destructor joins its separate cleanup runtime.
+        env.pool.close().await;
     }
 
     #[tokio::test]

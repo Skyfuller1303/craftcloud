@@ -44,6 +44,10 @@ const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 300;
 const MAINTENANCE_INTERVAL_SECS_RANGE: (u64, u64) = (10, 86_400);
 const DEFAULT_VERSION_RETENTION_DAYS: u64 = 30;
 const VERSION_RETENTION_DAYS_RANGE: (u64, u64) = (1, 3650);
+const DEFAULT_VERSION_KEEP_ALL_HOURS: u64 = 24;
+const DEFAULT_VERSION_DAILY_DAYS: u64 = 7;
+const DEFAULT_VERSION_WEEKLY_WEEKS: u64 = 4;
+const DEFAULT_VERSION_MAX_PER_FILE: u64 = 0;
 const DEFAULT_QUARANTINE_DAYS: u64 = 30;
 const QUARANTINE_DAYS_RANGE: (u64, u64) = (1, 3650);
 const DEFAULT_AUDIT_RETENTION_DAYS: u64 = 365;
@@ -91,6 +95,10 @@ const SUPPORTED_KEYS: &[&str] = &[
     "DATABASE_CONNECT_TIMEOUT_SECS",
     "MAINTENANCE_INTERVAL_SECS",
     "VERSION_RETENTION_DAYS",
+    "VERSIONS_KEEP_ALL_HOURS",
+    "VERSIONS_DAILY_DAYS",
+    "VERSIONS_WEEKLY_WEEKS",
+    "VERSIONS_MAX_PER_FILE",
     "VERIFY_BYTES_PER_RUN",
     "QUARANTINE_DAYS",
     "MAINTENANCE_ENABLED",
@@ -365,9 +373,16 @@ pub struct Config {
     /// Time between two runs of the maintenance job (purge, blob garbage
     /// collection, reconciliation, verification).
     pub maintenance_interval: Duration,
-    /// How long a superseded file version stays after its successor was
-    /// created (ADR-0014: 30 days by default).
+    /// Maximum age of a selected file version (ADR-0014: 30 days by default).
     pub version_retention: Duration,
+    /// Maximum age of the dense-version window (0 disables it).
+    pub version_keep_all_hours: u32,
+    /// Number of recent calendar days to sample (0 disables it).
+    pub version_daily_days: u32,
+    /// Number of recent ISO weeks to sample (0 disables it).
+    pub version_weekly_weeks: u32,
+    /// Maximum unpinned versions per file (0 is unlimited).
+    pub version_max_per_file: u32,
     /// Bytes the maintenance job re-reads per run to verify stored blobs.
     pub verify_bytes_per_run: u64,
     /// How long objects that reconciliation took out of service stay in the
@@ -687,6 +702,28 @@ impl Config {
                 parse_ranged(key, raw, VERSION_RETENTION_DAYS_RANGE)
             })
             .unwrap_or(DEFAULT_VERSION_RETENTION_DAYS);
+        let version_keep_all_hours =
+            field(&mut errors, env, "VERSIONS_KEEP_ALL_HOURS", |key, raw| {
+                parse_ranged(key, raw, (0, 168))
+            })
+            .unwrap_or(DEFAULT_VERSION_KEEP_ALL_HOURS);
+        let version_daily_days = field(&mut errors, env, "VERSIONS_DAILY_DAYS", |key, raw| {
+            parse_ranged(key, raw, (0, 90))
+        })
+        .unwrap_or(DEFAULT_VERSION_DAILY_DAYS);
+        let version_weekly_weeks = field(&mut errors, env, "VERSIONS_WEEKLY_WEEKS", |key, raw| {
+            parse_ranged(key, raw, (0, 52))
+        })
+        .unwrap_or(DEFAULT_VERSION_WEEKLY_WEEKS);
+        let version_max_per_file = field(&mut errors, env, "VERSIONS_MAX_PER_FILE", |key, raw| {
+            let value = parse_ranged(key, raw, (0, 10_000))?;
+            if value == 0 || (2..=10_000).contains(&value) {
+                Ok(value)
+            } else {
+                Err(ConfigError::new(key, "must be 0 or between 2 and 10000"))
+            }
+        })
+        .unwrap_or(DEFAULT_VERSION_MAX_PER_FILE);
         let verify_bytes_per_run = field(&mut errors, env, "VERIFY_BYTES_PER_RUN", |key, raw| {
             parse_ranged(key, raw, VERIFY_BYTES_PER_RUN_RANGE)
         })
@@ -861,6 +898,10 @@ impl Config {
                 upload_ttl: Duration::from_secs(upload_ttl_hours * 3600),
                 maintenance_interval: Duration::from_secs(maintenance_interval_secs),
                 version_retention: Duration::from_secs(version_retention_days * 24 * 3600),
+                version_keep_all_hours: u32::try_from(version_keep_all_hours).unwrap_or(u32::MAX),
+                version_daily_days: u32::try_from(version_daily_days).unwrap_or(u32::MAX),
+                version_weekly_weeks: u32::try_from(version_weekly_weeks).unwrap_or(u32::MAX),
+                version_max_per_file: u32::try_from(version_max_per_file).unwrap_or(u32::MAX),
                 verify_bytes_per_run,
                 quarantine_retention: Duration::from_secs(quarantine_days * 24 * 3600),
                 maintenance_enabled,
@@ -2170,6 +2211,10 @@ mod tests {
             defaults.version_retention,
             Duration::from_secs(30 * 24 * 3600)
         );
+        assert_eq!(defaults.version_keep_all_hours, 24);
+        assert_eq!(defaults.version_daily_days, 7);
+        assert_eq!(defaults.version_weekly_weeks, 4);
+        assert_eq!(defaults.version_max_per_file, 0);
         assert_eq!(defaults.verify_bytes_per_run, 1024 * 1024 * 1024);
         assert_eq!(
             defaults.quarantine_retention,
@@ -2259,6 +2304,10 @@ mod tests {
         let maintenance = Config::from_env_map(&env(&[
             ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "10"),
             ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "3650"),
+            ("CRAFTCLOUD_VERSIONS_KEEP_ALL_HOURS", "0"),
+            ("CRAFTCLOUD_VERSIONS_DAILY_DAYS", "90"),
+            ("CRAFTCLOUD_VERSIONS_WEEKLY_WEEKS", "52"),
+            ("CRAFTCLOUD_VERSIONS_MAX_PER_FILE", "10000"),
             ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1048576"),
         ]))
         .unwrap();
@@ -2268,6 +2317,10 @@ mod tests {
             Duration::from_secs(3650 * 24 * 3600)
         );
         assert_eq!(maintenance.verify_bytes_per_run, 1_048_576);
+        assert_eq!(maintenance.version_keep_all_hours, 0);
+        assert_eq!(maintenance.version_daily_days, 90);
+        assert_eq!(maintenance.version_weekly_weeks, 52);
+        assert_eq!(maintenance.version_max_per_file, 10000);
         for (key, bad) in [
             ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "9"),
             ("CRAFTCLOUD_MAINTENANCE_INTERVAL_SECS", "86401"),
@@ -2275,6 +2328,10 @@ mod tests {
             ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "0"),
             ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "3651"),
             ("CRAFTCLOUD_VERSION_RETENTION_DAYS", "-1"),
+            ("CRAFTCLOUD_VERSIONS_KEEP_ALL_HOURS", "169"),
+            ("CRAFTCLOUD_VERSIONS_DAILY_DAYS", "91"),
+            ("CRAFTCLOUD_VERSIONS_WEEKLY_WEEKS", "53"),
+            ("CRAFTCLOUD_VERSIONS_MAX_PER_FILE", "1"),
             ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1048575"),
             ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1099511627777"),
             ("CRAFTCLOUD_VERIFY_BYTES_PER_RUN", "1GiB"),

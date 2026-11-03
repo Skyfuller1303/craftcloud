@@ -38,6 +38,7 @@ pub mod overview;
 pub mod password_reset;
 mod pool;
 pub mod projects;
+pub mod rechunk;
 pub mod recovery;
 pub mod scim;
 mod scope;

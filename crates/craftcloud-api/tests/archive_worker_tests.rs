@@ -627,6 +627,11 @@ async fn archive_failure_before_commit_keeps_local_object() {
     let result = archive_batch(&env.pool, &local, &archive, &crypto, now, Duration::ZERO)
         .await
         .unwrap();
+    let followup_lock = maintenance::try_lock(&env.pool)
+        .await
+        .unwrap()
+        .expect("an archive batch must release its maintenance lock before returning");
+    followup_lock.release().await.unwrap();
     assert_eq!(
         result,
         ArchiveBatch {

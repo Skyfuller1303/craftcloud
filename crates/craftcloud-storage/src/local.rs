@@ -887,6 +887,7 @@ impl ObjectStore for LocalStore {
         key: &ObjectKey,
         range: Option<ByteRange>,
     ) -> Result<ObjectReader, StorageError> {
+        self.faults.before_read().await;
         let (mut file, meta) = self.open_object(key).await?;
         let len = meta.len();
         let (start, end) = match range {

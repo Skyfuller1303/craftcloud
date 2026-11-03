@@ -27,14 +27,17 @@ use craftcloud_core::policy::{Action, Actor, OrgMembership, Resource, WorkspaceM
 use craftcloud_db::audit::Detail;
 use craftcloud_db::members::OrgTx;
 use craftcloud_db::uploads::{
-    self, AbortOutcome, BeginOutcome, NewUpload, QuotaSetOutcome, StoreOutcome,
-    UploadCreateOutcome, UploadSession,
+    self, AbortOutcome, BeginOutcome, ChunkReuseCandidate, NewChunk, NewUpload, QuotaSetOutcome,
+    StoreOutcome, UploadCreateOutcome, UploadSession,
 };
 use craftcloud_db::{OrgScope, files, organizations, workspaces};
-use craftcloud_storage::{ObjectKey, ObjectStore, Sha256Digest, StorageError, WriteSink};
+use craftcloud_storage::{
+    ObjectKey, ObjectStore, ReadSource, Sha256Digest, StorageError, WriteSink,
+};
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::audit::{Change, Denied, commit_audited};
@@ -49,10 +52,14 @@ use crate::session::AuthenticatedSession;
 use crate::workspaces::{Locked, lock, read_actor};
 use crate::{ApiState, Services, error_response};
 
+/// A bounded request body containing at most 32,768 manifest entries.
+pub(crate) const CHUNK_MANIFEST_MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
+const CHUNK_MANIFEST_MAX_ENTRIES: usize = 32_768;
+
 // ---- helpers -----------------------------------------------------------------
 
-fn session_json(s: &UploadSession) -> Value {
-    json!({
+fn session_json(s: &UploadSession, missing_chunks: Option<Vec<u32>>) -> Value {
+    let mut value = json!({
         "upload_id": s.id.to_string(),
         "file_id": s.file_id.to_string(),
         "project_id": s.project_id.to_string(),
@@ -64,7 +71,14 @@ fn session_json(s: &UploadSession) -> Value {
         "created_by": s.created_by_user_id.to_string(),
         "created_at": rfc3339(s.created_at),
         "expires_at": rfc3339(s.expires_at),
-    })
+    });
+    if let Some(missing_chunks) = missing_chunks
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("mode".to_owned(), json!("chunked"));
+        object.insert("missing_chunks".to_owned(), json!(missing_chunks));
+    }
+    value
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -412,6 +426,63 @@ pub(crate) async fn upload_write_gate(
 pub(crate) struct CreateUploadRequest {
     size_bytes: u64,
     sha256: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    chunks: Option<Vec<CreateUploadChunk>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateUploadChunk {
+    size_bytes: u64,
+    sha256: String,
+}
+
+fn parse_chunk_manifest(
+    request: &CreateUploadRequest,
+    size: i64,
+    file_id: Uuid,
+    identity_keys: &[[u8; 32]],
+) -> Result<Option<Vec<uploads::ChunkManifestSpec>>, ()> {
+    match (request.mode.as_deref(), request.chunks.as_ref()) {
+        (None, None) => return Ok(None),
+        (Some("chunked"), Some(_)) => {}
+        _ => return Err(()),
+    }
+    let Some(chunks) = request.chunks.as_ref() else {
+        return Err(());
+    };
+    if chunks.len() > CHUNK_MANIFEST_MAX_ENTRIES || identity_keys.is_empty() {
+        return Err(());
+    }
+    let mut offset = 0i64;
+    let key = identity_keys.first().ok_or(())?;
+    let mut manifest = Vec::with_capacity(chunks.len());
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let block_size = i64::try_from(chunk.size_bytes).map_err(|_| ())?;
+        if !(1..=i64::from(craftcloud_storage::MAX_CHUNK_BYTES)).contains(&block_size)
+            || (ordinal + 1 < chunks.len()
+                && block_size < i64::from(craftcloud_storage::MIN_CHUNK_BYTES))
+        {
+            return Err(());
+        }
+        let sha256 = parse_sha256(&chunk.sha256).ok_or(())?;
+        let digest =
+            craftcloud_storage::chunk_digest_from_sha256(key, file_id, &sha256).ok_or(())?;
+        manifest.push(uploads::ChunkManifestSpec {
+            ordinal: i32::try_from(ordinal).map_err(|_| ())?,
+            byte_offset: offset,
+            size_bytes: block_size,
+            sha256,
+            digest,
+        });
+        offset = offset.checked_add(block_size).ok_or(())?;
+    }
+    if offset != size || (size == 0 && !chunks.is_empty()) || (size > 0 && chunks.is_empty()) {
+        return Err(());
+    }
+    Ok(Some(manifest))
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ()> {
@@ -493,6 +564,18 @@ pub(crate) async fn create_upload(
             &headers,
         );
     }
+    let identity_keys = services.chunk_identity_keys();
+    let chunk_manifest = match parse_chunk_manifest(&request, size, file_id, &identity_keys) {
+        Ok(manifest) => manifest,
+        Err(()) => return validation_failed(&["chunks"], &headers),
+    };
+    if request.mode.is_some() && (identity_keys.is_empty() || services.storage.is_none()) {
+        return conflict(
+            "CHUNKED_UPLOAD_UNAVAILABLE",
+            "Chunked uploads are not enabled on this server.",
+            &headers,
+        );
+    }
     let now = services.clock.now();
     let ttl = time::Duration::try_from(services.settings.upload_ttl).unwrap_or(time::Duration::DAY);
     let new = NewUpload {
@@ -506,10 +589,176 @@ pub(crate) async fn create_upload(
         max_per_user: services.settings.uploads_per_user,
         max_per_org: services.settings.uploads_per_org,
     };
-    let outcome = match tx.upload_create(&scope, &new).await {
+    let mut outcome = match tx.upload_create(&scope, &new).await {
         Ok(outcome) => outcome,
         Err(error) => return db_failure(&error, &headers, "upload creation failed"),
     };
+    let mut missing_chunks = None;
+    match (&chunk_manifest, outcome.clone()) {
+        (Some(entries), UploadCreateOutcome::Created(created)) => {
+            if let Err(error) = tx
+                .upload_manifest_create(&scope, created.id, entries, now)
+                .await
+            {
+                return db_failure(&error, &headers, "upload manifest creation failed");
+            }
+            let Some(store) = services.storage.as_ref() else {
+                return storage_unavailable(&headers);
+            };
+            let mut verified_candidates = std::collections::HashMap::<Uuid, bool>::new();
+            for entry in entries {
+                let expected_digests: Vec<[u8; 32]> = identity_keys
+                    .iter()
+                    .filter_map(|identity_key| {
+                        craftcloud_storage::chunk_digest_from_sha256(
+                            identity_key,
+                            file_id,
+                            &entry.sha256,
+                        )
+                    })
+                    .collect();
+                let candidate = match tx
+                    .upload_manifest_candidate(
+                        &scope,
+                        created.id,
+                        entry.ordinal,
+                        &expected_digests,
+                        now,
+                        Action::UploadCreate,
+                    )
+                    .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        return db_failure(&error, &headers, "upload manifest lookup failed");
+                    }
+                };
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                let matched_digest: [u8; 32] = match candidate.digest.as_slice().try_into() {
+                    Ok(digest) => digest,
+                    Err(_) => return internal(&headers),
+                };
+                if let Err(error) = tx
+                    .upload_manifest_set_digest(&scope, created.id, entry.ordinal, &matched_digest)
+                    .await
+                {
+                    return db_failure(&error, &headers, "upload manifest update failed");
+                }
+                if candidate.state == "deleting"
+                    || candidate.storage_tier != "local"
+                    || candidate.size_bytes != entry.size_bytes
+                    || candidate.sha256.as_slice() != entry.sha256
+                {
+                    continue;
+                }
+                let key = match ObjectKey::parse(&candidate.object_key) {
+                    Ok(key) => key,
+                    Err(_) => continue,
+                };
+                let size = u64::try_from(entry.size_bytes).unwrap_or(0);
+                let verified = if let Some(verified) = verified_candidates.get(&candidate.id) {
+                    *verified
+                } else {
+                    let verified = matches!(store.head(&key).await, Ok(head) if head.len == size)
+                        && store.verify(&key, &entry.sha256).await.is_ok();
+                    verified_candidates.insert(candidate.id, verified);
+                    verified
+                };
+                if !verified {
+                    continue;
+                }
+                if !matches!(
+                    tx.upload_manifest_attach(
+                        &scope,
+                        created.id,
+                        entry.ordinal,
+                        candidate.id,
+                        now,
+                        Action::UploadCreate,
+                    )
+                    .await,
+                    Ok(true)
+                ) {
+                    return internal(&headers);
+                }
+            }
+            let rows = match tx
+                .upload_manifest_rows(&scope, created.id, Action::UploadCreate)
+                .await
+            {
+                Ok(Some(rows)) => rows,
+                Ok(None) => return internal(&headers),
+                Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+            };
+            missing_chunks = Some(
+                rows.into_iter()
+                    .filter(|row| row.chunk_id.is_none())
+                    .filter_map(|row| u32::try_from(row.ordinal).ok())
+                    .collect(),
+            );
+        }
+        (Some(entries), UploadCreateOutcome::Replayed(existing))
+            if !matches!(existing.state.as_str(), "created" | "receiving" | "stored") =>
+        {
+            // Terminal session transitions remove the temporary manifest. The
+            // database replay check already matched file, size and whole SHA.
+            // Preserve that replay instead of treating deleted staging rows as
+            // an idempotency-key conflict.
+            missing_chunks = Some(if existing.state == "committed" {
+                Vec::new()
+            } else {
+                entries
+                    .iter()
+                    .filter_map(|entry| u32::try_from(entry.ordinal).ok())
+                    .collect()
+            });
+        }
+        (Some(entries), UploadCreateOutcome::Replayed(existing)) => {
+            let rows = match tx
+                .upload_manifest_rows(&scope, existing.id, Action::UploadCreate)
+                .await
+            {
+                Ok(Some(rows)) => rows,
+                Ok(None) => {
+                    if matches!(existing.state.as_str(), "created" | "receiving" | "stored") {
+                        outcome = UploadCreateOutcome::KeyReused;
+                    }
+                    Vec::new()
+                }
+                Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+            };
+            if rows.len() != entries.len()
+                || rows.iter().zip(entries).any(|(row, entry)| {
+                    row.ordinal != entry.ordinal
+                        || row.byte_offset != entry.byte_offset
+                        || row.size_bytes != entry.size_bytes
+                        || row.sha256.as_slice() != entry.sha256
+                })
+            {
+                outcome = UploadCreateOutcome::KeyReused;
+            } else {
+                missing_chunks = Some(
+                    rows.into_iter()
+                        .filter(|row| row.chunk_id.is_none())
+                        .filter_map(|row| u32::try_from(row.ordinal).ok())
+                        .collect(),
+                );
+            }
+        }
+        (None, UploadCreateOutcome::Created(_)) => {}
+        (None, UploadCreateOutcome::Replayed(created)) => {
+            if matches!(
+                tx.upload_manifest_rows(&scope, created.id, Action::UploadCreate)
+                    .await,
+                Ok(Some(_))
+            ) {
+                outcome = UploadCreateOutcome::KeyReused;
+            }
+        }
+        _ => {}
+    }
     // Expiry done on the way is committed with every outcome.
     if let Err(error) = tx.commit().await {
         return db_failure(&error, &headers, "upload creation failed");
@@ -524,11 +773,17 @@ pub(crate) async fn create_upload(
                 Some(created.id),
                 "success",
             );
-            (StatusCode::CREATED, Json(session_json(&created))).into_response()
+            (
+                StatusCode::CREATED,
+                Json(session_json(&created, missing_chunks)),
+            )
+                .into_response()
         }
-        UploadCreateOutcome::Replayed(existing) => {
-            (StatusCode::OK, Json(session_json(&existing))).into_response()
-        }
+        UploadCreateOutcome::Replayed(existing) => (
+            StatusCode::OK,
+            Json(session_json(&existing, missing_chunks)),
+        )
+            .into_response(),
         UploadCreateOutcome::KeyReused => conflict(
             "IDEMPOTENCY_KEY_REUSED",
             "The Idempotency-Key was used with a different request.",
@@ -600,7 +855,16 @@ pub(crate) async fn get_upload(
             {
                 upload = fresh;
             }
-            Json(session_json(&upload)).into_response()
+            let missing =
+                match uploads::chunk_manifest_missing(&resolved.services.pool, &scope, resolved.id)
+                    .await
+                {
+                    Ok(missing) => missing,
+                    Err(error) => {
+                        return db_failure(&error, &headers, "upload manifest read failed");
+                    }
+                };
+            Json(session_json(&upload, missing)).into_response()
         }
         Ok(None) => not_found(&headers),
         Err(error) => db_failure(&error, &headers, "upload read failed"),
@@ -705,12 +969,163 @@ async fn delete_object(services: &Services, key: &ObjectKey) {
     }
 }
 
+pub(crate) async fn local_chunk_matches(
+    store: &craftcloud_storage::LocalStore,
+    reuse: &ChunkReuseCandidate,
+) -> bool {
+    let Ok(key) = ObjectKey::parse(&reuse.existing_object_key) else {
+        return false;
+    };
+    let Ok(size) = u64::try_from(reuse.size_bytes) else {
+        return false;
+    };
+    matches!(store.head(&key).await, Ok(head) if head.len == size)
+        && store.verify(&key, &reuse.sha256).await.is_ok()
+}
+
 /// After this long a receiving upload must have shown the minimum average
 /// rate, or it is cancelled (slow-drip protection; the session would
 /// otherwise hold quota and a slot until it expires).
 pub(crate) const RATE_GRACE_SECS: i64 = 300;
 /// Minimum average rate in bytes per second once the grace period is over.
 pub(crate) const MIN_RATE_BYTES_PER_SEC: u64 = 16 * 1024;
+
+pub(crate) async fn stage_chunk_manifest(
+    store: &craftcloud_storage::LocalStore,
+    source_key: &ObjectKey,
+    size: u64,
+    expected: Sha256Digest,
+    file_id: Uuid,
+    identity_keys: &[[u8; 32]],
+) -> Result<(Vec<NewChunk>, Vec<ObjectKey>), StorageError> {
+    let mut manifest = Vec::new();
+    let mut keys = Vec::new();
+    let result = async {
+        store.verify(source_key, &expected).await?;
+        let mut reader = store.open_read(source_key, None).await?;
+        if reader.remaining() != size {
+            return Err(StorageError::LengthMismatch);
+        }
+        let mut buffer =
+            Vec::with_capacity(craftcloud_storage::MAX_CHUNK_BYTES as usize + 64 * 1024);
+        let mut offset = 0u64;
+        while let Some(bytes) = reader.next_chunk().await? {
+            buffer.extend_from_slice(&bytes);
+            write_ready_chunks(
+                store,
+                file_id,
+                identity_keys,
+                &mut buffer,
+                false,
+                &mut offset,
+                &mut manifest,
+                &mut keys,
+            )
+            .await?;
+        }
+        write_ready_chunks(
+            store,
+            file_id,
+            identity_keys,
+            &mut buffer,
+            true,
+            &mut offset,
+            &mut manifest,
+            &mut keys,
+        )
+        .await?;
+        if offset != size || !buffer.is_empty() {
+            return Err(StorageError::LengthMismatch);
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        for key in &keys {
+            delete_object_key(store, key).await;
+        }
+    }
+    result?;
+    Ok((manifest, keys))
+}
+
+async fn delete_object_key(store: &craftcloud_storage::LocalStore, key: &ObjectKey) {
+    if let Err(error) = store.delete(key).await {
+        tracing::error!(%error, "cannot delete an unpublished chunk candidate");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_ready_chunks(
+    store: &craftcloud_storage::LocalStore,
+    file_id: Uuid,
+    identity_keys: &[[u8; 32]],
+    buffer: &mut Vec<u8>,
+    final_input: bool,
+    offset: &mut u64,
+    manifest: &mut Vec<NewChunk>,
+    keys: &mut Vec<ObjectKey>,
+) -> Result<(), StorageError> {
+    let spans =
+        craftcloud_storage::fastcdc_chunks(buffer).map_err(|_| StorageError::LengthMismatch)?;
+    let ready = if final_input {
+        spans.len()
+    } else {
+        spans.len().saturating_sub(1)
+    };
+    let mut consumed = 0usize;
+    for span in spans.iter().take(ready) {
+        let Some(content) = buffer.get(span.offset..span.offset + span.length) else {
+            return Err(StorageError::LengthMismatch);
+        };
+        let Some(current_key) = identity_keys.first() else {
+            return Err(StorageError::ChecksumMismatch);
+        };
+        let digest = craftcloud_storage::chunk_digest(current_key, file_id, content)
+            .ok_or(StorageError::ChecksumMismatch)?;
+        let mut digest_candidates = Vec::with_capacity(identity_keys.len());
+        for identity_key in identity_keys {
+            if let Some(candidate) =
+                craftcloud_storage::chunk_digest(identity_key, file_id, content)
+            {
+                digest_candidates.push(candidate);
+            }
+        }
+        let object_key = ObjectKey::generate();
+        let chunk_len = u64::try_from(content.len()).map_err(|_| StorageError::TooLarge)?;
+        let mut temp = store.begin_write_as(object_key.clone(), chunk_len).await?;
+        if let Err(error) = temp.write(content).await {
+            store.abort(temp).await;
+            return Err(error);
+        }
+        let chunk_sha: Sha256Digest = Sha256::digest(content).into();
+        let published = store.finalize(temp, chunk_len, &chunk_sha).await?;
+        if published != object_key {
+            return Err(StorageError::ChecksumMismatch);
+        }
+        keys.push(published.clone());
+        let byte_offset = i64::try_from(*offset).map_err(|_| StorageError::TooLarge)?;
+        let size_bytes = i64::try_from(chunk_len).map_err(|_| StorageError::TooLarge)?;
+        manifest.push(NewChunk {
+            digest,
+            digest_candidates,
+            sha256: chunk_sha,
+            object_key: object_key.as_str().to_owned(),
+            size_bytes,
+            byte_offset,
+        });
+        *offset = offset
+            .checked_add(chunk_len)
+            .ok_or(StorageError::TooLarge)?;
+        consumed = consumed
+            .checked_add(span.length)
+            .ok_or(StorageError::TooLarge)?;
+    }
+    if consumed > 0 {
+        buffer.drain(..consumed);
+    }
+    Ok(())
+}
 
 /// Deletes a published object and fails its session unless disarmed: covers
 /// a task that ends abnormally between publishing and recording the blob.
@@ -719,17 +1134,69 @@ struct ObjectGuard {
     org_id: Uuid,
     id: Uuid,
     key: Option<ObjectKey>,
+    chunk_keys: Vec<ObjectKey>,
+}
+
+/// Deletes an uploaded chunk candidate unless a successful or ambiguous DB
+/// commit may have made it reachable.
+struct ChunkObjectGuard {
+    services: Arc<Services>,
+    key: Option<ObjectKey>,
+}
+
+impl ChunkObjectGuard {
+    fn disarm(&mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for ChunkObjectGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let services = Arc::clone(&self.services);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { delete_object(&services, &key).await });
+            }
+        }
+    }
+}
+
+impl ObjectGuard {
+    fn disarm(&mut self) {
+        self.key = None;
+        self.chunk_keys.clear();
+    }
 }
 
 impl Drop for ObjectGuard {
     fn drop(&mut self) {
         let Some(key) = self.key.take() else {
+            if self.chunk_keys.is_empty() {
+                return;
+            }
+            let services = Arc::clone(&self.services);
+            let chunk_keys = std::mem::take(&mut self.chunk_keys);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    for key in chunk_keys {
+                        delete_object(&services, &key).await;
+                    }
+                });
+            }
             return;
         };
-        let (services, org_id, id) = (Arc::clone(&self.services), self.org_id, self.id);
+        let (services, org_id, id, chunk_keys) = (
+            Arc::clone(&self.services),
+            self.org_id,
+            self.id,
+            std::mem::take(&mut self.chunk_keys),
+        );
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 delete_object(&services, &key).await;
+                for key in chunk_keys {
+                    delete_object(&services, &key).await;
+                }
                 fail_session(&services, org_id, id).await;
             });
         }
@@ -788,11 +1255,25 @@ async fn finish_upload(finish: Finish) -> Response {
             return storage_error(&error, &headers);
         }
     };
+    let identity_keys = services.chunk_identity_keys();
+    let (chunk_manifest, chunk_keys) = if identity_keys.is_empty() {
+        (None, Vec::new())
+    } else {
+        match stage_chunk_manifest(store, &key, size, expected, file_id, &identity_keys).await {
+            Ok((manifest, keys)) => (Some(manifest), keys),
+            Err(error) => {
+                delete_object(&services, &key).await;
+                fail_session(&services, org_id, upload_id).await;
+                return storage_error(&error, &headers);
+            }
+        }
+    };
     let mut guard = ObjectGuard {
         services: Arc::clone(&services),
         org_id,
         id: upload_id,
         key: Some(key.clone()),
+        chunk_keys,
     };
     let Locked { mut tx, actor } = match lock(
         &services,
@@ -807,7 +1288,9 @@ async fn finish_upload(finish: Finish) -> Response {
         Ok(locked) => locked,
         Err(response) => {
             guard.key = None;
-            delete_object(&services, &key).await;
+            if chunk_manifest.is_some() {
+                delete_object(&services, &key).await;
+            }
             fail_session(&services, org_id, upload_id).await;
             return *response;
         }
@@ -990,27 +1473,75 @@ async fn finish_upload(finish: Finish) -> Response {
             return db_failure(&error, &headers, "file lock lookup failed");
         }
     }
-    let stored = match tx.upload_store(&scope, upload_id, key.as_str(), now).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            guard.key = None;
-            drop(tx);
-            delete_object(&services, &key).await;
-            fail_session(&services, org_id, upload_id).await;
-            return db_failure(&error, &headers, "upload store failed");
-        }
-    };
-    match stored {
-        StoreOutcome::Stored(upload, _blob) => {
-            // Crash test hook: object published, blob row not committed yet.
-            craftcloud_storage::crash_point("upload-before-record", 0);
-            if let Err(error) = tx.commit().await {
+    let (stored, mut unused_chunk_keys, reuse_candidates) = match chunk_manifest.as_deref() {
+        Some(chunks) => match tx
+            .upload_store_chunked(&scope, upload_id, key.as_str(), now, chunks)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
                 guard.key = None;
+                drop(tx);
                 delete_object(&services, &key).await;
                 fail_session(&services, org_id, upload_id).await;
                 return db_failure(&error, &headers, "upload store failed");
             }
-            guard.key = None;
+        },
+        None => match tx.upload_store(&scope, upload_id, key.as_str(), now).await {
+            Ok(outcome) => (outcome, Vec::new(), Vec::new()),
+            Err(error) => {
+                guard.key = None;
+                drop(tx);
+                delete_object(&services, &key).await;
+                fail_session(&services, org_id, upload_id).await;
+                return db_failure(&error, &headers, "upload store failed");
+            }
+        },
+    };
+    match stored {
+        StoreOutcome::Stored(upload, _blob) => {
+            for reuse in &reuse_candidates {
+                if local_chunk_matches(store, reuse).await {
+                    continue;
+                }
+                match tx
+                    .upload_replace_chunk_object(&scope, upload_id, reuse)
+                    .await
+                {
+                    Ok(true) => {
+                        unused_chunk_keys
+                            .retain(|candidate| candidate != &reuse.candidate_object_key);
+                        unused_chunk_keys.push(reuse.existing_object_key.clone());
+                    }
+                    Ok(false) | Err(_) => {
+                        guard.key = None;
+                        drop(tx);
+                        delete_object(&services, &key).await;
+                        fail_session(&services, org_id, upload_id).await;
+                        return internal(&headers);
+                    }
+                }
+            }
+            // Crash test hook: object published, blob row not committed yet.
+            craftcloud_storage::crash_point("upload-before-record", 0);
+            if let Err(error) = tx.commit().await {
+                // COMMIT acknowledgement can fail after PostgreSQL committed.
+                // Preserve every candidate object; reconciliation and GC can
+                // remove true strays after observing durable references.
+                guard.disarm();
+                fail_session(&services, org_id, upload_id).await;
+                return db_failure(&error, &headers, "upload store failed");
+            }
+            for unused in unused_chunk_keys {
+                if let Ok(unused) = ObjectKey::parse(&unused) {
+                    guard.chunk_keys.retain(|candidate| candidate != &unused);
+                    delete_object(&services, &unused).await;
+                }
+            }
+            if chunk_manifest.is_some() {
+                delete_object(&services, &key).await;
+            }
+            guard.disarm();
             audit(
                 &headers,
                 user_id,
@@ -1019,7 +1550,7 @@ async fn finish_upload(finish: Finish) -> Response {
                 Some(upload_id),
                 "success",
             );
-            Json(session_json(&upload)).into_response()
+            Json(session_json(&upload, None)).into_response()
         }
         StoreOutcome::NotReceiving(state) => {
             // Expired (or otherwise closed) while the bytes were arriving.
@@ -1085,6 +1616,20 @@ pub(crate) async fn put_content(
         Ok(opened) => opened,
         Err(response) => return *response,
     };
+    match tx
+        .upload_manifest_rows(&scope, upload_id, Action::UploadWrite)
+        .await
+    {
+        Ok(Some(_)) => {
+            return conflict(
+                "UPLOAD_MODE_MISMATCH",
+                "This session accepts chunk blocks, not whole-file content.",
+                &headers,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+    }
     // Only an authorized caller learns about the server's storage state.
     if services.storage.is_none() {
         return storage_unavailable(&headers);
@@ -1244,6 +1789,383 @@ pub(crate) async fn put_content(
             internal(&headers)
         }
     }
+}
+
+/// PUT one missing block of a client-provided chunk manifest.
+pub(crate) async fn put_chunk(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path((raw, ordinal_raw)): Path<(String, String)>,
+    body: Body,
+) -> Response {
+    let Ok(ordinal) = ordinal_raw.parse::<u32>() else {
+        return not_found(&headers);
+    };
+    let Ok(ordinal_i32) = i32::try_from(ordinal) else {
+        return not_found(&headers);
+    };
+    let (resolved, creator, file_id) = match resolve_upload(&state, &headers, &raw).await {
+        Ok(found) => found,
+        Err(response) => return *response,
+    };
+    let services = Arc::clone(&resolved.services);
+    let now = services.clock.now();
+    let (mut tx, scope) = match upload_write_gate(
+        &resolved,
+        &session,
+        &headers,
+        Action::UploadWrite,
+        "upload.chunk",
+        creator,
+        file_id,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(response) => return *response,
+    };
+    let upload = match tx
+        .upload_get(&scope, resolved.id, Action::UploadWrite)
+        .await
+    {
+        Ok(Some(upload)) => upload,
+        Ok(None) => return not_found(&headers),
+        Err(error) => return db_failure(&error, &headers, "upload read failed"),
+    };
+    if upload.state != "created" {
+        return conflict(
+            "UPLOAD_CLOSED",
+            "This upload cannot receive blocks.",
+            &headers,
+        );
+    }
+    if upload.expires_at <= now {
+        let _ = tx.expire_due(now).await;
+        let _ = tx.commit().await;
+        return expired(&headers);
+    }
+    let manifest_rows = match tx
+        .upload_manifest_rows(&scope, resolved.id, Action::UploadWrite)
+        .await
+    {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return not_found(&headers),
+        Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+    };
+    let Some(entry) = manifest_rows
+        .iter()
+        .find(|entry| entry.ordinal == ordinal_i32)
+    else {
+        return not_found(&headers);
+    };
+    if !matches!(
+        tx.session_valid(
+            session.session_id,
+            session.user_id,
+            now,
+            session.credential_kind == crate::session::CredentialKind::Device,
+        )
+        .await,
+        Ok(true)
+    ) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHENTICATED",
+            "Authentication is required.",
+            &headers,
+        );
+    }
+    let size = match u64::try_from(entry.size_bytes) {
+        Ok(size) if size <= u64::from(craftcloud_storage::MAX_CHUNK_BYTES) => size,
+        _ => return internal(&headers),
+    };
+    let expected_sha: Sha256Digest = match entry.sha256.as_slice().try_into() {
+        Ok(digest) => digest,
+        Err(_) => return internal(&headers),
+    };
+    let expected_digest: [u8; 32] = match entry.digest.as_slice().try_into() {
+        Ok(digest) => digest,
+        Err(_) => return internal(&headers),
+    };
+    if let Err(error) = tx.commit().await {
+        return db_failure(&error, &headers, "upload start failed");
+    }
+    let Some(store) = services.storage.as_ref() else {
+        return storage_unavailable(&headers);
+    };
+    if headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|declared| declared > size)
+    {
+        return storage_error(&StorageError::TooLarge, &headers);
+    }
+    let candidate_key = ObjectKey::generate();
+    let mut temp = match store.begin_write_as(candidate_key.clone(), size).await {
+        Ok(temp) => temp,
+        Err(error) => return storage_error(&error, &headers),
+    };
+    let started = tokio::time::Instant::now();
+    let ttl: Duration = (upload.expires_at - now)
+        .try_into()
+        .unwrap_or(Duration::ZERO);
+    let deadline = started + ttl;
+    let idle = services.settings.upload_idle_timeout;
+    let mut body = body;
+    loop {
+        if services.clock.now() >= upload.expires_at {
+            store.abort(temp).await;
+            return expired(&headers);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            store.abort(temp).await;
+            return expired(&headers);
+        }
+        match tokio::time::timeout(idle.min(remaining), body.frame()).await {
+            Err(_) => {
+                store.abort(temp).await;
+                return if tokio::time::Instant::now() >= deadline {
+                    expired(&headers)
+                } else {
+                    deadline_error(&headers)
+                };
+            }
+            Ok(None) => break,
+            Ok(Some(Err(_))) => {
+                store.abort(temp).await;
+                return interrupted(&headers);
+            }
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    services.metrics.add_uploaded(data.len() as u64);
+                    if let Err(error) = temp.write(&data).await {
+                        store.abort(temp).await;
+                        return storage_error(&error, &headers);
+                    }
+                }
+            }
+        }
+    }
+    let candidate_key = match store.finalize(temp, size, &expected_sha).await {
+        Ok(key) if key == candidate_key => key,
+        Ok(key) => {
+            delete_object(&services, &key).await;
+            return internal(&headers);
+        }
+        Err(error) => return storage_error(&error, &headers),
+    };
+    let mut guard = ChunkObjectGuard {
+        services: Arc::clone(&services),
+        key: Some(candidate_key.clone()),
+    };
+
+    let (mut tx, scope) = match upload_write_gate(
+        &resolved,
+        &session,
+        &headers,
+        Action::UploadWrite,
+        "upload.chunk",
+        creator,
+        file_id,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(response) => return *response,
+    };
+    let now = services.clock.now();
+    if !matches!(
+        tx.session_valid(
+            session.session_id,
+            session.user_id,
+            now,
+            session.credential_kind == crate::session::CredentialKind::Device,
+        )
+        .await,
+        Ok(true)
+    ) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHENTICATED",
+            "Authentication is required.",
+            &headers,
+        );
+    }
+    let current_upload = match tx
+        .upload_get(&scope, resolved.id, Action::UploadWrite)
+        .await
+    {
+        Ok(Some(upload)) => upload,
+        Ok(None) => return not_found(&headers),
+        Err(error) => return db_failure(&error, &headers, "upload read failed"),
+    };
+    if current_upload.state != "created" {
+        return conflict(
+            "UPLOAD_CLOSED",
+            "This upload cannot receive blocks.",
+            &headers,
+        );
+    }
+    if current_upload.expires_at <= now {
+        let _ = tx.expire_due(now).await;
+        let _ = tx.commit().await;
+        return expired(&headers);
+    }
+    let rows = match tx
+        .upload_manifest_rows(&scope, resolved.id, Action::UploadWrite)
+        .await
+    {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return not_found(&headers),
+        Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+    };
+    let Some(current) = rows.iter().find(|row| row.ordinal == ordinal_i32) else {
+        return not_found(&headers);
+    };
+    if current.size_bytes != i64::try_from(size).unwrap_or(-1)
+        || current.sha256.as_slice() != expected_sha
+        || current.digest.as_slice() != expected_digest
+    {
+        return conflict(
+            "UPLOAD_CHANGED",
+            "The upload manifest changed; create a new upload session.",
+            &headers,
+        );
+    }
+    let already_good = if current.storage_tier.as_deref() == Some("local") {
+        if let Some(key) = current.object_key.as_deref() {
+            key_matches(store, key, size, &expected_sha).await
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let mut prior_key = None;
+    let mut adopted = false;
+    if already_good {
+        let Some(chunk_id) = current.chunk_id else {
+            return internal(&headers);
+        };
+        if !matches!(
+            tx.upload_manifest_attach(
+                &scope,
+                resolved.id,
+                ordinal_i32,
+                chunk_id,
+                now,
+                Action::UploadWrite,
+            )
+            .await,
+            Ok(true)
+        ) {
+            return internal(&headers);
+        }
+    } else {
+        let matching = match tx
+            .upload_manifest_candidate(
+                &scope,
+                resolved.id,
+                ordinal_i32,
+                &[expected_digest],
+                now,
+                Action::UploadWrite,
+            )
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => return db_failure(&error, &headers, "chunk lookup failed"),
+        };
+        let reusable = if let Some(candidate) = &matching {
+            candidate.sha256.as_slice() == expected_sha
+                && candidate.size_bytes == i64::try_from(size).unwrap_or(-1)
+                && candidate.storage_tier == "local"
+                && key_matches(store, &candidate.object_key, size, &expected_sha).await
+        } else {
+            false
+        };
+        if reusable {
+            let Some(candidate) = matching else {
+                return internal(&headers);
+            };
+            if !matches!(
+                tx.upload_manifest_attach(
+                    &scope,
+                    resolved.id,
+                    ordinal_i32,
+                    candidate.id,
+                    now,
+                    Action::UploadWrite,
+                )
+                .await,
+                Ok(true)
+            ) {
+                return internal(&headers);
+            }
+        } else {
+            prior_key = match tx
+                .upload_manifest_store_chunk(
+                    &scope,
+                    resolved.id,
+                    ordinal_i32,
+                    &expected_digest,
+                    &expected_sha,
+                    i64::try_from(size).unwrap_or(-1),
+                    candidate_key.as_str(),
+                    now,
+                )
+                .await
+            {
+                Ok(Some(prior)) => prior,
+                Ok(None) => {
+                    return conflict(
+                        "UPLOAD_CLOSED",
+                        "The upload was closed before the block could be stored.",
+                        &headers,
+                    );
+                }
+                Err(error) => return db_failure(&error, &headers, "chunk record failed"),
+            };
+            adopted = true;
+        }
+    }
+    if let Err(error) = tx.commit().await {
+        if adopted {
+            guard.disarm();
+        }
+        return db_failure(&error, &headers, "chunk record failed");
+    }
+    if adopted {
+        guard.disarm();
+    }
+    if let Some(old_key) = prior_key.and_then(|key| ObjectKey::parse(&key).ok()) {
+        delete_object(&services, &old_key).await;
+    }
+    audit(
+        &headers,
+        session.user_id,
+        "upload.chunk",
+        Some(resolved.org_id),
+        Some(resolved.id),
+        "success",
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn key_matches(
+    store: &craftcloud_storage::LocalStore,
+    key: &str,
+    size: u64,
+    expected: &Sha256Digest,
+) -> bool {
+    let Ok(key) = ObjectKey::parse(key) else {
+        return false;
+    };
+    matches!(store.head(&key).await, Ok(head) if head.len == size)
+        && store.verify(&key, expected).await.is_ok()
 }
 
 fn slow_error(headers: &HeaderMap) -> Response {
@@ -1477,6 +2399,11 @@ pub(crate) async fn get_usage(
         Ok(None) => return not_found(&headers),
         Err(error) => return db_failure(&error, &headers, "usage read failed"),
     };
+    let (physical_bytes, physical_workspaces) =
+        match uploads::physical_usage(&services.pool, &scope).await {
+            Ok(usage) => usage,
+            Err(error) => return db_failure(&error, &headers, "physical usage read failed"),
+        };
     let mut rows = match uploads::workspace_usage(&services.pool, &scope, limit + 1, after).await {
         Ok(rows) => rows,
         Err(error) => return db_failure(&error, &headers, "usage read failed"),
@@ -1504,6 +2431,9 @@ pub(crate) async fn get_usage(
                 "quota_bytes": w.quota_bytes,
                 "reserved_bytes": w.reserved_bytes,
                 "committed_bytes": w.committed_bytes,
+                "physical_bytes": physical_workspaces.iter()
+                    .find(|physical| physical.workspace_id == w.id)
+                    .map_or(0, |physical| physical.physical_bytes),
             })
         })
         .collect();
@@ -1512,9 +2442,59 @@ pub(crate) async fn get_usage(
             "quota_bytes": usage.quota_bytes,
             "reserved_bytes": usage.reserved_bytes,
             "committed_bytes": usage.committed_bytes,
+            "physical_bytes": physical_bytes,
         },
         "workspaces": items,
         "next_cursor": next,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod object_guard_tests {
+    use super::*;
+    use craftcloud_storage::{ObjectStore, WriteSink};
+
+    #[tokio::test]
+    async fn uncertain_commit_preserves_full_and_chunk_candidate_objects() {
+        let root = std::env::temp_dir().join(format!("craftcloud-object-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = craftcloud_storage::LocalStore::open(&root).await.unwrap();
+        let full_key = ObjectKey::generate();
+        let chunk_key = ObjectKey::generate();
+        let bytes = b"committed candidate";
+        let digest: Sha256Digest = Sha256::digest(bytes).into();
+        for key in [&full_key, &chunk_key] {
+            let mut writer = store
+                .begin_write_as(key.clone(), bytes.len() as u64)
+                .await
+                .unwrap();
+            writer.write(bytes).await.unwrap();
+            store
+                .finalize(writer, bytes.len() as u64, &digest)
+                .await
+                .unwrap();
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let services = Arc::new(
+            Services::new(pool, None, crate::AuthSettings::default()).with_storage(store.clone()),
+        );
+        let mut guard = ObjectGuard {
+            services,
+            org_id: Uuid::new_v4(),
+            id: Uuid::new_v4(),
+            key: Some(full_key.clone()),
+            chunk_keys: vec![chunk_key.clone()],
+        };
+
+        // The COMMIT response was lost after the server may have committed.
+        guard.disarm();
+        drop(guard);
+
+        assert_eq!(store.head(&full_key).await.unwrap().len, 19);
+        assert_eq!(store.head(&chunk_key).await.unwrap().len, 19);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

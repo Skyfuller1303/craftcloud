@@ -13,13 +13,14 @@ aws-smithy-http-client.workspace = true
 chacha20poly1305.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
+fastcdc = "=3.1.0"
 russh.workspace = true
 russh-sftp.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 url.workspace = true
 
 [features]

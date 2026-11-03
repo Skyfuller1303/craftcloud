@@ -37,6 +37,7 @@ use crate::{DbError, OrgScope};
 
 /// Session states that still hold a quota reservation.
 pub(crate) const HOLDING: &str = "('created', 'receiving', 'stored')";
+const MAX_MANIFEST_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
 
 /// A stored upload session.
 #[derive(Debug, Clone, FromRow)]
@@ -102,6 +103,111 @@ pub struct Blob {
     pub created_at: OffsetDateTime,
 }
 
+/// One new physical chunk candidate for a staged file upload.
+#[derive(Debug, Clone)]
+pub struct NewChunk {
+    /// File-scoped keyed content digest.
+    pub digest: [u8; 32],
+    /// Search digests from prior retained server keys, current first.
+    pub digest_candidates: Vec<[u8; 32]>,
+    /// Plain SHA-256 for storage integrity checks.
+    pub sha256: [u8; 32],
+    /// Opaque key of the already-published candidate object.
+    pub object_key: String,
+    /// Chunk size.
+    pub size_bytes: i64,
+    /// Byte offset in the whole file.
+    pub byte_offset: i64,
+}
+
+/// An existing local object selected for reuse after a newly uploaded
+/// candidate was staged. The API verifies it before deleting the candidate.
+#[derive(Debug, Clone)]
+pub struct ChunkReuseCandidate {
+    /// Stable chunk row id.
+    pub chunk_id: Uuid,
+    /// Existing key selected by the database.
+    pub existing_object_key: String,
+    /// Verified candidate key from this upload.
+    pub candidate_object_key: String,
+    /// Expected plaintext SHA-256.
+    pub sha256: [u8; 32],
+    /// Expected object size.
+    pub size_bytes: i64,
+}
+
+/// One validated ordinal in a client-provided chunk manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkManifestSpec {
+    /// Zero-based ordinal.
+    pub ordinal: i32,
+    /// Offset in the assembled file.
+    pub byte_offset: i64,
+    /// Plaintext byte length.
+    pub size_bytes: i64,
+    /// Plaintext SHA-256.
+    pub sha256: [u8; 32],
+    /// File-scoped HMAC identifier chosen at session creation.
+    pub digest: [u8; 32],
+}
+
+/// One transient manifest row joined with its optional pinned chunk.
+#[derive(Debug, Clone, FromRow)]
+pub struct ChunkManifestRow {
+    /// Zero-based ordinal.
+    pub ordinal: i32,
+    /// Offset in the assembled file.
+    pub byte_offset: i64,
+    /// Plaintext byte length.
+    pub size_bytes: i64,
+    /// Plaintext SHA-256.
+    pub sha256: Vec<u8>,
+    /// HMAC identifier selected at session creation.
+    pub digest: Vec<u8>,
+    /// Pinned physical chunk, absent while the ordinal is missing.
+    pub chunk_id: Option<Uuid>,
+    /// Local object key of the pinned chunk.
+    pub object_key: Option<String>,
+    /// Chunk tier.
+    pub storage_tier: Option<String>,
+}
+
+/// A same-file candidate selected while the organization transaction is held.
+#[derive(Debug, Clone, FromRow)]
+pub struct ManifestChunkCandidate {
+    /// Chunk row id.
+    pub id: Uuid,
+    /// HMAC identifier that matched.
+    pub digest: Vec<u8>,
+    /// Plaintext SHA-256.
+    pub sha256: Vec<u8>,
+    /// Object size.
+    pub size_bytes: i64,
+    /// Local object key.
+    pub object_key: String,
+    /// Chunk state.
+    pub state: String,
+    /// Storage tier.
+    pub storage_tier: String,
+}
+
+/// Ordered manifest snapshot for verification outside a write transaction.
+#[derive(Debug, Clone, FromRow)]
+pub struct ChunkManifestSnapshotRow {
+    /// Ordinal.
+    pub ordinal: i32,
+    /// Offset in the assembled file.
+    pub byte_offset: i64,
+    /// Expected plaintext length.
+    pub size_bytes: i64,
+    /// Expected plaintext SHA-256.
+    pub sha256: Vec<u8>,
+    /// Pinned chunk row.
+    pub chunk_id: Option<Uuid>,
+    /// Pinned local object key.
+    pub object_key: Option<String>,
+}
+
 /// Quota and usage of an organization or workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
 pub struct Usage {
@@ -126,6 +232,38 @@ pub struct WorkspaceUsage {
     pub reserved_bytes: i64,
     /// Committed bytes.
     pub committed_bytes: i64,
+}
+
+/// Accounted physical object bytes of one workspace.
+#[derive(Debug, Clone, Copy, FromRow)]
+pub struct PhysicalWorkspaceUsage {
+    /// Workspace id.
+    pub workspace_id: Uuid,
+    /// Bytes currently represented by whole blobs and chunk objects.
+    pub physical_bytes: i64,
+}
+
+/// Physical bytes by workspace for one organization.
+///
+/// Logical quota counters remain independent from this storage detail.
+pub async fn physical_usage(
+    pool: &PgPool,
+    scope: &OrgScope,
+) -> Result<(i64, Vec<PhysicalWorkspaceUsage>), DbError> {
+    let rows = sqlx::query_as::<_, PhysicalWorkspaceUsage>(
+        "SELECT workspace_id, SUM(size_bytes)::bigint AS physical_bytes FROM ( \
+           SELECT workspace_id, size_bytes FROM blobs WHERE org_id = $1 AND layout = 'whole' \
+           UNION ALL \
+           SELECT workspace_id, size_bytes FROM chunks WHERE org_id = $1 \
+         ) physical GROUP BY workspace_id ORDER BY workspace_id",
+    )
+    .bind(scope.org_id())
+    .fetch_all(pool)
+    .await?;
+    let total = rows.iter().try_fold(0i64, |sum, row| {
+        sum.checked_add(row.physical_bytes).ok_or(DbError::Internal)
+    })?;
+    Ok((total, rows))
 }
 
 /// Where a session lives, resolved from its row.
@@ -182,6 +320,68 @@ pub async fn get(
     .bind(id)
     .fetch_optional(pool)
     .await?)
+}
+
+/// Reads a temporary manifest and its pinned objects for commit verification.
+/// `None` identifies a legacy whole-object upload; `Some(empty)` is a valid
+/// chunked upload of an empty file.
+pub async fn chunk_manifest_snapshot(
+    pool: &PgPool,
+    scope: &OrgScope,
+    id: Uuid,
+) -> Result<Option<Vec<ChunkManifestSnapshotRow>>, DbError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM upload_chunk_manifests WHERE upload_id=$1 AND file_id=(SELECT file_id FROM upload_sessions WHERE id=$1 AND org_id=$2))",
+    )
+    .bind(id)
+    .bind(scope.org_id())
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Ok(None);
+    }
+    let rows = sqlx::query_as::<_, ChunkManifestSnapshotRow>(
+        "SELECT m.ordinal, m.byte_offset, m.size_bytes, m.sha256, u.chunk_id, c.object_key \
+         FROM upload_chunk_manifest_entries m \
+         LEFT JOIN upload_chunks u ON u.upload_id=m.upload_id AND u.ordinal=m.ordinal \
+         LEFT JOIN chunks c ON c.id=u.chunk_id AND c.file_id=(SELECT file_id FROM upload_chunk_manifests WHERE upload_id=m.upload_id) \
+         WHERE m.upload_id=$1 ORDER BY m.ordinal",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(rows))
+}
+
+/// Missing ordinals for an authorized upload session. Empty list also covers
+/// the valid empty-file chunk manifest.
+pub async fn chunk_manifest_missing(
+    pool: &PgPool,
+    scope: &OrgScope,
+    id: Uuid,
+) -> Result<Option<Vec<u32>>, DbError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM upload_chunk_manifests WHERE upload_id=$1 AND file_id=(SELECT file_id FROM upload_sessions WHERE id=$1 AND org_id=$2))",
+    )
+    .bind(id)
+    .bind(scope.org_id())
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Ok(None);
+    }
+    let rows: Vec<i32> = sqlx::query_scalar(
+        "SELECT m.ordinal FROM upload_chunk_manifest_entries m \
+         LEFT JOIN upload_chunks u ON u.upload_id=m.upload_id AND u.ordinal=m.ordinal \
+         WHERE m.upload_id=$1 AND u.chunk_id IS NULL ORDER BY m.ordinal",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|ordinal| u32::try_from(ordinal).map_err(|_| DbError::Internal))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Quota and usage of the scoped organization.
@@ -367,8 +567,9 @@ impl OrgTx {
         &mut self,
         scope: &OrgScope,
         id: Uuid,
+        action: Action,
     ) -> Result<Option<UploadSession>, DbError> {
-        self.check(scope, craftcloud_core::policy::Action::VersionCommit)?;
+        self.check(scope, action)?;
         Ok(sqlx::query_as::<_, UploadSession>(&format!(
             "SELECT {SESSION_COLUMNS} FROM upload_sessions WHERE org_id=$1 AND id=$2"
         ))
@@ -376,6 +577,322 @@ impl OrgTx {
         .bind(id)
         .fetch_optional(&mut *self.tx)
         .await?)
+    }
+
+    /// Creates the temporary manifest for a newly reserved chunked upload.
+    pub async fn upload_manifest_create(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        entries: &[ChunkManifestSpec],
+        now: OffsetDateTime,
+    ) -> Result<(), DbError> {
+        self.check(scope, Action::UploadCreate)?;
+        let Some(session) = self.session_locked(id, now).await? else {
+            return Err(DbError::Internal);
+        };
+        if session.state != "created" {
+            return Err(DbError::Internal);
+        }
+        let mut offset = 0i64;
+        for (expected_ordinal, entry) in entries.iter().enumerate() {
+            if entry.ordinal != i32::try_from(expected_ordinal).map_err(|_| DbError::Internal)?
+                || entry.byte_offset != offset
+                || !(1..=MAX_MANIFEST_CHUNK_BYTES).contains(&entry.size_bytes)
+            {
+                return Err(DbError::Internal);
+            }
+            offset = offset
+                .checked_add(entry.size_bytes)
+                .ok_or(DbError::Internal)?;
+        }
+        if offset != session.declared_size {
+            return Err(DbError::Internal);
+        }
+        sqlx::query(
+            "INSERT INTO upload_chunk_manifests (upload_id, file_id, created_at) VALUES ($1,$2,$3)",
+        )
+        .bind(id)
+        .bind(session.file_id)
+        .bind(now)
+        .execute(&mut *self.tx)
+        .await?;
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO upload_chunk_manifest_entries (upload_id,ordinal,byte_offset,size_bytes,sha256,digest) \
+                 VALUES ($1,$2,$3,$4,$5,$6)",
+            )
+            .bind(id)
+            .bind(entry.ordinal)
+            .bind(entry.byte_offset)
+            .bind(entry.size_bytes)
+            .bind(entry.sha256.as_slice())
+            .bind(entry.digest.as_slice())
+            .execute(&mut *self.tx)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Returns a same-file chunk candidate and locks it against GC/archive
+    /// while the caller verifies its local bytes.
+    pub async fn upload_manifest_candidate(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        ordinal: i32,
+        digests: &[[u8; 32]],
+        now: OffsetDateTime,
+        action: Action,
+    ) -> Result<Option<ManifestChunkCandidate>, DbError> {
+        self.check(scope, action)?;
+        let Some(session) = self.session_locked(id, now).await? else {
+            return Ok(None);
+        };
+        let manifest_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM upload_chunk_manifest_entries WHERE upload_id=$1 AND ordinal=$2)",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if !manifest_exists {
+            return Ok(None);
+        }
+        for digest in digests {
+            let candidate = sqlx::query_as::<_, ManifestChunkCandidate>(
+                "SELECT id, digest, sha256, size_bytes, object_key, state, storage_tier FROM chunks \
+                 WHERE file_id=$1 AND digest=$2 AND state <> 'deleting' FOR UPDATE",
+            )
+            .bind(session.file_id)
+            .bind(digest.as_slice())
+            .fetch_optional(&mut *self.tx)
+            .await?;
+            if candidate.is_some() {
+                return Ok(candidate);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Selects the matching key-version digest for this temporary ordinal.
+    pub async fn upload_manifest_set_digest(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        ordinal: i32,
+        digest: &[u8; 32],
+    ) -> Result<bool, DbError> {
+        self.check(scope, Action::UploadCreate)?;
+        let updated = sqlx::query(
+            "UPDATE upload_chunk_manifest_entries SET digest=$3 WHERE upload_id=$1 AND ordinal=$2",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .bind(digest.as_slice())
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Makes a verified same-file chunk reachable from this session. The
+    /// existing mapping is replaced atomically when a repaired object has a
+    /// different chunk row.
+    pub async fn upload_manifest_attach(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        ordinal: i32,
+        chunk_id: Uuid,
+        now: OffsetDateTime,
+        action: Action,
+    ) -> Result<bool, DbError> {
+        self.check(scope, action)?;
+        let Some(session) = self.session_locked(id, now).await? else {
+            return Ok(false);
+        };
+        if !matches!(session.state.as_str(), "created" | "receiving") {
+            return Ok(false);
+        }
+        let Some(offset) = sqlx::query_scalar::<_, i64>(
+            "SELECT byte_offset FROM upload_chunk_manifest_entries WHERE upload_id=$1 AND ordinal=$2",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .fetch_optional(&mut *self.tx)
+        .await?
+        else {
+            return Ok(false);
+        };
+        let old: Option<Uuid> = sqlx::query_scalar(
+            "SELECT chunk_id FROM upload_chunks WHERE upload_id=$1 AND ordinal=$2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        if old == Some(chunk_id) {
+            return Ok(true);
+        }
+        if old.is_some() {
+            sqlx::query("DELETE FROM upload_chunks WHERE upload_id=$1 AND ordinal=$2")
+                .bind(id)
+                .bind(ordinal)
+                .execute(&mut *self.tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO upload_chunks (upload_id,file_id,ordinal,chunk_id,byte_offset) \
+             SELECT $1,$2,$3,$4,$5 WHERE EXISTS (SELECT 1 FROM chunks WHERE id=$4 AND file_id=$2 AND state <> 'deleting')",
+        )
+        .bind(id)
+        .bind(session.file_id)
+        .bind(ordinal)
+        .bind(chunk_id)
+        .bind(offset)
+        .execute(&mut *self.tx)
+        .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM upload_chunks WHERE upload_id=$1 AND ordinal=$2 AND chunk_id=$3)",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .bind(chunk_id)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Returns ordered manifest entries and the chunks pinned to each ordinal.
+    pub async fn upload_manifest_rows(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        action: Action,
+    ) -> Result<Option<Vec<ChunkManifestRow>>, DbError> {
+        self.check(scope, action)?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM upload_chunk_manifests WHERE upload_id=$1 AND file_id=(SELECT file_id FROM upload_sessions WHERE id=$1 AND org_id=$2))",
+        )
+        .bind(id)
+        .bind(self.org_id)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if !exists {
+            return Ok(None);
+        }
+        Ok(Some(sqlx::query_as::<_, ChunkManifestRow>(
+            "SELECT m.ordinal,m.byte_offset,m.size_bytes,m.sha256,m.digest,u.chunk_id,c.object_key,c.storage_tier \
+             FROM upload_chunk_manifest_entries m LEFT JOIN upload_chunks u ON u.upload_id=m.upload_id AND u.ordinal=m.ordinal \
+             LEFT JOIN chunks c ON c.id=u.chunk_id AND c.file_id=(SELECT file_id FROM upload_chunk_manifests WHERE upload_id=m.upload_id) \
+             WHERE m.upload_id=$1 ORDER BY m.ordinal",
+        )
+        .bind(id)
+        .fetch_all(&mut *self.tx)
+        .await?))
+    }
+
+    /// Replaces or inserts one verified chunk object, then pins it to the
+    /// session ordinal. Returns the prior local key for post-commit deletion.
+    // Keep the verified identity, byte length and candidate key together at this write boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_manifest_store_chunk(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        ordinal: i32,
+        digest: &[u8; 32],
+        sha256: &[u8; 32],
+        size_bytes: i64,
+        object_key: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Option<String>>, DbError> {
+        self.check(scope, Action::UploadWrite)?;
+        let Some(session) = self.session_locked(id, now).await? else {
+            return Err(DbError::Internal);
+        };
+        if session.state != "created" {
+            return Ok(None);
+        }
+        let expected: Option<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT size_bytes,sha256,digest FROM upload_chunk_manifest_entries WHERE upload_id=$1 AND ordinal=$2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(ordinal)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let Some((expected_size, expected_sha, expected_digest)) = expected else {
+            return Ok(None);
+        };
+        if expected_size != size_bytes
+            || expected_sha.as_slice() != sha256
+            || expected_digest.as_slice() != digest
+        {
+            return Ok(None);
+        }
+        let existing: Option<(Uuid, String, String, Vec<u8>, i64, String)> = sqlx::query_as(
+            "SELECT id,object_key,storage_tier,sha256,size_bytes,state FROM chunks WHERE file_id=$1 AND digest=$2 FOR UPDATE",
+        )
+        .bind(session.file_id)
+        .bind(digest.as_slice())
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let (chunk_id, prior_key) = if let Some((
+            chunk_id,
+            old_key,
+            tier,
+            old_sha,
+            old_size,
+            state,
+        )) = existing
+        {
+            if state == "deleting" {
+                return Ok(None);
+            }
+            if old_sha.as_slice() != sha256 || old_size != size_bytes {
+                return Err(DbError::Internal);
+            }
+            sqlx::query(
+                "UPDATE chunks SET object_key=$3,state=CASE WHEN refcount>0 THEN 'committed' ELSE 'staged' END,storage_tier='local', \
+                 archive_claim_token=NULL,archive_claimed_at=NULL,archive_next_attempt_at=NULL, \
+                 archive_error_code=NULL,archive_local_delete_pending=false \
+                 WHERE id=$1 AND file_id=$2",
+            )
+            .bind(chunk_id)
+            .bind(session.file_id)
+            .bind(object_key)
+            .execute(&mut *self.tx)
+            .await?;
+            (
+                chunk_id,
+                (tier == "local" && old_key != object_key).then_some(old_key),
+            )
+        } else {
+            let chunk_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,created_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged',$9)",
+            )
+            .bind(chunk_id)
+            .bind(session.file_id)
+            .bind(self.org_id)
+            .bind(session.workspace_id)
+            .bind(digest.as_slice())
+            .bind(sha256.as_slice())
+            .bind(object_key)
+            .bind(size_bytes)
+            .bind(now)
+            .execute(&mut *self.tx)
+            .await?;
+            (chunk_id, None)
+        };
+        let attached = self
+            .upload_manifest_attach(scope, id, ordinal, chunk_id, now, Action::UploadWrite)
+            .await?;
+        if !attached {
+            return Ok(None);
+        }
+        Ok(Some(prior_key))
     }
 
     /// Where a file lives and whether it or its project is in the trash:
@@ -890,16 +1407,129 @@ impl OrgTx {
         object_key: &str,
         now: OffsetDateTime,
     ) -> Result<StoreOutcome, DbError> {
-        self.check(scope, Action::UploadWrite)?;
+        self.upload_store_inner(scope, id, object_key, now, None)
+            .await
+            .map(|(outcome, _, _)| outcome)
+    }
+
+    /// Stores a logical blob and its file-scoped chunk manifest.
+    /// Returns candidate object keys that lost a same-file deduplication race.
+    pub async fn upload_store_chunked(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        object_key: &str,
+        now: OffsetDateTime,
+        chunks: &[NewChunk],
+    ) -> Result<(StoreOutcome, Vec<String>, Vec<ChunkReuseCandidate>), DbError> {
+        self.upload_store_inner(scope, id, object_key, now, Some(chunks))
+            .await
+    }
+
+    /// Publishes the logical blob for a complete Phase-B manifest. The caller
+    /// has already verified the assembled whole-file SHA-256 outside this
+    /// transaction; every ordinal remains pinned by `upload_chunks` here.
+    pub async fn upload_store_chunk_manifest(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        object_key: &str,
+        now: OffsetDateTime,
+    ) -> Result<StoreOutcome, DbError> {
+        self.check(scope, Action::VersionCommit)?;
         let Some(session) = self.session_locked(id, now).await? else {
             return Ok(StoreOutcome::Gone);
         };
-        if session.state != "receiving" {
+        if session.state != "created" {
             return Ok(StoreOutcome::NotReceiving(session.state));
         }
         match self.file_state(session.file_id).await? {
             Some((_, _, _, true)) => return Ok(StoreOutcome::ProjectDeleted),
             Some((_, _, true, _)) => return Ok(StoreOutcome::FileDeleted),
+            _ => {}
+        }
+        let ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM upload_chunk_manifests h WHERE h.upload_id=$1 AND h.file_id=$2) \
+             AND (SELECT count(*) FROM upload_chunk_manifest_entries WHERE upload_id=$1) = \
+                 (SELECT count(*) FROM upload_chunks WHERE upload_id=$1) \
+             AND NOT EXISTS (SELECT 1 FROM upload_chunk_manifest_entries m \
+                 LEFT JOIN upload_chunks u ON u.upload_id=m.upload_id AND u.ordinal=m.ordinal \
+                 LEFT JOIN chunks c ON c.id=u.chunk_id AND c.file_id=$2 \
+                 WHERE m.upload_id=$1 AND (c.id IS NULL OR c.size_bytes <> m.size_bytes \
+                   OR c.sha256 <> m.sha256 OR c.state='deleting' OR c.storage_tier <> 'local')) \
+             AND COALESCE((SELECT sum(size_bytes) FROM upload_chunk_manifest_entries WHERE upload_id=$1),0)=$3",
+        )
+        .bind(id)
+        .bind(session.file_id)
+        .bind(session.declared_size)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if !ready {
+            return Ok(StoreOutcome::NotReceiving("created".to_owned()));
+        }
+        let blob_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO blob_quota_groups (id, org_id, workspace_id, size_bytes) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(blob_id)
+        .bind(self.org_id)
+        .bind(session.workspace_id)
+        .bind(session.declared_size)
+        .execute(&mut *self.tx)
+        .await?;
+        let blob = sqlx::query_as::<_, Blob>(
+            "INSERT INTO blobs (id,org_id,workspace_id,quota_group_id,object_key,size_bytes,sha256,layout,created_at) \
+             VALUES ($1,$2,$3,$1,$4,$5,$6,'chunked',$7) \
+             RETURNING id,org_id,workspace_id,quota_group_id,object_key,size_bytes,sha256,state,created_at",
+        )
+        .bind(blob_id)
+        .bind(self.org_id)
+        .bind(session.workspace_id)
+        .bind(object_key)
+        .bind(session.declared_size)
+        .bind(&session.declared_sha256)
+        .bind(now)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        let updated = sqlx::query_as::<_, UploadSession>(&format!(
+            "UPDATE upload_sessions SET state='stored',blob_id=$3,updated_at=$4,version=version+1 \
+             WHERE id=$1 AND org_id=$2 RETURNING {SESSION_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(self.org_id)
+        .bind(blob.id)
+        .bind(now)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        Ok(StoreOutcome::Stored(Box::new(updated), Box::new(blob)))
+    }
+
+    async fn upload_store_inner(
+        &mut self,
+        scope: &OrgScope,
+        id: Uuid,
+        object_key: &str,
+        now: OffsetDateTime,
+        chunks: Option<&[NewChunk]>,
+    ) -> Result<(StoreOutcome, Vec<String>, Vec<ChunkReuseCandidate>), DbError> {
+        self.check(scope, Action::UploadWrite)?;
+        let Some(session) = self.session_locked(id, now).await? else {
+            return Ok((StoreOutcome::Gone, Vec::new(), Vec::new()));
+        };
+        if session.state != "receiving" {
+            return Ok((
+                StoreOutcome::NotReceiving(session.state),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        match self.file_state(session.file_id).await? {
+            Some((_, _, _, true)) => {
+                return Ok((StoreOutcome::ProjectDeleted, Vec::new(), Vec::new()));
+            }
+            Some((_, _, true, _)) => {
+                return Ok((StoreOutcome::FileDeleted, Vec::new(), Vec::new()));
+            }
             _ => {}
         }
         let blob_id = Uuid::new_v4();
@@ -914,8 +1544,8 @@ impl OrgTx {
         .execute(&mut *self.tx)
         .await?;
         let blob = sqlx::query_as::<_, Blob>(
-            "INSERT INTO blobs (id, org_id, workspace_id, quota_group_id, object_key, size_bytes, sha256, created_at) \
-             VALUES ($1, $2, $3, $1, $4, $5, $6, $7) \
+            "INSERT INTO blobs (id, org_id, workspace_id, quota_group_id, object_key, size_bytes, sha256, layout, created_at) \
+             VALUES ($1, $2, $3, $1, $4, $5, $6, $8, $7) \
              RETURNING id, org_id, workspace_id, quota_group_id, object_key, size_bytes, sha256, state, created_at",
         )
         .bind(blob_id)
@@ -925,8 +1555,174 @@ impl OrgTx {
         .bind(session.declared_size)
         .bind(&session.declared_sha256)
         .bind(now)
+        .bind(if chunks.is_some() { "chunked" } else { "whole" })
         .fetch_one(&mut *self.tx)
         .await?;
+        let mut unused_keys = Vec::new();
+        let mut local_reuse_candidates = Vec::new();
+        if let Some(chunks) = chunks {
+            let mut previous_offset = 0i64;
+            for (ordinal, chunk) in chunks.iter().enumerate() {
+                if chunk.byte_offset != previous_offset || chunk.size_bytes <= 0 {
+                    return Err(DbError::Internal);
+                }
+                previous_offset = previous_offset
+                    .checked_add(chunk.size_bytes)
+                    .ok_or(DbError::Internal)?;
+                let mut existing_chunk: Option<(Uuid, i64, Vec<u8>, String, String, String)> = None;
+                for digest in &chunk.digest_candidates {
+                    existing_chunk = sqlx::query_as(
+                        "SELECT id, size_bytes, sha256, state, storage_tier, object_key FROM chunks WHERE file_id = $1 AND digest = $2 FOR UPDATE",
+                    )
+                    .bind(session.file_id)
+                    .bind(digest.as_slice())
+                    .fetch_optional(&mut *self.tx)
+                    .await?;
+                    if existing_chunk.is_some() {
+                        break;
+                    }
+                }
+                let chunk_id = if let Some((
+                    existing_id,
+                    existing_size,
+                    existing_sha,
+                    existing_state,
+                    existing_tier,
+                    existing_key,
+                )) = existing_chunk
+                {
+                    if existing_size != chunk.size_bytes
+                        || existing_sha.as_slice() != chunk.sha256
+                        || existing_state == "deleting"
+                        || !matches!(existing_tier.as_str(), "local" | "archiving" | "archive")
+                    {
+                        return Err(DbError::Internal);
+                    }
+                    if existing_tier == "local" {
+                        unused_keys.push(chunk.object_key.clone());
+                        if !local_reuse_candidates
+                            .iter()
+                            .any(|reuse: &ChunkReuseCandidate| reuse.chunk_id == existing_id)
+                        {
+                            local_reuse_candidates.push(ChunkReuseCandidate {
+                                chunk_id: existing_id,
+                                existing_object_key: existing_key,
+                                candidate_object_key: chunk.object_key.clone(),
+                                sha256: chunk.sha256,
+                                size_bytes: chunk.size_bytes,
+                            });
+                        }
+                    } else {
+                        // The candidate bytes are a verified local replacement. Fencing the
+                        // archive worker before commit prevents a later delete from removing
+                        // a chunk used by the new head.
+                        sqlx::query(
+                            "UPDATE chunks SET object_key=$2, storage_tier='local', \
+                                 archive_local_delete_pending=false, archive_claim_token=NULL, \
+                                 archive_claimed_at=NULL, archive_next_attempt_at=NULL \
+                             WHERE id=$1 AND file_id=$3",
+                        )
+                        .bind(existing_id)
+                        .bind(&chunk.object_key)
+                        .bind(session.file_id)
+                        .execute(&mut *self.tx)
+                        .await?;
+                        unused_keys.push(existing_key);
+                    }
+                    existing_id
+                } else {
+                    let candidate_id = Uuid::new_v4();
+                    let inserted: Option<Uuid> = sqlx::query_scalar(
+                        "INSERT INTO chunks (id, file_id, org_id, workspace_id, digest, sha256, object_key, size_bytes, state, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'staged', $9) \
+                     ON CONFLICT (file_id, digest) DO NOTHING RETURNING id",
+                    )
+                    .bind(candidate_id)
+                    .bind(session.file_id)
+                    .bind(self.org_id)
+                    .bind(session.workspace_id)
+                    .bind(chunk.digest.as_slice())
+                    .bind(chunk.sha256.as_slice())
+                    .bind(&chunk.object_key)
+                    .bind(chunk.size_bytes)
+                    .bind(now)
+                    .fetch_optional(&mut *self.tx)
+                    .await?;
+                    if let Some(inserted) = inserted {
+                        inserted
+                    } else {
+                        let existing: Option<(Uuid, i64, Vec<u8>, String, String, String)> = sqlx::query_as(
+                            "SELECT id, size_bytes, sha256, state, storage_tier, object_key FROM chunks WHERE file_id = $1 AND digest = $2 FOR UPDATE",
+                        )
+                        .bind(session.file_id)
+                        .bind(chunk.digest.as_slice())
+                        .fetch_optional(&mut *self.tx)
+                        .await?;
+                        let Some((
+                            existing_id,
+                            existing_size,
+                            existing_sha,
+                            existing_state,
+                            existing_tier,
+                            existing_key,
+                        )) = existing
+                        else {
+                            return Err(DbError::Internal);
+                        };
+                        if existing_size != chunk.size_bytes
+                            || existing_sha.as_slice() != chunk.sha256
+                            || existing_state == "deleting"
+                            || !matches!(existing_tier.as_str(), "local" | "archiving" | "archive")
+                        {
+                            return Err(DbError::Internal);
+                        }
+                        if existing_tier == "local" {
+                            unused_keys.push(chunk.object_key.clone());
+                            if !local_reuse_candidates
+                                .iter()
+                                .any(|reuse: &ChunkReuseCandidate| reuse.chunk_id == existing_id)
+                            {
+                                local_reuse_candidates.push(ChunkReuseCandidate {
+                                    chunk_id: existing_id,
+                                    existing_object_key: existing_key,
+                                    candidate_object_key: chunk.object_key.clone(),
+                                    sha256: chunk.sha256,
+                                    size_bytes: chunk.size_bytes,
+                                });
+                            }
+                        } else {
+                            sqlx::query(
+                                "UPDATE chunks SET object_key=$2, storage_tier='local', \
+                                     archive_local_delete_pending=false, archive_claim_token=NULL, \
+                                     archive_claimed_at=NULL, archive_next_attempt_at=NULL \
+                                 WHERE id=$1 AND file_id=$3",
+                            )
+                            .bind(existing_id)
+                            .bind(&chunk.object_key)
+                            .bind(session.file_id)
+                            .execute(&mut *self.tx)
+                            .await?;
+                            unused_keys.push(existing_key);
+                        }
+                        existing_id
+                    }
+                };
+                sqlx::query(
+                    "INSERT INTO upload_chunks (upload_id, file_id, ordinal, chunk_id, byte_offset) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(id)
+                .bind(session.file_id)
+                .bind(i32::try_from(ordinal).map_err(|_| DbError::Internal)?)
+                .bind(chunk_id)
+                .bind(chunk.byte_offset)
+                .execute(&mut *self.tx)
+                .await?;
+            }
+            if previous_offset != session.declared_size {
+                return Err(DbError::Internal);
+            }
+        }
         let updated = sqlx::query_as::<_, UploadSession>(&format!(
             "UPDATE upload_sessions SET state = 'stored', blob_id = $3, updated_at = $4, \
                  version = version + 1 \
@@ -938,7 +1734,39 @@ impl OrgTx {
         .bind(now)
         .fetch_one(&mut *self.tx)
         .await?;
-        Ok(StoreOutcome::Stored(Box::new(updated), Box::new(blob)))
+        Ok((
+            StoreOutcome::Stored(Box::new(updated), Box::new(blob)),
+            unused_keys,
+            local_reuse_candidates,
+        ))
+    }
+
+    /// Replaces a selected local chunk object with the verified candidate
+    /// uploaded by this session. The caller holds the same organization
+    /// transaction that selected and locked the chunk row.
+    pub async fn upload_replace_chunk_object(
+        &mut self,
+        scope: &OrgScope,
+        upload_id: Uuid,
+        reuse: &ChunkReuseCandidate,
+    ) -> Result<bool, DbError> {
+        self.check(scope, Action::UploadWrite)?;
+        let done = sqlx::query(
+            "UPDATE chunks SET object_key=$4 WHERE id=$1 AND org_id=$2 \
+             AND object_key=$3 AND storage_tier='local' AND state <> 'deleting' \
+             AND size_bytes=$6 AND sha256=$7 \
+             AND EXISTS (SELECT 1 FROM upload_chunks u WHERE u.upload_id=$5 AND u.chunk_id=chunks.id)",
+        )
+        .bind(reuse.chunk_id)
+        .bind(self.org_id)
+        .bind(&reuse.existing_object_key)
+        .bind(&reuse.candidate_object_key)
+        .bind(upload_id)
+        .bind(reuse.size_bytes)
+        .bind(reuse.sha256.as_slice())
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(done.rows_affected() == 1)
     }
 
     /// Marks a session `failed` and releases its reservation (lifecycle path:

@@ -53,10 +53,28 @@ fn body_budget(bytes: u64) -> Duration {
 }
 
 /// Content uploads and downloads (`.../content`) are the only requests with large bodies.
+/// Chunk PUT routes carry content too and share the same size-dependent deadlines.
 fn is_content_transfer(path: &str) -> bool {
-    path.split(['?', '#'])
+    // SDK requests carry absolute URLs; transport tests also use relative paths.
+    let Ok(uri) = path
+        .split(['?', '#'])
         .next()
-        .is_some_and(|path| path.ends_with("/content"))
+        .unwrap_or(path)
+        .parse::<ureq::http::Uri>()
+    else {
+        return false;
+    };
+    let path = uri.path();
+    if path.ends_with("/content") {
+        return true;
+    }
+    let Some((session, ordinal)) = path
+        .strip_prefix("/api/v1/uploads/")
+        .and_then(|tail| tail.split_once("/chunks/"))
+    else {
+        return false;
+    };
+    Uuid::parse_str(session).is_ok() && ordinal.parse::<u32>().is_ok() && !ordinal.contains('/')
 }
 
 /// How long the response body may take once its head arrived. A declared
@@ -586,6 +604,11 @@ pub enum SaveOutcome {
     LocalOnly,
     Uploaded(Version),
 }
+/// Cancellation and byte-progress callback for a native upload.
+pub struct UploadControl<F> {
+    pub cancel: Arc<AtomicBool>,
+    pub on_progress: F,
+}
 #[derive(Serialize)]
 struct CreateFileRequest<'a> {
     name: &'a str,
@@ -628,10 +651,43 @@ pub fn save_new_local_first_with_cancel<T: CloudTransport>(
     bytes: Vec<u8>,
     cancel: Arc<AtomicBool>,
 ) -> Result<Version, CloudError> {
+    save_new_local_first_with_progress_and_cancel(
+        client,
+        links,
+        local_path,
+        server,
+        target,
+        bytes,
+        UploadControl {
+            cancel,
+            on_progress: |_, _| {},
+        },
+    )
+}
+
+/// Like [`save_new_local_first_with_cancel`], reporting completed upload bytes.
+pub fn save_new_local_first_with_progress_and_cancel<T, F>(
+    client: &CloudClient<T>,
+    links: &LinksStore,
+    local_path: &Path,
+    server: &str,
+    target: &NewFile,
+    bytes: Vec<u8>,
+    control: UploadControl<F>,
+) -> Result<Version, CloudError>
+where
+    T: CloudTransport,
+    F: FnMut(u64, u64),
+{
+    let UploadControl {
+        cancel,
+        on_progress,
+    } = control;
     atomic_write(local_path, &bytes)?;
     if cancel.load(Ordering::Acquire) {
         return Err(CloudError::Cancelled);
     }
+    let digest = hash_bytes_cancellable(&bytes, &cancel)?;
     let request = CreateFileRequest {
         name: &target.name,
         app: &target.app,
@@ -646,10 +702,10 @@ pub fn save_new_local_first_with_cancel<T: CloudTransport>(
         server: server.into(),
         file_id: file.id.to_string(),
         base_version: None,
-        sha256: hash_bytes(&bytes),
+        sha256: digest,
     };
     links.upsert(link.clone())?;
-    let version = client.upload_with_cancel(
+    let version = client.upload_with_cancel_and_progress(
         &UploadContent {
             file_id: file.id,
             base_version: None,
@@ -657,6 +713,7 @@ pub fn save_new_local_first_with_cancel<T: CloudTransport>(
             bytes,
         },
         cancel,
+        on_progress,
     )?;
     link.base_version = Some(version.id.to_string());
     links.upsert(link)?;
@@ -686,7 +743,33 @@ pub fn save_local_first_with_cancel<T: CloudTransport>(
     upload: UploadContent,
     cancel: Arc<AtomicBool>,
 ) -> Result<SaveOutcome, CloudError> {
-    save_linked(client, links, local_path, server, upload, None, cancel)
+    save_local_first_with_progress_and_cancel(
+        client,
+        links,
+        local_path,
+        server,
+        upload,
+        UploadControl {
+            cancel,
+            on_progress: |_, _| {},
+        },
+    )
+}
+
+/// Like [`save_local_first_with_cancel`], reporting completed upload bytes.
+pub fn save_local_first_with_progress_and_cancel<T, F>(
+    client: &CloudClient<T>,
+    links: &LinksStore,
+    local_path: &Path,
+    server: &str,
+    upload: UploadContent,
+    control: UploadControl<F>,
+) -> Result<SaveOutcome, CloudError>
+where
+    T: CloudTransport,
+    F: FnMut(u64, u64),
+{
+    save_linked(client, links, local_path, server, upload, None, control)
 }
 /// Like [`save_local_first_with_cancel`], but commits against `head` (the server's
 /// current head version, `None` for a file without versions) instead of the base version
@@ -709,18 +792,25 @@ pub fn overwrite_local_first_with_cancel<T: CloudTransport>(
         server,
         upload,
         Some(head),
-        cancel,
+        UploadControl {
+            cancel,
+            on_progress: |_, _| {},
+        },
     )
 }
-fn save_linked<T: CloudTransport>(
+fn save_linked<T: CloudTransport, F: FnMut(u64, u64)>(
     client: &CloudClient<T>,
     links: &LinksStore,
     local_path: &Path,
     server: &str,
     mut upload: UploadContent,
     base_override: Option<Option<Uuid>>,
-    cancel: Arc<AtomicBool>,
+    control: UploadControl<F>,
 ) -> Result<SaveOutcome, CloudError> {
+    let UploadControl {
+        cancel,
+        on_progress,
+    } = control;
     atomic_write(local_path, &upload.bytes)?;
     let Some(mut link) = links.get(local_path)? else {
         return Ok(SaveOutcome::LocalOnly);
@@ -740,10 +830,10 @@ fn save_linked<T: CloudTransport>(
             .transpose()
             .map_err(|_| CloudError::InvalidResponse)?,
     };
-    let digest = hash_bytes(&upload.bytes);
+    let digest = hash_bytes_cancellable(&upload.bytes, &cancel)?;
     upload.file_id = file_id;
     upload.base_version = base_version;
-    let version = client.upload_with_cancel(&upload, cancel)?;
+    let version = client.upload_with_cancel_and_progress(&upload, cancel, on_progress)?;
     link.base_version = Some(version.id.to_string());
     link.sha256 = digest;
     links.upsert(link)?;
@@ -990,9 +1080,19 @@ fn hash(value: &str) -> String {
     let h = Sha256::digest(value.as_bytes());
     h.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn hash_bytes(value: &[u8]) -> String {
-    let h = Sha256::digest(value);
-    h.iter().map(|b| format!("{b:02x}")).collect()
+fn hash_bytes_cancellable(value: &[u8], cancel: &AtomicBool) -> Result<String, CloudError> {
+    let mut digest = Sha256::new();
+    for block in value.chunks(256 * 1024) {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CloudError::Cancelled);
+        }
+        digest.update(block);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(CloudError::Cancelled);
+    }
+    let digest = digest.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn unique_temp_file(parent: &Path, stem: &str) -> Result<(PathBuf, fs::File), CloudError> {
@@ -1356,6 +1456,48 @@ mod tests {
             );
         }
         assert!(is_content_transfer("/api/v1/uploads/u/content"));
+        let chunk = "/api/v1/uploads/00000000-0000-0000-0000-000000000001/chunks/3";
+        let four_mib = 4 * 1024 * 1024;
+        assert_eq!(
+            response_budget("PUT", chunk, Some(four_mib), max),
+            Ok(Duration::from_secs(158))
+        );
+        let absolute_chunk = format!("https://cloud.example{chunk}?request=one");
+        assert!(is_content_transfer(&absolute_chunk));
+        assert_eq!(
+            response_budget("PUT", &absolute_chunk, Some(four_mib), max),
+            Ok(Duration::from_secs(158))
+        );
+        assert!(!is_content_transfer(
+            "https://cloud.example/api/v1/info?next=/api/v1/uploads/00000000-0000-0000-0000-000000000001/chunks/3"
+        ));
+        assert_eq!(
+            response_budget(
+                "PUT",
+                "/api/v1/uploads/not-a-uuid/chunks/3",
+                Some(four_mib),
+                max
+            ),
+            Ok(BODY_BASE_TIMEOUT)
+        );
+        assert_eq!(
+            response_budget(
+                "PUT",
+                "/api/v1/uploads/00000000-0000-0000-0000-000000000001/chunks/3/extra",
+                Some(four_mib),
+                max
+            ),
+            Ok(BODY_BASE_TIMEOUT)
+        );
+        assert_eq!(
+            response_budget(
+                "PUT",
+                "/api/v1/uploads/00000000-0000-0000-0000-000000000001/chunks/4294967296",
+                Some(four_mib),
+                max
+            ),
+            Ok(BODY_BASE_TIMEOUT)
+        );
         assert!(!is_content_transfer("/api/v1/files/x/content/list"));
     }
 
@@ -1581,6 +1723,86 @@ mod tests {
     const VERSION: &str = r#"{"id":"00000000-0000-0000-0000-0000000000aa","file_id":"00000000-0000-0000-0000-000000000002","number":2,"size_bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}"#;
 
     #[test]
+    fn native_linked_save_uses_chunked_upload_and_forwards_progress() {
+        let file_id = Uuid::from_u128(2);
+        let session_id = Uuid::from_u128(1);
+        let transport = Scripted {
+            replies: Mutex::new(vec![
+                reply(
+                    200,
+                    r#"{"api_version":"1.0","feature_flags":{"chunked_upload":true}}"#,
+                ),
+                reply(201, &format!(
+                    "{{\"upload_id\":\"{session_id}\",\"file_id\":\"{file_id}\",\"state\":\"created\",\"size_bytes\":3,\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"mode\":\"chunked\",\"missing_chunks\":[0]}}"
+                )),
+                reply(204, ""),
+                reply(201, VERSION),
+            ].into()),
+            seen: Mutex::new(Vec::new()),
+        };
+        let client = CloudClient::new("https://cloud.example", transport);
+        assert!(client.is_ok());
+        let Some(client) = client.ok() else {
+            return;
+        };
+        assert!(
+            client
+                .set_tokens(craftcloud_client::DeviceTokens {
+                    access_token: craftcloud_client::Secret::new("a"),
+                    refresh_token: craftcloud_client::Secret::new("r"),
+                    expires_at: String::new(),
+                })
+                .is_ok()
+        );
+        let dir = std::env::temp_dir().join(format!("cc-native-progress-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let path = dir.join("linked.fig");
+        let links = LinksStore::new(&dir);
+        assert!(
+            links
+                .upsert(CloudLink {
+                    local_path: path.clone(),
+                    server: "https://cloud.example".into(),
+                    file_id: file_id.to_string(),
+                    base_version: None,
+                    sha256: String::new(),
+                })
+                .is_ok()
+        );
+        let upload = UploadContent {
+            file_id: Uuid::nil(),
+            base_version: None,
+            idempotency_key: "native-progress".into(),
+            bytes: b"abc".to_vec(),
+        };
+        let mut progress = Vec::new();
+        let result = save_local_first_with_progress_and_cancel(
+            &client,
+            &links,
+            &path,
+            "https://cloud.example",
+            upload,
+            UploadControl {
+                cancel: Arc::new(AtomicBool::new(false)),
+                on_progress: |done, total| progress.push((done, total)),
+            },
+        );
+        assert!(matches!(result, Ok(SaveOutcome::Uploaded(_))));
+        assert_eq!(progress, vec![(0, 3), (3, 3)]);
+        let requests = client.transport().seen.lock();
+        assert!(requests.is_ok_and(|requests| {
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/chunks/0"))
+                && requests
+                    .iter()
+                    .any(|request| request.path.ends_with("/versions"))
+        }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn overwrite_uses_the_head_for_one_upload_and_moves_the_link_only_after_the_commit() {
         let old_base = uuid::Uuid::from_u128(1);
         let head = uuid::Uuid::from_u128(2);
@@ -1626,8 +1848,12 @@ mod tests {
         };
 
         // The commit fails: the stored base stays, so the next plain save still conflicts.
-        if let Some(client) = signed_in(vec![reply(201, SESSION), reply(204, ""), reply(503, "{}")])
-        {
+        if let Some(client) = signed_in(vec![
+            reply(200, r#"{"api_version":"1.0","feature_flags":{}}"#),
+            reply(201, SESSION),
+            reply(204, ""),
+            reply(503, "{}"),
+        ]) {
             let failed = overwrite_local_first_with_cancel(
                 &client,
                 &links,
@@ -1652,6 +1878,7 @@ mod tests {
 
         // The commit succeeds: only now the link moves to the new version.
         if let Some(client) = signed_in(vec![
+            reply(200, r#"{"api_version":"1.0","feature_flags":{}}"#),
             reply(201, SESSION),
             reply(204, ""),
             reply(201, VERSION),

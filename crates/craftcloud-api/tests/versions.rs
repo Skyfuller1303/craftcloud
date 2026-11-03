@@ -11,6 +11,7 @@ mod common;
 mod tests {
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::Duration;
 
@@ -18,6 +19,7 @@ mod tests {
     use axum::http::StatusCode;
     use base64::Engine as _;
     use bytes::Bytes;
+    use craftcloud_api::Clock;
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -270,6 +272,31 @@ mod tests {
                 req = req.header("Range", range);
             }
             self.send(req).await
+        }
+
+        async fn download_large(
+            &self,
+            who: &Session,
+            path: &str,
+        ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+            let (status, headers, body) =
+                call_stream(&self.env.app, Req::new("GET", path).cookie_only(who)).await;
+            let bytes = body.collect().await.unwrap().to_bytes().to_vec();
+            (status, headers, bytes)
+        }
+
+        async fn download_range_large(
+            &self,
+            who: &Session,
+            path: &str,
+            range: &str,
+        ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+            let request = Req::new("GET", path)
+                .cookie_only(who)
+                .header("Range", range);
+            let (status, headers, body) = call_stream(&self.env.app, request).await;
+            let bytes = body.collect().await.unwrap().to_bytes().to_vec();
+            (status, headers, bytes)
         }
 
         async fn count(&self, sql: &str) -> i64 {
@@ -1141,6 +1168,43 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn editors_can_pin_versions_and_audit_transitions() {
+        let w = W::new().await;
+        let c = cast(&w).await;
+        let version = w.push(&c.editor.1, c.file, &pattern(20, 7)).await;
+        let path = format!("/api/v1/files/{}/versions/{version}", c.file);
+        let denied = w
+            .json("PATCH", &path, &c.viewer.1, json!({"pinned": true}))
+            .await;
+        assert_status(&denied, StatusCode::FORBIDDEN, "FORBIDDEN");
+        let pinned = w
+            .json("PATCH", &path, &c.editor.1, json!({"pinned": true}))
+            .await;
+        assert_eq!(pinned.status, StatusCode::OK, "{}", pinned.text);
+        assert_eq!(pinned.body["pinned"], true);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE id='{version}' AND pinned"
+            ))
+            .await,
+            1
+        );
+        let unpinned = w
+            .json("PATCH", &path, &c.editor.1, json!({"pinned": false}))
+            .await;
+        assert_eq!(unpinned.status, StatusCode::OK, "{}", unpinned.text);
+        assert_eq!(unpinned.body["pinned"], false);
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM audit_events WHERE action IN ('version.pin','version.unpin') AND result='success'"
+            )
+            .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn versions_of_another_organization_are_invisible_and_cannot_be_committed_into() {
         let w = W::new().await;
         let c = cast(&w).await;
@@ -1392,6 +1456,997 @@ mod tests {
             "FILE_DELETED",
         );
         hidden(&w.download(&c.plain.1, &url, None).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn chunked_versions_reuse_file_scoped_objects_and_preserve_ranges() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let mut state = 0x6d2b_79f5_u32;
+        let original: Vec<u8> = (0..64 * 1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let first = w.push(&c.editor.1, c.file, &original).await;
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(size_bytes), 0)::bigint FROM chunks WHERE file_id = $1 AND state = 'committed'",
+        )
+        .bind(c.file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let mut changed = original.clone();
+        let change_start = changed.len() / 2;
+        let change_len = changed.len() / 100;
+        changed[change_start..change_start + change_len].fill(0x37);
+        let second = w.push(&c.editor.1, c.file, &changed).await;
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(size_bytes), 0)::bigint FROM chunks WHERE file_id = $1 AND state = 'committed'",
+        )
+        .bind(c.file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(
+            after - before <= (changed.len() / 10) as i64,
+            "new physical bytes: {}",
+            after - before
+        );
+        println!(
+            "chunk benchmark: logical={} changed={} physical_before={} physical_after={} added={} ratio={:.2}%",
+            changed.len(),
+            change_len,
+            before,
+            after,
+            after - before,
+            100.0 * (after - before) as f64 / changed.len() as f64
+        );
+
+        let (download_status, download_headers, download_bytes) = w
+            .download_large(
+                &c.viewer.1,
+                &format!("/api/v1/files/{}/versions/{first}/content", c.file),
+            )
+            .await;
+        assert_eq!(download_status, StatusCode::OK,);
+        assert_eq!(download_bytes, original);
+        assert_eq!(
+            download_headers.get("repr-digest").unwrap(),
+            &format!(
+                "sha-256=:{}:",
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&original))
+            )
+        );
+        let (second_status, _, second_bytes) = w
+            .download_large(&c.viewer.1, &format!("/api/v1/files/{}/content", c.file))
+            .await;
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(second_bytes, changed);
+        let boundaries: Vec<i64> = sqlx::query_scalar(
+            "SELECT byte_offset FROM version_chunks WHERE version_id = $1 ORDER BY ordinal OFFSET 1",
+        )
+        .bind(second)
+        .fetch_all(&w.env.pool)
+        .await
+        .unwrap();
+        let boundary = u64::try_from(*boundaries.first().expect("multiple chunks")).unwrap();
+        let range = w
+            .download(
+                &c.viewer.1,
+                &format!("/api/v1/files/{}/content", c.file),
+                Some(&format!("bytes={}-{}", boundary - 2, boundary + 2)),
+            )
+            .await;
+        assert_eq!(range.status, StatusCode::PARTIAL_CONTENT, "{}", range.text);
+        assert_eq!(
+            range.bytes,
+            changed[(boundary - 2) as usize..=(boundary + 2) as usize]
+        );
+        for (start, end) in [
+            (0_u64, 0_u64),
+            (boundaries[0] as u64 - 1, boundaries[1] as u64 + 1),
+            (changed.len() as u64 - 1, changed.len() as u64 - 1),
+        ] {
+            let range_header = format!("bytes={start}-{end}");
+            let (status, headers, range_bytes) = w
+                .download_range_large(
+                    &c.viewer.1,
+                    &format!("/api/v1/files/{}/content", c.file),
+                    &range_header,
+                )
+                .await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                headers.get("content-range").unwrap(),
+                &format!("bytes {start}-{end}/{}", changed.len())
+            );
+            assert_eq!(
+                range_bytes.len(),
+                usize::try_from(end - start + 1).unwrap(),
+                "streamed range length must match its requested bounds"
+            );
+            assert_eq!(range_bytes, changed[start as usize..=end as usize]);
+        }
+        let copied = w.file(&c.owner.1, c.project, "copy.fig").await;
+        let copied_version = w.push(&c.owner.1, copied, &original).await;
+        assert!(!copied_version.is_nil());
+        let distinct: bool = sqlx::query_scalar(
+            "SELECT a.digest <> b.digest AND a.object_key <> b.object_key FROM chunks a JOIN chunks b ON a.sha256 = b.sha256 AND a.file_id = $1 AND b.file_id = $2 LIMIT 1",
+        )
+        .bind(c.file)
+        .bind(copied)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(
+            distinct,
+            "identical content in another file must use a separate chunk"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn phase_b_chunk_upload_verifies_replay_reuse_scope_and_expiry() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let data = pattern(9 * 1024 * 1024 + 123, 61);
+        let spans = craftcloud_storage::fastcdc_chunks(&data).unwrap();
+        let blocks: Vec<(usize, Vec<u8>)> = spans
+            .iter()
+            .map(|span| {
+                let start = span.offset;
+                let end = start + span.length;
+                (start, data[start..end].to_vec())
+            })
+            .collect();
+        let chunk_json = || {
+            blocks
+                .iter()
+                .map(|(_, bytes)| json!({"size_bytes": bytes.len(), "sha256": sha_hex(bytes)}))
+                .collect::<Vec<_>>()
+        };
+        let wrong_sha = "00".repeat(32);
+        let create = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{}/uploads", c.file))
+                    .session(&c.editor.1)
+                    .header("Idempotency-Key", "phase-b-manifest-1")
+                    .json(json!({
+                        "size_bytes": data.len(),
+                        "sha256": wrong_sha,
+                        "mode": "chunked",
+                        "chunks": chunk_json(),
+                    })),
+            )
+            .await;
+        assert_eq!(create.status, StatusCode::CREATED, "{}", create.text);
+        let upload = Uuid::parse_str(create.body["upload_id"].as_str().unwrap()).unwrap();
+        assert_eq!(create.body["mode"], "chunked");
+        assert_eq!(
+            create.body["missing_chunks"].as_array().unwrap().len(),
+            blocks.len()
+        );
+        let replay = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{}/uploads", c.file))
+                    .session(&c.editor.1)
+                    .header("Idempotency-Key", "phase-b-manifest-1")
+                    .json(json!({
+                        "size_bytes": data.len(),
+                        "sha256": wrong_sha,
+                        "mode": "chunked",
+                        "chunks": chunk_json(),
+                    })),
+            )
+            .await;
+        assert_eq!(replay.status, StatusCode::OK, "{}", replay.text);
+        assert_eq!(replay.body["upload_id"], upload.to_string());
+
+        let (first_offset, first_bytes) = &blocks[0];
+        let first_url = format!("/api/v1/uploads/{upload}/chunks/0");
+        let mut wrong_block = first_bytes.clone();
+        wrong_block[0] ^= 0x80;
+        let rejected = w
+            .send(
+                Req::new("PUT", &first_url)
+                    .session(&c.editor.1)
+                    .body(Body::from(wrong_block)),
+            )
+            .await;
+        assert_status(
+            &rejected,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CHECKSUM_MISMATCH",
+        );
+        for (ordinal, (_, bytes)) in blocks.iter().enumerate() {
+            let response = w
+                .send(
+                    Req::new("PUT", &format!("/api/v1/uploads/{upload}/chunks/{ordinal}"))
+                        .session(&c.editor.1)
+                        .body(Body::from(bytes.clone())),
+                )
+                .await;
+            assert_eq!(response.status, StatusCode::NO_CONTENT, "{}", response.text);
+        }
+        let mapped_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM upload_chunks WHERE upload_id=$1")
+                .bind(upload)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        let repeated = w
+            .send(
+                Req::new("PUT", &first_url)
+                    .session(&c.editor.1)
+                    .body(Body::from(first_bytes.clone())),
+            )
+            .await;
+        assert_eq!(repeated.status, StatusCode::NO_CONTENT, "{}", repeated.text);
+        let mapped_after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM upload_chunks WHERE upload_id=$1")
+                .bind(upload)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(mapped_after, mapped_before);
+        assert_eq!(*first_offset, 0);
+        let bad_commit = w.first_commit(&c.editor.1, c.file, upload).await;
+        assert_status(
+            &bad_commit,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CHECKSUM_MISMATCH",
+        );
+
+        let completed_manifest = json!({
+            "size_bytes": data.len(),
+            "sha256": sha_hex(&data),
+            "mode": "chunked",
+            "chunks": chunk_json(),
+        });
+        let valid = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{}/uploads", c.file))
+                    .session(&c.editor.1)
+                    .header("Idempotency-Key", "phase-b-completed-manifest")
+                    .json(completed_manifest.clone()),
+            )
+            .await;
+        assert_eq!(valid.status, StatusCode::CREATED, "{}", valid.text);
+        let valid_id = Uuid::parse_str(valid.body["upload_id"].as_str().unwrap()).unwrap();
+        assert_eq!(valid.body["missing_chunks"], json!([]));
+        let committed = w.first_commit(&c.editor.1, c.file, valid_id).await;
+        assert_eq!(committed.status, StatusCode::CREATED, "{}", committed.text);
+        let version_id = id_of(&committed);
+        let (status, _, downloaded) = w
+            .download_large(
+                &c.viewer.1,
+                &format!("/api/v1/files/{}/versions/{version_id}/content", c.file),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(downloaded, data);
+        let after_commit = w.counters().await;
+        let mapped_after_commit = w
+            .count(&format!(
+                "SELECT count(*) FROM version_chunks WHERE version_id='{version_id}'"
+            ))
+            .await;
+        let replay = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{}/uploads", c.file))
+                    .session(&c.editor.1)
+                    .header("Idempotency-Key", "phase-b-completed-manifest")
+                    .json(completed_manifest.clone()),
+            )
+            .await;
+        assert_eq!(replay.status, StatusCode::OK, "{}", replay.text);
+        assert_eq!(replay.body["upload_id"], valid_id.to_string());
+        assert_eq!(replay.body["missing_chunks"], json!([]));
+        assert_eq!(w.counters().await, after_commit);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM version_chunks WHERE version_id='{version_id}'"
+            ))
+            .await,
+            mapped_after_commit
+        );
+        let conflicting_replay = w
+            .send(
+                Req::new("POST", &format!("/api/v1/files/{}/uploads", c.file))
+                    .session(&c.editor.1)
+                    .header("Idempotency-Key", "phase-b-completed-manifest")
+                    .json(json!({
+                        "size_bytes": data.len(),
+                        "sha256": "00".repeat(32),
+                        "mode": "chunked",
+                        "chunks": chunk_json(),
+                    })),
+            )
+            .await;
+        assert_status(
+            &conflicting_replay,
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_REUSED",
+        );
+
+        let copied_file = w.file(&c.owner.1, c.project, "separate.fig").await;
+        let cross_file = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{copied_file}/uploads"),
+                &c.owner.1,
+                json!({
+                    "size_bytes": data.len(),
+                    "sha256": sha_hex(&data),
+                    "mode": "chunked",
+                    "chunks": chunk_json(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            cross_file.status,
+            StatusCode::CREATED,
+            "{}",
+            cross_file.text
+        );
+        let cross_id = Uuid::parse_str(cross_file.body["upload_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            cross_file.body["missing_chunks"].as_array().unwrap().len(),
+            blocks.len(),
+            "another file must not reveal or reuse these chunks"
+        );
+        let denied = w
+            .send(
+                Req::new("PUT", &format!("/api/v1/uploads/{cross_id}/chunks/0"))
+                    .session(&c.outsider.1)
+                    .body(Body::from(blocks[0].1.clone())),
+            )
+            .await;
+        assert_status(&denied, StatusCode::NOT_FOUND, "NOT_FOUND");
+        w.delete(&c.owner.1, &format!("/api/v1/uploads/{cross_id}"))
+            .await;
+
+        let expiring = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/uploads", c.file),
+                &c.editor.1,
+                json!({
+                    "size_bytes": data.len(),
+                    "sha256": sha_hex(&data),
+                    "mode": "chunked",
+                    "chunks": chunk_json(),
+                }),
+            )
+            .await;
+        let expiring_id = Uuid::parse_str(expiring.body["upload_id"].as_str().unwrap()).unwrap();
+        w.env.clock.advance(Duration::from_secs(25 * 3600));
+        let editor = w.env.login_ok("editor").await;
+        let expired = w
+            .send(
+                Req::new("PUT", &format!("/api/v1/uploads/{expiring_id}/chunks/0"))
+                    .session(&editor)
+                    .body(Body::from(blocks[0].1.clone())),
+            )
+            .await;
+        assert_status(&expired, StatusCode::GONE, "UPLOAD_EXPIRED");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn chunked_commit_rechecks_expiry_and_credential_after_hashing() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let block = pattern(256 * 1024, 73);
+        let block_sha = sha_hex(&block);
+        let seed = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/uploads", c.file),
+                &c.editor.1,
+                json!({
+                    "size_bytes": block.len(),
+                    "sha256": block_sha,
+                    "mode": "chunked",
+                    "chunks": [{"size_bytes": block.len(), "sha256": block_sha}],
+                }),
+            )
+            .await;
+        assert_eq!(seed.status, StatusCode::CREATED, "{}", seed.text);
+        let seed_id = Uuid::parse_str(seed.body["upload_id"].as_str().unwrap()).unwrap();
+        let put = w
+            .send(
+                Req::new("PUT", &format!("/api/v1/uploads/{seed_id}/chunks/0"))
+                    .session(&c.editor.1)
+                    .body(Body::from(block.clone())),
+            )
+            .await;
+        assert_eq!(put.status, StatusCode::NO_CONTENT, "{}", put.text);
+        assert_eq!(
+            w.first_commit(&c.editor.1, c.file, seed_id).await.status,
+            StatusCode::CREATED
+        );
+        let seed_head = w.head(&c.editor.1, c.file).await.unwrap();
+
+        let manifest = json!({
+            "size_bytes": block.len(),
+            "sha256": block_sha,
+            "mode": "chunked",
+            "chunks": [{"size_bytes": block.len(), "sha256": block_sha}],
+        });
+        let expiring = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/uploads", c.file),
+                &c.editor.1,
+                manifest.clone(),
+            )
+            .await;
+        assert_eq!(expiring.status, StatusCode::CREATED, "{}", expiring.text);
+        assert!(
+            expiring.body["missing_chunks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let expiring_id = Uuid::parse_str(expiring.body["upload_id"].as_str().unwrap()).unwrap();
+        let expires_at = w.env.clock.now() + time::Duration::seconds(60);
+        sqlx::query("UPDATE upload_sessions SET expires_at=$2 WHERE id=$1")
+            .bind(expiring_id)
+            .bind(expires_at)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let before_expiring_commit = w.counters().await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        w.env
+            .faults
+            .pause_next_read(Arc::clone(&entered), Arc::clone(&release));
+        let app = w.env.app.clone();
+        let editor = c.editor.1.clone();
+        let commit_file = c.file;
+        let commit = tokio::spawn(async move {
+            call(
+                &app,
+                Req::new("POST", &format!("/api/v1/files/{commit_file}/versions"))
+                    .session(&editor)
+                    .header("If-Match", &tag(seed_head))
+                    .json(json!({"upload_id": expiring_id.to_string()})),
+            )
+            .await
+        });
+        entered.wait().await;
+        w.env.clock.advance(Duration::from_secs(120));
+        release.wait().await;
+        let expired = commit.await.unwrap();
+        assert_status(&expired, StatusCode::GONE, "UPLOAD_EXPIRED");
+        assert_eq!(w.head(&c.editor.1, c.file).await, Some(seed_head));
+        assert_eq!(
+            w.counters().await.0,
+            before_expiring_commit.0 - block.len() as i64
+        );
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                c.file
+            ))
+            .await,
+            1
+        );
+        let expired_state: String =
+            sqlx::query_scalar("SELECT state FROM upload_sessions WHERE id=$1")
+                .bind(expiring_id)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(expired_state, "expired");
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM upload_chunks WHERE upload_id='{expiring_id}'"
+            ))
+            .await,
+            0
+        );
+
+        let editor = w.env.login_ok("editor").await;
+        let revoked = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{}/uploads", c.file),
+                &editor,
+                manifest,
+            )
+            .await;
+        assert_eq!(revoked.status, StatusCode::CREATED, "{}", revoked.text);
+        let revoked_id = Uuid::parse_str(revoked.body["upload_id"].as_str().unwrap()).unwrap();
+        let before_revoked_commit = w.counters().await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        w.env
+            .faults
+            .pause_next_read(Arc::clone(&entered), Arc::clone(&release));
+        let app = w.env.app.clone();
+        let commit_file = c.file;
+        let revoked_token = editor.token.clone();
+        let commit = tokio::spawn(async move {
+            call(
+                &app,
+                Req::new("POST", &format!("/api/v1/files/{commit_file}/versions"))
+                    .session(&editor)
+                    .header("If-Match", &tag(seed_head))
+                    .json(json!({"upload_id": revoked_id.to_string()})),
+            )
+            .await
+        });
+        entered.wait().await;
+        assert!(
+            !commit.is_finished(),
+            "whole-file hashing is still in progress"
+        );
+        let token_hash: [u8; 32] = Sha256::digest(revoked_token.as_bytes()).into();
+        sqlx::query("UPDATE sessions SET revoked_at=$2 WHERE token_hash=$1")
+            .bind(token_hash.as_slice())
+            .bind(w.env.clock.now())
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        release.wait().await;
+        let rejected = commit.await.unwrap();
+        assert_status(&rejected, StatusCode::UNAUTHORIZED, "UNAUTHENTICATED");
+        assert_eq!(w.head(&c.owner.1, c.file).await, Some(seed_head));
+        assert_eq!(w.counters().await.1, before_revoked_commit.1);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                c.file
+            ))
+            .await,
+            1
+        );
+    }
+
+    async fn push_chunked(w: &W, who: &Session, file: Uuid, data: &[u8]) -> (Uuid, u64, u64) {
+        let head = w.head(who, file).await;
+        let spans = craftcloud_storage::fastcdc_chunks(data).unwrap();
+        let chunks: Vec<Value> = spans
+            .iter()
+            .map(|span| {
+                let bytes = &data[span.offset..span.offset + span.length];
+                json!({"size_bytes": bytes.len(), "sha256": sha_hex(bytes)})
+            })
+            .collect();
+        let manifest = json!({
+            "size_bytes": data.len(),
+            "sha256": sha_hex(data),
+            "mode": "chunked",
+            "chunks": chunks,
+        });
+        let control_bytes = serde_json::to_vec(&manifest).unwrap().len() as u64;
+        let created = w
+            .json(
+                "POST",
+                &format!("/api/v1/files/{file}/uploads"),
+                who,
+                manifest,
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text);
+        let upload = Uuid::parse_str(created.body["upload_id"].as_str().unwrap()).unwrap();
+        let missing: Vec<usize> = created.body["missing_chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ordinal| usize::try_from(ordinal.as_u64().unwrap()).unwrap())
+            .collect();
+        let mut payload_bytes = 0_u64;
+        for ordinal in missing {
+            let span = spans[ordinal];
+            let bytes = &data[span.offset..span.offset + span.length];
+            let response = w
+                .send(
+                    Req::new("PUT", &format!("/api/v1/uploads/{upload}/chunks/{ordinal}"))
+                        .session(who)
+                        .body(Body::from(bytes.to_vec())),
+                )
+                .await;
+            assert_eq!(response.status, StatusCode::NO_CONTENT, "{}", response.text);
+            payload_bytes += bytes.len() as u64;
+        }
+        let commit = json!({"upload_id": upload.to_string()});
+        let control_bytes = control_bytes + serde_json::to_vec(&commit).unwrap().len() as u64;
+        let response = match head {
+            Some(head) => w.next_commit(who, file, upload, head).await,
+            None => w.first_commit(who, file, upload).await,
+        };
+        assert_eq!(response.status, StatusCode::CREATED, "{}", response.text);
+        (id_of(&response), payload_bytes, control_bytes)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn reupload_repairs_a_corrupt_local_chunk_before_reuse() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let content = pattern(12 * 1024 * 1024, 97);
+        let first = w.push(&c.editor.1, c.file, &content).await;
+        let (chunk_id, corrupt_key): (Uuid, String) = sqlx::query_as(
+            "SELECT c.id,c.object_key FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+             WHERE vc.version_id=$1 ORDER BY vc.ordinal LIMIT 1",
+        )
+        .bind(first)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let path = w.object_path(&corrupt_key);
+        let mut corrupted = std::fs::read(&path).unwrap();
+        assert!(!corrupted.is_empty());
+        corrupted[0] ^= 0x80;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::write(&path, &corrupted).unwrap();
+
+        let second = w.push(&c.editor.1, c.file, &content).await;
+        assert_ne!(first, second);
+        let repaired_key: String = sqlx::query_scalar("SELECT object_key FROM chunks WHERE id=$1")
+            .bind(chunk_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_ne!(repaired_key, corrupt_key);
+        assert!(!path.exists(), "the superseded corrupt object is deleted");
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                c.file
+            ))
+            .await,
+            2,
+            "reupload publishes a complete second version only"
+        );
+        for version in [first, second] {
+            let (status, _, bytes) = w
+                .download_large(
+                    &c.viewer.1,
+                    &format!("/api/v1/files/{}/versions/{version}/content", c.file),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(bytes, content);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "300 MiB AC-15 benchmark; requires PostgreSQL: cargo xtask db-test"]
+    async fn chunked_300_mib_one_percent_delta_benchmark() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let size = 300 * 1024 * 1024;
+        let mut state = 0xa341_316c_u32;
+        let original: Vec<u8> = (0..size)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let upload_one = std::time::Instant::now();
+        let (first, first_payload, first_control) =
+            push_chunked(&w, &c.editor.1, c.file, &original).await;
+        let first_elapsed = upload_one.elapsed();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(size_bytes), 0)::bigint FROM chunks WHERE file_id = $1 AND state = 'committed'",
+        )
+        .bind(c.file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let mut changed = original.clone();
+        let change_start = changed.len() / 2;
+        let change_len = changed.len() / 100;
+        changed[change_start..change_start + change_len].fill(0x91);
+        let upload_two = std::time::Instant::now();
+        let (_second, delta_payload, delta_control) =
+            push_chunked(&w, &c.editor.1, c.file, &changed).await;
+        let second_elapsed = upload_two.elapsed();
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(size_bytes), 0)::bigint FROM chunks WHERE file_id = $1 AND state = 'committed'",
+        )
+        .bind(c.file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let incremental = after - before;
+        assert!(
+            incremental <= (size / 10) as i64,
+            "incremental physical bytes: {incremental}"
+        );
+        let download = std::time::Instant::now();
+        let (status, _, bytes) = w
+            .download_large(&c.viewer.1, &format!("/api/v1/files/{}/content", c.file))
+            .await;
+        let download_elapsed = download.elapsed();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(bytes, changed);
+        assert!(!first.is_nil());
+        println!(
+            "AC-15 benchmark: logical_bytes={size} (300 MiB; {:.3} decimal MB), mutation=one contiguous middle region, changed_bytes={change_len}, first_payload_bytes={first_payload}, delta_payload_bytes={delta_payload}, payload_ratio={:.2}%, first_control_json_bytes={first_control}, delta_control_json_bytes={delta_control}, first_upload={first_elapsed:?}, delta_upload={second_elapsed:?}, download={download_elapsed:?}, added_physical_bytes={incremental}, added_ratio={:.2}%",
+            size as f64 / 1_000_000.0,
+            100.0 * delta_payload as f64 / size as f64,
+            100.0 * incremental as f64 / size as f64
+        );
+        assert!(delta_payload <= (size / 10) as u64);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn archived_chunks_remain_readable_after_verified_local_removal() {
+        use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore};
+
+        let mut w = W::new().await;
+        let (archive, crypto) = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let local = LocalStore::open(&w.env.storage_dir).await.unwrap();
+        let mut seed = 0x193a_5b7d_u32;
+        let old: Vec<u8> = (0..12 * 1024 * 1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let old_version = w.push(&c.editor.1, c.file, &old).await;
+        let mut new = old.clone();
+        let change_start = new.len() / 2;
+        let change_len = new.len() / 100;
+        new[change_start..change_start + change_len].fill(0x73);
+        w.push(&c.editor.1, c.file, &new).await;
+        let version_list = w
+            .send(
+                Req::new("GET", &format!("/api/v1/files/{}/versions", c.file)).session(&c.viewer.1),
+            )
+            .await;
+        assert_eq!(version_list.status, StatusCode::OK, "{}", version_list.text);
+        let old_tier = version_list.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == old_version.to_string())
+            .unwrap()["storage_tier"]
+            .as_str();
+        assert_eq!(old_tier, Some("local"));
+
+        let old_chunks: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
+            "SELECT c.id,c.object_key,c.storage_tier,EXISTS(SELECT 1 FROM version_chunks hv JOIN files f ON f.id=hv.file_id JOIN file_versions h ON h.id=hv.version_id WHERE f.head_version_id=h.id AND hv.chunk_id=c.id) FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id WHERE vc.version_id=$1 ORDER BY vc.ordinal",
+        )
+        .bind(old_version)
+        .fetch_all(&w.env.pool)
+        .await
+        .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let batch = craftcloud_api::archive_worker::archive_batch(
+            &w.env.pool,
+            &local,
+            archive.as_ref(),
+            crypto.as_ref(),
+            now,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let exclusive = old_chunks
+            .iter()
+            .filter(|(_, _, _, shared)| !shared)
+            .count();
+        assert_eq!(batch.archived as usize, exclusive);
+        assert!(exclusive > 0 && exclusive < old_chunks.len());
+        let version_list = w
+            .send(
+                Req::new("GET", &format!("/api/v1/files/{}/versions", c.file)).session(&c.viewer.1),
+            )
+            .await;
+        assert_eq!(version_list.status, StatusCode::OK, "{}", version_list.text);
+        let old_tier = version_list.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == old_version.to_string())
+            .unwrap()["storage_tier"]
+            .as_str();
+        assert_eq!(old_tier, Some("archive"));
+        for (id, local_key, tier, shared) in &old_chunks {
+            if *shared {
+                assert_eq!(tier, "local");
+                assert!(
+                    local
+                        .head(&ObjectKey::parse(local_key).unwrap())
+                        .await
+                        .is_ok()
+                );
+                continue;
+            }
+            assert_eq!(tier, "local");
+            assert!(matches!(
+                local.head(&ObjectKey::parse(local_key).unwrap()).await,
+                Err(craftcloud_storage::StorageError::NotFound)
+            ));
+            let (archive_key, envelope, tier): (Option<String>, Option<Vec<u8>>, String) = sqlx::query_as(
+                "SELECT archive_object_key,archive_wrapped_key,storage_tier FROM chunks WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+            assert_eq!(tier, "archive");
+            assert!(envelope.is_some());
+            assert!(
+                archive
+                    .as_ref()
+                    .head(&ObjectKey::parse(&archive_key.unwrap()).unwrap())
+                    .await
+                    .is_ok()
+            );
+        }
+        let (status, _, bytes) = w
+            .download_large(
+                &c.viewer.1,
+                &format!("/api/v1/files/{}/versions/{old_version}/content", c.file),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(bytes, old);
+        let head = w.head(&c.editor.1, c.file).await.unwrap();
+        let restored = w
+            .send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{old_version}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(head)),
+            )
+            .await;
+        assert_eq!(restored.status, StatusCode::CREATED, "{}", restored.text);
+        let restored_id = id_of(&restored);
+        let restored_keys: Vec<(String, String)> = sqlx::query_as(
+            "SELECT c.object_key,c.storage_tier FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id WHERE vc.version_id=$1 ORDER BY vc.ordinal",
+        )
+        .bind(restored_id)
+        .fetch_all(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(restored_keys.iter().all(|(_, tier)| tier == "local"));
+        for (key, _) in restored_keys {
+            assert!(local.head(&ObjectKey::parse(&key).unwrap()).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn chunk_restore_integrity_failure_releases_locks_before_corruption_mark() {
+        use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore};
+
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let old_data = pattern(12 * 1024 * 1024, 121);
+        let old = w.push(&c.editor.1, c.file, &old_data).await;
+        let mut head_data = old_data.clone();
+        let changed_at = head_data.len() / 2;
+        head_data[changed_at] ^= 0x5a;
+        let head = w.push(&c.editor.1, c.file, &head_data).await;
+
+        let layout: String = sqlx::query_scalar(
+            "SELECT layout FROM blobs WHERE id=(SELECT blob_id FROM file_versions WHERE id=$1)",
+        )
+        .bind(old)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(layout, "chunked", "test setup must use chunk storage");
+        let (chunk_id, chunk_size): (Uuid, i64) = sqlx::query_as(
+            "SELECT c.id,c.size_bytes FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+             WHERE vc.version_id=$1 ORDER BY vc.ordinal LIMIT 1",
+        )
+        .bind(old)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE chunks SET size_bytes=$2 WHERE id=$1")
+            .bind(chunk_id)
+            .bind(chunk_size - 1)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let local_failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            w.send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{old}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(head)),
+            ),
+        )
+        .await
+        .expect("local chunk integrity response must not deadlock");
+        assert_status(
+            &local_failure,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_CORRUPT",
+        );
+        let local_write = w
+            .file(&c.owner.1, c.project, "after-local-integrity.fig")
+            .await;
+        assert!(!local_write.is_nil());
+
+        let archive_file = w.file(&c.owner.1, c.project, "archive-integrity.fig").await;
+        let archived_old = w.push(&c.editor.1, archive_file, &old_data).await;
+        let archived_head = w.push(&c.editor.1, archive_file, &head_data).await;
+        let (chunk_id, local_object_key): (Uuid, String) = sqlx::query_as(
+            "SELECT c.id,c.object_key FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+             WHERE vc.version_id=$1 ORDER BY vc.ordinal LIMIT 1",
+        )
+        .bind(archived_old)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let local = LocalStore::open(&w.env.storage_dir).await.unwrap();
+        local
+            .delete(&ObjectKey::parse(&local_object_key).unwrap())
+            .await
+            .unwrap();
+        let remote_key = ObjectKey::generate();
+        sqlx::query(
+            "UPDATE chunks SET storage_tier='archive',archive_object_key=$2,archive_wrapped_key=$3 WHERE id=$1",
+        )
+        .bind(chunk_id)
+        .bind(remote_key.as_str())
+        .bind(vec![0_u8])
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        let archive_failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            w.send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{archive_file}/versions/{archived_old}/restore"),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(archived_head)),
+            ),
+        )
+        .await
+        .expect("archive chunk integrity response must not deadlock");
+        assert_status(
+            &archive_failure,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_CORRUPT",
+        );
+        let archive_write = w
+            .file(&c.owner.1, c.project, "after-archive-integrity.fig")
+            .await;
+        assert!(!archive_write.is_nil());
     }
 
     #[tokio::test]

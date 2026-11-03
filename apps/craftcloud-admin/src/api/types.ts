@@ -468,6 +468,7 @@ export interface FileVersion {
   created_by: Uuid;
   actor_kind?: "user" | "figcraft_live";
   storage_tier?: "local" | "archive";
+  pinned: boolean;
   created_at: string;
 }
 

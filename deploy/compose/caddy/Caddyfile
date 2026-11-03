@@ -39,10 +39,11 @@ http://{$CRAFTCLOUD_DOMAIN} {
 	# Optional companion routes, mounted only by compose.figcraft.yaml.
 	import optional/*.caddy
 
-	# No `request_body { max_size ... }` here on purpose: uploads
-	# (PUT /api/v1/uploads/{id}/content) are streamed and the server enforces the
-	# declared size, the quota and a stall timeout. Caddy does not buffer request
-	# bodies unless asked to. The server's own limit still applies to all other routes.
+	# No `request_body { max_size ... }` here: whole-file PUT /content and block
+	# PUT /chunks/{ordinal} stream to the server, which enforces declared sizes,
+	# quota and idle timeouts. POST /files/{id}/uploads carries a JSON manifest
+	# capped at 4 MiB by the server. Caddy does not buffer request bodies unless
+	# asked to; the server keeps its separate 64 KiB default for other routes.
 	reverse_proxy server:8080 {
 		# Pass response bytes on immediately (downloads stream, nothing is held back).
 		flush_interval -1

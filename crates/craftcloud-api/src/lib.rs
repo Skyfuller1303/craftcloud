@@ -32,6 +32,7 @@ mod locks;
 pub mod maintenance;
 mod observe;
 mod oidc;
+pub mod rechunk;
 mod setup_wizard;
 #[cfg(test)]
 mod setup_wizard_tests;
@@ -69,7 +70,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -225,7 +226,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/api/v1/organizations/{org_id}/shared-with-me", &["GET"]),
     ("/api/v1/files/{file_id}/uploads", &["POST"]),
     ("/api/v1/files/{file_id}/versions", &["GET", "POST"]),
-    ("/api/v1/files/{file_id}/versions/{version_id}", &["GET"]),
+    (
+        "/api/v1/files/{file_id}/versions/{version_id}",
+        &["GET", "PATCH"],
+    ),
     (
         "/api/v1/files/{file_id}/versions/{version_id}/restore",
         &["POST"],
@@ -237,6 +241,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ),
     ("/api/v1/uploads/{upload_id}", &["GET", "DELETE"]),
     ("/api/v1/uploads/{upload_id}/content", &["PUT"]),
+    ("/api/v1/uploads/{upload_id}/chunks/{ordinal}", &["PUT"]),
     ("/api/v1/organizations/{org_id}/usage", &["GET"]),
     ("/api/v1/organizations/{org_id}/overview", &["GET"]),
     ("/api/v1/workspaces/{workspace_id}/quota", &["PUT"]),
@@ -526,16 +531,12 @@ pub fn router_with_shared(
             get(grants::shared_with_me),
         )
         .route(
-            "/api/v1/files/{file_id}/uploads",
-            post(uploads::create_upload),
-        )
-        .route(
             "/api/v1/files/{file_id}/versions",
             get(versions::list_versions).post(versions::commit_version),
         )
         .route(
             "/api/v1/files/{file_id}/versions/{version_id}",
-            get(versions::get_version),
+            get(versions::get_version).patch(versions::pin_version),
         )
         .route(
             "/api/v1/files/{file_id}/versions/{version_id}/restore",
@@ -685,19 +686,40 @@ pub fn router_with_shared(
     // Upload content streams a large body: no global body limit and no
     // handler timeout (the handler caps the body at the declared size and
     // times out idle reads itself). Everything else is shared.
+    let manifest = Router::new()
+        .route(
+            "/api/v1/files/{file_id}/uploads",
+            post(uploads::create_upload),
+        )
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(DefaultBodyLimit::max(
+            uploads::CHUNK_MANIFEST_MAX_JSON_BYTES,
+        ))
+        .with_state(state.clone());
     let streaming = Router::new()
         .route(
             "/api/v1/uploads/{upload_id}/content",
             put(uploads::put_content),
         )
+        .route(
+            "/api/v1/uploads/{upload_id}/chunks/{ordinal}",
+            put(uploads::put_chunk),
+        )
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
-    with_middleware(routes, config, false, audit_services.clone()).merge(with_middleware(
-        streaming,
-        config,
-        true,
-        audit_services,
-    ))
+    with_middleware(routes, config, false, audit_services.clone())
+        .merge(with_middleware(
+            streaming,
+            config,
+            true,
+            audit_services.clone(),
+        ))
+        .merge(with_middleware_body_limit(
+            manifest,
+            config,
+            uploads::CHUNK_MANIFEST_MAX_JSON_BYTES,
+            audit_services.clone(),
+        ))
 }
 
 /// Shared handler state. Opaque: only used as the state type of
@@ -716,6 +738,25 @@ fn with_middleware(
     streaming: bool,
     audit_services: Option<Arc<Services>>,
 ) -> Router {
+    with_middleware_body_limit_option(router, config, streaming, None, audit_services)
+}
+
+fn with_middleware_body_limit(
+    router: Router,
+    config: &ApiConfig,
+    max_body_bytes: usize,
+    audit_services: Option<Arc<Services>>,
+) -> Router {
+    with_middleware_body_limit_option(router, config, false, Some(max_body_bytes), audit_services)
+}
+
+fn with_middleware_body_limit_option(
+    router: Router,
+    config: &ApiConfig,
+    streaming: bool,
+    max_body_bytes: Option<usize>,
+    audit_services: Option<Arc<Services>>,
+) -> Router {
     let scim_audit_services = audit_services.clone();
     // Innermost: stores the policy denials (403) that handlers marked.
     let router = router.layer(middleware::from_fn_with_state(
@@ -730,7 +771,9 @@ fn with_middleware(
         router
     } else {
         router
-            .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
+            .layer(RequestBodyLimitLayer::new(
+                max_body_bytes.unwrap_or(config.max_body_bytes),
+            ))
             // Maps limit and timeout failures to the JSON error shape.
             .layer(middleware::from_fn_with_state(
                 config.request_timeout,

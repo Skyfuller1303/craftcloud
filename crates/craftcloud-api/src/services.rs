@@ -399,6 +399,16 @@ impl Services {
         self
     }
 
+    /// Returns the versioned chunk identity keys from current and previous
+    /// configured server keys. An absent key preserves whole-blob writes.
+    pub(crate) fn chunk_identity_keys(&self) -> Vec<[u8; 32]> {
+        [self.two_factor_keys.current, self.two_factor_keys.old]
+            .into_iter()
+            .flatten()
+            .filter_map(|key| craftcloud_storage::derive_chunk_key(&key))
+            .collect()
+    }
+
     /// Marks email delivery active after the server validates SMTP settings.
     #[must_use]
     pub fn with_email_delivery(self, enabled: bool) -> Self {

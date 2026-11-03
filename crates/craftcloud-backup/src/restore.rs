@@ -13,9 +13,8 @@
 //!    must own `audit_events` (see below). Nothing is ever overwritten.
 //! 4. A database without tables is migrated to the backup's migration version
 //!    (and the runtime role is granted, when one is configured).
-//! 5. Blobs are streamed into the store under their original keys; every
-//!    object is checked against its SHA-256 while it is written, and the blob
-//!    list is hashed while it is read and compared with the manifest.
+//! 5. Whole blobs and physical chunks are streamed into the store under their
+//!    original keys; each object and both indexes are checked against SHA-256.
 //! 6. One transaction loads the tables with `COPY ... FROM STDIN` in
 //!    foreign-key order (every table file is hashed while it streams and
 //!    compared with the manifest before the commit), cleans up unfinished
@@ -64,10 +63,10 @@ use craftcloud_db::audit::{self, AuditCtx, Detail, NewEvent};
 use craftcloud_db::maintenance as db;
 use craftcloud_storage::{LocalStore, MarkerInfo, ObjectKey, ObjectStore, StorageError, WriteSink};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, ReadBuf};
 use uuid::Uuid;
 
-use crate::archive::{ArchiveAccess, verify_remote_refs};
+use crate::archive::{ArchiveAccess, verify_remote_chunks, verify_remote_refs};
 use crate::blob_stream::blob_entries;
 use crate::create::register_archive_pins;
 use crate::error::{BackupError, ErrorKind};
@@ -243,6 +242,16 @@ async fn restore_locked(context: LockedRestore<'_, '_, '_>) -> Result<RestoreRep
     let _ = entries.summary().ok_or_else(|| {
         BackupError::new(ErrorKind::Io, "the archive reference scan was incomplete")
     })?;
+    if manifest.chunks.is_some() {
+        crate::verify::for_each_chunk(dir, |entry| {
+            if entry.archive_object_key.is_some() {
+                archive_refs = archive_refs.checked_add(1).ok_or_else(|| {
+                    BackupError::new(ErrorKind::Integrity, "archive reference count overflow")
+                })?;
+            }
+            Ok(())
+        })?;
+    }
     if archive_refs > 0 {
         let access = archive.ok_or_else(|| {
             BackupError::new(
@@ -267,13 +276,16 @@ async fn restore_locked(context: LockedRestore<'_, '_, '_>) -> Result<RestoreRep
                 "the archive verification did not match the blob list",
             ));
         }
+        verify_remote_chunks(access, id, dir).await?;
     }
     ensure_store_empty(store).await?;
     prepare_database(pool, &manifest, options.runtime_role).await?;
     if archive_refs > 0 {
         let id = Uuid::parse_str(manifest.backup_id.as_deref().unwrap_or_default())
             .map_err(|_| BackupError::new(ErrorKind::Format, "the archive backup id is invalid"))?;
-        if let Err(error) = register_archive_pins(pool, dir, id, &manifest.blobs).await {
+        if let Err(error) =
+            register_archive_pins(pool, dir, id, &manifest.blobs, manifest.chunks.as_ref()).await
+        {
             if let Err(cancel_error) = db::archive_backup_cancel(pool, id).await {
                 tracing::error!(%cancel_error, backup = %id, "partial restore pins remain; archive GC stays closed");
             }
@@ -296,6 +308,14 @@ async fn restore_locked(context: LockedRestore<'_, '_, '_>) -> Result<RestoreRep
             return Err(error);
         }
     };
+    let written_chunks = match write_chunks(store, dir, &manifest).await {
+        Ok(written) => written,
+        Err(error) => {
+            remove_blobs(store, &written).await;
+            release_restore_pins(pool, &manifest, &manifest_sha256, archive_refs).await;
+            return Err(error);
+        }
+    };
     notify(options, RestorePhase::BlobsWritten).await;
 
     // A fresh identity for the restored pair: it must not look like the
@@ -305,6 +325,7 @@ async fn restore_locked(context: LockedRestore<'_, '_, '_>) -> Result<RestoreRep
         Ok(done) => done,
         Err(LoadFailure::BeforeCommit(error)) => {
             remove_blobs(store, &written).await;
+            remove_blobs(store, &written_chunks).await;
             release_restore_pins(pool, &manifest, &manifest_sha256, archive_refs).await;
             return Err(error);
         }
@@ -630,6 +651,108 @@ async fn write_one(store: &LocalStore, dir: &Path, entry: &BlobEntry) -> Result<
     }
 }
 
+async fn write_chunks(
+    store: &LocalStore,
+    dir: &Path,
+    manifest: &Manifest,
+) -> Result<Written, BackupError> {
+    let mut written = Written::default();
+    let result = write_chunks_into(store, dir, manifest, &mut written).await;
+    match result {
+        Ok(()) => Ok(written),
+        Err(error) => {
+            remove_blobs(store, &written).await;
+            Err(error)
+        }
+    }
+}
+
+async fn write_chunks_into(
+    store: &LocalStore,
+    dir: &Path,
+    manifest: &Manifest,
+    written: &mut Written,
+) -> Result<(), BackupError> {
+    let Some(index) = &manifest.chunks else {
+        return Ok(());
+    };
+    let mut file = tokio::fs::File::open(dir.join(&index.file))
+        .await
+        .map_err(|error| BackupError::io("cannot open the chunk list", &error))?;
+    let mut reader = tokio::io::BufReader::new(&mut file);
+    let mut line = Vec::new();
+    let mut listed_count = 0_u64;
+    let mut listed_total = 0_u64;
+    let mut hasher = Sha256::new();
+    loop {
+        line.clear();
+        let n = (&mut reader)
+            .take(crate::manifest::MAX_BLOB_LINE_BYTES as u64 + 2)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|error| BackupError::io("cannot read the chunk list", &error))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&line);
+        if line.pop() != Some(b'\n') {
+            return Err(BackupError::new(
+                ErrorKind::Format,
+                "the chunk list is damaged",
+            ));
+        }
+        let entry = crate::manifest::ChunkEntry::parse_line(&line)?;
+        listed_count += 1;
+        listed_total = listed_total
+            .checked_add(entry.size)
+            .ok_or_else(|| BackupError::new(ErrorKind::Integrity, "chunk size total overflow"))?;
+        if !entry.local_copy {
+            continue;
+        }
+        let key = ObjectKey::parse(&entry.key)
+            .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk key is invalid"))?;
+        let digest = parse_sha256(&entry.sha256)
+            .ok_or_else(|| BackupError::new(ErrorKind::Format, "a chunk checksum is invalid"))?;
+        let mut src = tokio::fs::File::open(dir.join(crate::manifest::chunk_file(&entry.id)))
+            .await
+            .map_err(|error| BackupError::io("cannot open a chunk file", &error))?;
+        let mut temp = store.begin_write(entry.size).await?;
+        let mut buf = vec![0_u8; BLOCK];
+        loop {
+            let got = src
+                .read(&mut buf)
+                .await
+                .map_err(|error| BackupError::io("cannot read a chunk file", &error))?;
+            if got == 0 {
+                break;
+            }
+            let block = buf.get(..got).ok_or_else(|| {
+                BackupError::new(ErrorKind::Integrity, "chunk read exceeded its buffer")
+            })?;
+            temp.write(block).await?;
+        }
+        store.finalize_as(temp, key, entry.size, &digest).await?;
+        written.keys.push(
+            u128::from_str_radix(&entry.key, 16)
+                .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk key is invalid"))?,
+        );
+        written.bytes = written
+            .bytes
+            .checked_add(entry.size)
+            .ok_or_else(|| BackupError::new(ErrorKind::Integrity, "chunk byte total overflow"))?;
+    }
+    if listed_count != index.count
+        || listed_total != index.total_bytes
+        || hex(&hasher.finalize()) != index.sha256
+    {
+        return Err(BackupError::new(
+            ErrorKind::Integrity,
+            "chunk list changed after verification",
+        ));
+    }
+    Ok(())
+}
+
 /// Removes the objects this restore wrote (compensation after a failure; best
 /// effort). The store was empty and the lock is held, so these are the only
 /// objects that can be there.
@@ -795,6 +918,14 @@ async fn load_tables(
     )
     .execute(&mut *tx)
     .await?;
+
+    if manifest.migration_version >= 25 {
+        // COPY restores source counters before version_chunks triggers increment them.
+        sqlx::query(
+            "UPDATE chunks c SET refcount = (SELECT count(*) FROM version_chunks vc WHERE vc.chunk_id = c.id), \
+             state = CASE WHEN EXISTS (SELECT 1 FROM version_chunks vc WHERE vc.chunk_id = c.id) THEN 'committed' ELSE 'orphaned' END",
+        ).execute(&mut *tx).await?;
+    }
 
     let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
     audit::record_in(

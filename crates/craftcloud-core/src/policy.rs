@@ -334,6 +334,8 @@ pub enum Action {
     VersionCommit,
     /// Create a new version from an older one.
     VersionRestore,
+    /// Pin or unpin a file version against automatic thinning.
+    VersionPin,
     /// Read the status of the maintenance job (operator).
     MaintenanceRead,
     /// Read the operator health view: component status, pool, disk,
@@ -443,6 +445,7 @@ impl Action {
             | Self::WorkspaceQuotaSet
             | Self::VersionCommit
             | Self::VersionRestore
+            | Self::VersionPin
             | Self::GrantCreate
             | Self::GrantChange
             | Self::FileLockAcquire
@@ -452,7 +455,7 @@ impl Action {
     }
 
     /// Every action. Tests assert that the policy table covers all of them.
-    pub const ALL: [Action; 75] = [
+    pub const ALL: [Action; 76] = [
         Action::OrganizationListOwn,
         Action::OrganizationRead,
         Action::OrganizationUpdate,
@@ -513,6 +516,7 @@ impl Action {
         Action::FileDownload,
         Action::VersionCommit,
         Action::VersionRestore,
+        Action::VersionPin,
         Action::MaintenanceRead,
         Action::HealthRead,
         Action::AuditRead,
@@ -845,6 +849,7 @@ fn requires_app_assignment(action: Action) -> bool {
             | Action::VersionRead
             | Action::VersionCommit
             | Action::VersionRestore
+            | Action::VersionPin
             | Action::FileLockAcquire
             | Action::FileLockRelease
             | Action::FileLockForce
@@ -1202,7 +1207,8 @@ fn can_user_without_app(actor: &Actor, action: Action, resource: &Resource) -> D
             | A::FileRename
             | A::FileDelete
             | A::FileRestore
-            | A::VersionRestore,
+            | A::VersionRestore
+            | A::VersionPin,
             Resource::Workspace {
                 org_id,
                 workspace_id,
@@ -1298,6 +1304,7 @@ fn can_user_without_app(actor: &Actor, action: Action, resource: &Resource) -> D
                     | A::UploadWrite
                     | A::VersionCommit
                     | A::VersionRestore
+                    | A::VersionPin
                     | A::FileLockAcquire
                     | A::FileLockRelease,
                 ) => workspace_write || grant_write,
@@ -2244,6 +2251,7 @@ mod tests {
             Action::FileDownload,
             Action::VersionCommit,
             Action::VersionRestore,
+            Action::VersionPin,
             Action::MaintenanceRead,
             Action::HealthRead,
             Action::AuditRead,
@@ -2325,6 +2333,7 @@ mod tests {
                 | Action::FileDownload
                 | Action::VersionCommit
                 | Action::VersionRestore
+                | Action::VersionPin
                 | Action::MaintenanceRead
                 | Action::HealthRead
                 | Action::AuditRead
@@ -2420,6 +2429,7 @@ mod tests {
             (Action::VersionRead, version_reads),
             (Action::FileDownload, version_reads),
             (Action::VersionRestore, [H, H, F, Y, Y, Y, Y]),
+            (Action::VersionPin, [H, H, F, Y, Y, Y, Y]),
             (Action::ProjectCreate, editor_writes),
             (Action::ProjectRename, editor_writes),
             (Action::FileCreate, editor_writes),
@@ -2507,6 +2517,7 @@ mod tests {
                         | Action::UploadWrite
                         | Action::VersionCommit
                         | Action::VersionRestore
+                        | Action::VersionPin
                         | Action::FileLockAcquire
                         | Action::FileLockRelease
                 );
@@ -2578,6 +2589,7 @@ mod tests {
             (Action::UploadWrite, F),
             (Action::VersionCommit, F),
             (Action::VersionRestore, F),
+            (Action::VersionPin, F),
             (Action::FileLockAcquire, F),
             (Action::FileLockRelease, F),
             (Action::FileLockForce, F),
@@ -2599,6 +2611,7 @@ mod tests {
             Action::UploadWrite,
             Action::VersionCommit,
             Action::VersionRestore,
+            Action::VersionPin,
             Action::FileLockAcquire,
             Action::FileLockRelease,
         ] {
@@ -2714,6 +2727,7 @@ mod tests {
                                         | Action::UploadWrite
                                         | Action::VersionCommit
                                         | Action::VersionRestore
+                                        | Action::VersionPin
                                         | Action::FileLockAcquire
                                         | Action::FileLockRelease
                                         | Action::FileLockForce
@@ -2763,6 +2777,7 @@ mod tests {
                                         | Action::UploadWrite
                                         | Action::VersionCommit
                                         | Action::VersionRestore
+                                        | Action::VersionPin
                                         | Action::FileLockAcquire
                                         | Action::FileLockRelease,
                                     ) => org_write || grant_write,

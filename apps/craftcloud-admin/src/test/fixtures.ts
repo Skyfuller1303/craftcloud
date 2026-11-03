@@ -73,6 +73,7 @@ export const version = (number: number, id: string, extra: Record<string, unknow
   restored_from_version_id: null,
   upload_id: null,
   created_by: ME,
+  pinned: false,
   created_at: "2026-10-04T10:00:00Z",
   ...extra,
 });

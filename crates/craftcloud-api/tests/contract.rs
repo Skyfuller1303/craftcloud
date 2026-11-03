@@ -628,6 +628,7 @@ mod tests {
         assert_eq!(info.body["feature_flags"]["device_login"], true);
         assert_eq!(info.body["feature_flags"]["two_factor"], false);
         assert_eq!(info.body["feature_flags"]["figcraft_live"], false);
+        assert_eq!(info.body["feature_flags"]["chunked_upload"], false);
         assert_eq!(
             info.body["limits"]["block_size"],
             craftcloud_storage::CHUNK_BYTES

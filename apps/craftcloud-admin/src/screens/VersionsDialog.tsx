@@ -92,6 +92,7 @@ export function VersionsDialog({
                     {version.restored_from_version_id !== null ? ` · ${t("Restored")}` : ""}
                     {version.actor_kind === "figcraft_live" ? ` · ${t("FigCraft Live")}` : ""}
                     {version.storage_tier === "archive" ? <> · <Badge>{t("Archive")}</Badge></> : null}
+                    {version.pinned ? <> · <Badge>{t("Keep")}</Badge></> : null}
                   </th>
                   <td className="numeric" data-label={t("Size")}>{formatBytes(language, version.size_bytes)}</td>
                   <td className="numeric" data-label={t("Saved")}>{formatDateTime(language, version.created_at)}</td>
@@ -110,6 +111,27 @@ export function VersionsDialog({
                       >
                         {t("Download")}
                       </a>
+                      {canRestore && (
+                        <Button
+                          className="button button--sm"
+                          isDisabled={action.pending}
+                          aria-label={version.pinned
+                            ? t("Unpin version {number}", { number: version.number })
+                            : t("Pin version {number}", { number: version.number })}
+                          onPress={() => {
+                            void action.run(() => api.pinVersion(file.id, version.id, !version.pinned)).then((updated) => {
+                              if (updated === undefined) return;
+                              setChanged(true);
+                              versions.refresh();
+                              announce(updated.pinned
+                                ? t("Version {number} will be kept.", { number: version.number })
+                                : t("Version {number} will no longer be kept.", { number: version.number }));
+                            });
+                          }}
+                        >
+                          {version.pinned ? t("Unpin") : t("Keep")}
+                        </Button>
+                      )}
                       {canRestore && !(lock != null && !lock.held_by_current_session) && version.id !== head && head !== null && (
                         <Button
                           className="button button--sm"

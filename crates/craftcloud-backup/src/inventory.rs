@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use craftcloud_db::{PgPool, maintenance as db};
 
-use crate::archive::ArchiveAccess;
+use crate::archive::{ArchiveAccess, verify_remote_chunks};
 use crate::blob_stream::blob_entries;
 use crate::create::register_archive_pins;
 use crate::error::{BackupError, ErrorKind};
@@ -130,6 +130,14 @@ async fn inventory_locked(
         let _ = entries.summary().ok_or_else(|| {
             BackupError::new(ErrorKind::Io, "the blob list verification was incomplete")
         })?;
+        let mut chunks_archived = false;
+        if report.manifest.chunks.is_some() {
+            crate::verify::for_each_chunk(directory, |entry| {
+                chunks_archived |= entry.archive_object_key.is_some();
+                Ok(())
+            })?;
+        }
+        archived |= chunks_archived;
         if archived {
             let access = archive.ok_or_else(|| {
                 BackupError::new(
@@ -138,6 +146,17 @@ async fn inventory_locked(
                 )
             })?;
             verify_with_archive(directory, Some(&report.manifest_sha256), access).await?;
+            if chunks_archived {
+                let id = report
+                    .manifest
+                    .backup_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .ok_or_else(|| {
+                        BackupError::new(ErrorKind::Format, "the archive backup id is invalid")
+                    })?;
+                verify_remote_chunks(access, id, directory).await?;
+            }
         }
         checked.push((directory.clone(), report));
     }
@@ -154,8 +173,14 @@ async fn inventory_locked(
             // Format v1 is local-only and has no durable archive identity.
             continue;
         };
-        let refs =
-            register_archive_pins(pool, &directory, backup_id, &report.manifest.blobs).await?;
+        let refs = register_archive_pins(
+            pool,
+            &directory,
+            backup_id,
+            &report.manifest.blobs,
+            report.manifest.chunks.as_ref(),
+        )
+        .await?;
         if !db::archive_backup_complete(pool, backup_id, &report.manifest_sha256, refs).await? {
             return Err(BackupError::new(
                 ErrorKind::Integrity,

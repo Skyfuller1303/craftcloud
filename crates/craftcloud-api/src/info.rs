@@ -26,6 +26,7 @@ struct FeatureFlags {
     locks: bool,
     figcraft_live: bool,
     email_delivery: bool,
+    chunked_upload: bool,
 }
 
 #[derive(Serialize)]
@@ -60,6 +61,9 @@ pub(crate) async fn discover(State(state): State<ApiState>) -> Json<Discovery> {
                 .services
                 .as_ref()
                 .is_some_and(|services| services.email_delivery_enabled()),
+            chunked_upload: state.services.as_ref().is_some_and(|services| {
+                services.storage.is_some() && !services.chunk_identity_keys().is_empty()
+            }),
         },
         limits: Limits {
             max_file_size,
@@ -95,5 +99,30 @@ mod tests {
         assert_eq!(value["limits"]["max_file_size"], 1234567);
         assert!(!value.to_string().contains("synthetic"));
         assert_eq!(value["feature_flags"]["locks"], true);
+        assert_eq!(value["feature_flags"]["chunked_upload"], false);
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_discovery_requires_storage_and_identity_key() {
+        let root = std::env::temp_dir().join(format!("craftcloud-info-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = craftcloud_storage::LocalStore::open(&root).await.unwrap();
+        let services = crate::Services::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://synthetic:synthetic@127.0.0.1:1/unused")
+                .unwrap(),
+            None,
+            AuthSettings::default(),
+        )
+        .with_two_factor_keys(Some([7; 32]), None)
+        .with_storage(store);
+        let Json(discovery) = discover(State(ApiState {
+            capabilities: Capabilities::development_defaults(),
+            services: Some(Arc::new(services)),
+        }))
+        .await;
+        let value = serde_json::to_value(discovery).unwrap();
+        assert_eq!(value["feature_flags"]["chunked_upload"], true);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

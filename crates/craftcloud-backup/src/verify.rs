@@ -18,11 +18,13 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::archive::{ArchiveAccess, verify_remote_refs};
+use crate::archive::{ArchiveAccess, verify_remote_chunks, verify_remote_refs};
 use crate::error::{BackupError, ErrorKind};
 use crate::manifest::{
-    BLOB_INDEX_FILE, BLOBS_DIR, BlobEntry, MANIFEST_FILE, MANIFEST_SUM_FILE, MAX_BLOB_LINE_BYTES,
-    MAX_MANIFEST_BYTES, Manifest, TABLES_DIR, blob_file, hex, is_sha256_hex, parse_sha256,
+    BLOB_INDEX_FILE, BLOBS_DIR, BlobEntry, CHUNK_INDEX_FILE, CHUNKED_VERSION_INDEX_FILE,
+    CHUNKS_DIR, ChunkEntry, MANIFEST_FILE, MANIFEST_SUM_FILE, MAX_BLOB_LINE_BYTES,
+    MAX_MANIFEST_BYTES, Manifest, TABLES_DIR, VERSION_CHUNK_INDEX_FILE, blob_file, hex,
+    is_sha256_hex, parse_sha256,
 };
 
 /// Block size for hashing and copying.
@@ -82,6 +84,20 @@ pub async fn verify_with_archive(
             ));
         }
     }
+    if report.manifest.chunks.is_some() {
+        verify_remote_chunks(
+            archive,
+            report
+                .manifest
+                .backup_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .unwrap_or_default(),
+            dir,
+        )
+        .await?;
+    }
+    verify_archived_version_assemblies(dir, archive).await?;
     Ok(report)
 }
 
@@ -130,7 +146,119 @@ pub async fn preflight_restore_archive(
             ));
         }
     }
+    if report.manifest.chunks.is_some() {
+        let has_archive = {
+            let mut found = false;
+            for_each_chunk(dir, |entry| {
+                found |= entry.archive_object_key.is_some();
+                Ok(())
+            })?;
+            found
+        };
+        if has_archive {
+            let access = archive.ok_or_else(|| {
+                BackupError::new(
+                    ErrorKind::SourceDamaged,
+                    "restore of archived chunks requires the configured provider and server key",
+                )
+            })?;
+            let id = report
+                .manifest
+                .backup_id
+                .as_deref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .ok_or_else(|| {
+                    BackupError::new(ErrorKind::Format, "the archive backup id is invalid")
+                })?;
+            verify_remote_chunks(access, id, dir).await?;
+        }
+    }
+    if let Some(access) = archive {
+        verify_archived_version_assemblies(dir, access).await?;
+    }
     Ok(report)
+}
+
+async fn verify_archived_version_assemblies(
+    dir: &Path,
+    access: ArchiveAccess<'_>,
+) -> Result<(), BackupError> {
+    use crate::manifest::{ChunkedVersionEntry, VersionChunkEntry};
+    let Some(versions_path) = dir
+        .join(CHUNKED_VERSION_INDEX_FILE)
+        .exists()
+        .then(|| dir.join(CHUNKED_VERSION_INDEX_FILE))
+    else {
+        return Ok(());
+    };
+    let mut expected = std::collections::BTreeMap::new();
+    let mut versions_reader = std::io::BufReader::new(
+        File::open(versions_path)
+            .map_err(|e| BackupError::io("cannot open chunked version list", &e))?,
+    );
+    let mut line = Vec::new();
+    while read_jsonl_line(&mut versions_reader, &mut line, "chunked version list")? {
+        let entry = ChunkedVersionEntry::parse_line(&line)?;
+        expected.insert(entry.id, (entry.size, entry.sha256));
+    }
+    let mappings = File::open(dir.join(VERSION_CHUNK_INDEX_FILE))
+        .map_err(|e| BackupError::io("cannot open version chunk list", &e))?;
+    let mut current_id = String::new();
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut ordinal = 0_u32;
+    async fn finish(
+        id: &str,
+        size: u64,
+        hasher: &mut Sha256,
+        expected: &std::collections::BTreeMap<String, (u64, String)>,
+    ) -> Result<(), BackupError> {
+        if id.is_empty() {
+            return Ok(());
+        }
+        let Some((expected_size, expected_sha)) = expected.get(id) else {
+            return Err(integrity("a chunk mapping references an unknown version"));
+        };
+        let actual: [u8; 32] = hasher.clone().finalize().into();
+        if size != *expected_size || hex(&actual) != *expected_sha {
+            return Err(integrity(
+                "assembled archived version does not match its size or SHA-256",
+            ));
+        }
+        Ok(())
+    }
+    let mut mappings_reader = std::io::BufReader::new(mappings);
+    let mut line = Vec::new();
+    while read_jsonl_line(&mut mappings_reader, &mut line, "version chunk list")? {
+        let entry = VersionChunkEntry::parse_line(&line)?;
+        if current_id != entry.version_id {
+            finish(&current_id, size, &mut hasher, &expected).await?;
+            current_id = entry.version_id.clone();
+            hasher = Sha256::new();
+            size = 0;
+            ordinal = 0;
+        }
+        if entry.ordinal != ordinal || entry.byte_offset != size {
+            return Err(integrity(
+                "version chunk mappings have a discontinuous ordinal or offset",
+            ));
+        }
+        let bytes = if entry.chunk.local_copy {
+            std::fs::read(dir.join(crate::manifest::chunk_file(&entry.chunk.id)))
+                .map_err(|e| BackupError::io("cannot read mapped chunk", &e))?
+        } else {
+            crate::archive::read_archive_chunk(access.store, access.crypto, &entry.chunk).await?
+        };
+        hasher.update(&bytes);
+        size = size
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| integrity("assembled version size overflow"))?;
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| integrity("chunk ordinal overflow"))?;
+    }
+    finish(&current_id, size, &mut hasher, &expected).await?;
+    Ok(())
 }
 
 pub(crate) fn integrity(message: impl Into<String>) -> BackupError {
@@ -183,6 +311,31 @@ pub(crate) fn sum_file(dir: &Path, relative: &str) -> Result<FileSum, BackupErro
         sha256: hasher.finalize().into(),
         newlines,
     })
+}
+
+/// Reads one bounded JSONL record. The reader consumes at most two bytes
+/// beyond the accepted payload, even when the input has no newline.
+fn read_jsonl_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    what: &'static str,
+) -> Result<bool, BackupError> {
+    line.clear();
+    let got = reader
+        .by_ref()
+        .take(MAX_BLOB_LINE_BYTES as u64 + 2)
+        .read_until(b'\n', line)
+        .map_err(|error| BackupError::io(&format!("cannot read {what}"), &error))?;
+    if got == 0 {
+        return Ok(false);
+    }
+    if line.pop() != Some(b'\n') || line.len() > MAX_BLOB_LINE_BYTES {
+        return Err(BackupError::new(
+            ErrorKind::Format,
+            format!("{what} has an overlong or unterminated line"),
+        ));
+    }
+    Ok(true)
 }
 
 /// Reads the whole manifest (bounded) and returns its bytes.
@@ -339,6 +492,30 @@ pub fn verify(
         }
     }
     let (manifest, manifest_sha256) = read_manifest(dir, expected_manifest_sha256)?;
+    if manifest.chunks.is_some() {
+        match fs::symlink_metadata(dir.join(CHUNKS_DIR)) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(integrity(
+                    "chunks must be a real directory (links are not allowed)",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(integrity("the chunks directory is missing"));
+            }
+            Err(error) => return Err(BackupError::io("cannot read chunks", &error)),
+        }
+    } else if dir.join(CHUNK_INDEX_FILE).exists() || dir.join(CHUNKS_DIR).exists() {
+        return Err(integrity("this backup format does not list chunk files"));
+    }
+    if manifest.chunked_versions.is_none()
+        && (dir.join(CHUNKED_VERSION_INDEX_FILE).exists()
+            || dir.join(VERSION_CHUNK_INDEX_FILE).exists())
+    {
+        return Err(integrity(
+            "this backup format does not list chunked version indexes",
+        ));
+    }
 
     // Tables: size, row count and checksum.
     let mut rows = 0_u64;
@@ -418,6 +595,62 @@ pub fn verify(
         ));
     }
 
+    let mut chunk_count = 0_u64;
+    if let Some(index) = &manifest.chunks {
+        require_file(dir, CHUNK_INDEX_FILE)?;
+        let idx = sum_file(dir, CHUNK_INDEX_FILE)?;
+        if hex(&idx.sha256) != index.sha256 || idx.newlines != index.count {
+            return Err(integrity("chunks.jsonl does not match its manifest"));
+        }
+        let mut previous = String::new();
+        let mut total_chunks = 0_u64;
+        let mut local_chunks = 0_u64;
+        for_each_chunk(dir, |entry| {
+            if entry.id <= previous {
+                return Err(integrity("chunks.jsonl is not sorted or repeats an id"));
+            }
+            previous.clone_from(&entry.id);
+            if entry.local_copy {
+                let relative = crate::manifest::chunk_file(&entry.id);
+                require_file(dir, &relative)?;
+                let sum = sum_file(dir, &relative)?;
+                if sum.len != entry.size || hex(&sum.sha256) != entry.sha256 {
+                    return Err(integrity(format!(
+                        "chunk {} does not match its recorded checksum",
+                        entry.id
+                    )));
+                }
+                local_chunks += 1;
+            }
+            total_chunks = total_chunks
+                .checked_add(entry.size)
+                .ok_or_else(|| integrity("chunk sizes overflow"))?;
+            chunk_count += 1;
+            Ok(())
+        })?;
+        if chunk_count != index.count || total_chunks != index.total_bytes {
+            return Err(integrity(
+                "chunk list does not match its count or size total",
+            ));
+        }
+        let _ = local_chunks;
+    }
+
+    if let (Some(versions), Some(mappings)) = (&manifest.chunked_versions, &manifest.version_chunks)
+    {
+        for (name, index) in [
+            (CHUNKED_VERSION_INDEX_FILE, versions),
+            (VERSION_CHUNK_INDEX_FILE, mappings),
+        ] {
+            require_file(dir, name)?;
+            let sum = sum_file(dir, name)?;
+            if hex(&sum.sha256) != index.sha256 || sum.newlines != index.count {
+                return Err(integrity(format!("{name} does not match its manifest")));
+            }
+        }
+        verify_chunked_index_contents(dir)?;
+    }
+
     check_no_extra_files(dir, &manifest, local_count)?;
     Ok(VerifyReport {
         manifest,
@@ -428,14 +661,161 @@ pub fn verify(
     })
 }
 
+pub(crate) fn for_each_chunk<F>(dir: &Path, mut each: F) -> Result<(), BackupError>
+where
+    F: FnMut(&ChunkEntry) -> Result<(), BackupError>,
+{
+    let file = File::open(dir.join(CHUNK_INDEX_FILE))
+        .map_err(|error| BackupError::io("cannot open the chunk list", &error))?;
+    let mut reader = BufReader::with_capacity(BLOCK, file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let got = reader
+            .by_ref()
+            .take(MAX_BLOB_LINE_BYTES as u64 + 2)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| BackupError::io("cannot read the chunk list", &error))?;
+        if got == 0 {
+            return Ok(());
+        }
+        if line.pop() != Some(b'\n') {
+            return Err(BackupError::new(
+                ErrorKind::Format,
+                "the chunk list has an overlong or unterminated line",
+            ));
+        }
+        each(&ChunkEntry::parse_line(&line)?)?;
+    }
+}
+
+fn verify_chunked_index_contents(dir: &Path) -> Result<(), BackupError> {
+    use crate::manifest::{ChunkedVersionEntry, VersionChunkEntry};
+    let versions = File::open(dir.join(CHUNKED_VERSION_INDEX_FILE))
+        .map_err(|e| BackupError::io("cannot open chunked version list", &e))?;
+    let mut expected = std::collections::BTreeMap::new();
+    let mut versions_reader = BufReader::new(versions);
+    let mut line = Vec::new();
+    while read_jsonl_line(&mut versions_reader, &mut line, "chunked version list")? {
+        let entry = ChunkedVersionEntry::parse_line(&line)?;
+        if expected
+            .insert(entry.id, (entry.size, entry.sha256))
+            .is_some()
+        {
+            return Err(integrity("chunked version list repeats an id"));
+        }
+    }
+    let mappings = File::open(dir.join(VERSION_CHUNK_INDEX_FILE))
+        .map_err(|e| BackupError::io("cannot open version chunk list", &e))?;
+    let mut current: Option<(String, u32, u64, Sha256, bool)> = None;
+    let mut seen = BTreeSet::new();
+    let mut previous: Option<(String, u32)> = None;
+    let mut mappings_reader = BufReader::new(mappings);
+    let mut line = Vec::new();
+    while read_jsonl_line(&mut mappings_reader, &mut line, "version chunk list")? {
+        let entry = VersionChunkEntry::parse_line(&line)?;
+        let key = (entry.version_id.clone(), entry.ordinal);
+        if previous.as_ref().is_some_and(|last| last >= &key) {
+            return Err(integrity(
+                "version chunk list is not sorted or repeats a mapping",
+            ));
+        }
+        previous = Some(key);
+        if current
+            .as_ref()
+            .is_some_and(|item| item.0 != entry.version_id)
+        {
+            finish_chunked_version(current.take(), &expected, &mut seen)?;
+        }
+        if current.is_none() {
+            current = Some((entry.version_id.clone(), 0, 0, Sha256::new(), false));
+        }
+        let (version, ordinal, offset, digest, archived) = current
+            .as_mut()
+            .ok_or_else(|| integrity("chunked version state is missing"))?;
+        if entry.ordinal != *ordinal || entry.byte_offset != *offset {
+            return Err(integrity(
+                "version chunk mappings have a discontinuous ordinal or offset",
+            ));
+        }
+        if entry.chunk.local_copy {
+            let path = dir.join(crate::manifest::chunk_file(&entry.chunk.id));
+            let mut file =
+                File::open(path).map_err(|e| BackupError::io("cannot open mapped chunk", &e))?;
+            let mut chunk_hash = Sha256::new();
+            let mut buf = vec![0; BLOCK];
+            let mut chunk_len = 0_u64;
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| BackupError::io("cannot read mapped chunk", &e))?;
+                if n == 0 {
+                    break;
+                }
+                chunk_len += n as u64;
+                let block = buf
+                    .get(..n)
+                    .ok_or_else(|| integrity("mapped chunk read exceeded its buffer"))?;
+                chunk_hash.update(block);
+                digest.update(block);
+            }
+            if chunk_len != entry.chunk.size || hex(&chunk_hash.finalize()) != entry.chunk.sha256 {
+                return Err(integrity("mapped chunk bytes do not match their digest"));
+            }
+        } else {
+            *archived = true;
+        }
+        *ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| integrity("chunk ordinal overflow"))?;
+        *offset = offset
+            .checked_add(entry.chunk.size)
+            .ok_or_else(|| integrity("chunk offset overflow"))?;
+        *version = entry.version_id;
+    }
+    finish_chunked_version(current, &expected, &mut seen)?;
+    for (id, (size, sha)) in expected {
+        if !seen.contains(&id) && (size != 0 || sha != hex(&Sha256::digest([]))) {
+            return Err(integrity(
+                "a chunked version has no mappings but is not empty",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn finish_chunked_version(
+    current: Option<(String, u32, u64, Sha256, bool)>,
+    expected: &std::collections::BTreeMap<String, (u64, String)>,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), BackupError> {
+    let Some((id, _, size, digest, archived)) = current else {
+        return Ok(());
+    };
+    let (expected_size, expected_sha) = expected
+        .get(&id)
+        .ok_or_else(|| integrity("a chunk mapping references an unknown version"))?;
+    if size != *expected_size || (!archived && hex(&digest.finalize()) != *expected_sha) {
+        return Err(integrity(
+            "assembled chunked version does not match its size or SHA-256",
+        ));
+    }
+    seen.insert(id);
+    Ok(())
+}
+
 /// Nothing may be in the directory that the manifest does not list.
 fn check_no_extra_files(dir: &Path, manifest: &Manifest, blobs: u64) -> Result<(), BackupError> {
     let top: BTreeSet<&str> = [
         MANIFEST_FILE,
         MANIFEST_SUM_FILE,
         BLOB_INDEX_FILE,
+        CHUNK_INDEX_FILE,
+        CHUNKED_VERSION_INDEX_FILE,
+        VERSION_CHUNK_INDEX_FILE,
         TABLES_DIR,
         BLOBS_DIR,
+        CHUNKS_DIR,
     ]
     .into_iter()
     .collect();
@@ -446,11 +826,14 @@ fn check_no_extra_files(dir: &Path, manifest: &Manifest, blobs: u64) -> Result<(
         if !top.contains(name.as_str()) {
             return Err(integrity(format!("unexpected entry {name} in the backup")));
         }
-        if name == TABLES_DIR || name == BLOBS_DIR {
+        if name == TABLES_DIR
+            || name == BLOBS_DIR
+            || (name == CHUNKS_DIR && manifest.chunks.is_some())
+        {
             seen_dirs += 1;
         }
     }
-    if seen_dirs != 2 {
+    if seen_dirs != if manifest.chunks.is_some() { 3 } else { 2 } {
         return Err(integrity("the tables or blobs directory is missing"));
     }
 
@@ -501,6 +884,33 @@ fn check_no_extra_files(dir: &Path, manifest: &Manifest, blobs: u64) -> Result<(
             "the backup holds {found} blob files but lists {blobs}"
         )));
     }
+    if let Some(index) = &manifest.chunks {
+        let mut found_chunks = 0_u64;
+        for file in read_dir(&dir.join(CHUNKS_DIR), "chunks")? {
+            let file = file?;
+            if !file.file_type().is_ok_and(|t| t.is_file()) {
+                return Err(integrity("unexpected entry in chunks directory"));
+            }
+            found_chunks += 1;
+        }
+        let expected_local = {
+            let mut n = 0_u64;
+            for_each_chunk(dir, |e| {
+                if e.local_copy {
+                    n += 1;
+                }
+                Ok(())
+            })?;
+            n
+        };
+        if found_chunks != expected_local || index.count < expected_local {
+            return Err(integrity("chunk directory does not match the chunk list"));
+        }
+    }
+    if manifest.chunked_versions.is_some() {
+        require_file(dir, CHUNKED_VERSION_INDEX_FILE)?;
+        require_file(dir, VERSION_CHUNK_INDEX_FILE)?;
+    }
     Ok(())
 }
 
@@ -546,6 +956,18 @@ mod tests {
         hex(&Sha256::digest(bytes))
     }
 
+    #[test]
+    fn oversized_jsonl_record_is_rejected_after_bounded_read() {
+        let mut bytes = vec![b'x'; MAX_BLOB_LINE_BYTES + 1_000_000];
+        bytes.push(b'\n');
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut line = Vec::new();
+        let error = read_jsonl_line(&mut reader, &mut line, "test index").unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Format);
+        assert!(line.len() <= MAX_BLOB_LINE_BYTES + 2);
+        assert!(reader.position() <= (MAX_BLOB_LINE_BYTES + 2) as u64);
+    }
+
     /// Writes a complete, valid backup of empty tables and the given blobs
     /// (sorted by key by this function).
     fn write_backup(dir: &Path, blobs: &[(&str, &[u8])]) {
@@ -553,6 +975,7 @@ mod tests {
         blobs.sort_by_key(|(key, _)| *key);
         fs::create_dir_all(dir.join(TABLES_DIR)).unwrap();
         fs::create_dir_all(dir.join(BLOBS_DIR)).unwrap();
+        fs::create_dir_all(dir.join(CHUNKS_DIR)).unwrap();
         let mut tables = Vec::new();
         for spec in backup_tables_for(14).unwrap() {
             let content: &[u8] = if spec.name == "users" { b"row\n" } else { b"" };
@@ -573,6 +996,7 @@ mod tests {
                 id: uuid::Uuid::new_v4().to_string(),
                 key: (*key).to_owned(),
                 size: content.len() as u64,
+                layout: "whole".to_owned(),
                 sha256: sha(content),
                 local_copy: true,
                 archive_object_key: None,
@@ -586,6 +1010,9 @@ mod tests {
             total += content.len() as u64;
         }
         fs::write(dir.join(BLOB_INDEX_FILE), &list).unwrap();
+        fs::write(dir.join(CHUNK_INDEX_FILE), b"").unwrap();
+        fs::write(dir.join(CHUNKED_VERSION_INDEX_FILE), b"").unwrap();
+        fs::write(dir.join(VERSION_CHUNK_INDEX_FILE), b"").unwrap();
         let manifest = Manifest {
             format: FORMAT.to_owned(),
             format_version: FORMAT_VERSION,
@@ -603,6 +1030,24 @@ mod tests {
                 total_bytes: total,
                 sha256: sha(&list),
             },
+            chunks: Some(crate::manifest::ChunkIndex {
+                file: crate::manifest::CHUNK_INDEX_FILE.to_owned(),
+                count: 0,
+                total_bytes: 0,
+                sha256: sha(b""),
+            }),
+            chunked_versions: Some(crate::manifest::JsonlIndex {
+                file: crate::manifest::CHUNKED_VERSION_INDEX_FILE.to_owned(),
+                count: 0,
+                total_bytes: 0,
+                sha256: sha(b""),
+            }),
+            version_chunks: Some(crate::manifest::JsonlIndex {
+                file: crate::manifest::VERSION_CHUNK_INDEX_FILE.to_owned(),
+                count: 0,
+                total_bytes: 0,
+                sha256: sha(b""),
+            }),
             excluded_tables: Vec::new(),
             unavailable_version_blobs: 0,
             backup_id: Some(uuid::Uuid::new_v4().to_string()),

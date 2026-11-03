@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     blob_stream::blob_entries,
     error::{BackupError, ErrorKind},
-    manifest::{BlobEntry, parse_sha256},
+    manifest::{BlobEntry, ChunkEntry, parse_sha256},
     verify::BlobListSum,
 };
 
@@ -84,6 +84,174 @@ pub(crate) async fn verify_remote_refs(
         verify_one(access.store, access.crypto, &entry).await?;
     }
     Ok(sum)
+}
+
+pub(crate) async fn verify_remote_chunks(
+    access: ArchiveAccess<'_>,
+    backup_id: Uuid,
+    dir: &std::path::Path,
+) -> Result<(), BackupError> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<ChunkEntry, BackupError>>(8);
+    let path = dir.to_path_buf();
+    let producer = tokio::task::spawn_blocking(move || {
+        let result = crate::verify::for_each_chunk(&path, |entry| {
+            sender
+                .blocking_send(Ok(entry.clone()))
+                .map_err(|_| BackupError::new(ErrorKind::Io, "chunk verification was cancelled"))
+        });
+        if let Err(error) = &result {
+            let _ = sender.blocking_send(Err(error.clone()));
+        }
+        result
+    });
+    let mut sample = Vec::<(u64, ChunkEntry)>::new();
+    let mut failure = None;
+    while let Some(next) = receiver.recv().await {
+        let entry = match next {
+            Ok(entry) => entry,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        };
+        let Some(archive_key) = entry.archive_object_key.as_deref() else {
+            continue;
+        };
+        let key = ObjectKey::parse(archive_key)
+            .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk archive key is invalid"))?;
+        let expected = encrypted_len(entry.size).map_err(|_| {
+            BackupError::new(ErrorKind::Integrity, "chunk ciphertext length overflow")
+        })?;
+        let head = access.store.head(&key).await.map_err(|error| {
+            if matches!(error, StorageError::NotFound) {
+                BackupError::new(
+                    ErrorKind::SourceDamaged,
+                    format!("archive chunk {archive_key} is missing"),
+                )
+            } else {
+                error.into()
+            }
+        })?;
+        if head.len != expected {
+            failure = Some(BackupError::new(
+                ErrorKind::SourceDamaged,
+                format!("archive chunk {archive_key} has an unexpected encrypted size"),
+            ));
+            break;
+        }
+        if access.verify_sample > 0 {
+            let rank = sample_rank(backup_id, archive_key);
+            if sample.len() < access.verify_sample {
+                sample.push((rank, entry));
+                sample.sort_by_key(|(rank, _)| *rank);
+            } else if sample.last().is_some_and(|(last, _)| rank < *last) {
+                if let Some(last) = sample.last_mut() {
+                    *last = (rank, entry);
+                }
+                sample.sort_by_key(|(rank, _)| *rank);
+            }
+        }
+    }
+    drop(receiver);
+    let produced = producer.await;
+    if failure.is_none() {
+        failure = match produced {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(BackupError::new(ErrorKind::Io, "chunk verification failed")),
+        };
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    for (_, entry) in sample {
+        let _ = read_archive_chunk(access.store, access.crypto, &entry).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn read_archive_chunk(
+    store: &ArchiveStore,
+    crypto: &ArchiveCrypto,
+    entry: &ChunkEntry,
+) -> Result<Vec<u8>, BackupError> {
+    let chunk_id = Uuid::parse_str(&entry.id)
+        .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk id is invalid"))?;
+    let archive_key = entry
+        .archive_object_key
+        .as_deref()
+        .ok_or_else(|| BackupError::new(ErrorKind::Format, "a chunk archive key is missing"))?;
+    let key = ObjectKey::parse(archive_key)
+        .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk archive key is invalid"))?;
+    let wrapped = entry.archive_wrapped_key.as_deref().ok_or_else(|| {
+        BackupError::new(ErrorKind::Format, "a chunk archive envelope is missing")
+    })?;
+    let envelope = WrappedDataKey::from_bytes(&parse_hex(wrapped)?).map_err(|_| {
+        BackupError::new(ErrorKind::Integrity, "a chunk archive envelope is invalid")
+    })?;
+    let digest = parse_sha256(&entry.sha256)
+        .ok_or_else(|| BackupError::new(ErrorKind::Format, "a chunk checksum is invalid"))?;
+    let data_key = crypto
+        .unwrap_data_key(&envelope, chunk_id, entry.size)
+        .map_err(|_| {
+            BackupError::new(
+                ErrorKind::Integrity,
+                "a chunk archive key cannot be unwrapped",
+            )
+        })?;
+    let expected_len = encrypted_len(entry.size)
+        .map_err(|_| BackupError::new(ErrorKind::Integrity, "chunk ciphertext length overflow"))?;
+    let source = store.open_read(&key, None).await.map_err(|error| {
+        if matches!(error, StorageError::NotFound) {
+            BackupError::new(
+                ErrorKind::SourceDamaged,
+                format!("archive chunk {archive_key} is missing"),
+            )
+        } else {
+            error.into()
+        }
+    })?;
+    if source.remaining() != expected_len {
+        return Err(BackupError::new(
+            ErrorKind::SourceDamaged,
+            format!("archive chunk {archive_key} has an unexpected size"),
+        ));
+    }
+    let mut exact = ExactReader::new(source);
+    let mut hasher = Sha256::new();
+    let mut plaintext = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0));
+    let mut remaining = entry.size;
+    let mut index = 0_u64;
+    loop {
+        let plain_len = usize::try_from(remaining.min(CHUNK_BYTES as u64))
+            .map_err(|_| BackupError::new(ErrorKind::Integrity, "archive block size overflow"))?;
+        let cipher = exact.read_exact(plain_len + 16).await?;
+        let plain = data_key
+            .decrypt_block(&envelope, index, &cipher)
+            .map_err(|_| {
+                BackupError::new(
+                    ErrorKind::Integrity,
+                    "an archive chunk block failed authentication",
+                )
+            })?;
+        hasher.update(&plain);
+        plaintext.extend_from_slice(&plain);
+        remaining -= plain_len as u64;
+        if remaining == 0 {
+            break;
+        }
+        index = index.checked_add(1).ok_or_else(|| {
+            BackupError::new(ErrorKind::Integrity, "archive block index overflow")
+        })?;
+    }
+    exact.finish().await?;
+    if <[u8; 32]>::from(hasher.finalize()) != digest {
+        return Err(BackupError::new(
+            ErrorKind::Integrity,
+            format!("archive chunk {archive_key} does not match its checksum"),
+        ));
+    }
+    Ok(plaintext)
 }
 
 fn sample_rank(backup_id: Uuid, key: &str) -> u64 {

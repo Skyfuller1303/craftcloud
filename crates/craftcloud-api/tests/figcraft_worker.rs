@@ -24,7 +24,7 @@ mod tests {
     use craftcloud_backup::{CreateOptions, RestoreOptions};
     use craftcloud_db::PgPool;
     use craftcloud_figcraft::{Access, Backend, Error, Export, Link};
-    use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore};
+    use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore, WriteSink};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -110,6 +110,7 @@ mod tests {
         owner: Session,
         file: Uuid,
         backend: Arc<FakeFigcraft>,
+        source: Vec<u8>,
     }
 
     fn archive(name: &str) -> Vec<u8> {
@@ -197,6 +198,7 @@ mod tests {
             owner,
             file: file_id,
             backend,
+            source,
         }
     }
 
@@ -276,17 +278,41 @@ mod tests {
             .env
             .configure_archive_figcraft(fixture.backend.clone(), "ws://figcraft.test/figcraft")
             .await;
-        let (blob_id, local_key, size, sha256): (Uuid, String, i64, Vec<u8>) = sqlx::query_as(
-            "SELECT b.id,b.object_key,b.size_bytes,b.sha256 FROM file_versions v \
+        let (blob_id, local_key, size, sha256, layout): (Uuid, String, i64, Vec<u8>, String) =
+            sqlx::query_as(
+                "SELECT b.id,b.object_key,b.size_bytes,b.sha256,b.layout FROM file_versions v \
              JOIN blobs b ON b.id=v.blob_id WHERE v.id=$1",
-        )
-        .bind(published)
-        .fetch_one(&fixture.env.pool)
-        .await
-        .unwrap();
+            )
+            .bind(published)
+            .fetch_one(&fixture.env.pool)
+            .await
+            .unwrap();
         let local = LocalStore::open(&fixture.env.storage_dir).await.unwrap();
         let local_key = ObjectKey::parse(&local_key).unwrap();
         let digest: [u8; 32] = sha256.as_slice().try_into().unwrap();
+        // Keep the legacy whole-object archive regression explicit even when
+        // ordinary uploads default to chunks. AC-15 covers archived chunks too.
+        if layout == "chunked" {
+            let mut temporary = local
+                .begin_write_as(local_key.clone(), size as u64)
+                .await
+                .unwrap();
+            temporary.write(&fixture.source).await.unwrap();
+            local
+                .finalize(temporary, size as u64, &digest)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM version_chunks WHERE version_id=$1")
+                .bind(published)
+                .execute(&fixture.env.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE blobs SET layout='whole' WHERE id=$1")
+                .bind(blob_id)
+                .execute(&fixture.env.pool)
+                .await
+                .unwrap();
+        }
         let archived = craftcloud_api::archive_transport::upload_verified(
             &local,
             archive_store.as_ref(),

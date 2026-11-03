@@ -35,12 +35,16 @@ pub const CRASH_ENV: &str = "CC_FAULT_ABORT_AT";
 /// - `archive-db-committed`: verified archive reference committed, local copy
 ///   remains.
 /// - `archive-local-deleted`: local bytes removed, pending-delete state remains.
+/// - `archive-chunk-db-committed`: verified chunk archive reference committed,
+///   the local chunk remains.
+/// - `archive-chunk-local-deleted`: local chunk removed, pending-delete state
+///   remains.
 /// - `archive-recall-claimed`, `archive-recall-download-started`,
 ///   `archive-recall-download-complete`, `archive-recall-local-written`,
 ///   `archive-recall-verified`, `archive-recall-committed`: operator recall
 ///   stages. Recall never deletes the archive object.
 #[cfg(feature = "fault-injection")]
-pub const CRASH_POINTS: [&str; 17] = [
+pub const CRASH_POINTS: [&str; 19] = [
     "upload-mid-stream",
     "upload-before-record",
     "version-after-commit",
@@ -52,6 +56,8 @@ pub const CRASH_POINTS: [&str; 17] = [
     "archive-upload-verified",
     "archive-db-committed",
     "archive-local-deleted",
+    "archive-chunk-db-committed",
+    "archive-chunk-local-deleted",
     "archive-recall-claimed",
     "archive-recall-download-started",
     "archive-recall-download-complete",

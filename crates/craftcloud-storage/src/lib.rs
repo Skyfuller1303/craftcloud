@@ -19,6 +19,7 @@
 
 mod archive_crypto;
 mod archive_store;
+mod chunking;
 mod crash;
 mod error;
 mod faults;
@@ -33,6 +34,10 @@ pub use archive_crypto::{
     map_range, verify_ciphertext_len,
 };
 pub use archive_store::{ArchiveReader, ArchiveStore, ArchiveTemp};
+pub use chunking::{
+    Chunk, ChunkError, MAX_CHUNK_BYTES, MIN_CHUNK_BYTES, TARGET_CHUNK_BYTES, chunk_digest,
+    chunk_digest_from_sha256, derive_chunk_key, fastcdc_chunks,
+};
 pub use crash::crash_point;
 #[cfg(feature = "fault-injection")]
 pub use crash::{CRASH_ENV, CRASH_POINTS, arm_crash_point_from_env};

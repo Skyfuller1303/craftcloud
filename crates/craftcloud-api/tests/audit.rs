@@ -1273,7 +1273,7 @@ mod tests {
             let r = w
                 .get(&c.owner.1, &format!("/api/v1/files/{file_id}/content"))
                 .await;
-            assert_eq!(r.status, StatusCode::OK);
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text);
             if record {
                 w.wait_count(
                     "SELECT count(*) FROM audit_events WHERE action = 'file.download'",
@@ -1411,10 +1411,18 @@ mod tests {
             1001,
         )
         .await;
+        // The database-clock window can roll over during the 1,000 requests.
+        let (rows, windows): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(DISTINCT floor(extract(epoch FROM created_at) / $1::bigint)) \
+             FROM audit_events WHERE action = 'file.download'",
+        )
+        .bind(craftcloud_db::audit::AGGREGATION_WINDOW_SECS)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
         assert_eq!(
-            w.count("SELECT count(*) FROM audit_events WHERE action = 'file.download'")
-                .await,
-            1
+            rows, windows,
+            "downloads fold once per database-clock window"
         );
         // HEAD hands out no content and records nothing.
         let head = w.send(Req::new("HEAD", &url).cookie_only(&c.owner.1)).await;

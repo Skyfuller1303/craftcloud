@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::DbError;
@@ -124,6 +124,138 @@ pub struct PurgeCounts {
     pub sessions: u64,
     /// Project rows.
     pub projects: u64,
+}
+
+/// Time-grid and count limits for file-version retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionThinningPolicy {
+    /// Maximum age before the legacy version-retention rule permits deletion.
+    pub retention_days: u32,
+    pub keep_all_hours: u32,
+    pub daily_days: u32,
+    pub weekly_weeks: u32,
+    /// Zero means unlimited. Pinned versions are excluded from this count.
+    pub max_per_file: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct RetentionVersion {
+    pub id: Uuid,
+    pub number: i64,
+    pub created_at: OffsetDateTime,
+    pub pinned: bool,
+    pub protected: bool,
+}
+
+/// IDs to retain, oldest-to-newest input accepted. Ties use the larger version
+/// number, then the UUID, so results do not depend on database row order.
+#[must_use]
+pub fn versions_to_keep(
+    versions: &[RetentionVersion],
+    head: Option<Uuid>,
+    policy: VersionThinningPolicy,
+    now: OffsetDateTime,
+) -> HashSet<Uuid> {
+    let mut ordered = versions.to_vec();
+    ordered.sort_by_key(|version| (version.created_at, version.number, version.id));
+    let mut keep = HashSet::new();
+    for version in &ordered {
+        if Some(version.id) == head
+            || version.pinned
+            || version.protected
+            || version.created_at > now
+        {
+            keep.insert(version.id);
+        }
+    }
+
+    let grid_disabled =
+        policy.keep_all_hours == 0 && policy.daily_days == 0 && policy.weekly_weeks == 0;
+    if grid_disabled {
+        let cutoff = now - time::Duration::days(i64::from(policy.retention_days));
+        // Legacy behavior looks up the nearest greater version number, not
+        // the nearest creation time. Sort once and scan distinct number runs.
+        let mut by_number: Vec<_> = ordered.iter().collect();
+        by_number.sort_by_key(|version| (version.number, version.created_at, version.id));
+        let mut groups = by_number
+            .chunk_by(|left, right| left.number == right.number)
+            .peekable();
+        while let Some(group) = groups.next() {
+            if groups
+                .peek()
+                .and_then(|next| next.first())
+                .is_some_and(|successor| successor.created_at >= cutoff)
+            {
+                keep.extend(group.iter().map(|version| version.id));
+            }
+        }
+    }
+
+    let daily_start = if policy.daily_days > 0 {
+        now.date() - time::Duration::days(i64::from(policy.daily_days.saturating_sub(1)))
+    } else {
+        Date::MAX
+    };
+    let weekly_start = if policy.weekly_weeks > 0 {
+        let (year, week, _) = now.date().to_iso_week_date();
+        let monday =
+            Date::from_iso_week_date(year, week, time::Weekday::Monday).unwrap_or(now.date());
+        monday - time::Duration::days(i64::from(policy.weekly_weeks.saturating_sub(1)) * 7)
+    } else {
+        Date::MAX
+    };
+
+    let mut daily: std::collections::BTreeMap<Date, RetentionVersion> =
+        std::collections::BTreeMap::new();
+    let mut weekly: std::collections::BTreeMap<(i32, u8), RetentionVersion> =
+        std::collections::BTreeMap::new();
+    for version in &ordered {
+        if keep.contains(&version.id)
+            || version.created_at > now
+            || now - version.created_at > time::Duration::days(i64::from(policy.retention_days))
+        {
+            continue;
+        }
+        let age = now - version.created_at;
+        if policy.keep_all_hours > 0
+            && age < time::Duration::hours(i64::from(policy.keep_all_hours))
+        {
+            keep.insert(version.id);
+        }
+        let date = version.created_at.date();
+        if policy.daily_days > 0 && date >= daily_start && date <= now.date() {
+            daily.insert(date, *version);
+        }
+        if policy.weekly_weeks > 0 && date >= weekly_start && date <= now.date() {
+            let (year, week, _) = date.to_iso_week_date();
+            weekly.insert((year, week), *version);
+        }
+    }
+    keep.extend(daily.values().map(|version| version.id));
+    keep.extend(weekly.values().map(|version| version.id));
+
+    if policy.max_per_file > 0 {
+        let mut excess = ordered
+            .iter()
+            .filter(|version| keep.contains(&version.id) && !version.pinned)
+            .count()
+            .saturating_sub(policy.max_per_file as usize);
+        for version in &ordered {
+            if excess == 0 {
+                break;
+            }
+            if keep.contains(&version.id)
+                && !version.pinned
+                && !version.protected
+                && Some(version.id) != head
+                && version.created_at <= now
+            {
+                keep.remove(&version.id);
+                excess -= 1;
+            }
+        }
+    }
+    keep
 }
 
 impl PurgeCounts {
@@ -244,6 +376,28 @@ pub async fn files_with_old_versions(
     .bind(limit)
     .bind(orgs)
     .bind(exclude)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Files with more than one version that can be evaluated by version thinning.
+pub async fn files_with_versions_to_thin(
+    pool: &PgPool,
+    after: Option<(Uuid, Uuid)>,
+    exclude: &[Uuid],
+    limit: i64,
+) -> Result<Vec<(Uuid, Uuid)>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT f.org_id, f.id FROM files f JOIN projects p ON p.id=f.project_id \
+         WHERE f.deleted_at IS NULL AND p.deleted_at IS NULL \
+           AND ($1::uuid IS NULL OR (f.org_id, f.id) > ($1, $2)) \
+           AND f.id<>ALL($3) AND (SELECT count(*) FROM file_versions v WHERE v.file_id=f.id)>1 \
+         ORDER BY f.org_id, f.id LIMIT $4",
+    )
+    .bind(after.map(|(org_id, _)| org_id))
+    .bind(after.map(|(_, file_id)| file_id))
+    .bind(exclude)
+    .bind(limit)
     .fetch_all(pool)
     .await?)
 }
@@ -479,7 +633,9 @@ impl OrgTx {
     pub async fn maint_trim_versions(
         &mut self,
         file_id: Uuid,
-        cutoff: OffsetDateTime,
+        policy: VersionThinningPolicy,
+        now: OffsetDateTime,
+        dry_run: bool,
     ) -> Result<u64, DbError> {
         let live: Option<(Option<Uuid>, bool, bool, Uuid)> = sqlx::query_as(
             "SELECT f.head_version_id, f.deleted_at IS NOT NULL, p.deleted_at IS NOT NULL, \
@@ -494,24 +650,31 @@ impl OrgTx {
         let Some((head, false, false, workspace_id)) = live else {
             return Ok(0);
         };
-        let old: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT v.id FROM file_versions v \
-             JOIN LATERAL (SELECT n.created_at FROM file_versions n \
-                           WHERE n.file_id = v.file_id AND n.number > v.number \
-                           ORDER BY n.number LIMIT 1) nx ON true \
-             WHERE v.file_id = $1 AND v.org_id = $2 AND v.id IS DISTINCT FROM $3 \
-               AND nx.created_at < $4 \
-               AND NOT EXISTS (SELECT 1 FROM figcraft_live_files l WHERE l.file_id=v.file_id \
-                               AND (l.published_from_version_id=v.id OR l.last_snapshot_version_id=v.id))",
+        let versions: Vec<RetentionVersion> = sqlx::query_as(
+            "SELECT v.id, v.number, v.created_at, v.pinned, \
+                (EXISTS (SELECT 1 FROM figcraft_live_files l WHERE l.file_id=v.file_id \
+                         AND (l.published_from_version_id=v.id OR l.last_snapshot_version_id=v.id)) \
+                 OR EXISTS (SELECT 1 FROM upload_sessions s WHERE s.file_id=v.file_id \
+                            AND s.org_id=v.org_id AND s.state IN ('created','receiving','stored') \
+                            AND s.expires_at > $3)) AS protected \
+             FROM file_versions v WHERE v.file_id=$1 AND v.org_id=$2 ORDER BY v.created_at, v.number, v.id",
         )
         .bind(file_id)
         .bind(self.org_id)
-        .bind(head)
-        .bind(cutoff)
+        .bind(now)
         .fetch_all(&mut *self.tx)
         .await?;
+        let keep = versions_to_keep(&versions, head, policy, now);
+        let old = versions
+            .iter()
+            .filter(|version| !keep.contains(&version.id))
+            .map(|version| version.id)
+            .collect::<Vec<_>>();
         if old.is_empty() {
             return Ok(0);
+        }
+        if dry_run {
+            return Ok(old.len() as u64);
         }
         sqlx::query(
             "UPDATE file_versions SET \
@@ -585,6 +748,7 @@ pub struct ArchiveClaim {
 }
 
 type ArchiveClaimRow = (String, Option<String>, Option<Vec<u8>>, i64, Vec<u8>);
+type ChunkArchiveClaimRow = (String, Option<String>, Option<Vec<u8>>, i64, Vec<u8>);
 type ArchiveRecallRow = (
     String,
     Option<String>,
@@ -613,6 +777,25 @@ pub struct ArchiveRecallClaim {
     pub claim_token: Uuid,
 }
 
+/// Chunk claimed for encrypted archive publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkArchiveClaim {
+    /// Stable chunk identity used as archive encryption AAD.
+    pub chunk_id: Uuid,
+    /// Local source object key.
+    pub object_key: String,
+    /// Persisted archive key from a previous attempt.
+    pub archive_object_key: Option<String>,
+    /// Persisted wrapped data key from a previous attempt.
+    pub archive_wrapped_key: Option<Vec<u8>>,
+    /// Plaintext size.
+    pub size_bytes: i64,
+    /// Plaintext SHA-256.
+    pub sha256: Vec<u8>,
+    /// Claim token fencing other workers.
+    pub claim_token: Uuid,
+}
+
 /// Result of finalizing a verified archive copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFinish {
@@ -624,7 +807,7 @@ pub enum ArchiveFinish {
     StaleClaim,
 }
 
-pub(crate) const ARCHIVE_DUE: &str = "NOT EXISTS ( \
+pub(crate) const ARCHIVE_DUE: &str = "b.layout = 'whole' AND NOT EXISTS ( \
     SELECT 1 FROM file_versions v \
     JOIN files f ON f.id = v.file_id AND f.org_id = v.org_id \
     LEFT JOIN LATERAL ( \
@@ -650,7 +833,7 @@ pub async fn archive_candidates(
 ) -> Result<Vec<(Uuid, Uuid)>, DbError> {
     Ok(sqlx::query_as(&format!(
         "SELECT b.org_id, b.id FROM blobs b \
-         WHERE b.state = 'committed' AND b.tier_state IN ('local', 'archiving') \
+         WHERE b.layout = 'whole' AND b.state = 'committed' AND b.tier_state IN ('local', 'archiving') \
            AND (b.archive_next_attempt_at IS NULL OR b.archive_next_attempt_at <= $2) \
            AND b.org_id = ANY($3) AND b.id <> ALL($4) AND {ARCHIVE_DUE} \
          ORDER BY b.created_at, b.id LIMIT $5"
@@ -659,6 +842,62 @@ pub async fn archive_candidates(
     .bind(now)
     .bind(orgs)
     .bind(exclude)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+const CHUNK_ARCHIVE_DUE: &str = "NOT EXISTS ( \
+    SELECT 1 FROM version_chunks vc \
+    JOIN file_versions v ON v.id = vc.version_id AND v.file_id = vc.file_id \
+    JOIN files f ON f.id = v.file_id AND f.org_id = v.org_id \
+    LEFT JOIN LATERAL (SELECT n.created_at FROM file_versions n \
+        WHERE n.file_id = v.file_id AND n.org_id = v.org_id AND n.number > v.number \
+        ORDER BY n.number LIMIT 1) nx ON true \
+    WHERE vc.chunk_id = c.id AND v.org_id = c.org_id \
+      AND (f.head_version_id = v.id OR nx.created_at IS NULL OR nx.created_at >= $1) \
+) AND EXISTS (SELECT 1 FROM version_chunks vc WHERE vc.chunk_id = c.id) \
+  AND NOT EXISTS (SELECT 1 FROM upload_chunks u WHERE u.chunk_id = c.id)";
+
+/// Chunks whose every version reference is superseded past the archive delay and no upload is using them.
+pub async fn archive_chunk_candidates(
+    pool: &PgPool,
+    cutoff: OffsetDateTime,
+    now: OffsetDateTime,
+    stale_before: OffsetDateTime,
+    orgs: &[Uuid],
+    limit: i64,
+) -> Result<Vec<(Uuid, Uuid)>, DbError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT c.org_id, c.id FROM chunks c \
+         WHERE c.state = 'committed' AND c.storage_tier IN ('local', 'archiving') \
+           AND (c.archive_next_attempt_at IS NULL OR c.archive_next_attempt_at <= $2) \
+           AND (c.storage_tier = 'local' OR c.archive_claimed_at <= $3) \
+           AND c.org_id = ANY($4) AND {CHUNK_ARCHIVE_DUE} \
+         ORDER BY c.created_at, c.id LIMIT $5"
+    ))
+    .bind(cutoff)
+    .bind(now)
+    .bind(stale_before)
+    .bind(orgs)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Local cleanup interrupted after a verified chunk archive copy committed.
+pub async fn pending_archive_chunk_local_deletes(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<(Uuid, Uuid, Uuid)>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT org_id, id, archive_claim_token FROM chunks WHERE storage_tier='archive' \
+         AND archive_local_delete_pending AND archive_claim_token IS NOT NULL \
+         AND (archive_next_attempt_at IS NULL OR archive_next_attempt_at <= $1) \
+         ORDER BY archive_next_attempt_at NULLS FIRST, archive_claimed_at, id LIMIT $2",
+    )
+    .bind(now)
     .bind(limit)
     .fetch_all(pool)
     .await?)
@@ -721,6 +960,15 @@ pub async fn has_nonlocal_archive(pool: &PgPool) -> Result<bool, DbError> {
 pub struct ArchiveBackupRef {
     /// Blob identity, retained even if its row is later removed.
     pub blob_id: Uuid,
+    /// Opaque archive provider key.
+    pub archive_object_key: String,
+}
+
+/// Archived chunk retained by a durable backup.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ArchiveChunkBackupRef {
+    /// Chunk identity, retained even if its row is later removed.
+    pub chunk_id: Uuid,
     /// Opaque archive provider key.
     pub archive_object_key: String,
 }
@@ -803,6 +1051,60 @@ pub async fn archive_backup_add_refs(
     Ok(())
 }
 
+/// Adds one bounded batch of archived-chunk pins to a backup registration.
+pub async fn archive_backup_add_chunk_refs(
+    pool: &PgPool,
+    backup_id: Uuid,
+    refs: &[ArchiveChunkBackupRef],
+) -> Result<(), DbError> {
+    let mut tx = pool.begin().await?;
+    let digest: Option<String> = sqlx::query_scalar(
+        "SELECT manifest_sha256 FROM archive_backups WHERE backup_id = $1 FOR UPDATE",
+    )
+    .bind(backup_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    for reference in refs {
+        if digest.is_none() {
+            sqlx::query(
+                "INSERT INTO archive_chunk_backup_refs (backup_id, chunk_id, archive_object_key) \
+                 VALUES ($1, $2, $3) ON CONFLICT (backup_id, chunk_id) DO NOTHING",
+            )
+            .bind(backup_id)
+            .bind(reference.chunk_id)
+            .bind(&reference.archive_object_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let stored: String = sqlx::query_scalar(
+            "SELECT archive_object_key FROM archive_chunk_backup_refs WHERE backup_id = $1 AND chunk_id = $2",
+        )
+        .bind(backup_id)
+        .bind(reference.chunk_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if stored != reference.archive_object_key {
+            tx.rollback().await?;
+            return Err(DbError::Internal);
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Lists pinned chunk objects for exact manifest comparison during backup verification and restore.
+pub async fn archive_backup_chunk_refs(
+    pool: &PgPool,
+    backup_id: Uuid,
+) -> Result<Vec<ArchiveChunkBackupRef>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT chunk_id, archive_object_key FROM archive_chunk_backup_refs WHERE backup_id = $1 ORDER BY chunk_id",
+    )
+    .bind(backup_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Finalizes a registered backup after its manifest and checksum are durable.
 pub async fn archive_backup_complete(
     pool: &PgPool,
@@ -814,7 +1116,8 @@ pub async fn archive_backup_complete(
     let done = sqlx::query(
         "UPDATE archive_backups SET manifest_sha256 = $2 \
          WHERE backup_id = $1 AND manifest_sha256 IS NULL \
-           AND (SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1) = $3",
+           AND ((SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1) + \
+                (SELECT count(*) FROM archive_chunk_backup_refs WHERE backup_id = $1)) = $3",
     )
     .bind(backup_id)
     .bind(manifest_sha256)
@@ -826,7 +1129,8 @@ pub async fn archive_backup_complete(
     }
     let same: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM archive_backups WHERE backup_id = $1 AND manifest_sha256 = $2) \
-         AND (SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1) = $3",
+         AND ((SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1) + \
+              (SELECT count(*) FROM archive_chunk_backup_refs WHERE backup_id = $1)) = $3",
     )
     .bind(backup_id)
     .bind(manifest_sha256)
@@ -869,7 +1173,7 @@ pub async fn archive_backup_release(
 ) -> Result<Option<u64>, DbError> {
     let mut tx = pool.begin().await?;
     let refs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1")
+        sqlx::query_scalar("SELECT (SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1) + (SELECT count(*) FROM archive_chunk_backup_refs WHERE backup_id = $1)")
             .bind(backup_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -909,7 +1213,7 @@ pub async fn archive_backup_abort_restore(
     let expected_refs = i64::try_from(expected_refs).map_err(|_| DbError::Internal)?;
     let mut tx = pool.begin().await?;
     let refs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1")
+        sqlx::query_scalar("SELECT (SELECT count(*) FROM archive_backup_refs WHERE backup_id = $1) + (SELECT count(*) FROM archive_chunk_backup_refs WHERE backup_id = $1)")
             .bind(backup_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -981,20 +1285,27 @@ pub async fn archive_status(
         .unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let query = format!(
         "SELECT \
-           COALESCE(sum(size_bytes) FILTER (WHERE state <> 'deleting' AND \
-             (tier_state IN ('local', 'archiving', 'recalling') OR archive_local_delete_pending)), 0)::bigint AS local_bytes, \
-           COALESCE(sum(size_bytes) FILTER (WHERE state <> 'deleting' AND archive_object_key IS NOT NULL \
-             AND archive_verified_at IS NOT NULL AND tier_state IN ('local', 'archiving', 'archived', 'recalling')), 0)::bigint AS archive_bytes, \
-           count(*) FILTER (WHERE state = 'committed' AND tier_state IN ('local', 'archiving') \
-             AND (archive_next_attempt_at IS NULL OR archive_next_attempt_at <= $2) AND {ARCHIVE_DUE})::bigint AS pending_archives, \
-           count(*) FILTER (WHERE archive_error_code IS NOT NULL)::bigint AS archive_errors, \
-           count(*) FILTER (WHERE archive_local_delete_pending OR (state = 'deleting' AND archive_delete_pending))::bigint AS pending_archive_deletes, \
-           count(*) FILTER (WHERE archive_local_delete_error_code IS NOT NULL OR archive_delete_error_code IS NOT NULL)::bigint AS archive_delete_errors, \
-           max(archive_verified_at) AS last_verified_at, \
+           (COALESCE(sum(size_bytes) FILTER (WHERE layout = 'whole' AND state <> 'deleting' AND \
+             (tier_state IN ('local', 'archiving', 'recalling') OR archive_local_delete_pending)), 0) + \
+             COALESCE((SELECT sum(size_bytes) FROM chunks WHERE state <> 'deleting' AND (storage_tier IN ('local','archiving') OR archive_local_delete_pending)), 0))::bigint AS local_bytes, \
+           (COALESCE(sum(size_bytes) FILTER (WHERE layout = 'whole' AND state <> 'deleting' AND archive_object_key IS NOT NULL \
+             AND archive_verified_at IS NOT NULL AND tier_state IN ('local', 'archiving', 'archived', 'recalling')), 0) + \
+             COALESCE((SELECT sum(size_bytes) FROM chunks WHERE state <> 'deleting' AND archive_object_key IS NOT NULL AND archive_verified_at IS NOT NULL AND storage_tier IN ('archiving','archive')), 0))::bigint AS archive_bytes, \
+           count(*) FILTER (WHERE layout = 'whole' AND state = 'committed' AND tier_state IN ('local', 'archiving') \
+             AND (archive_next_attempt_at IS NULL OR archive_next_attempt_at <= $2) AND {ARCHIVE_DUE}) + \
+           (SELECT count(*) FROM chunks c WHERE c.state = 'committed' AND c.storage_tier IN ('local','archiving') \
+             AND (c.archive_next_attempt_at IS NULL OR c.archive_next_attempt_at <= $2) AND {CHUNK_ARCHIVE_DUE})::bigint AS pending_archives, \
+           (count(*) FILTER (WHERE archive_error_code IS NOT NULL) + (SELECT count(*) FROM chunks WHERE archive_error_code IS NOT NULL))::bigint AS archive_errors, \
+           (count(*) FILTER (WHERE archive_local_delete_pending OR (state = 'deleting' AND archive_delete_pending)) + \
+             (SELECT count(*) FROM chunks WHERE archive_local_delete_pending))::bigint AS pending_archive_deletes, \
+           (count(*) FILTER (WHERE archive_local_delete_error_code IS NOT NULL OR archive_delete_error_code IS NOT NULL) + \
+             (SELECT count(*) FROM chunks WHERE archive_error_code IS NOT NULL AND archive_local_delete_pending))::bigint AS archive_delete_errors, \
+           GREATEST(max(archive_verified_at), (SELECT max(archive_verified_at) FROM chunks)) AS last_verified_at, \
            (SELECT error_code FROM ( \
               SELECT archive_error_code AS error_code, archive_error_at AS error_at FROM blobs WHERE archive_error_code IS NOT NULL \
               UNION ALL SELECT archive_local_delete_error_code, archive_local_delete_error_at FROM blobs WHERE archive_local_delete_error_code IS NOT NULL \
               UNION ALL SELECT archive_delete_error_code, archive_delete_error_at FROM blobs WHERE archive_delete_error_code IS NOT NULL \
+              UNION ALL SELECT archive_error_code, archive_verified_at FROM chunks WHERE archive_error_code IS NOT NULL \
            ) e ORDER BY error_at DESC NULLS LAST LIMIT 1) AS last_error_code \
          FROM blobs b"
     );
@@ -1020,7 +1331,7 @@ impl OrgTx {
         let row: Option<ArchiveClaimRow> = sqlx::query_as(&format!(
             "SELECT b.object_key, b.archive_object_key, b.archive_wrapped_key, \
                         b.size_bytes, b.sha256 \
-                 FROM blobs b WHERE b.id = $1 AND b.org_id = $2 AND b.state = 'committed' \
+                 FROM blobs b WHERE b.id = $1 AND b.org_id = $2 AND b.layout = 'whole' AND b.state = 'committed' \
                    AND (b.archive_next_attempt_at IS NULL OR b.archive_next_attempt_at <= $3) \
                    AND (b.tier_state = 'local' OR \
                         (b.tier_state = 'archiving' AND b.archive_claimed_at <= $4)) \
@@ -1204,6 +1515,145 @@ impl OrgTx {
         .bind(retry_at)
         .execute(&mut *self.tx)
         .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn maint_chunk_archive_claim(
+        &mut self,
+        chunk_id: Uuid,
+        cutoff: OffsetDateTime,
+        now: OffsetDateTime,
+        stale_before: OffsetDateTime,
+        claim_token: Uuid,
+    ) -> Result<Option<ChunkArchiveClaim>, DbError> {
+        let due = CHUNK_ARCHIVE_DUE.replace("$1", "$5");
+        let row: Option<ChunkArchiveClaimRow> = sqlx::query_as(&format!(
+            "SELECT c.object_key, c.archive_object_key, c.archive_wrapped_key, c.size_bytes, c.sha256 \
+             FROM chunks c WHERE c.id=$1 AND c.org_id=$2 AND c.state='committed' \
+               AND c.storage_tier IN ('local','archiving') \
+               AND (c.archive_next_attempt_at IS NULL OR c.archive_next_attempt_at <= $3) \
+               AND (c.storage_tier='local' OR c.archive_claimed_at <= $4) \
+               AND {due} FOR UPDATE OF c SKIP LOCKED"
+        ))
+        .bind(chunk_id).bind(self.org_id).bind(now).bind(stale_before).bind(cutoff)
+        .fetch_optional(&mut *self.tx).await?;
+        let Some((object_key, archive_object_key, archive_wrapped_key, size_bytes, sha256)) = row
+        else {
+            return Ok(None);
+        };
+        sqlx::query("UPDATE chunks SET storage_tier='archiving', archive_claim_token=$3, archive_claimed_at=$4, archive_error_code=NULL WHERE id=$1 AND org_id=$2")
+            .bind(chunk_id).bind(self.org_id).bind(claim_token).bind(now)
+            .execute(&mut *self.tx).await?;
+        Ok(Some(ChunkArchiveClaim {
+            chunk_id,
+            object_key,
+            archive_object_key,
+            archive_wrapped_key,
+            size_bytes,
+            sha256,
+            claim_token,
+        }))
+    }
+
+    pub async fn maint_chunk_archive_intent(
+        &mut self,
+        chunk_id: Uuid,
+        claim_token: Uuid,
+        key: &str,
+        envelope: &[u8],
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE chunks SET archive_object_key=$3, archive_wrapped_key=$4 WHERE id=$1 AND org_id=$2 AND storage_tier='archiving' AND archive_claim_token=$5 AND archive_object_key IS NULL AND archive_wrapped_key IS NULL")
+            .bind(chunk_id).bind(self.org_id).bind(key).bind(envelope).bind(claim_token)
+            .execute(&mut *self.tx).await?;
+        if result.rows_affected() == 1 {
+            return Ok(true);
+        }
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chunks WHERE id=$1 AND org_id=$2 AND storage_tier='archiving' AND archive_claim_token=$3 AND archive_object_key=$4 AND archive_wrapped_key=$5)")
+            .bind(chunk_id).bind(self.org_id).bind(claim_token).bind(key).bind(envelope)
+            .fetch_one(&mut *self.tx).await?)
+    }
+
+    pub async fn maint_chunk_archive_finish(
+        &mut self,
+        chunk_id: Uuid,
+        token: Uuid,
+        key: &str,
+        envelope: &[u8],
+        cutoff: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<ArchiveFinish, DbError> {
+        let row: Option<(String, Option<Uuid>)> = sqlx::query_as("SELECT storage_tier, archive_claim_token FROM chunks WHERE id=$1 AND org_id=$2 AND state='committed' FOR UPDATE")
+            .bind(chunk_id).bind(self.org_id).fetch_optional(&mut *self.tx).await?;
+        let Some((tier, claimed)) = row else {
+            return Ok(ArchiveFinish::StaleClaim);
+        };
+        if tier != "archiving" || claimed != Some(token) {
+            return Ok(ArchiveFinish::StaleClaim);
+        }
+        let due: bool = sqlx::query_scalar(&format!(
+            "SELECT {CHUNK_ARCHIVE_DUE} FROM chunks c WHERE c.id=$2 AND c.org_id=$3"
+        ))
+        .bind(cutoff)
+        .bind(chunk_id)
+        .bind(self.org_id)
+        .fetch_optional(&mut *self.tx)
+        .await?
+        .unwrap_or(false);
+        if !due {
+            sqlx::query("UPDATE chunks SET storage_tier='local', archive_claim_token=NULL, archive_claimed_at=NULL WHERE id=$1 AND org_id=$2")
+                .bind(chunk_id).bind(self.org_id).execute(&mut *self.tx).await?;
+            return Ok(ArchiveFinish::KeepLocal);
+        }
+        let done = sqlx::query("UPDATE chunks SET storage_tier='archive', archive_object_key=$3, archive_wrapped_key=$4, archive_verified_at=$5, archive_local_delete_pending=true, archive_error_code=NULL WHERE id=$1 AND org_id=$2 AND storage_tier='archiving' AND archive_claim_token=$6")
+            .bind(chunk_id).bind(self.org_id).bind(key).bind(envelope).bind(now).bind(token)
+            .execute(&mut *self.tx).await?;
+        Ok(if done.rows_affected() == 1 {
+            ArchiveFinish::Archived
+        } else {
+            ArchiveFinish::StaleClaim
+        })
+    }
+
+    pub async fn maint_chunk_archive_local_delete_target(
+        &mut self,
+        chunk_id: Uuid,
+        token: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT object_key FROM chunks c WHERE c.id=$1 AND c.org_id=$2 AND c.storage_tier='archive' AND c.archive_local_delete_pending AND c.archive_claim_token=$3 AND NOT EXISTS(SELECT 1 FROM version_chunks vc JOIN file_versions v ON v.id=vc.version_id JOIN files f ON f.id=v.file_id AND f.org_id=v.org_id WHERE vc.chunk_id=c.id AND f.head_version_id=v.id) AND NOT EXISTS(SELECT 1 FROM upload_chunks u WHERE u.chunk_id=c.id) FOR UPDATE")
+            .bind(chunk_id).bind(self.org_id).bind(token).fetch_optional(&mut *self.tx).await?)
+    }
+
+    pub async fn maint_chunk_archive_local_delete_finish(
+        &mut self,
+        chunk_id: Uuid,
+        token: Uuid,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query("UPDATE chunks SET archive_local_delete_pending=false, archive_claim_token=NULL, archive_claimed_at=NULL, archive_next_attempt_at=NULL WHERE id=$1 AND org_id=$2 AND storage_tier='archive' AND archive_local_delete_pending AND archive_claim_token=$3 AND NOT EXISTS(SELECT 1 FROM version_chunks vc JOIN file_versions v ON v.id=vc.version_id JOIN files f ON f.id=v.file_id AND f.org_id=v.org_id WHERE vc.chunk_id=chunks.id AND f.head_version_id=v.id) AND NOT EXISTS(SELECT 1 FROM upload_chunks u WHERE u.chunk_id=chunks.id)")
+            .bind(chunk_id).bind(self.org_id).bind(token).execute(&mut *self.tx).await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn maint_chunk_archive_local_delete_failed(
+        &mut self,
+        chunk_id: Uuid,
+        token: Uuid,
+        code: &str,
+        retry_at: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query("UPDATE chunks SET archive_error_code=$3, archive_next_attempt_at=$4 WHERE id=$1 AND org_id=$2 AND archive_local_delete_pending AND archive_claim_token=$5")
+            .bind(chunk_id).bind(self.org_id).bind(code).bind(retry_at).bind(token).execute(&mut *self.tx).await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    pub async fn maint_chunk_archive_retry(
+        &mut self,
+        chunk_id: Uuid,
+        token: Uuid,
+        code: &str,
+        retry_at: OffsetDateTime,
+    ) -> Result<bool, DbError> {
+        let done = sqlx::query("UPDATE chunks SET storage_tier='local', archive_claim_token=NULL, archive_claimed_at=NULL, archive_error_code=$3, archive_next_attempt_at=$4 WHERE id=$1 AND org_id=$2 AND storage_tier='archiving' AND archive_claim_token=$5")
+            .bind(chunk_id).bind(self.org_id).bind(code).bind(retry_at).bind(token).execute(&mut *self.tx).await?;
         Ok(done.rows_affected() == 1)
     }
 
@@ -1422,6 +1872,115 @@ pub async fn gc_deleting_targets(pool: &PgPool, limit: i64) -> Result<Vec<Deleti
     .bind(limit)
     .fetch_all(pool)
     .await?)
+}
+
+/// A chunk eligible for physical deletion, or already claimed by an earlier run.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DeletingChunk {
+    /// Organization id.
+    pub org_id: Uuid,
+    /// Chunk id.
+    pub id: Uuid,
+    /// Local object key.
+    pub object_key: String,
+    /// Archive copy to delete after local object removal.
+    pub archive_object_key: Option<String>,
+}
+
+/// Lists chunk objects whose durable deletion claim must be resumed.
+pub async fn gc_deleting_chunks(pool: &PgPool, limit: i64) -> Result<Vec<DeletingChunk>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT org_id, id, object_key, archive_object_key FROM chunks WHERE state = 'deleting' \
+         ORDER BY created_at, id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Lists unreferenced chunks old enough for GC.
+pub async fn gc_chunk_candidates(
+    pool: &PgPool,
+    created_before: OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<(Uuid, Uuid)>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT c.org_id, c.id FROM chunks c WHERE c.state = 'orphaned' \
+         AND c.created_at < $1 \
+         AND NOT EXISTS (SELECT 1 FROM version_chunks v WHERE v.chunk_id = c.id) \
+         AND NOT EXISTS (SELECT 1 FROM upload_chunks u WHERE u.chunk_id = c.id) \
+         AND NOT EXISTS (SELECT 1 FROM archive_chunk_backup_refs r WHERE r.chunk_id = c.id) \
+         ORDER BY c.created_at, c.id LIMIT $2",
+    )
+    .bind(created_before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// A claimed local chunk object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkGcClaim {
+    /// Object key.
+    pub object_key: String,
+    /// Archive copy, if this chunk was archived.
+    pub archive_object_key: Option<String>,
+}
+
+impl OrgTx {
+    /// Claims a chunk only while it has no upload or version references.
+    pub async fn maint_chunk_gc_claim(
+        &mut self,
+        chunk_id: Uuid,
+        created_before: OffsetDateTime,
+    ) -> Result<Option<ChunkGcClaim>, DbError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT object_key, archive_object_key FROM chunks c WHERE c.id = $1 AND c.org_id = $2 \
+             AND c.state = 'orphaned' AND c.created_at < $3 \
+             AND NOT EXISTS (SELECT 1 FROM version_chunks v WHERE v.chunk_id = c.id) \
+             AND NOT EXISTS (SELECT 1 FROM upload_chunks u WHERE u.chunk_id = c.id) \
+             AND NOT EXISTS (SELECT 1 FROM archive_chunk_backup_refs r WHERE r.chunk_id = c.id) \
+             AND (c.archive_object_key IS NULL OR (COALESCE((SELECT inventory_complete FROM archive_gc_state WHERE id), false) \
+                  AND NOT EXISTS (SELECT 1 FROM archive_chunk_backup_refs r WHERE r.chunk_id=c.id OR r.archive_object_key=c.archive_object_key))) \
+             FOR UPDATE SKIP LOCKED",
+        )
+        .bind(chunk_id)
+        .bind(self.org_id)
+        .bind(created_before)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        let Some((object_key, archive_object_key)) = row else {
+            return Ok(None);
+        };
+        sqlx::query("UPDATE chunks SET state = 'deleting' WHERE id = $1 AND org_id = $2")
+            .bind(chunk_id)
+            .bind(self.org_id)
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(Some(ChunkGcClaim {
+            object_key,
+            archive_object_key,
+        }))
+    }
+
+    /// Removes the metadata after local object deletion succeeded.
+    pub async fn maint_chunk_gc_finish(&mut self, chunk_id: Uuid) -> Result<bool, DbError> {
+        let deleted = sqlx::query(
+            "DELETE FROM chunks c WHERE c.id = $1 AND c.org_id = $2 AND c.state = 'deleting' \
+             AND NOT EXISTS (SELECT 1 FROM version_chunks v WHERE v.chunk_id = c.id) \
+             AND NOT EXISTS (SELECT 1 FROM upload_chunks u WHERE u.chunk_id = c.id) \
+             AND NOT EXISTS (SELECT 1 FROM archive_chunk_backup_refs r WHERE r.chunk_id = c.id) \
+             AND (c.archive_object_key IS NULL OR (COALESCE((SELECT inventory_complete FROM archive_gc_state WHERE id), false) \
+                  AND NOT EXISTS (SELECT 1 FROM archive_chunk_backup_refs r WHERE r.chunk_id=c.id OR r.archive_object_key=c.archive_object_key)))",
+        )
+        .bind(chunk_id)
+        .bind(self.org_id)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected()
+            == 1;
+        Ok(deleted)
+    }
 }
 
 /// Phase 2 of the garbage collection, after the object is gone: deletes the
@@ -1706,11 +2265,13 @@ impl OrgTx {
 ///
 /// Database failures only.
 pub async fn known_object_keys(pool: &PgPool, keys: &[String]) -> Result<HashSet<String>, DbError> {
-    let found: Vec<String> =
-        sqlx::query_scalar("SELECT object_key FROM blobs WHERE object_key = ANY($1)")
-            .bind(keys)
-            .fetch_all(pool)
-            .await?;
+    let found: Vec<String> = sqlx::query_scalar(
+        "SELECT object_key FROM blobs WHERE layout = 'whole' AND object_key = ANY($1) \
+         UNION SELECT object_key FROM chunks WHERE object_key = ANY($1)",
+    )
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
     Ok(found.into_iter().collect())
 }
 
@@ -1727,6 +2288,12 @@ pub struct VerifyCandidate {
     pub sha256: Vec<u8>,
     /// `committed` or `corrupt`.
     pub state: String,
+    /// `whole` or `chunked`.
+    pub layout: String,
+    /// A representative file mapping for chunked verification.
+    pub file_id: Option<Uuid>,
+    /// A representative version mapping for chunked verification.
+    pub version_id: Option<Uuid>,
 }
 
 /// The committed and corrupt blobs that were verified longest ago (never
@@ -1737,11 +2304,43 @@ pub struct VerifyCandidate {
 /// Database failures only.
 pub async fn verify_candidates(pool: &PgPool, limit: i64) -> Result<Vec<VerifyCandidate>, DbError> {
     Ok(sqlx::query_as(
-        "SELECT id, object_key, size_bytes, sha256, state FROM blobs \
-         WHERE state IN ('committed', 'corrupt') AND tier_state IN ('local', 'archiving') \
-         ORDER BY verified_at NULLS FIRST, created_at, id LIMIT $1",
+        "SELECT b.id, b.object_key, b.size_bytes, b.sha256, b.state, b.layout, \
+                mapping.file_id, mapping.version_id \
+         FROM blobs b LEFT JOIN LATERAL ( \
+             SELECT file_id, id AS version_id FROM file_versions WHERE blob_id=b.id \
+             ORDER BY created_at, id LIMIT 1 \
+         ) mapping ON true \
+         WHERE b.state IN ('committed', 'corrupt') AND b.tier_state IN ('local', 'archiving') \
+           AND (b.layout = 'whole' OR (b.layout = 'chunked' AND mapping.version_id IS NOT NULL \
+             AND NOT EXISTS (SELECT 1 FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+                             WHERE vc.version_id=mapping.version_id AND c.storage_tier='archive'))) \
+         ORDER BY b.verified_at NULLS FIRST, b.created_at, b.id LIMIT $1",
     )
     .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Loads the bounded per-file manifest for one maintenance verification candidate.
+/// Candidate identifiers originate from `verify_candidates`; this path is only
+/// used by the global maintenance runner and deliberately has no user scope.
+pub async fn verify_candidate_chunks(
+    pool: &PgPool,
+    blob_id: Uuid,
+    file_id: Uuid,
+    version_id: Uuid,
+) -> Result<Vec<crate::versions::DownloadChunk>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT c.id AS chunk_id, vc.ordinal, vc.byte_offset, c.object_key, c.size_bytes, \
+                c.digest, c.sha256, vc.file_id, c.storage_tier, c.archive_object_key, \
+                c.archive_wrapped_key \
+         FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+         JOIN file_versions v ON v.id=vc.version_id AND v.file_id=vc.file_id \
+         WHERE v.id=$1 AND v.file_id=$2 AND v.blob_id=$3 ORDER BY vc.ordinal",
+    )
+    .bind(version_id)
+    .bind(file_id)
+    .bind(blob_id)
     .fetch_all(pool)
     .await?)
 }
@@ -2374,4 +2973,265 @@ pub async fn last_run(pool: &PgPool) -> Result<Option<RunRecord>, DbError> {
     )
     .fetch_optional(pool)
     .await?)
+}
+
+#[cfg(test)]
+mod thinning_tests {
+    use super::*;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_794_012_000).unwrap()
+    }
+
+    fn version(number: i64, created_at: OffsetDateTime) -> RetentionVersion {
+        RetentionVersion {
+            id: Uuid::from_u128(number as u128),
+            number,
+            created_at,
+            pinned: false,
+            protected: false,
+        }
+    }
+
+    fn defaults() -> VersionThinningPolicy {
+        VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 24,
+            daily_days: 7,
+            weekly_weeks: 4,
+            max_per_file: 0,
+        }
+    }
+
+    #[test]
+    fn empty_and_head_only_files_are_safe() {
+        assert!(versions_to_keep(&[], None, defaults(), now()).is_empty());
+        let head = version(1, now());
+        assert_eq!(
+            versions_to_keep(&[head], Some(head.id), defaults(), now()),
+            HashSet::from([head.id])
+        );
+    }
+
+    #[test]
+    fn hourly_versions_over_sixty_days_fit_default_grid() {
+        let now = now();
+        let versions = (0..1_440)
+            .map(|age| {
+                version(
+                    i64::from(age + 1),
+                    now - time::Duration::hours(i64::from(age)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let head = versions.first().unwrap().id;
+        let kept = versions_to_keep(&versions, Some(head), defaults(), now);
+        assert!(kept.len() <= 36, "kept {} versions", kept.len());
+        assert!(kept.contains(&head));
+        let hundred = (0..100)
+            .map(|index| {
+                version(
+                    i64::from(index + 1),
+                    now - time::Duration::hours(i64::from(index) * 14),
+                )
+            })
+            .collect::<Vec<_>>();
+        let hundred_head = hundred.first().unwrap().id;
+        let hundred_kept = versions_to_keep(&hundred, Some(hundred_head), defaults(), now);
+        assert!(hundred_kept.contains(&hundred_head));
+        assert!(
+            hundred_kept
+                .iter()
+                .all(|id| hundred.iter().any(|version| version.id == *id))
+        );
+    }
+
+    #[test]
+    fn daily_sampling_uses_utc_calendar_boundaries_and_latest_tie_break() {
+        let now = now();
+        let midnight = now.date().with_hms(0, 0, 0).unwrap().assume_utc();
+        let versions = vec![
+            version(1, midnight - time::Duration::minutes(1)),
+            version(2, midnight + time::Duration::minutes(30)),
+            version(3, midnight + time::Duration::minutes(30)),
+        ];
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 1,
+            weekly_weeks: 0,
+            max_per_file: 0,
+        };
+        assert_eq!(
+            versions_to_keep(&versions, None, policy, now),
+            HashSet::from([versions[2].id])
+        );
+    }
+
+    #[test]
+    fn weekly_sampling_handles_iso_year_change() {
+        let now = Date::from_calendar_date(2024, time::Month::January, 1)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let versions = vec![
+            version(
+                1,
+                Date::from_calendar_date(2023, time::Month::December, 28)
+                    .unwrap()
+                    .midnight()
+                    .assume_utc(),
+            ),
+            version(2, now),
+        ];
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 0,
+            weekly_weeks: 2,
+            max_per_file: 0,
+        };
+        assert_eq!(
+            versions_to_keep(&versions, None, policy, now),
+            HashSet::from([versions[0].id, versions[1].id])
+        );
+    }
+
+    #[test]
+    fn weekly_sampling_handles_leap_day() {
+        let leap = Date::from_calendar_date(2024, time::Month::February, 29)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let versions = vec![version(1, leap - time::Duration::days(7)), version(2, leap)];
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 0,
+            weekly_weeks: 2,
+            max_per_file: 0,
+        };
+        let kept = versions_to_keep(&versions, None, policy, leap + time::Duration::hours(1));
+        assert_eq!(kept, HashSet::from([versions[0].id, versions[1].id]));
+    }
+
+    #[test]
+    fn zero_grid_disables_sampling_and_head_remains() {
+        let now = now();
+        let versions = vec![version(1, now - time::Duration::days(2)), version(2, now)];
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 0,
+            weekly_weeks: 0,
+            max_per_file: 0,
+        };
+        assert_eq!(
+            versions_to_keep(&versions, Some(versions[1].id), policy, now),
+            HashSet::from([versions[0].id, versions[1].id])
+        );
+    }
+
+    #[test]
+    fn zero_grid_successor_uses_version_number_order() {
+        let now = now();
+        let versions = vec![
+            version(1, now - time::Duration::days(40)),
+            version(2, now - time::Duration::days(10)),
+            version(3, now - time::Duration::days(50)),
+        ];
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 0,
+            weekly_weeks: 0,
+            max_per_file: 0,
+        };
+        assert_eq!(
+            versions_to_keep(&versions, None, policy, now),
+            HashSet::from([versions[0].id]),
+        );
+    }
+
+    #[test]
+    fn hundred_thousand_versions_apply_cap_in_one_history_pass() {
+        let now = now();
+        let versions = (0..100_000)
+            .map(|index| {
+                version(
+                    i64::from(index + 1),
+                    now - time::Duration::seconds(i64::from(100_000 - index)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let head = versions.last().unwrap().id;
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 24,
+            daily_days: 7,
+            weekly_weeks: 4,
+            max_per_file: 2,
+        };
+        let kept = versions_to_keep(&versions, Some(head), policy, now);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&head));
+    }
+
+    #[test]
+    fn cap_keeps_head_and_oldest_pins_do_not_count() {
+        let now = now();
+        let mut versions = (0..8)
+            .map(|n| version(n + 1, now - time::Duration::days(8 - n)))
+            .collect::<Vec<_>>();
+        versions[0].pinned = true;
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 0,
+            weekly_weeks: 0,
+            max_per_file: 2,
+        };
+        let kept = versions_to_keep(&versions, Some(versions[7].id), policy, now);
+        assert_eq!(
+            kept,
+            HashSet::from([versions[0].id, versions[6].id, versions[7].id])
+        );
+    }
+
+    #[test]
+    fn published_and_upload_protected_versions_survive_the_cap() {
+        let now = now();
+        let mut versions = (0..5)
+            .map(|n| version(n + 1, now - time::Duration::days(5 - n)))
+            .collect::<Vec<_>>();
+        versions[1].protected = true;
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 0,
+            weekly_weeks: 0,
+            max_per_file: 2,
+        };
+        let kept = versions_to_keep(&versions, Some(versions[4].id), policy, now);
+        assert!(kept.contains(&versions[1].id));
+        assert!(kept.contains(&versions[4].id));
+    }
+
+    #[test]
+    fn version_created_after_the_maintenance_clock_is_preserved() {
+        let now = now();
+        let versions = vec![
+            version(1, now - time::Duration::days(40)),
+            version(2, now + time::Duration::seconds(1)),
+        ];
+        let policy = VersionThinningPolicy {
+            retention_days: 30,
+            keep_all_hours: 0,
+            daily_days: 1,
+            weekly_weeks: 0,
+            max_per_file: 2,
+        };
+        let kept = versions_to_keep(&versions, None, policy, now);
+        assert_eq!(kept, HashSet::from([versions[1].id]));
+    }
 }

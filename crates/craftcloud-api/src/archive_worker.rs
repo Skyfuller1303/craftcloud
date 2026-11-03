@@ -109,7 +109,7 @@ pub async fn archive_batch_with_verify_budget<S: ObjectStore>(
     archive_after: Duration,
     verify_budget: ArchiveVerifyBudget,
 ) -> Result<ArchiveBatch, DbError> {
-    let Some(_run_lock) = db_maintenance::try_lock(pool).await? else {
+    let Some(run_lock) = db_maintenance::try_lock(pool).await? else {
         return Ok(ArchiveBatch::default());
     };
     let seconds = i64::try_from(archive_after.as_secs()).unwrap_or(i64::MAX);
@@ -154,10 +154,26 @@ pub async fn archive_batch_with_verify_budget<S: ObjectStore>(
     }
     let candidates =
         db_maintenance::archive_candidates(pool, cutoff, now, &orgs, &[], CANDIDATE_LIMIT).await?;
+    let chunk_candidates = db_maintenance::archive_chunk_candidates(
+        pool,
+        cutoff,
+        now,
+        stale_before,
+        &orgs,
+        CANDIDATE_LIMIT,
+    )
+    .await?;
     let mut report = ArchiveBatch::default();
     let pending = db_maintenance::pending_archive_local_deletes(pool, now, CANDIDATE_LIMIT).await?;
     for (org_id, blob_id, claim_token) in pending {
         if complete_local_delete(pool, local, org_id, blob_id, claim_token, now).await? {
+            report.archived += 1;
+        }
+    }
+    for (org_id, chunk_id, claim_token) in
+        db_maintenance::pending_archive_chunk_local_deletes(pool, now, CANDIDATE_LIMIT).await?
+    {
+        if complete_chunk_local_delete(pool, local, org_id, chunk_id, claim_token, now).await? {
             report.archived += 1;
         }
     }
@@ -169,7 +185,17 @@ pub async fn archive_batch_with_verify_budget<S: ObjectStore>(
             WorkResult::Skipped => {}
         }
     }
-    drop(_run_lock);
+    for (org_id, chunk_id) in chunk_candidates {
+        report.attempted += 1;
+        match archive_chunk_one(pool, local, archive, crypto, org_id, chunk_id, cutoff, now).await?
+        {
+            WorkResult::Archived => report.archived += 1,
+            WorkResult::Retried => report.retried += 1,
+            WorkResult::Skipped => {}
+        }
+    }
+    // Complete the database unlock before another batch can retry immediately.
+    run_lock.release().await?;
     verify_archive_sample(pool, archive, crypto, now, verify_budget).await?;
     Ok(report)
 }
@@ -687,6 +713,205 @@ async fn complete_local_delete(
     }
     tx.commit().await?;
     Ok(true)
+}
+
+// Mirrors `archive_one`: this is one bounded archive transaction with distinct
+// chunk identity, local/remote stores, crypto and lease timing inputs.
+#[allow(clippy::too_many_arguments)]
+async fn archive_chunk_one<S: ObjectStore>(
+    pool: &PgPool,
+    local: &LocalStore,
+    archive: &S,
+    crypto: &ArchiveCrypto,
+    org_id: Uuid,
+    chunk_id: Uuid,
+    cutoff: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<WorkResult, DbError> {
+    let token = Uuid::new_v4();
+    let stale_before = now
+        .checked_sub(time::Duration::minutes(15))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let Some(mut tx) = OrgTx::begin(pool, org_id).await? else {
+        return Ok(WorkResult::Skipped);
+    };
+    let Some(claim) = tx
+        .maint_chunk_archive_claim(chunk_id, cutoff, now, stale_before, token)
+        .await?
+    else {
+        tx.commit().await?;
+        return Ok(WorkResult::Skipped);
+    };
+    tx.commit().await?;
+    let (Ok(local_key), Ok(size), Ok(expected_sha)) = (
+        ObjectKey::parse(&claim.object_key),
+        u64::try_from(claim.size_bytes),
+        <[u8; 32]>::try_from(claim.sha256.as_slice()),
+    ) else {
+        retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_CHUNK").await?;
+        return Ok(WorkResult::Retried);
+    };
+    let intent = match (&claim.archive_object_key, &claim.archive_wrapped_key) {
+        (None, None) => {
+            let key = ObjectKey::generate();
+            let (envelope, _) = match crypto.create_data_key(chunk_id, size) {
+                Ok(value) => value,
+                Err(_) => {
+                    retry_chunk(pool, org_id, chunk_id, token, now, "CRYPTO_FAILED").await?;
+                    return Ok(WorkResult::Retried);
+                }
+            };
+            let Some(mut tx) = OrgTx::begin(pool, org_id).await? else {
+                return Ok(WorkResult::Skipped);
+            };
+            let saved = tx
+                .maint_chunk_archive_intent(chunk_id, token, key.as_str(), &envelope.to_bytes())
+                .await?;
+            tx.commit().await?;
+            if !saved {
+                return Ok(WorkResult::Skipped);
+            }
+            Ok((key, envelope))
+        }
+        (Some(key), Some(wrapped)) => {
+            match (ObjectKey::parse(key), WrappedDataKey::from_bytes(wrapped)) {
+                (Ok(key), Ok(envelope)) => Ok((key, envelope)),
+                _ => Err(()),
+            }
+        }
+        _ => Err(()),
+    };
+    let (archive_key, envelope) = match intent {
+        Ok(intent) => intent,
+        Err(()) => {
+            retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_ARCHIVE_INTENT").await?;
+            return Ok(WorkResult::Retried);
+        }
+    };
+    let uploaded = crate::archive_transport::upload_intent_verified(
+        local,
+        archive,
+        crypto,
+        chunk_id,
+        &local_key,
+        &archive_key,
+        &envelope,
+        size,
+        &expected_sha,
+    )
+    .await;
+    let copy = match uploaded {
+        Ok(copy) => copy,
+        Err(error) => {
+            let code = match error {
+                crate::archive_transport::ArchiveTransportError::Integrity => "INTEGRITY_FAILED",
+                crate::archive_transport::ArchiveTransportError::Crypto(_) => "CRYPTO_FAILED",
+                crate::archive_transport::ArchiveTransportError::Storage(_) => "STORAGE_FAILED",
+            };
+            retry_chunk(pool, org_id, chunk_id, token, now, code).await?;
+            return Ok(WorkResult::Retried);
+        }
+    };
+    let Some(mut tx) = OrgTx::begin(pool, org_id).await? else {
+        return Ok(WorkResult::Skipped);
+    };
+    let finished = tx
+        .maint_chunk_archive_finish(
+            chunk_id,
+            token,
+            copy.object_key.as_str(),
+            &copy.envelope.to_bytes(),
+            cutoff,
+            now,
+        )
+        .await?;
+    tx.commit().await?;
+    if finished != db_maintenance::ArchiveFinish::Archived {
+        return Ok(WorkResult::Skipped);
+    }
+    craftcloud_storage::crash_point("archive-chunk-db-committed", 0);
+    if complete_chunk_local_delete(pool, local, org_id, chunk_id, token, now).await? {
+        Ok(WorkResult::Archived)
+    } else {
+        Ok(WorkResult::Skipped)
+    }
+}
+
+async fn complete_chunk_local_delete(
+    pool: &PgPool,
+    local: &LocalStore,
+    org_id: Uuid,
+    chunk_id: Uuid,
+    token: Uuid,
+    now: OffsetDateTime,
+) -> Result<bool, DbError> {
+    let Some(mut tx) = OrgTx::begin(pool, org_id).await? else {
+        return Ok(false);
+    };
+    let target = tx
+        .maint_chunk_archive_local_delete_target(chunk_id, token)
+        .await?;
+    let Some(target) = target else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    let key = match ObjectKey::parse(&target) {
+        Ok(key) => key,
+        Err(_) => {
+            let retry_at = now.checked_add(time::Duration::minutes(5)).unwrap_or(now);
+            tx.maint_chunk_archive_local_delete_failed(
+                chunk_id,
+                token,
+                "INVALID_LOCAL_KEY",
+                retry_at,
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
+    };
+    if !matches!(
+        local.delete(&key).await,
+        Ok(()) | Err(StorageError::NotFound)
+    ) {
+        let retry_at = now.checked_add(time::Duration::minutes(5)).unwrap_or(now);
+        tx.maint_chunk_archive_local_delete_failed(
+            chunk_id,
+            token,
+            "LOCAL_DELETE_FAILED",
+            retry_at,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    craftcloud_storage::crash_point("archive-chunk-local-deleted", 0);
+    if !tx
+        .maint_chunk_archive_local_delete_finish(chunk_id, token)
+        .await?
+    {
+        return Err(DbError::Internal);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+async fn retry_chunk(
+    pool: &PgPool,
+    org_id: Uuid,
+    chunk_id: Uuid,
+    token: Uuid,
+    now: OffsetDateTime,
+    code: &str,
+) -> Result<(), DbError> {
+    let Some(mut tx) = OrgTx::begin(pool, org_id).await? else {
+        return Ok(());
+    };
+    let retry_at = now.checked_add(time::Duration::minutes(1)).unwrap_or(now);
+    let _ = tx
+        .maint_chunk_archive_retry(chunk_id, token, code, retry_at)
+        .await?;
+    tx.commit().await
 }
 
 #[allow(clippy::too_many_arguments)]

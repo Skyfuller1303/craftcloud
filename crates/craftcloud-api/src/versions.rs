@@ -24,8 +24,10 @@ use axum::{
 };
 use base64::Engine as _;
 use craftcloud_core::policy::Action;
+use craftcloud_db::members::OrgTx;
 use craftcloud_db::versions::{
-    self, CommitOutcome, DownloadInfo, DownloadTarget, FileVersion, Precondition, RestoreOutcome,
+    self, CommitOutcome, DownloadChunk, DownloadInfo, DownloadTarget, FileVersion, Precondition,
+    RestoreOutcome,
 };
 use craftcloud_db::{OrgScope, files, uploads};
 use craftcloud_storage::{ByteRange, ObjectKey, ObjectStore, ReadSource, StorageError, WriteSink};
@@ -72,6 +74,7 @@ pub(crate) fn version_json(v: &FileVersion) -> Value {
         "created_by": v.created_by_user_id.to_string(),
         "actor_kind": v.actor_kind,
         "storage_tier": v.storage_tier,
+        "pinned": v.pinned,
         "created_at": rfc3339(v.created_at),
     })
 }
@@ -144,6 +147,78 @@ fn optional_precondition(headers: &HeaderMap) -> Result<Option<Precondition>, Bo
 /// The precondition of a request that cannot go on without one.
 fn required_precondition(headers: &HeaderMap) -> Result<Precondition, Box<Response>> {
     optional_precondition(headers)?.ok_or_else(|| Box::new(precondition_required(headers)))
+}
+
+fn same_manifest_refs(
+    expected: &[craftcloud_db::uploads::ChunkManifestRow],
+    current: &[craftcloud_db::uploads::ChunkManifestRow],
+) -> bool {
+    expected.len() == current.len()
+        && expected.iter().zip(current).all(|(before, after)| {
+            before.ordinal == after.ordinal
+                && before.byte_offset == after.byte_offset
+                && before.size_bytes == after.size_bytes
+                && before.sha256 == after.sha256
+                && before.digest == after.digest
+                && before.chunk_id == after.chunk_id
+        })
+}
+
+/// Verifies every pinned block and the assembled file digest with bounded
+/// memory. Call before reacquiring the organization write lock.
+async fn verify_chunked_manifest(
+    store: &craftcloud_storage::LocalStore,
+    rows: &[craftcloud_db::uploads::ChunkManifestRow],
+    expected_size: i64,
+    expected_sha256: &[u8; 32],
+) -> Result<bool, StorageError> {
+    let mut total = 0i64;
+    let mut whole = Sha256::new();
+    for (expected_ordinal, row) in rows.iter().enumerate() {
+        if row.ordinal != i32::try_from(expected_ordinal).unwrap_or(-1)
+            || row.byte_offset != total
+            || row.chunk_id.is_none()
+            || row.storage_tier.as_deref() != Some("local")
+        {
+            return Ok(false);
+        }
+        let size = u64::try_from(row.size_bytes).map_err(|_| StorageError::LengthMismatch)?;
+        let Some(raw_key) = row.object_key.as_deref() else {
+            return Ok(false);
+        };
+        let key = ObjectKey::parse(raw_key).map_err(|_| StorageError::NotFound)?;
+        let expected_chunk_sha: [u8; 32] = row
+            .sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| StorageError::ChecksumMismatch)?;
+        let head = store.head(&key).await?;
+        if head.len != size {
+            return Ok(false);
+        }
+        let mut reader = store.open_read(&key, None).await?;
+        if reader.remaining() != size {
+            return Ok(false);
+        }
+        let mut chunk_hash = Sha256::new();
+        let mut chunk_size = 0u64;
+        while let Some(bytes) = reader.next_chunk().await? {
+            chunk_size = chunk_size
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| StorageError::TooLarge)?)
+                .ok_or(StorageError::TooLarge)?;
+            chunk_hash.update(&bytes);
+            whole.update(&bytes);
+        }
+        let actual_chunk_sha: [u8; 32] = chunk_hash.finalize().into();
+        if chunk_size != size || actual_chunk_sha != expected_chunk_sha {
+            return Ok(false);
+        }
+        total = total
+            .checked_add(row.size_bytes)
+            .ok_or(StorageError::TooLarge)?;
+    }
+    let actual_whole_sha: [u8; 32] = whole.finalize().into();
+    Ok(total == expected_size && &actual_whole_sha == expected_sha256)
 }
 
 async fn resolve_file(
@@ -248,7 +323,10 @@ pub(crate) async fn commit_version(
     };
     // An Idempotency-Key, if sent, must be the one the upload was created with.
     if let Some(sent) = headers.get("idempotency-key") {
-        match tx.upload_get(&scope, upload_id).await {
+        match tx
+            .upload_get(&scope, upload_id, Action::VersionCommit)
+            .await
+        {
             Ok(Some(upload)) => {
                 if sent.to_str().ok() != upload.idempotency_key.as_deref() {
                     return conflict(
@@ -263,8 +341,172 @@ pub(crate) async fn commit_version(
         }
     }
     let now = services.clock.now();
+    let chunk_manifest = match tx
+        .upload_manifest_rows(&scope, upload_id, Action::VersionCommit)
+        .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+    };
+    let (mut tx, scope, commit_now) = if let Some(manifest) = chunk_manifest {
+        let upload = match tx
+            .upload_get(&scope, upload_id, Action::VersionCommit)
+            .await
+        {
+            Ok(Some(upload)) => upload,
+            Ok(None) => return not_found(&headers),
+            Err(error) => return db_failure(&error, &headers, "upload read failed"),
+        };
+        if upload.state != "committed" && pre.is_none() {
+            return precondition_required(&headers);
+        }
+        if matches!(upload.state.as_str(), "created" | "stored") {
+            if manifest.iter().any(|entry| entry.chunk_id.is_none()) {
+                return conflict(
+                    "UPLOAD_INCOMPLETE",
+                    "Upload every missing block before committing this version.",
+                    &headers,
+                );
+            }
+            if let Err(error) = tx.commit().await {
+                return db_failure(&error, &headers, "upload verification start failed");
+            }
+            let Some(store) = services.storage.as_ref() else {
+                return unavailable(&headers, "STORAGE_UNAVAILABLE");
+            };
+            let expected_sha: [u8; 32] = match upload.declared_sha256.as_slice().try_into() {
+                Ok(digest) => digest,
+                Err(_) => return internal(&headers),
+            };
+            match verify_chunked_manifest(store, &manifest, upload.declared_size, &expected_sha)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return error_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "CHECKSUM_MISMATCH",
+                        "The assembled upload does not match the declared SHA-256.",
+                        &headers,
+                    );
+                }
+                Err(error) => return local_write_error(error, &headers),
+            }
+            let (mut fresh_tx, fresh_scope) = match upload_write_gate(
+                &upload_resolved,
+                &session,
+                &headers,
+                Action::VersionCommit,
+                "version.commit",
+                creator,
+                upload_file_id,
+            )
+            .await
+            {
+                Ok(opened) => opened,
+                Err(response) => return *response,
+            };
+            let current = match fresh_tx
+                .upload_manifest_rows(&fresh_scope, upload_id, Action::VersionCommit)
+                .await
+            {
+                Ok(Some(rows)) => rows,
+                Ok(None) => {
+                    return conflict("UPLOAD_CHANGED", "The upload manifest changed.", &headers);
+                }
+                Err(error) => return db_failure(&error, &headers, "upload manifest read failed"),
+            };
+            if !same_manifest_refs(&manifest, &current) {
+                return conflict(
+                    "UPLOAD_CHANGED",
+                    "The upload blocks changed during verification; retry the commit.",
+                    &headers,
+                );
+            }
+            let fresh_now = services.clock.now();
+            if !matches!(
+                fresh_tx
+                    .session_valid(
+                        session.session_id,
+                        session.user_id,
+                        fresh_now,
+                        session.credential_kind == crate::session::CredentialKind::Device,
+                    )
+                    .await,
+                Ok(true)
+            ) {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHENTICATED",
+                    "Authentication is required.",
+                    &headers,
+                );
+            }
+            if upload.state == "created" {
+                let staged_key = ObjectKey::generate();
+                match fresh_tx
+                    .upload_store_chunk_manifest(
+                        &fresh_scope,
+                        upload_id,
+                        staged_key.as_str(),
+                        fresh_now,
+                    )
+                    .await
+                {
+                    Ok(craftcloud_db::uploads::StoreOutcome::Stored(_, _)) => {}
+                    Ok(craftcloud_db::uploads::StoreOutcome::NotReceiving(state))
+                        if state == "expired" =>
+                    {
+                        let _ = fresh_tx.commit().await;
+                        return error_response(
+                            StatusCode::GONE,
+                            "UPLOAD_EXPIRED",
+                            "The upload session has expired; create a new one.",
+                            &headers,
+                        );
+                    }
+                    Ok(craftcloud_db::uploads::StoreOutcome::NotReceiving(state))
+                        if state == "created" =>
+                    {
+                        return conflict(
+                            "UPLOAD_INCOMPLETE",
+                            "Upload every missing block before committing this version.",
+                            &headers,
+                        );
+                    }
+                    Ok(craftcloud_db::uploads::StoreOutcome::NotReceiving(_)) => {
+                        return conflict(
+                            "UPLOAD_CLOSED",
+                            "This upload cannot be committed.",
+                            &headers,
+                        );
+                    }
+                    Ok(craftcloud_db::uploads::StoreOutcome::Gone) => return not_found(&headers),
+                    Ok(craftcloud_db::uploads::StoreOutcome::FileDeleted) => {
+                        return file_deleted(&headers);
+                    }
+                    Ok(craftcloud_db::uploads::StoreOutcome::ProjectDeleted) => {
+                        return project_deleted(&headers);
+                    }
+                    Err(error) => return db_failure(&error, &headers, "upload staging failed"),
+                }
+            }
+            (fresh_tx, fresh_scope, fresh_now)
+        } else {
+            (tx, scope, now)
+        }
+    } else {
+        (tx, scope, now)
+    };
     let outcome = match tx
-        .version_commit(&scope, resolved.id, upload_id, session.user_id, pre, now)
+        .version_commit(
+            &scope,
+            resolved.id,
+            upload_id,
+            session.user_id,
+            pre,
+            commit_now,
+        )
         .await
     {
         Ok(outcome) => outcome,
@@ -428,6 +670,75 @@ pub(crate) async fn get_version(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PinVersionRequest {
+    pinned: bool,
+}
+
+pub(crate) async fn pin_version(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    session: AuthenticatedSession,
+    Path((file_raw, version_raw)): Path<(String, String)>,
+    body: Result<Json<PinVersionRequest>, JsonRejection>,
+) -> Response {
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(error) => return rejection_response(&error, &headers),
+    };
+    let resolved = match resolve_file(&state, &headers, &file_raw).await {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    let Some(version_id) = parse_id(&version_raw) else {
+        return not_found(&headers);
+    };
+    let (mut tx, scope) = match write_gate(
+        &resolved,
+        &session,
+        &headers,
+        Action::VersionPin,
+        if request.pinned {
+            "version.pin"
+        } else {
+            "version.unpin"
+        },
+        resolved.id,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(response) => return *response,
+    };
+    let outcome = match tx
+        .version_pin(
+            &scope,
+            resolved.id,
+            version_id,
+            request.pinned,
+            &audit_ctx(&headers, Some(session.user_id)),
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return db_failure(&error, &headers, "version pin failed"),
+    };
+    if let Err(error) = tx.commit().await {
+        return db_failure(&error, &headers, "version pin failed");
+    }
+    match outcome {
+        Some(_) => {
+            match versions::get(&resolved.services.pool, &scope, resolved.id, version_id).await {
+                Ok(Some(version)) => version_response(StatusCode::OK, &version),
+                Ok(None) => not_found(&headers),
+                Err(error) => db_failure(&error, &headers, "version read failed"),
+            }
+        }
+        None => not_found(&headers),
+    }
+}
+
 // ---- POST /files/{id}/versions/{vid}/restore --------------------------------------------------
 
 pub(crate) async fn restore_version(
@@ -482,6 +793,43 @@ pub(crate) async fn restore_version(
         }
         return restore_archived_version(resolved, &headers, &session, version_id, pre, *source)
             .await;
+    }
+    if source.layout == "chunked" {
+        let Some(local) = resolved.services.storage.as_ref() else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "STORAGE_UNAVAILABLE",
+                "File storage is not configured on this server.",
+                &headers,
+            );
+        };
+        match restore_archived_chunks_to_local(
+            local,
+            resolved.services.archive_store.as_deref(),
+            resolved.services.archive_crypto.as_deref(),
+            &resolved.services.pool,
+            &mut tx,
+            &scope,
+            resolved.id,
+            version_id,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(ChunkRestoreError::ArchiveUnavailable) => return archive_unavailable(&headers),
+            Err(ChunkRestoreError::Integrity) => {
+                // version_restore_source holds a shared lock on this blob and
+                // OrgTx owns the organization write lock. corrupt_response
+                // updates the blob through a separate pool transaction, so
+                // release both locks before awaiting that update.
+                drop(tx);
+                return corrupt_response(&resolved.services, &source, &headers).await;
+            }
+            Err(ChunkRestoreError::Local(error)) => return local_write_error(error, &headers),
+            Err(ChunkRestoreError::Db(error)) => {
+                return db_failure(&error, &headers, "restore failed");
+            }
+        }
     }
     let now = resolved.services.clock.now();
     match tx
@@ -542,6 +890,128 @@ pub(crate) fn archive_unavailable(headers: &HeaderMap) -> Response {
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
     response
+}
+
+enum ChunkRestoreError {
+    ArchiveUnavailable,
+    Integrity,
+    Local(StorageError),
+    Db(craftcloud_db::DbError),
+}
+
+// Keeps the organization transaction and storage providers explicit for the
+// bounded per-version restore operation, matching the whole-blob restore path.
+#[allow(clippy::too_many_arguments)]
+async fn restore_archived_chunks_to_local(
+    local: &craftcloud_storage::LocalStore,
+    archive: Option<&craftcloud_storage::ArchiveStore>,
+    crypto: Option<&craftcloud_storage::ArchiveCrypto>,
+    pool: &sqlx::PgPool,
+    tx: &mut OrgTx,
+    scope: &OrgScope,
+    file_id: Uuid,
+    version_id: Uuid,
+) -> Result<(), ChunkRestoreError> {
+    let chunks = versions::download_chunks(pool, scope, file_id, version_id)
+        .await
+        .map_err(ChunkRestoreError::Db)?;
+    for chunk in chunks {
+        let size = u64::try_from(chunk.size_bytes).map_err(|_| ChunkRestoreError::Integrity)?;
+        let local_key =
+            ObjectKey::parse(&chunk.object_key).map_err(|_| ChunkRestoreError::Integrity)?;
+        match local.head(&local_key).await {
+            Ok(head) if head.len == size => {
+                if chunk.storage_tier == "archive" {
+                    let _ = tx
+                        .chunk_restore_local(scope, file_id, chunk.chunk_id, local_key.as_str())
+                        .await
+                        .map_err(ChunkRestoreError::Db)?;
+                }
+                continue;
+            }
+            Ok(_) => return Err(ChunkRestoreError::Integrity),
+            Err(StorageError::NotFound) if chunk.storage_tier == "archive" => {}
+            Err(error) => return Err(ChunkRestoreError::Local(error)),
+        }
+        let (Some(archive), Some(crypto), Some(raw_key), Some(raw_envelope)) = (
+            archive,
+            crypto,
+            chunk.archive_object_key.as_deref(),
+            chunk.archive_wrapped_key.as_deref(),
+        ) else {
+            return Err(ChunkRestoreError::ArchiveUnavailable);
+        };
+        let key = ObjectKey::parse(raw_key).map_err(|_| ChunkRestoreError::Integrity)?;
+        let envelope = craftcloud_storage::WrappedDataKey::from_bytes(raw_envelope)
+            .map_err(|_| ChunkRestoreError::Integrity)?;
+        let expected_sha: [u8; 32] = chunk
+            .sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| ChunkRestoreError::Integrity)?;
+        let mut reader = crate::archive_transport::open_archive_range(
+            archive,
+            crypto,
+            &key,
+            &envelope,
+            chunk.chunk_id,
+            size,
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::archive_transport::ArchiveTransportError::Storage(_) => {
+                ChunkRestoreError::ArchiveUnavailable
+            }
+            _ => ChunkRestoreError::Integrity,
+        })?;
+        if reader.remaining() != size {
+            return Err(ChunkRestoreError::Integrity);
+        }
+        let capacity = usize::try_from(size).map_err(|_| ChunkRestoreError::Integrity)?;
+        if capacity > craftcloud_storage::MAX_CHUNK_BYTES as usize {
+            return Err(ChunkRestoreError::Integrity);
+        }
+        let mut content = Vec::with_capacity(capacity);
+        let mut hasher = Sha256::new();
+        while let Some(bytes) = match reader.next_chunk().await {
+            Ok(bytes) => bytes,
+            Err(crate::archive_transport::ArchiveTransportError::Storage(_)) => {
+                return Err(ChunkRestoreError::ArchiveUnavailable);
+            }
+            Err(_) => return Err(ChunkRestoreError::Integrity),
+        } {
+            if content.len().saturating_add(bytes.len()) > capacity {
+                return Err(ChunkRestoreError::Integrity);
+            }
+            hasher.update(&bytes);
+            content.extend_from_slice(&bytes);
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if content.len() != capacity || actual != expected_sha {
+            return Err(ChunkRestoreError::Integrity);
+        }
+        let mut temp = local
+            .begin_write(size)
+            .await
+            .map_err(ChunkRestoreError::Local)?;
+        if let Err(error) = temp.write(&content).await {
+            local.abort(temp).await;
+            return Err(ChunkRestoreError::Local(error));
+        }
+        let local_key = local
+            .finalize(temp, size, &expected_sha)
+            .await
+            .map_err(ChunkRestoreError::Local)?;
+        if !tx
+            .chunk_restore_local(scope, file_id, chunk.chunk_id, local_key.as_str())
+            .await
+            .map_err(ChunkRestoreError::Db)?
+        {
+            return Err(ChunkRestoreError::Integrity);
+        }
+    }
+    Ok(())
 }
 
 async fn restore_archived_version(
@@ -775,11 +1245,212 @@ pub(crate) struct ChannelBody {
 enum DownloadReader {
     Local(craftcloud_storage::ObjectReader),
     Archive(Box<crate::archive_transport::ArchiveReader<craftcloud_storage::ArchiveReader>>),
+    Chunked(ChunkedReader),
 }
 
-enum DownloadReadError {
+pub(crate) enum DownloadReadError {
     Local(StorageError),
     Archive(crate::archive_transport::ArchiveTransportError),
+    Chunked(StorageError),
+}
+
+pub(crate) enum ChunkOpenError {
+    Local(StorageError),
+    ArchiveUnavailable,
+    Integrity,
+}
+
+pub(crate) struct ChunkedReader {
+    store: craftcloud_storage::LocalStore,
+    chunks: Vec<DownloadChunk>,
+    local_available: Vec<bool>,
+    archive: Option<Arc<craftcloud_storage::ArchiveStore>>,
+    crypto: Option<Arc<craftcloud_storage::ArchiveCrypto>>,
+    index: usize,
+    range_start: u64,
+    range_end: u64,
+    remaining: u64,
+}
+
+impl ChunkedReader {
+    pub(crate) async fn new(
+        store: craftcloud_storage::LocalStore,
+        chunks: Vec<DownloadChunk>,
+        size: u64,
+        range_start: u64,
+        range_end: u64,
+        archive: Option<Arc<craftcloud_storage::ArchiveStore>>,
+        crypto: Option<Arc<craftcloud_storage::ArchiveCrypto>>,
+    ) -> Result<Self, ChunkOpenError> {
+        let mut offset = 0u64;
+        let mut local_available = Vec::with_capacity(chunks.len());
+        for (ordinal, chunk) in chunks.iter().enumerate() {
+            let (Ok(index), Ok(chunk_offset), Ok(chunk_len)) = (
+                i32::try_from(ordinal),
+                u64::try_from(chunk.byte_offset),
+                u64::try_from(chunk.size_bytes),
+            ) else {
+                return Err(ChunkOpenError::Integrity);
+            };
+            if chunk.ordinal != index || chunk_offset != offset || chunk_len == 0 {
+                return Err(ChunkOpenError::Integrity);
+            }
+            let key = ObjectKey::parse(&chunk.object_key).map_err(|_| ChunkOpenError::Integrity)?;
+            let local = match store.head(&key).await {
+                Ok(head) => {
+                    if head.len != chunk_len {
+                        return Err(ChunkOpenError::Integrity);
+                    }
+                    true
+                }
+                Err(StorageError::NotFound) if chunk.storage_tier == "archive" => false,
+                Err(error) => return Err(ChunkOpenError::Local(error)),
+            };
+            if !local {
+                let (Some(archive), Some(envelope_bytes), Some(crypto), Some(raw_key)) = (
+                    archive.as_deref(),
+                    chunk.archive_wrapped_key.as_deref(),
+                    crypto.as_deref(),
+                    chunk.archive_object_key.as_deref(),
+                ) else {
+                    return Err(ChunkOpenError::ArchiveUnavailable);
+                };
+                let (Ok(archive_key), Ok(envelope)) = (
+                    ObjectKey::parse(raw_key),
+                    craftcloud_storage::WrappedDataKey::from_bytes(envelope_bytes),
+                ) else {
+                    return Err(ChunkOpenError::Integrity);
+                };
+                let archive_head = archive
+                    .head(&archive_key)
+                    .await
+                    .map_err(|_| ChunkOpenError::ArchiveUnavailable)?;
+                if craftcloud_storage::verify_ciphertext_len(chunk_len, archive_head.len).is_err()
+                    || crypto
+                        .unwrap_data_key(&envelope, chunk.chunk_id, chunk_len)
+                        .is_err()
+                {
+                    return Err(ChunkOpenError::Integrity);
+                }
+            }
+            local_available.push(local);
+            offset = offset
+                .checked_add(chunk_len)
+                .ok_or(ChunkOpenError::Integrity)?;
+        }
+        if offset != size || range_start > range_end || range_end > size {
+            return Err(ChunkOpenError::Integrity);
+        }
+        Ok(Self {
+            store,
+            chunks,
+            local_available,
+            archive,
+            crypto,
+            index: 0,
+            range_start,
+            range_end,
+            remaining: range_end.saturating_sub(range_start),
+        })
+    }
+
+    pub(crate) async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, DownloadReadError> {
+        while let Some(chunk) = self.chunks.get(self.index) {
+            let current_index = self.index;
+            self.index = self.index.saturating_add(1);
+            let offset = u64::try_from(chunk.byte_offset)
+                .map_err(|_| DownloadReadError::Chunked(StorageError::LengthMismatch))?;
+            let length = u64::try_from(chunk.size_bytes)
+                .map_err(|_| DownloadReadError::Chunked(StorageError::LengthMismatch))?;
+            let end = offset
+                .checked_add(length)
+                .ok_or(DownloadReadError::Chunked(StorageError::TooLarge))?;
+            let selected_start = self.range_start.max(offset);
+            let selected_end = self.range_end.min(end);
+            if selected_start >= selected_end {
+                continue;
+            }
+            let expected_len = usize::try_from(chunk.size_bytes)
+                .map_err(|_| DownloadReadError::Chunked(StorageError::TooLarge))?;
+            let mut content = Vec::with_capacity(expected_len);
+            if self
+                .local_available
+                .get(current_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                let key = ObjectKey::parse(&chunk.object_key)
+                    .map_err(|_| DownloadReadError::Chunked(StorageError::NotFound))?;
+                let mut reader = self
+                    .store
+                    .open_read(&key, None)
+                    .await
+                    .map_err(DownloadReadError::Chunked)?;
+                if reader.remaining() != length {
+                    return Err(DownloadReadError::Chunked(StorageError::LengthMismatch));
+                }
+                while let Some(bytes) = reader
+                    .next_chunk()
+                    .await
+                    .map_err(DownloadReadError::Chunked)?
+                {
+                    content.extend_from_slice(&bytes);
+                }
+            } else {
+                let (Some(archive), Some(crypto), Some(raw_key), Some(raw_envelope)) = (
+                    self.archive.as_deref(),
+                    self.crypto.as_deref(),
+                    chunk.archive_object_key.as_deref(),
+                    chunk.archive_wrapped_key.as_deref(),
+                ) else {
+                    return Err(DownloadReadError::Chunked(StorageError::NotFound));
+                };
+                let archive_key = ObjectKey::parse(raw_key)
+                    .map_err(|_| DownloadReadError::Chunked(StorageError::NotFound))?;
+                let envelope = craftcloud_storage::WrappedDataKey::from_bytes(raw_envelope)
+                    .map_err(|_| DownloadReadError::Chunked(StorageError::ChecksumMismatch))?;
+                let mut reader = crate::archive_transport::open_archive_range(
+                    archive,
+                    crypto,
+                    &archive_key,
+                    &envelope,
+                    chunk.chunk_id,
+                    length,
+                    None,
+                )
+                .await
+                .map_err(DownloadReadError::Archive)?;
+                while let Some(bytes) = reader
+                    .next_chunk()
+                    .await
+                    .map_err(DownloadReadError::Archive)?
+                {
+                    content.extend_from_slice(&bytes);
+                }
+            }
+            let digest: [u8; 32] = Sha256::digest(&content).into();
+            if content.len() != expected_len
+                || <[u8; 32]>::try_from(chunk.sha256.as_slice()).ok() != Some(digest)
+            {
+                return Err(DownloadReadError::Chunked(StorageError::ChecksumMismatch));
+            }
+            let start = usize::try_from(selected_start - offset)
+                .map_err(|_| DownloadReadError::Chunked(StorageError::TooLarge))?;
+            let stop = usize::try_from(selected_end - offset)
+                .map_err(|_| DownloadReadError::Chunked(StorageError::TooLarge))?;
+            let result = content
+                .get(start..stop)
+                .ok_or(DownloadReadError::Chunked(StorageError::LengthMismatch))?
+                .to_vec();
+            self.remaining = self.remaining.saturating_sub(result.len() as u64);
+            return Ok(Some(result));
+        }
+        if self.remaining == 0 {
+            Ok(None)
+        } else {
+            Err(DownloadReadError::Chunked(StorageError::LengthMismatch))
+        }
+    }
 }
 
 impl DownloadReader {
@@ -787,6 +1458,7 @@ impl DownloadReader {
         match self {
             Self::Local(reader) => reader.remaining(),
             Self::Archive(reader) => reader.remaining(),
+            Self::Chunked(reader) => reader.remaining,
         }
     }
 
@@ -797,6 +1469,7 @@ impl DownloadReader {
                 .next_chunk()
                 .await
                 .map_err(DownloadReadError::Archive),
+            Self::Chunked(reader) => reader.next_chunk().await,
         }
     }
 }
@@ -1082,7 +1755,46 @@ async fn download(
             }
             Err(_) => return corrupt_response(&services, &info, headers).await,
         }
-    } else {
+    } else if info.layout == "chunked" {
+        let chunks =
+            match versions::download_chunks(&services.pool, &scope, resolved.id, info.version_id)
+                .await
+            {
+                Ok(chunks) => chunks,
+                Err(error) => return db_failure(&error, headers, "chunk manifest lookup failed"),
+            };
+        let range_end = if status == StatusCode::OK {
+            size
+        } else {
+            last.saturating_add(1)
+        };
+        match ChunkedReader::new(
+            store.clone(),
+            chunks,
+            size,
+            first,
+            range_end,
+            services.archive_store.clone(),
+            services.archive_crypto.clone(),
+        )
+        .await
+        {
+            Ok(reader) => DownloadReader::Chunked(reader),
+            Err(ChunkOpenError::Local(StorageError::NotFound)) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "STORAGE_UNAVAILABLE",
+                    "The stored data is not available right now.",
+                    headers,
+                );
+            }
+            Err(ChunkOpenError::ArchiveUnavailable) => return archive_unavailable(headers),
+            Err(ChunkOpenError::Integrity) => {
+                return corrupt_response(&services, &info, headers).await;
+            }
+            Err(ChunkOpenError::Local(_)) => return internal(headers),
+        }
+    } else if info.layout == "whole" {
         let Ok(key) = ObjectKey::parse(&info.object_key) else {
             return corrupt_response(&services, &info, headers).await;
         };
@@ -1104,6 +1816,8 @@ async fn download(
                 return internal(headers);
             }
         }
+    } else {
+        return corrupt_response(&services, &info, headers).await;
     };
     let whole = storage_range.is_none();
     // A stored object whose length differs from the record is corrupt.
@@ -1251,7 +1965,12 @@ async fn stream_download_reader(
                     | DownloadReadError::Archive(
                         crate::archive_transport::ArchiveTransportError::Crypto(_),
                     ) => true,
-                    DownloadReadError::Local(_) | DownloadReadError::Archive(_) => false,
+                    DownloadReadError::Chunked(
+                        StorageError::ChecksumMismatch | StorageError::LengthMismatch,
+                    ) => true,
+                    DownloadReadError::Local(_)
+                    | DownloadReadError::Archive(_)
+                    | DownloadReadError::Chunked(_) => false,
                 };
                 tracing::error!(error = ?download_read_error_name(&error), blob = %blob_id, "download read failed");
                 if corrupt {
@@ -1283,6 +2002,7 @@ fn download_read_error_name(error: &DownloadReadError) -> &'static str {
     match error {
         DownloadReadError::Local(_) => "local read failure",
         DownloadReadError::Archive(_) => "archive read failure",
+        DownloadReadError::Chunked(_) => "chunk read failure",
     }
 }
 

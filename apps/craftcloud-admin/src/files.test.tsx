@@ -607,7 +607,11 @@ describe("version history", () => {
       `/api/v1/files/${FILE_1.id}/versions/${OLD}/content`,
     );
     // The current version cannot be restored onto itself.
-    expect(within(within(dialog).getByRole("row", { name: /2 · Current/ })).queryByRole("button")).toBeNull();
+    expect(
+      within(within(dialog).getByRole("row", { name: /2 · Current/ })).queryByRole("button", {
+        name: /Restore version/,
+      }),
+    ).toBeNull();
 
     await user.click(within(dialog).getByRole("button", { name: "Restore version 1 as a new version" }));
     expect(await within(dialog).findByRole("row", { name: /3 · Current · Restored/ })).toBeTruthy();
@@ -640,5 +644,28 @@ describe("version history", () => {
     await waitFor(() =>
       expect(calls.filter((c) => c.path === `/files/${FILE_1.id}/versions` && c.method === "GET").length).toBe(before + 1),
     );
+  });
+
+  it("pins a version and updates its protected state", async () => {
+    let pinned = false;
+    const { fetch, calls } = mockFetch(
+      viewRoutes({
+        [`GET /files/${FILE_1.id}/versions`]: () => ({
+          body: { items: [version(2, HEAD), version(1, OLD, { pinned })], next_cursor: null },
+        }),
+        [`PATCH /files/${FILE_1.id}/versions/${OLD}`]: () => {
+          pinned = true;
+          return { body: version(1, OLD, { pinned }) };
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp(fetch);
+    await openFiles(user);
+    await user.click(screen.getByRole("button", { name: "Versions of logo.fig" }));
+    const dialog = await screen.findByRole("dialog", { name: "Versions of logo.fig" });
+    await user.click(await within(dialog).findByRole("button", { name: "Pin version 1" }));
+    expect(await within(dialog).findByRole("button", { name: "Unpin version 1" })).toBeTruthy();
+    expect(calls.some((call) => call.method === "PATCH" && call.path.endsWith(`/versions/${OLD}`))).toBe(true);
   });
 });

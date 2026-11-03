@@ -56,7 +56,10 @@ mod tests {
         let old: String = current
             .lines()
             .map(|line| {
-                let fields: Vec<_> = line.split('\t').collect();
+                let mut fields: Vec<_> = line.split('\t').collect();
+                if craftcloud_db::migrate::embedded_versions().contains(&25) {
+                    assert_eq!(fields.pop(), Some("whole"));
+                }
                 // Keep quota_group_id, then remove all 24 AC-12 columns added
                 // by migration 0022, including the durable verification fields.
                 let split = fields.len().checked_sub(25).unwrap();
@@ -70,6 +73,94 @@ mod tests {
                     ]
                 );
                 format!("{}\n", fields[..split].join("\t"))
+            })
+            .collect();
+        std::fs::write(path, &old).unwrap();
+        old
+    }
+
+    /// Model a format-v2 backup before migration 0025 added physical chunks.
+    fn pre_chunk_backup(out: &Path) {
+        if !craftcloud_db::migrate::embedded_versions().contains(&25) {
+            return;
+        }
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 3);
+        assert_eq!(manifest["chunks"]["count"], 0);
+        for index in ["chunked_versions", "version_chunks"] {
+            assert_eq!(manifest[index]["count"], 0);
+            std::fs::remove_file(out.join(format!("{index}.jsonl"))).unwrap();
+        }
+        let new_tables: Vec<_> = BACKUP_TABLES
+            .iter()
+            .filter(|table| table.since >= 25)
+            .map(|table| table.name)
+            .collect();
+        let new_excluded: Vec<_> = craftcloud_backup::tables::EXCLUDED_WITH_VERSION
+            .iter()
+            .filter(|(_, since)| *since >= 25)
+            .map(|(name, _)| *name)
+            .collect();
+        for table in &new_tables {
+            let entry = manifest["tables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(*table))
+                .unwrap();
+            assert_eq!(entry["rows"], 0);
+            std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
+        }
+        std::fs::remove_file(out.join("chunks.jsonl")).unwrap();
+        std::fs::remove_dir(out.join("chunks")).unwrap();
+        let blobs_path = out.join("blobs.jsonl");
+        let old_blobs: String = std::fs::read_to_string(&blobs_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut blob: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(
+                    blob.as_object_mut().unwrap().remove("layout"),
+                    Some(json!("whole"))
+                );
+                format!("{}\n", serde_json::to_string(&blob).unwrap())
+            })
+            .collect();
+        std::fs::write(blobs_path, &old_blobs).unwrap();
+        rewrite_manifest(out, |manifest| {
+            manifest["format_version"] = json!(2);
+            manifest.as_object_mut().unwrap().remove("chunks");
+            manifest.as_object_mut().unwrap().remove("chunked_versions");
+            manifest.as_object_mut().unwrap().remove("version_chunks");
+            manifest["tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|entry| !new_tables.contains(&entry["name"].as_str().unwrap()));
+            manifest["excluded_tables"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|entry| !new_excluded.contains(&entry.as_str().unwrap()));
+            manifest["blobs"]["sha256"] = json!(sha_hex(old_blobs.as_bytes()));
+        });
+    }
+
+    /// Model version columns before migration 0024 added the pin flag.
+    fn pre_pin_version_export(out: &Path) -> String {
+        let path = out.join("tables").join("file_versions.copy");
+        let current = std::fs::read_to_string(&path).unwrap();
+        let has_pins = craftcloud_db::migrate::embedded_versions().contains(&24);
+        let old: String = current
+            .lines()
+            .map(|line| {
+                let columns = if has_pins {
+                    let (columns, pinned) = line.rsplit_once('\t').unwrap();
+                    assert_eq!(pinned, "f");
+                    columns
+                } else {
+                    line
+                };
+                format!("{columns}\n")
             })
             .collect();
         std::fs::write(path, &old).unwrap();
@@ -976,14 +1067,15 @@ mod tests {
             ErrorKind::Format,
             &format!("only knows up to {newest}"),
         );
+        let unsupported_format = created.manifest.format_version + 1;
         rewrite_manifest(&out, |m| {
             m["migration_version"] = json!(14);
-            m["format_version"] = json!(3);
+            m["format_version"] = json!(unsupported_format);
         });
         expect(
             &out,
             ErrorKind::Format,
-            "unsupported backup format version 3",
+            &format!("unsupported backup format version {unsupported_format}"),
         );
         rewrite_manifest(&out, |m| {
             m["format_version"] = json!(created.manifest.format_version);
@@ -1185,6 +1277,7 @@ mod tests {
         let w = W::new().await;
         let dir = TempDir::new("backup-older");
         let (out, _) = small_backup(&w, &dir).await;
+        pre_chunk_backup(&out);
         // Migrations 0015 and 0016 add excluded credential and lease tables and
         // the backed-up `grants` table. Remove their entries (and the grants
         // export) to model the manifest produced by a version 11 server. (No
@@ -1229,7 +1322,7 @@ mod tests {
         }
         let old_blobs = pre_archive_blob_export(&out);
         let versions_path = out.join("tables").join("file_versions.copy");
-        let current_versions = std::fs::read_to_string(&versions_path).unwrap();
+        let current_versions = pre_pin_version_export(&out);
         let old_versions: String = current_versions
             .lines()
             .map(|line| {
@@ -1435,6 +1528,7 @@ mod tests {
         // seat_limit or app_access_mode, and the eight original link columns.
         let out = dir.child("backup");
         w.create_backup(&out).await.unwrap();
+        pre_chunk_backup(&out);
         std::fs::remove_file(out.join("tables").join("member_app_access.copy")).unwrap();
         // AC-10 tables did not exist in either legacy schema.
         for table in [
@@ -1461,6 +1555,7 @@ mod tests {
             std::fs::remove_file(out.join("tables").join(format!("{table}.copy"))).unwrap();
         }
         let old_blobs = pre_archive_blob_export(&out);
+        let old_versions = pre_pin_version_export(&out);
         let org_path = out.join("tables").join("organizations.copy");
         let old_orgs: String = std::fs::read_to_string(&org_path)
             .unwrap()
@@ -1531,6 +1626,7 @@ mod tests {
                 ("organizations", &old_orgs),
                 ("figcraft_links", &old_links),
                 ("blobs", &old_blobs),
+                ("file_versions", &old_versions),
             ] {
                 let entry = tables.iter_mut().find(|t| t["name"] == name).unwrap();
                 entry["bytes"] = json!(text.len());

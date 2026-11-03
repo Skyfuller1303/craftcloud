@@ -13,6 +13,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+const CHUNK_MIN_BYTES: u32 = 256 * 1024;
+const CHUNK_TARGET_BYTES: u32 = 1024 * 1024;
+const CHUNK_MAX_BYTES: u32 = 4 * 1024 * 1024;
+const MAX_UPLOAD_CHUNKS: usize = 32_768;
+const MAX_CHUNK_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
 pub mod dto;
 pub use dto::*;
 pub mod oidc;
@@ -225,6 +231,7 @@ pub struct CloudClient<T: CloudTransport> {
     tokens: Mutex<Option<DeviceTokens>>,
     user: Mutex<Option<DeviceUser>>,
     token_store: Mutex<Option<Arc<dyn RefreshTokenStore>>>,
+    chunked_upload: Mutex<Option<bool>>,
     api_major: u32,
 }
 impl<T: CloudTransport> CloudClient<T> {
@@ -253,6 +260,7 @@ impl<T: CloudTransport> CloudClient<T> {
             tokens: Mutex::new(None),
             user: Mutex::new(None),
             token_store: Mutex::new(None),
+            chunked_upload: Mutex::new(None),
             api_major: 1,
         })
     }
@@ -340,7 +348,12 @@ impl<T: CloudTransport> CloudClient<T> {
         if version.split('.').next() != Some(&self.api_major.to_string()) {
             return Err(CloudError::IncompatibleServer(version.to_owned()));
         }
-        serde_json::from_value(value).map_err(|_| CloudError::InvalidResponse)
+        let discovery: Discovery =
+            serde_json::from_value(value).map_err(|_| CloudError::InvalidResponse)?;
+        if let Ok(mut cached) = self.chunked_upload.lock() {
+            *cached = Some(discovery.feature_flags.chunked_upload);
+        }
+        Ok(discovery)
     }
     pub fn login(
         &self,
@@ -516,6 +529,21 @@ impl<T: CloudTransport> CloudClient<T> {
     ) -> Result<TOut, CloudError> {
         self.auth_json("POST", path, Some(body), None, &[])
     }
+    /// Protect or unprotect one immutable file version from automatic thinning.
+    pub fn pin_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        pinned: bool,
+    ) -> Result<Version, CloudError> {
+        self.auth_json(
+            "PATCH",
+            &format!("/api/v1/files/{file_id}/versions/{version_id}"),
+            Some(&serde_json::json!({ "pinned": pinned })),
+            None,
+            &[],
+        )
+    }
     /// Update a resource under its ETag without bypassing session refresh or URL checks.
     pub fn patch<TOut: DeserializeOwned, B: Serialize>(
         &self,
@@ -602,43 +630,235 @@ impl<T: CloudTransport> CloudClient<T> {
         upload: &UploadContent,
         cancel: Arc<AtomicBool>,
     ) -> Result<Version, CloudError> {
+        self.upload_with_cancel_and_progress(upload, cancel, |_, _| {})
+    }
+    /// Uploads with byte progress. Chunked-capable servers report completed bytes after
+    /// each requested chunk; the legacy path reports only its completed transfer.
+    pub fn upload_with_cancel_and_progress<F>(
+        &self,
+        upload: &UploadContent,
+        cancel: Arc<AtomicBool>,
+        mut on_progress: F,
+    ) -> Result<Version, CloudError>
+    where
+        F: FnMut(u64, u64),
+    {
         if cancel.load(Ordering::Acquire) {
             return Err(CloudError::Cancelled);
         }
-        let digest = hex(&Sha256::digest(&upload.bytes));
+        if self.chunked_upload_enabled()?
+            && !cancel.load(Ordering::Acquire)
+            && let Some(spans) = chunk_spans(&upload.bytes, &cancel)?
+        {
+            return self.upload_chunked_with_cancel_and_progress(
+                upload,
+                cancel,
+                spans,
+                &mut on_progress,
+            );
+        }
+        self.upload_legacy_with_cancel_and_progress(upload, cancel, &mut on_progress)
+    }
+    fn chunked_upload_enabled(&self) -> Result<bool, CloudError> {
+        if let Ok(cached) = self.chunked_upload.lock()
+            && let Some(enabled) = *cached
+        {
+            return Ok(enabled);
+        }
+        self.discover()
+            .map(|discovery| discovery.feature_flags.chunked_upload)
+    }
+    fn upload_chunked_with_cancel_and_progress<F>(
+        &self,
+        upload: &UploadContent,
+        cancel: Arc<AtomicBool>,
+        spans: Vec<ChunkSpan>,
+        on_progress: &mut F,
+    ) -> Result<Version, CloudError>
+    where
+        F: FnMut(u64, u64),
+    {
+        let descriptors = spans
+            .iter()
+            .map(|span| {
+                let bytes = span_bytes(&upload.bytes, span)?;
+                if cancel.load(Ordering::Acquire) {
+                    return Err(CloudError::Cancelled);
+                }
+                Ok(UploadChunkDescriptor {
+                    size_bytes: span.length as u64,
+                    sha256: hex(&hash_cancellable(bytes, &cancel)?),
+                })
+            })
+            .collect::<Result<Vec<_>, CloudError>>()?;
+        let size_bytes =
+            u64::try_from(upload.bytes.len()).map_err(|_| CloudError::InvalidResponse)?;
+        let request = ChunkedUploadRequest {
+            size_bytes,
+            sha256: hex(&hash_cancellable(&upload.bytes, &cancel)?),
+            mode: "chunked",
+            chunks: descriptors,
+        };
+        let manifest = serde_json::to_vec(&request).map_err(|_| CloudError::InvalidResponse)?;
+        if manifest.len() > MAX_CHUNK_MANIFEST_BYTES {
+            return self.upload_legacy_with_cancel_and_progress(upload, cancel, on_progress);
+        }
         let key = upload.idempotency_key.clone();
-        let create = serde_json::json!({"size_bytes":upload.bytes.len(),"sha256":digest});
-        let session: UploadSession = self.auth_json(
+        let session_response = self.cancellable_raw(
             "POST",
             &format!("/api/v1/files/{}/uploads", upload.file_id),
-            Some(&create),
-            None,
-            &[("Idempotency-Key".into(), key.clone())],
+            manifest,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Idempotency-Key".into(), key.clone()),
+            ],
+            Arc::clone(&cancel),
+            true,
         )?;
+        let session: UploadSession = serde_json::from_slice(&session_response.body)
+            .map_err(|_| CloudError::InvalidResponse)?;
         if cancel.load(Ordering::Acquire) {
             self.abort_upload(session.upload_id);
             return Err(CloudError::Cancelled);
         }
+        if session.mode.as_deref() != Some("chunked") {
+            self.abort_upload(session.upload_id);
+            return Err(CloudError::InvalidResponse);
+        }
+        let missing_chunks =
+            match serde_json::from_slice::<ChunkedMissingChunks>(&session_response.body) {
+                Ok(response) => response.missing_chunks,
+                Err(_) => {
+                    self.abort_upload(session.upload_id);
+                    return Err(CloudError::InvalidResponse);
+                }
+            };
+        let mut missing = vec![false; spans.len()];
+        let mut missing_bytes = 0_u64;
+        for ordinal in &missing_chunks {
+            let Some(slot) = missing.get_mut(*ordinal as usize) else {
+                self.abort_upload(session.upload_id);
+                return Err(CloudError::InvalidResponse);
+            };
+            if *slot {
+                self.abort_upload(session.upload_id);
+                return Err(CloudError::InvalidResponse);
+            }
+            *slot = true;
+            let Some(span) = spans.get(*ordinal as usize) else {
+                self.abort_upload(session.upload_id);
+                return Err(CloudError::InvalidResponse);
+            };
+            missing_bytes = missing_bytes
+                .checked_add(span.length as u64)
+                .ok_or(CloudError::InvalidResponse)?;
+        }
+        let mut completed = size_bytes
+            .checked_sub(missing_bytes)
+            .ok_or(CloudError::InvalidResponse)?;
+        on_progress(completed, size_bytes);
+        for ordinal in missing_chunks {
+            if cancel.load(Ordering::Acquire) {
+                self.abort_upload(session.upload_id);
+                return Err(CloudError::Cancelled);
+            }
+            let Some(span) = spans.get(ordinal as usize) else {
+                self.abort_upload(session.upload_id);
+                return Err(CloudError::InvalidResponse);
+            };
+            let block = match span_bytes(&upload.bytes, span) {
+                Ok(block) => block,
+                Err(error) => {
+                    self.abort_upload(session.upload_id);
+                    return Err(error);
+                }
+            };
+            let put = self.cancellable_raw(
+                "PUT",
+                &format!("/api/v1/uploads/{}/chunks/{ordinal}", session.upload_id),
+                block.to_vec(),
+                vec![("Content-Type".into(), "application/octet-stream".into())],
+                Arc::clone(&cancel),
+                false,
+            );
+            if let Err(error) = put {
+                self.abort_upload(session.upload_id);
+                return Err(error);
+            }
+            completed = completed
+                .checked_add(span.length as u64)
+                .ok_or(CloudError::InvalidResponse)?;
+            on_progress(completed, size_bytes);
+        }
+        if cancel.load(Ordering::Acquire) {
+            self.abort_upload(session.upload_id);
+            return Err(CloudError::Cancelled);
+        }
+        self.commit_upload_session(upload, session.upload_id, key, &cancel)
+    }
+    fn upload_legacy_with_cancel_and_progress<F>(
+        &self,
+        upload: &UploadContent,
+        cancel: Arc<AtomicBool>,
+        on_progress: &mut F,
+    ) -> Result<Version, CloudError>
+    where
+        F: FnMut(u64, u64),
+    {
+        let digest = hex(&hash_cancellable(&upload.bytes, &cancel)?);
+        let key = upload.idempotency_key.clone();
+        let create = serde_json::json!({"size_bytes":upload.bytes.len(),"sha256":digest});
+        let session: UploadSession = self
+            .cancellable_raw(
+                "POST",
+                &format!("/api/v1/files/{}/uploads", upload.file_id),
+                serde_json::to_vec(&create).map_err(|_| CloudError::InvalidResponse)?,
+                vec![
+                    ("Content-Type".into(), "application/json".into()),
+                    ("Idempotency-Key".into(), key.clone()),
+                ],
+                Arc::clone(&cancel),
+                true,
+            )
+            .and_then(|response| {
+                serde_json::from_slice(&response.body).map_err(|_| CloudError::InvalidResponse)
+            })?;
+        if cancel.load(Ordering::Acquire) {
+            self.abort_upload(session.upload_id);
+            return Err(CloudError::Cancelled);
+        }
+        on_progress(0, upload.bytes.len() as u64);
         let stored = self.cancellable_raw(
             "PUT",
             &format!("/api/v1/uploads/{}/content", session.upload_id),
             upload.bytes.clone(),
             vec![("Content-Type".into(), "application/octet-stream".into())],
             Arc::clone(&cancel),
+            false,
         );
-        if let Err(e) = stored {
+        if let Err(error) = stored {
             self.abort_upload(session.upload_id);
-            return Err(e);
+            return Err(error);
         }
+        on_progress(upload.bytes.len() as u64, upload.bytes.len() as u64);
+        self.commit_upload_session(upload, session.upload_id, key, &cancel)
+    }
+    fn commit_upload_session(
+        &self,
+        upload: &UploadContent,
+        upload_id: Uuid,
+        key: String,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Version, CloudError> {
         if cancel.load(Ordering::Acquire) {
-            self.abort_upload(session.upload_id);
+            self.abort_upload(upload_id);
             return Err(CloudError::Cancelled);
         }
-        let body = serde_json::json!({"upload_id":session.upload_id});
+        let body = serde_json::json!({"upload_id":upload_id});
         let headers = if let Some(base) = upload.base_version {
             vec![
                 ("If-Match".to_string(), format!("\"version:{base}\"")),
-                ("Idempotency-Key".to_string(), key),
+                ("Idempotency-Key".into(), key),
             ]
         } else {
             vec![
@@ -646,10 +866,6 @@ impl<T: CloudTransport> CloudClient<T> {
                 ("Idempotency-Key".into(), key),
             ]
         };
-        if cancel.load(Ordering::Acquire) {
-            self.abort_upload(session.upload_id);
-            return Err(CloudError::Cancelled);
-        }
         self.auth_json(
             "POST",
             &format!("/api/v1/files/{}/versions", upload.file_id),
@@ -726,6 +942,7 @@ impl<T: CloudTransport> CloudClient<T> {
         b: Vec<u8>,
         extra: Vec<(String, String)>,
         cancel: Arc<AtomicBool>,
+        preserve_success_after_cancel: bool,
     ) -> Result<Response, CloudError> {
         if cancel.load(Ordering::Acquire) {
             return Err(CloudError::Cancelled);
@@ -752,7 +969,9 @@ impl<T: CloudTransport> CloudClient<T> {
                 body: b.clone(),
                 cancelled: Some(Arc::clone(&cancel)),
             })?;
-            if cancel.load(Ordering::Acquire) {
+            if cancel.load(Ordering::Acquire)
+                && !(preserve_success_after_cancel && (200..300).contains(&response.status))
+            {
                 return Err(CloudError::Cancelled);
             }
             if (200..300).contains(&response.status) {
@@ -905,6 +1124,86 @@ fn error_for(r: Response) -> CloudError {
         },
     }
 }
+#[derive(Debug, Clone, Copy)]
+struct ChunkSpan {
+    offset: usize,
+    length: usize,
+}
+
+fn span_bytes<'a>(bytes: &'a [u8], span: &ChunkSpan) -> Result<&'a [u8], CloudError> {
+    let end = span
+        .offset
+        .checked_add(span.length)
+        .ok_or(CloudError::InvalidResponse)?;
+    bytes
+        .get(span.offset..end)
+        .ok_or(CloudError::InvalidResponse)
+}
+
+fn chunk_spans(bytes: &[u8], cancel: &AtomicBool) -> Result<Option<Vec<ChunkSpan>>, CloudError> {
+    if bytes.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let min_chunk_bytes =
+        usize::try_from(CHUNK_MIN_BYTES).map_err(|_| CloudError::InvalidResponse)?;
+    let max_chunk_bytes =
+        usize::try_from(CHUNK_MAX_BYTES).map_err(|_| CloudError::InvalidResponse)?;
+    let mut spans: Vec<ChunkSpan> = Vec::new();
+    let mut expected_offset = 0_usize;
+    for chunk in
+        fastcdc::v2020::FastCDC::new(bytes, CHUNK_MIN_BYTES, CHUNK_TARGET_BYTES, CHUNK_MAX_BYTES)
+    {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CloudError::Cancelled);
+        }
+        if spans.len() >= MAX_UPLOAD_CHUNKS {
+            return Ok(None);
+        }
+        let end = chunk
+            .offset
+            .checked_add(chunk.length)
+            .ok_or(CloudError::InvalidResponse)?;
+        if chunk.offset != expected_offset
+            || chunk.length == 0
+            || chunk.length > max_chunk_bytes
+            || end > bytes.len()
+        {
+            return Err(CloudError::InvalidResponse);
+        }
+        if let Some(previous) = spans.last()
+            && previous.length < min_chunk_bytes
+        {
+            return Err(CloudError::InvalidResponse);
+        }
+        spans.push(ChunkSpan {
+            offset: chunk.offset,
+            length: chunk.length,
+        });
+        expected_offset = end;
+    }
+    if expected_offset != bytes.len() {
+        return Err(CloudError::InvalidResponse);
+    }
+    Ok(Some(spans))
+}
+
+fn hash_cancellable(bytes: &[u8], cancel: &AtomicBool) -> Result<[u8; 32], CloudError> {
+    let mut digest = Sha256::new();
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(CloudError::Cancelled);
+        }
+        let end = offset.saturating_add(256 * 1024).min(bytes.len());
+        digest.update(bytes.get(offset..end).ok_or(CloudError::InvalidResponse)?);
+        offset = end;
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(CloudError::Cancelled);
+    }
+    Ok(digest.finalize().into())
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|v| format!("{v:02x}")).collect()
 }
@@ -939,6 +1238,14 @@ pub struct UploadSession {
     pub size_bytes: u64,
     pub sha256: String,
     pub state: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub missing_chunks: Vec<u32>,
+}
+#[derive(Debug, Deserialize)]
+struct ChunkedMissingChunks {
+    missing_chunks: Vec<u32>,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct Version {
@@ -947,6 +1254,8 @@ pub struct Version {
     pub number: u64,
     pub size_bytes: u64,
     pub sha256: String,
+    #[serde(default)]
+    pub pinned: bool,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct LockInfo {
@@ -1014,6 +1323,32 @@ mod tests {
     impl CloudTransport for Mock {
         fn send(&self, _: Request) -> Result<Response, CloudError> {
             self.0
+                .lock()
+                .map_err(|_| CloudError::Offline)?
+                .pop_front()
+                .unwrap_or(Err(CloudError::Offline))
+        }
+    }
+    #[derive(Default)]
+    struct RecordingUploadTransport {
+        replies: Mutex<VecDeque<Result<Response, CloudError>>>,
+        requests: Mutex<Vec<Request>>,
+    }
+    impl RecordingUploadTransport {
+        fn new(replies: Vec<Result<Response, CloudError>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl CloudTransport for RecordingUploadTransport {
+        fn send(&self, request: Request) -> Result<Response, CloudError> {
+            self.requests
+                .lock()
+                .map_err(|_| CloudError::Offline)?
+                .push(request);
+            self.replies
                 .lock()
                 .map_err(|_| CloudError::Offline)?
                 .pop_front()
@@ -1309,6 +1644,396 @@ mod tests {
         }
     }
     #[test]
+    fn chunked_upload_sends_the_manifest_missing_blocks_and_monotonic_progress() {
+        let mut state = 0x51f0_a7c3_u32;
+        let bytes: Vec<u8> = (0..8 * 1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let spans = chunk_spans(&bytes, &cancel);
+        assert!(spans.is_ok());
+        let Some(spans) = spans.ok().flatten() else {
+            return;
+        };
+        assert_eq!(
+            spans.iter().map(|span| span.length).collect::<Vec<_>>(),
+            vec![1_529_997, 1_708_052, 1_761_647, 893_944, 1_566_347, 928_621]
+        );
+        let file_id = Uuid::from_u128(2);
+        let session_id = Uuid::from_u128(3);
+        let digest = hex(&Sha256::digest(&bytes));
+        let missing: Vec<u32> = (0..spans.len())
+            .filter(|index| index % 2 == 0)
+            .filter_map(|index| u32::try_from(index).ok())
+            .collect();
+        let session = serde_json::json!({
+            "upload_id":session_id,
+            "file_id":file_id,
+            "state":"created",
+            "size_bytes":bytes.len(),
+            "sha256":digest,
+            "mode":"chunked",
+            "missing_chunks":missing,
+        })
+        .to_string();
+        let version = serde_json::json!({
+            "id":Uuid::from_u128(4),
+            "file_id":file_id,
+            "number":1,
+            "size_bytes":bytes.len(),
+            "sha256":digest,
+        })
+        .to_string();
+        let mut replies = vec![
+            Ok(response(
+                200,
+                r#"{"api_version":"1.0","feature_flags":{"chunked_upload":true}}"#,
+            )),
+            Ok(response(201, &session)),
+        ];
+        replies.extend(missing.iter().map(|_| Ok(response(204, ""))));
+        replies.push(Ok(response(201, &version)));
+        let client = authenticated(RecordingUploadTransport::new(replies));
+        assert!(client.is_ok());
+        let Some(client) = client.ok() else {
+            return;
+        };
+        let upload = UploadContent {
+            file_id,
+            base_version: None,
+            idempotency_key: "chunked-key".into(),
+            bytes,
+        };
+        let mut progress = Vec::new();
+        let result = client.upload_with_cancel_and_progress(&upload, cancel, |completed, total| {
+            progress.push((completed, total))
+        });
+        assert!(result.is_ok());
+        assert_eq!(progress.len(), missing.len() + 1);
+        let missing_bytes: u64 = missing
+            .iter()
+            .filter_map(|ordinal| spans.get(*ordinal as usize))
+            .map(|span| span.length as u64)
+            .sum();
+        assert!(
+            progress
+                .first()
+                .is_some_and(|point| point.0 == upload.bytes.len() as u64 - missing_bytes)
+        );
+        assert!(
+            progress
+                .iter()
+                .zip(progress.iter().skip(1))
+                .all(|(left, right)| left.0 <= right.0 && left.1 == right.1)
+        );
+        assert!(
+            progress
+                .last()
+                .is_some_and(|point| point.0 == upload.bytes.len() as u64)
+        );
+
+        let requests = client.transport().requests.lock();
+        assert!(requests.is_ok());
+        let Ok(requests) = requests else {
+            return;
+        };
+        let create = requests.iter().find(|request| {
+            request.method == "POST" && request.path.ends_with(&format!("/files/{file_id}/uploads"))
+        });
+        let Some(create) = create else {
+            return;
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+        assert_eq!(
+            manifest.get("mode").and_then(serde_json::Value::as_str),
+            Some("chunked")
+        );
+        assert_eq!(
+            manifest
+                .get("chunks")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(spans.len())
+        );
+        let puts: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.contains("/chunks/"))
+            .collect();
+        assert_eq!(puts.len(), missing.len());
+        assert_eq!(
+            puts.iter().map(|put| put.body.len()).sum::<usize>() as u64,
+            missing_bytes
+        );
+        for (ordinal, put) in missing.iter().zip(puts.iter()) {
+            let Some(span) = spans.get(*ordinal as usize) else {
+                return;
+            };
+            assert_eq!(put.body, span_bytes(&upload.bytes, span).unwrap());
+            assert!(put.path.ends_with(&format!("/chunks/{ordinal}")));
+        }
+        assert!(requests.iter().any(|request| {
+            request.method == "POST"
+                && request
+                    .path
+                    .ends_with(&format!("/files/{file_id}/versions"))
+                && request
+                    .headers
+                    .iter()
+                    .any(|(key, value)| key == "If-None-Match" && value == "*")
+        }));
+    }
+
+    #[test]
+    fn old_discovery_defaults_chunked_upload_off_and_keeps_legacy_path() {
+        let file_id = Uuid::from_u128(2);
+        let session_id = Uuid::from_u128(3);
+        let bytes = b"legacy".to_vec();
+        let digest = hex(&Sha256::digest(&bytes));
+        let session = serde_json::json!({
+            "upload_id":session_id,
+            "file_id":file_id,
+            "state":"created",
+            "size_bytes":bytes.len(),
+            "sha256":digest,
+        })
+        .to_string();
+        let version = serde_json::json!({
+            "id":Uuid::from_u128(4),
+            "file_id":file_id,
+            "number":1,
+            "size_bytes":bytes.len(),
+            "sha256":digest,
+        })
+        .to_string();
+        let client = authenticated(RecordingUploadTransport::new(vec![
+            Ok(response(200, r#"{"api_version":"1.0"}"#)),
+            Ok(response(201, &session)),
+            Ok(response(204, "")),
+            Ok(response(201, &version)),
+        ]));
+        assert!(client.is_ok());
+        let Some(client) = client.ok() else {
+            return;
+        };
+        let upload = UploadContent {
+            file_id,
+            base_version: None,
+            idempotency_key: "legacy-key".into(),
+            bytes,
+        };
+        assert!(client.upload(&upload).is_ok());
+        let requests = client.transport().requests.lock();
+        assert!(requests.is_ok_and(|requests| {
+            requests
+                .iter()
+                .any(|request| request.path.ends_with("/content"))
+                && !requests
+                    .iter()
+                    .any(|request| request.path.contains("/chunks/"))
+        }));
+    }
+
+    #[test]
+    fn chunked_empty_and_fully_reused_uploads_report_completion() {
+        for (bytes, missing) in [
+            (Vec::new(), Vec::<u32>::new()),
+            (b"same".to_vec(), Vec::new()),
+        ] {
+            let file_id = Uuid::from_u128(2);
+            let session_id = Uuid::from_u128(3);
+            let digest = hex(&Sha256::digest(&bytes));
+            let session = serde_json::json!({
+                "upload_id":session_id,
+                "file_id":file_id,
+                "state":"created",
+                "size_bytes":bytes.len(),
+                "sha256":digest,
+                "mode":"chunked",
+                "missing_chunks":missing,
+            })
+            .to_string();
+            let version = serde_json::json!({
+                "id":Uuid::from_u128(4),
+                "file_id":file_id,
+                "number":1,
+                "size_bytes":bytes.len(),
+                "sha256":digest,
+            })
+            .to_string();
+            let client = authenticated(RecordingUploadTransport::new(vec![
+                Ok(response(
+                    200,
+                    r#"{"api_version":"1.0","feature_flags":{"chunked_upload":true}}"#,
+                )),
+                Ok(response(201, &session)),
+                Ok(response(201, &version)),
+            ]));
+            assert!(client.is_ok());
+            let Some(client) = client.ok() else {
+                return;
+            };
+            let upload = UploadContent {
+                file_id,
+                base_version: None,
+                idempotency_key: "reused-key".into(),
+                bytes,
+            };
+            let mut progress = Vec::new();
+            assert!(
+                client
+                    .upload_with_cancel_and_progress(
+                        &upload,
+                        Arc::new(AtomicBool::new(false)),
+                        |completed, total| progress.push((completed, total)),
+                    )
+                    .is_ok()
+            );
+            assert_eq!(
+                progress.last().copied(),
+                Some((upload.bytes.len() as u64, upload.bytes.len() as u64))
+            );
+            assert!(
+                !client
+                    .transport()
+                    .requests
+                    .lock()
+                    .is_ok_and(|requests| requests.iter().any(|r| r.path.contains("/chunks/")))
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_create_requires_missing_ordinals_and_aborts_bad_responses() {
+        let file_id = Uuid::from_u128(2);
+        let session_id = Uuid::from_u128(3);
+        for missing_field in [None, Some("[0,0]"), Some("[1]")] {
+            let missing = missing_field
+                .map(|value| format!(",\"missing_chunks\":{value}"))
+                .unwrap_or_default();
+            let session = format!(
+                "{{\"upload_id\":\"{session_id}\",\"file_id\":\"{file_id}\",\"state\":\"created\",\"size_bytes\":3,\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"mode\":\"chunked\"{missing}}}"
+            );
+            let client = authenticated(RecordingUploadTransport::new(vec![
+                Ok(response(
+                    200,
+                    r#"{"api_version":"1.0","feature_flags":{"chunked_upload":true}}"#,
+                )),
+                Ok(response(201, &session)),
+                Ok(response(204, "")),
+            ]));
+            assert!(client.is_ok());
+            let Some(client) = client.ok() else {
+                return;
+            };
+            let upload = UploadContent {
+                file_id,
+                base_version: None,
+                idempotency_key: "malformed-manifest".into(),
+                bytes: b"abc".to_vec(),
+            };
+            let mut progress = Vec::new();
+            assert!(matches!(
+                client.upload_with_cancel_and_progress(
+                    &upload,
+                    Arc::new(AtomicBool::new(false)),
+                    |done, total| progress.push((done, total)),
+                ),
+                Err(CloudError::InvalidResponse)
+            ));
+            assert!(progress.is_empty());
+            let requests = client.transport().requests.lock();
+            assert!(requests.is_ok_and(|requests| {
+                requests.iter().any(|request| {
+                    request.method == "DELETE"
+                        && request.path.ends_with(&format!("/uploads/{session_id}"))
+                }) && !requests
+                    .iter()
+                    .any(|request| request.method == "PUT" || request.path.ends_with("/versions"))
+            }));
+        }
+    }
+
+    #[test]
+    fn late_cancel_after_create_response_aborts_legacy_and_chunked_sessions() {
+        struct LateCancelCreate {
+            cancel: Arc<AtomicBool>,
+            chunked: bool,
+            requests: Mutex<Vec<(String, String)>>,
+        }
+        impl CloudTransport for LateCancelCreate {
+            fn send(&self, request: Request) -> Result<Response, CloudError> {
+                self.requests
+                    .lock()
+                    .map_err(|_| CloudError::Offline)?
+                    .push((request.method.clone(), request.path.clone()));
+                if request.method == "GET" && request.path.ends_with("/info") {
+                    return Ok(response(
+                        200,
+                        if self.chunked {
+                            r#"{"api_version":"1.0","feature_flags":{"chunked_upload":true}}"#
+                        } else {
+                            r#"{"api_version":"1.0"}"#
+                        },
+                    ));
+                }
+                if request.method == "POST" && request.path.ends_with("/uploads") {
+                    let chunk_fields = if self.chunked {
+                        ",\"mode\":\"chunked\",\"missing_chunks\":[0]"
+                    } else {
+                        ""
+                    };
+                    let body = format!(
+                        "{{\"upload_id\":\"00000000-0000-0000-0000-000000000003\",\"file_id\":\"00000000-0000-0000-0000-000000000002\",\"state\":\"created\",\"size_bytes\":3,\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"{chunk_fields}}}"
+                    );
+                    // Simulate cancellation after the server created the session but before
+                    // its successful response reaches the client.
+                    self.cancel.store(true, Ordering::Release);
+                    return Ok(response(201, &body));
+                }
+                if request.method == "DELETE" {
+                    return Ok(response(204, ""));
+                }
+                Err(CloudError::Io("unexpected upload stage".into()))
+            }
+        }
+
+        for chunked in [false, true] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let transport = LateCancelCreate {
+                cancel: Arc::clone(&cancel),
+                chunked,
+                requests: Mutex::new(Vec::new()),
+            };
+            let client = authenticated(transport);
+            assert!(client.is_ok());
+            let Some(client) = client.ok() else {
+                return;
+            };
+            let upload = UploadContent {
+                file_id: Uuid::from_u128(2),
+                base_version: None,
+                idempotency_key: "late-cancel".into(),
+                bytes: b"abc".to_vec(),
+            };
+            assert!(matches!(
+                client.upload_with_cancel(&upload, cancel),
+                Err(CloudError::Cancelled)
+            ));
+            let requests = client.transport().requests.lock();
+            assert!(requests.is_ok_and(|requests| {
+                requests.iter().any(|(method, path)| {
+                    method == "DELETE"
+                        && path.ends_with("/uploads/00000000-0000-0000-0000-000000000003")
+                }) && !requests
+                    .iter()
+                    .any(|(method, path)| method == "PUT" || path.ends_with("/versions"))
+            }));
+        }
+    }
+    #[test]
     fn locked_and_offline_are_recoverable() {
         let file = Uuid::nil();
         let locked = authenticated(Mock::new(vec![Ok(response(
@@ -1340,7 +2065,13 @@ mod tests {
                 if let Ok(mut calls) = self.calls.lock() {
                     calls.push((request.method.clone(), request.path.clone()));
                 }
-                if request.method == "PUT" {
+                if request.method == "GET" && request.path.ends_with("/info") {
+                    return Ok(response(
+                        200,
+                        r#"{"api_version":"1.0","feature_flags":{"chunked_upload":true}}"#,
+                    ));
+                }
+                if request.method == "PUT" && request.path.contains("/chunks/") {
                     self.flag.store(true, Ordering::Release);
                     return Ok(response(204, ""));
                 }
@@ -1349,7 +2080,7 @@ mod tests {
                 }
                 Ok(response(
                     201,
-                    r#"{"upload_id":"00000000-0000-0000-0000-000000000001","file_id":"00000000-0000-0000-0000-000000000002","project_id":"00000000-0000-0000-0000-000000000003","workspace_id":"00000000-0000-0000-0000-000000000004","state":"created","size_bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","max_bytes":3,"created_by":"00000000-0000-0000-0000-000000000005","created_at":"now","expires_at":"later"}"#,
+                    r#"{"upload_id":"00000000-0000-0000-0000-000000000001","file_id":"00000000-0000-0000-0000-000000000002","state":"created","size_bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","mode":"chunked","missing_chunks":[0]}"#,
                 ))
             }
         }
@@ -1436,6 +2167,7 @@ mod tests {
             b"local bytes".to_vec(),
             Vec::new(),
             Arc::new(AtomicBool::new(false)),
+            false,
         )?;
         assert_eq!(result.status, 204);
         assert_eq!(client.refresh_token()?.expose(), "new-r");

@@ -87,6 +87,11 @@ mod tests {
             verify_bytes,
         );
         settings.max_clock_drift = None;
+        // Legacy age-retention integration cases disable the new raster and
+        // retain recent versions until their existing expiry.
+        settings.version_thinning.keep_all_hours = 0;
+        settings.version_thinning.daily_days = 0;
+        settings.version_thinning.weekly_weeks = 0;
         settings
     }
 
@@ -1282,6 +1287,105 @@ mod tests {
         assert_eq!(w.counters().await, counters);
     }
 
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn verification_detects_and_clears_corrupt_chunked_blobs() {
+        use craftcloud_storage::{LocalStore, ObjectKey, ObjectStore};
+
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let project = w.project("Verify chunks").await;
+        let file = w.file(project, "chunked.fig").await;
+        let data = pattern(12 * 1024 * 1024, 47);
+        let version = w.push(file, &data).await;
+        let (blob_id, chunk_id, chunk_key, layout): (Uuid, Uuid, String, String) = sqlx::query_as(
+            "SELECT b.id,c.id,c.object_key,b.layout FROM file_versions v JOIN blobs b ON b.id=v.blob_id \
+             JOIN version_chunks vc ON vc.version_id=v.id JOIN chunks c ON c.id=vc.chunk_id \
+             WHERE v.id=$1 ORDER BY vc.ordinal LIMIT 1",
+        )
+        .bind(version)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(layout, "chunked");
+
+        let later_file = w.file(project, "later-chunked.fig").await;
+        let later_data = pattern(12 * 1024 * 1024, 48);
+        w.push(later_file, &later_data).await;
+        let later_version: Uuid =
+            sqlx::query_scalar("SELECT head_version_id FROM files WHERE id=$1")
+                .bind(later_file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+        let later_blob: Uuid = sqlx::query_scalar("SELECT blob_id FROM file_versions WHERE id=$1")
+            .bind(later_version)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE blobs SET created_at=created_at + interval '1 second' WHERE id=$1")
+            .bind(later_blob)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+
+        let small_job = w.job_with(settings(1)).await;
+        let dry = run_with(&small_job, true).await;
+        assert_eq!(dry.count("verify_blobs", "would_verify"), 1);
+        let verified_during_dry_run: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM blobs WHERE id = ANY($1) AND verified_at IS NOT NULL",
+        )
+        .bind(vec![blob_id, later_blob])
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            verified_during_dry_run, 0,
+            "dry run must not record verification"
+        );
+
+        let chunk_path = w.object_path(&chunk_key);
+        make_writable(&chunk_path);
+        let mut corrupted = std::fs::read(&chunk_path).unwrap();
+        corrupted[0] ^= 0xff;
+        std::fs::write(&chunk_path, corrupted).unwrap();
+        let found = run(&small_job).await;
+        assert!(!found.has_errors(), "{found:?}");
+        assert_eq!(found.count("verify_blobs", "newly_corrupt"), 1);
+        let state: String = sqlx::query_scalar("SELECT state FROM blobs WHERE id=$1")
+            .bind(blob_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "corrupt");
+
+        // A fresh upload proves the deduplicated local chunk against the staged
+        // bytes and atomically adopts the verified object before commit.
+        w.push(file, &data).await;
+        let job = w.job().await;
+        let repaired = run(&job).await;
+        assert!(!repaired.has_errors(), "{repaired:?}");
+        assert_eq!(repaired.count("verify_blobs", "repaired"), 1);
+        let state: String = sqlx::query_scalar("SELECT state FROM blobs WHERE id=$1")
+            .bind(blob_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "committed");
+        let repaired_key: String = sqlx::query_scalar("SELECT object_key FROM chunks WHERE id=$1")
+            .bind(chunk_id)
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap();
+        let local = LocalStore::open(&w.env.storage_dir).await.unwrap();
+        assert!(
+            local
+                .head(&ObjectKey::parse(&repaired_key).unwrap())
+                .await
+                .is_ok()
+        );
+    }
+
     // ---- usage drift ------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1420,7 +1524,7 @@ mod tests {
         assert!(dry.dry_run);
         assert_eq!(dry.count("purge_trash", "files_due"), 1);
         assert_eq!(dry.count("expire_uploads", "would_expire"), 1);
-        assert_eq!(dry.count("trim_versions", "files_with_old_versions"), 1);
+        assert_eq!(dry.count("trim_versions", "versions_thinned_due"), 1);
         assert_eq!(snapshot(&w).await, before);
         assert_eq!(w.counters().await, counters);
         assert_eq!(files_below(&w.objects_dir()), objects);
@@ -1433,6 +1537,345 @@ mod tests {
         // A real run afterwards does change things.
         let real = run(&job).await;
         assert!(real.count("purge_trash", "purged_files") >= 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn thinning_keyset_reaches_later_files_and_wraps() {
+        let w = W::new().await;
+        let project = w.project("Thinning keyset").await;
+        let mut files = Vec::new();
+        for index in 0..3 {
+            let file = w.file(project, &format!("kept-{index}.fig")).await;
+            w.push(file, &pattern(100, index as u8)).await;
+            w.push(file, &pattern(100, (index + 10) as u8)).await;
+            files.push(file);
+        }
+        let ordered: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM files WHERE id=ANY($1) ORDER BY org_id,id")
+                .bind(&files)
+                .fetch_all(&w.env.pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE file_versions SET pinned=true WHERE file_id=ANY($1)")
+            .bind(&ordered[..2])
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+
+        let mut policy = settings(1024 * 1024);
+        policy.batch_size = 1;
+        policy.version_thinning.keep_all_hours = 0;
+        policy.version_thinning.daily_days = 0;
+        policy.version_thinning.weekly_weeks = 0;
+        policy.version_thinning.retention_days = 0;
+        policy.version_thinning.max_per_file = 1;
+        let job = w.job_with(policy).await;
+
+        for expected_deleted in [0, 0, 1] {
+            let report = run(&job).await;
+            assert!(!report.has_errors(), "{report:?}");
+            assert_eq!(
+                report.count("trim_versions", "deleted_versions"),
+                expected_deleted,
+                "ordered candidates: {ordered:?}"
+            );
+        }
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                ordered[2]
+            ))
+            .await,
+            1,
+            "the later due file must be reached after retained files"
+        );
+
+        sqlx::query("UPDATE file_versions SET pinned=false WHERE file_id=$1")
+            .bind(ordered[0])
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let wrapped = run(&job).await;
+        assert!(!wrapped.has_errors(), "{wrapped:?}");
+        assert_eq!(wrapped.count("trim_versions", "deleted_versions"), 1);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                ordered[0]
+            ))
+            .await,
+            1,
+            "the scan must wrap from the last key to the first"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn thinning_dry_run_does_not_advance_the_keyset_cursor() {
+        let w = W::new().await;
+        let project = w.project("Thinning dry cursor").await;
+        let mut files = Vec::new();
+        for index in 0..2 {
+            let file = w.file(project, &format!("due-{index}.fig")).await;
+            w.push(file, &pattern(100, index as u8)).await;
+            w.push(file, &pattern(100, (index + 10) as u8)).await;
+            files.push(file);
+        }
+        let ordered: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM files WHERE id=ANY($1) ORDER BY org_id,id")
+                .bind(&files)
+                .fetch_all(&w.env.pool)
+                .await
+                .unwrap();
+        let mut policy = settings(1024 * 1024);
+        policy.batch_size = 1;
+        policy.version_thinning.keep_all_hours = 0;
+        policy.version_thinning.daily_days = 0;
+        policy.version_thinning.weekly_weeks = 0;
+        policy.version_thinning.retention_days = 0;
+        policy.version_thinning.max_per_file = 1;
+        let job = w.job_with(policy).await;
+
+        let dry = run_with(&job, true).await;
+        assert!(!dry.has_errors(), "{dry:?}");
+        assert_eq!(dry.count("trim_versions", "versions_thinned_due"), 1);
+        let real = run(&job).await;
+        assert!(!real.has_errors(), "{real:?}");
+        assert_eq!(real.count("trim_versions", "deleted_versions"), 1);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                ordered[0]
+            ))
+            .await,
+            1,
+            "the real run must revisit the first file selected by the dry run"
+        );
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{}'",
+                ordered[1]
+            ))
+            .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn thinning_preserves_pins_published_versions_and_live_uploads() {
+        let w = W::new().await;
+        let project = w.project("Protected versions").await;
+        let file = w.file(project, "protected.fig").await;
+        let first = w.push(file, &pattern(100, 1)).await;
+        let middle = w.push(file, &pattern(100, 2)).await;
+        let head = w.push(file, &pattern(100, 3)).await;
+        let upload = w.stored_upload(file, &pattern(100, 4)).await;
+        sqlx::query(
+            "UPDATE file_versions SET created_at=now()-interval '40 days' WHERE file_id=$1",
+        )
+        .bind(file)
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE file_versions SET pinned=true WHERE id=$1")
+            .bind(first)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO figcraft_live_files(file_id,org_id,workspace_id,published_from_version_id,state,published_by_user_id,created_at,updated_at) VALUES($1,$2,$3,$4,'live',$5,now(),now())")
+            .bind(file).bind(w.org).bind(w.ws).bind(first).bind(w.owner.0)
+            .execute(&w.env.pool).await.unwrap();
+
+        let mut policy = settings(1024 * 1024);
+        policy.version_thinning.retention_days = 0;
+        policy.version_thinning.max_per_file = 1;
+        let job = w.job_with(policy).await;
+        let dry = run_with(&job, true).await;
+        assert!(!dry.has_errors(), "{dry:?}");
+        assert_eq!(dry.count("trim_versions", "versions_thinned_due"), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM file_versions WHERE file_id=$1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap(),
+            3
+        );
+        let held = run(&job).await;
+        assert!(!held.has_errors(), "{held:?}");
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{file}'"
+            ))
+            .await,
+            3
+        );
+
+        sqlx::query("UPDATE upload_sessions SET state='aborted' WHERE id=$1")
+            .bind(upload)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        let trimmed = run(&job).await;
+        assert!(!trimmed.has_errors(), "{trimmed:?}");
+        let surviving: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM file_versions WHERE file_id=$1 ORDER BY number")
+                .bind(file)
+                .fetch_all(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(surviving, vec![first, head]);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{file}' AND id='{middle}'"
+            ))
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn version_retention_shortening_uses_the_previous_value_for_24_hours() {
+        let w = W::new().await;
+        let project = w.project("Retention grace").await;
+        let file = w.file(project, "grace.fig").await;
+        w.push(file, &pattern(100, 1)).await;
+        w.push(file, &pattern(100, 2)).await;
+        w.push(file, &pattern(100, 3)).await;
+        sqlx::query(
+            "UPDATE file_versions SET created_at=now()-interval '20 days' WHERE file_id=$1",
+        )
+        .bind(file)
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO instance_settings(key,value,updated_at) VALUES('retention.version_days','{\"value\":1,\"previous\":30}',now()-interval '12 hours')")
+            .execute(&w.env.pool).await.unwrap();
+        let job = w.job().await;
+        let grace = run_with(&job, true).await;
+        assert!(!grace.has_errors(), "{grace:?}");
+        assert_eq!(grace.count("trim_versions", "versions_thinned_due"), 0);
+        sqlx::query("UPDATE instance_settings SET updated_at=now()-interval '25 hours' WHERE key='retention.version_days'")
+            .execute(&w.env.pool).await.unwrap();
+        let expired = run_with(&job, true).await;
+        assert!(!expired.has_errors(), "{expired:?}");
+        assert_eq!(expired.count("trim_versions", "versions_thinned_due"), 2);
+        let deleted = run(&job).await;
+        assert!(!deleted.has_errors(), "{deleted:?}");
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM file_versions WHERE file_id='{file}'"
+            ))
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn thinning_gc_deletes_unreferenced_archived_objects_after_inventory() {
+        use craftcloud_storage::{ObjectKey, ObjectStore};
+
+        let mut w = W::new().await;
+        let project = w.project("Archived thinning").await;
+        let file = w.file(project, "archive.fig").await;
+        let old = w.push(file, &pattern(256, 5)).await;
+        w.push(file, &pattern(256, 6)).await;
+        sqlx::query(
+            "UPDATE file_versions SET created_at=now()-interval '40 days' WHERE file_id=$1",
+        )
+        .bind(file)
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        let (archive, crypto) = w.env.configure_archive().await;
+        let (blob_id, local_key, size, sha256): (Uuid, String, i64, Vec<u8>) = sqlx::query_as(
+            "SELECT b.id,b.object_key,b.size_bytes,b.sha256 FROM file_versions v JOIN blobs b ON b.id=v.blob_id WHERE v.id=$1",
+        )
+        .bind(old)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let digest: [u8; 32] = sha256.as_slice().try_into().unwrap();
+        let local = w.store().await;
+        let local_key = ObjectKey::parse(&local_key).unwrap();
+        let copy = craftcloud_api::archive_transport::upload_verified(
+            &local,
+            archive.as_ref(),
+            &crypto,
+            blob_id,
+            &local_key,
+            size as u64,
+            &digest,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE blobs SET tier_state='archived',archive_object_key=$2,archive_wrapped_key=$3,archive_verified_at=now() WHERE id=$1")
+            .bind(blob_id)
+            .bind(copy.object_key.as_str())
+            .bind(copy.envelope.to_bytes().as_slice())
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE blobs SET created_at=now()-interval '40 days' WHERE id=$1")
+            .bind(blob_id)
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        local.delete(&local_key).await.unwrap();
+        sqlx::query(
+            "UPDATE archive_gc_state SET inventory_complete=true,updated_at=now() WHERE id=true",
+        )
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+
+        let mut policy = settings(1024 * 1024);
+        policy.version_thinning.retention_days = 1;
+        let job = w.job_with(policy).await.with_archive(archive.clone());
+        let report = run(&job).await;
+        assert!(!report.has_errors(), "{report:?}");
+        assert_eq!(report.count("trim_versions", "deleted_versions"), 1);
+        assert_eq!(report.count("collect_blobs", "archive_objects_deleted"), 1);
+        assert_eq!(report.count("collect_blobs", "blobs_deleted"), 1);
+        assert!(matches!(
+            archive.head(&copy.object_key).await,
+            Err(craftcloud_storage::StorageError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn finite_version_cap_from_unlimited_waits_for_grace_before_trimming() {
+        let w = W::new().await;
+        let project = w.project("Cap grace").await;
+        let file = w.file(project, "cap.fig").await;
+        for seed in 1..=4 {
+            w.push(file, &pattern(100, seed)).await;
+        }
+        sqlx::query("INSERT INTO instance_settings(key,value,updated_at) VALUES('versions.max_per_file','{\"value\":2,\"previous\":0}',now()-interval '12 hours')")
+            .execute(&w.env.pool).await.unwrap();
+        let job = w.job().await;
+        let grace = run_with(&job, true).await;
+        assert!(!grace.has_errors(), "{grace:?}");
+        assert_eq!(grace.count("trim_versions", "versions_thinned_due"), 0);
+        sqlx::query("UPDATE instance_settings SET updated_at=now()-interval '25 hours' WHERE key='versions.max_per_file'")
+            .execute(&w.env.pool).await.unwrap();
+        let expired = run_with(&job, true).await;
+        assert!(!expired.has_errors(), "{expired:?}");
+        assert_eq!(expired.count("trim_versions", "versions_thinned_due"), 2);
+        let deleted = run(&job).await;
+        assert!(!deleted.has_errors(), "{deleted:?}");
+        let kept: Vec<i64> =
+            sqlx::query_scalar("SELECT number FROM file_versions WHERE file_id=$1 ORDER BY number")
+                .bind(file)
+                .fetch_all(&w.env.pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, vec![3, 4]);
     }
 
     #[tokio::test]
@@ -2443,5 +2886,76 @@ mod tests {
         assert_eq!(later.count("purge_trash", "excluded_items"), 0);
         assert!(later.count("purge_trash", "item_errors") >= 1);
         assert_eq!(w.count("SELECT count(*) FROM files").await, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn purged_chunk_remains_until_archive_backup_pin_is_released() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let project = w.project("Chunk backup GC").await;
+        let file = w.file(project, "chunked.fig").await;
+        let bytes = pattern(12 * 1024 * 1024, 41);
+        w.push(file, &bytes).await;
+        let chunk_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM chunks WHERE file_id = $1 ORDER BY id LIMIT 1")
+                .bind(file)
+                .fetch_one(&w.env.pool)
+                .await
+                .unwrap();
+
+        let backup_id = Uuid::new_v4();
+        dbm::archive_backup_begin(&w.env.pool, backup_id)
+            .await
+            .unwrap();
+        dbm::archive_backup_add_chunk_refs(
+            &w.env.pool,
+            backup_id,
+            &[dbm::ArchiveChunkBackupRef {
+                chunk_id,
+                archive_object_key: "archive/chunk-pin-test".to_owned(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            w.delete(&format!("/api/v1/files/{file}"))
+                .await
+                .status
+                .is_success()
+        );
+        w.age(31).await;
+        let now = w.env.clock.now();
+        let mut tx = OrgTx::begin(&w.env.pool, w.org).await.unwrap().unwrap();
+        let purged = tx
+            .maint_purge_file(file, now - Duration::from_secs(30 * DAY), now)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(purged.files, 1);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM chunks WHERE id = '{chunk_id}'"
+            ))
+            .await,
+            1,
+            "purge must retain chunk identity until its object is collected"
+        );
+
+        let gc_cutoff = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let candidates = dbm::gc_chunk_candidates(&w.env.pool, gc_cutoff, 100)
+            .await
+            .unwrap();
+        assert!(!candidates.iter().any(|(_, id)| *id == chunk_id));
+        assert!(
+            dbm::archive_backup_cancel(&w.env.pool, backup_id)
+                .await
+                .unwrap()
+        );
+        let candidates = dbm::gc_chunk_candidates(&w.env.pool, gc_cutoff, 100)
+            .await
+            .unwrap();
+        assert!(candidates.iter().any(|(_, id)| *id == chunk_id));
     }
 }

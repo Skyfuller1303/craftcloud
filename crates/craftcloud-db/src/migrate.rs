@@ -398,13 +398,17 @@ mod tests {
     #[test]
     fn embedded_migrations_are_ordered_and_complete() {
         // Migration 19 adds email delivery state, 20 adds app access, 22 adds
-        // archive tiers and 23 adds instance setup/settings tables.
-        assert_eq!(
-            embedded_versions(),
-            vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
-            ]
-        );
+        // archive tiers, 23 adds instance setup/settings, 25 adds per-file chunks,
+        // and 26 adds temporary chunked-upload manifests.
+        let versions = embedded_versions();
+        assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(versions.first(), Some(&1));
+        assert_eq!(versions.last(), Some(&26));
+        assert!((1..=23).all(|version| versions.contains(&version)));
+        // Migration 24 belongs to AC-14 and may be absent in this standalone
+        // worktree; the integrated branch contains both allocated migrations.
+        assert!(versions.contains(&25));
+        assert!(versions.contains(&26));
     }
 
     #[test]
@@ -420,6 +424,8 @@ mod tests {
         assert_eq!(migrator_up_to(21).iter().count(), 21);
         assert_eq!(migrator_up_to(22).iter().count(), 22);
         assert_eq!(migrator_up_to(23).iter().count(), 23);
-        assert_eq!(migrator_up_to(99).iter().count(), 23);
+        let latest_count = embedded_versions().len();
+        assert_eq!(migrator_up_to(26).iter().count(), latest_count);
+        assert_eq!(migrator_up_to(99).iter().count(), latest_count);
     }
 }

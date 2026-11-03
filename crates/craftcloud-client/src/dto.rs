@@ -24,12 +24,31 @@ pub struct Discovery {
     pub server_mode: Option<String>,
 }
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct FeatureFlags {
     pub device_login: bool,
     pub two_factor: bool,
     pub grants: bool,
     pub locks: bool,
     pub figcraft_live: bool,
+    #[serde(default)]
+    pub chunked_upload: bool,
+}
+
+/// Plaintext chunk descriptor sent when creating a chunked upload session.
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadChunkDescriptor {
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// Chunked upload session request. The server assigns stable file-scoped IDs.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkedUploadRequest {
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub mode: &'static str,
+    pub chunks: Vec<UploadChunkDescriptor>,
 }
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ServerLimits {
@@ -201,6 +220,8 @@ pub struct VersionInfo {
     pub size_bytes: u64,
     pub sha256: String,
     pub created_at: String,
+    #[serde(default)]
+    pub pinned: bool,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Grant {

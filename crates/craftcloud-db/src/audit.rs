@@ -299,6 +299,12 @@ pub(crate) fn valid_instance_setting_value(key: &str, value: &Value) -> bool {
             value.as_u64().is_some_and(|v| (1..=3650).contains(&v))
         }
         "retention.audit_days" => value.as_u64().is_some_and(|v| (30..=3650).contains(&v)),
+        "versions.keep_all_hours" => value.as_u64().is_some_and(|v| v <= 168),
+        "versions.daily_days" => value.as_u64().is_some_and(|v| v <= 90),
+        "versions.weekly_weeks" => value.as_u64().is_some_and(|v| v <= 52),
+        "versions.max_per_file" => value
+            .as_u64()
+            .is_some_and(|v| v == 0 || (2..=10_000).contains(&v)),
         "mail.host" => value.as_str().is_some_and(valid_setting_host),
         "mail.username" | "mail.from" | "mail.tenant_id" | "mail.client_id" | "mail.sender" => {
             value

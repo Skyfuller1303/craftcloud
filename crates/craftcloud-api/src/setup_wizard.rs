@@ -77,6 +77,10 @@ const SETTING_KEYS: &[&str] = &[
     "retention.trash_days",
     "retention.audit_days",
     "retention.quarantine_days",
+    "versions.keep_all_hours",
+    "versions.daily_days",
+    "versions.weekly_weeks",
+    "versions.max_per_file",
 ];
 
 fn failed(error: &craftcloud_db::DbError, headers: &HeaderMap, action: &'static str) -> Response {
@@ -144,6 +148,10 @@ fn setting_code(key: &str) -> Option<&'static str> {
         "retention.trash_days" => Some("retention.trash_days"),
         "retention.audit_days" => Some("retention.audit_days"),
         "retention.quarantine_days" => Some("retention.quarantine_days"),
+        "versions.keep_all_hours" => Some("versions.keep_all_hours"),
+        "versions.daily_days" => Some("versions.daily_days"),
+        "versions.weekly_weeks" => Some("versions.weekly_weeks"),
+        "versions.max_per_file" => Some("versions.max_per_file"),
         _ => None,
     }
 }
@@ -153,7 +161,7 @@ fn setting_requires_fresh_auth(key: &str) -> bool {
 }
 
 fn is_retention_key(key: &str) -> bool {
-    key.starts_with("retention.")
+    key.starts_with("retention.") || key.starts_with("versions.")
 }
 
 /// True when the new value is shorter than the period currently in force
@@ -167,9 +175,21 @@ fn shortens_retention(
     let current = rows
         .iter()
         .find(|row| row.key == key)
-        .and_then(|row| db::effective_retention_days(key, &row.value, row.updated_at, now))
+        .and_then(|row| {
+            if key.starts_with("versions.") {
+                db::effective_version_setting(key, &row.value, row.updated_at, now)
+            } else {
+                db::effective_retention_days(key, &row.value, row.updated_at, now)
+            }
+        })
         .or_else(|| default_setting_value(key).as_u64());
-    current.is_some_and(|current| new_days < current)
+    current.is_some_and(|current| {
+        if key == "versions.max_per_file" {
+            (current == 0 && new_days > 0) || (current > 0 && new_days > 0 && new_days < current)
+        } else {
+            new_days < current
+        }
+    })
 }
 
 fn valid_setting_host(host: &str) -> bool {
@@ -204,6 +224,10 @@ fn default_setting_value(key: &str) -> Value {
             json!(30)
         }
         "retention.audit_days" => json!(365),
+        "versions.keep_all_hours" => json!(24),
+        "versions.daily_days" => json!(7),
+        "versions.weekly_weeks" => json!(4),
+        "versions.max_per_file" => json!(0),
         _ => Value::Null,
     }
 }
@@ -227,6 +251,12 @@ fn setting_value_valid(key: &str, value: &Value) -> bool {
             value.as_u64().is_some_and(|v| (1..=3650).contains(&v))
         }
         "retention.audit_days" => value.as_u64().is_some_and(|v| (30..=3650).contains(&v)),
+        "versions.keep_all_hours" => value.as_u64().is_some_and(|v| v <= 168),
+        "versions.daily_days" => value.as_u64().is_some_and(|v| v <= 90),
+        "versions.weekly_weeks" => value.as_u64().is_some_and(|v| v <= 52),
+        "versions.max_per_file" => value
+            .as_u64()
+            .is_some_and(|v| v == 0 || (2..=10_000).contains(&v)),
         "mail.host" => value.as_str().is_some_and(valid_setting_host),
         "mail.username" | "mail.from" | "mail.tenant_id" | "mail.client_id" | "mail.sender" => {
             value.is_null() && key != "mail.host"

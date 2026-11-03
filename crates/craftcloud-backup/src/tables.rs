@@ -62,10 +62,13 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     },
     table("blob_quota_groups", 22),
     table("blobs", 8),
+    table("chunks", 25),
     table("archive_backups", 22),
     table("archive_backup_refs", 22),
+    table("archive_chunk_backup_refs", 25),
     table("upload_sessions", 8),
     table("file_versions", 9),
+    table("version_chunks", 25),
     table("grants", 16),
     table("user_two_factor", 17),
     table("user_two_factor_recovery_codes", 17),
@@ -94,6 +97,10 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
 /// - `maintenance_runs`: a run log that the new instance rebuilds.
 /// - `archive_gc_state`: restored databases always start with an incomplete
 ///   external-backup inventory; operators must explicitly complete inventory.
+/// - `upload_chunks`, `upload_chunk_manifests` and
+///   `upload_chunk_manifest_entries`: upload sessions are restored as aborted,
+///   so staged upload chunk mappings and temporary client manifests are not
+///   useful on the new instance.
 pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("sessions", 4),
     ("password_reset_tokens", 4),
@@ -112,6 +119,9 @@ pub const EXCLUDED_WITH_VERSION: &[(&str, i64)] = &[
     ("sso_session_bindings", 21),
     ("organization_session_cutoffs", 21),
     ("scim_tokens", 21),
+    ("upload_chunks", 25),
+    ("upload_chunk_manifests", 26),
+    ("upload_chunk_manifest_entries", 26),
 ];
 
 /// The names of [`EXCLUDED_WITH_VERSION`].
@@ -133,6 +143,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "sso_session_bindings",
     "organization_session_cutoffs",
     "scim_tokens",
+    "upload_chunks",
+    "upload_chunk_manifests",
+    "upload_chunk_manifest_entries",
 ];
 
 /// The migration bookkeeping table: recreated by running the migrations.
@@ -352,6 +365,11 @@ mod tests {
         );
         assert!(position(&backup_23, "instance_setup_steps").is_some());
         assert!(position(&backup_23, "instance_settings").is_some());
+        let backup_25 = backup_tables_for(25).unwrap();
+        assert!(position(&backup_25, "files") < position(&backup_25, "chunks"));
+        assert!(position(&backup_25, "chunks") < position(&backup_25, "version_chunks"));
+        assert!(position(&backup_25, "file_versions") < position(&backup_25, "version_chunks"));
+        assert!(excluded_tables_for(25).contains(&"upload_chunks"));
         assert!(!is_backup_table("outbound_emails"));
         assert!(!is_backup_table("email_verification_tokens"));
         assert!(!is_backup_table("pending_email_changes"));

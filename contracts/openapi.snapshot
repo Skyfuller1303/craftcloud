@@ -75,6 +75,7 @@ POST /api/v1/files/{file_id}/uploads auth=cookie+csrf|bearer req=CreateUploadReq
 GET /api/v1/files/{file_id}/versions auth=cookie|bearer req=- ok=VersionPage codes=200,400,401,404,422,500,503
 POST /api/v1/files/{file_id}/versions auth=cookie+csrf|bearer req=CommitVersionRequest ok=Version codes=200,201,400,401,403,404,409,410,412,413,415,422,423,428,500,503
 GET /api/v1/files/{file_id}/versions/{version_id} auth=cookie|bearer req=- ok=Version codes=200,400,401,404,500,503
+PATCH /api/v1/files/{file_id}/versions/{version_id} auth=cookie+csrf|bearer req=PinVersionRequest ok=Version codes=200,400,401,403,404,422,500,503
 GET /api/v1/files/{file_id}/versions/{version_id}/content auth=cookie|bearer req=- ok=- codes=200,206,400,401,404,409,416,500,503
 POST /api/v1/files/{file_id}/versions/{version_id}/restore auth=cookie+csrf|bearer req=- ok=Version codes=201,400,401,403,404,409,412,422,423,428,500,503
 DELETE /api/v1/grants/{grant_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,500,503
@@ -128,6 +129,7 @@ POST /api/v1/setup/complete auth=none req=SetupCompleteRequest ok=- codes=201,40
 GET /api/v1/setup/status auth=none req=- ok=- codes=200,500,503
 DELETE /api/v1/uploads/{upload_id} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,409,500,503
 GET /api/v1/uploads/{upload_id} auth=cookie|bearer req=- ok=Upload codes=200,400,401,403,404,500,503
+PUT /api/v1/uploads/{upload_id}/chunks/{ordinal} auth=cookie+csrf|bearer req=- ok=- codes=204,400,401,403,404,408,409,410,413,422,500,503
 PUT /api/v1/uploads/{upload_id}/content auth=cookie+csrf|bearer req=- ok=Upload codes=200,400,401,403,404,408,409,410,413,422,423,500,503,507
 GET /api/v1/workspaces/{workspace_id} auth=cookie|bearer req=- ok=Workspace codes=200,400,401,404,500,503
 PATCH /api/v1/workspaces/{workspace_id} auth=cookie+csrf|bearer req=UpdateWorkspaceRequest ok=Workspace codes=200,400,401,403,404,412,413,415,422,428,500,503
@@ -173,6 +175,7 @@ CreateFileRequest
 CreateInvitationRequest
 CreateOrganizationRequest
 CreateProjectRequest
+CreateUploadChunk
 CreateUploadRequest
 CreateWorkspaceRequest
 CreatedInvitation
@@ -231,6 +234,7 @@ OrganizationApps
 OrganizationLock
 OrganizationOverview
 OrganizationSummaryPage
+PinVersionRequest
 Project
 ProjectPage
 QuotaRequest

@@ -5,6 +5,8 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(any(test, feature = "fault-injection"))]
+use std::sync::{Arc, Mutex};
 
 use crate::error::StorageError;
 
@@ -34,6 +36,21 @@ pub struct FaultPlan {
     write_kind_full: AtomicBool,
     fail_fsync: AtomicBool,
     fail_rename: AtomicBool,
+    #[cfg(any(test, feature = "fault-injection"))]
+    read_gate: Mutex<Option<ReadGate>>,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+struct ReadGate {
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl std::fmt::Debug for ReadGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadGate").finish_non_exhaustive()
+    }
 }
 
 const NEVER: u64 = u64::MAX;
@@ -45,6 +62,8 @@ impl Default for FaultPlan {
             write_kind_full: AtomicBool::new(false),
             fail_fsync: AtomicBool::new(false),
             fail_rename: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            read_gate: Mutex::new(None),
         }
     }
 }
@@ -72,6 +91,36 @@ impl FaultPlan {
     pub fn fail_rename(&self) {
         self.fail_rename.store(true, Ordering::SeqCst);
     }
+
+    /// Pauses the next local object read until the test releases it.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn pause_next_read(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) {
+        *self
+            .read_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ReadGate { entered, release });
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) async fn before_read(&self) {
+        let gate = {
+            self.read_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        };
+        if let Some(gate) = gate {
+            gate.entered.wait().await;
+            gate.release.wait().await;
+        }
+    }
+
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    pub(crate) async fn before_read(&self) {}
 
     /// The offset at which writes fail, if armed.
     pub(crate) fn write_limit(&self) -> Option<u64> {

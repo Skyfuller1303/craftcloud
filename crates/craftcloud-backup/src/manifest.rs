@@ -7,8 +7,10 @@
 //! manifest.json          this file's content, see [`Manifest`]
 //! manifest.sha256        "<64 hex>  manifest.json"
 //! blobs.jsonl            one [`BlobEntry`] per line, ascending by key
+//! chunks.jsonl           one [`ChunkEntry`] per line in format version 3
 //! tables/<table>.copy    PostgreSQL COPY text format of one table
-//! blobs/<xx>/<key>       the object bytes (xx = first two characters of the key)
+//! blobs/<xx>/<key>       whole-object bytes
+//! chunks/<id>            physical chunk bytes in format version 3
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -17,8 +19,8 @@ use crate::error::{BackupError, ErrorKind};
 
 /// Value of [`Manifest::format`].
 pub const FORMAT: &str = "craftcloud-backup";
-/// The current format version. Version 1 local-only backups remain readable.
-pub const FORMAT_VERSION: u32 = 2;
+/// The current format version. Versions 1 and 2 remain readable.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// File name of the manifest.
 pub const MANIFEST_FILE: &str = "manifest.json";
@@ -30,6 +32,14 @@ pub const BLOB_INDEX_FILE: &str = "blobs.jsonl";
 pub const TABLES_DIR: &str = "tables";
 /// Directory of the blob files.
 pub const BLOBS_DIR: &str = "blobs";
+/// File containing physical chunk records.
+pub const CHUNK_INDEX_FILE: &str = "chunks.jsonl";
+/// File containing the expected SHA-256 for each chunked version.
+pub const CHUNKED_VERSION_INDEX_FILE: &str = "chunked_versions.jsonl";
+/// Ordered chunk mappings used to verify assembled versions.
+pub const VERSION_CHUNK_INDEX_FILE: &str = "version_chunks.jsonl";
+/// Directory containing copied physical chunks.
+pub const CHUNKS_DIR: &str = "chunks";
 
 /// Largest accepted manifest (it has one entry per table, so it is tiny).
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -79,6 +89,84 @@ pub struct BlobIndex {
     pub sha256: String,
 }
 
+/// Index of unique physical chunks in a version-3 backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChunkIndex {
+    /// Always `chunks.jsonl`.
+    pub file: String,
+    /// Number of distinct chunks.
+    pub count: u64,
+    /// Sum of chunk sizes.
+    pub total_bytes: u64,
+    /// SHA-256 of the index.
+    pub sha256: String,
+}
+
+/// Bounded checksum index for a JSONL file in format version 3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonlIndex {
+    /// Fixed file name for this index.
+    pub file: String,
+    /// Number of lines.
+    pub count: u64,
+    /// Total represented bytes (version sizes or chunk sizes).
+    pub total_bytes: u64,
+    /// SHA-256 of the index file.
+    pub sha256: String,
+}
+
+/// One expected whole-version digest for a chunked version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChunkedVersionEntry {
+    /// Version UUID.
+    pub id: String,
+    /// Assembled content size.
+    pub size: u64,
+    /// SHA-256 of the assembled content.
+    pub sha256: String,
+}
+
+/// One ordered mapping and the complete metadata needed to assemble a version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionChunkEntry {
+    /// Version UUID.
+    pub version_id: String,
+    /// Zero-based position.
+    pub ordinal: u32,
+    /// Byte offset within the version.
+    pub byte_offset: u64,
+    /// Physical chunk metadata.
+    pub chunk: ChunkEntry,
+}
+
+/// One physical chunk. Local bytes are stored at `chunks/<id>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChunkEntry {
+    /// Stable chunk UUID and archive encryption identity.
+    pub id: String,
+    /// File scoped to this chunk.
+    pub file_id: String,
+    /// Store object key.
+    pub key: String,
+    /// Byte size.
+    pub size: u64,
+    /// Plaintext SHA-256.
+    pub sha256: String,
+    /// Whether plaintext bytes are included locally.
+    pub local_copy: bool,
+    /// Immutable encrypted archive provider key.
+    #[serde(default)]
+    pub archive_object_key: Option<String>,
+    /// Wrapped per-chunk key envelope as lowercase hex.
+    #[serde(default)]
+    pub archive_wrapped_key: Option<String>,
+}
+
 /// One line of `blobs.jsonl`: a committed blob and its bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +177,9 @@ pub struct BlobEntry {
     pub key: String,
     /// Size in bytes.
     pub size: u64,
+    /// `whole` for legacy blobs; `chunked` references physical chunks.
+    #[serde(default = "whole_layout")]
+    pub layout: String,
     /// SHA-256 of the content, lowercase hex.
     pub sha256: String,
     /// Whether plaintext bytes are included in the local blob directory.
@@ -101,6 +192,10 @@ pub struct BlobEntry {
     /// Wrapped per-object key envelope as lowercase hex, when one exists.
     #[serde(default)]
     pub archive_wrapped_key: Option<String>,
+}
+
+fn whole_layout() -> String {
+    "whole".to_owned()
 }
 
 fn local_copy_default() -> bool {
@@ -128,6 +223,15 @@ pub struct Manifest {
     pub tables: Vec<TableEntry>,
     /// The blob list.
     pub blobs: BlobIndex,
+    /// Physical chunk list. Absent in format versions 1 and 2.
+    #[serde(default)]
+    pub chunks: Option<ChunkIndex>,
+    /// Full-version checksums, absent in format versions 1 and 2.
+    #[serde(default)]
+    pub chunked_versions: Option<JsonlIndex>,
+    /// Ordered physical chunk mappings, absent in format versions 1 and 2.
+    #[serde(default)]
+    pub version_chunks: Option<JsonlIndex>,
     /// Tables left out on purpose (see `EXCLUDED_TABLES`).
     pub excluded_tables: Vec<String>,
     /// Versions whose blob was not `committed` at snapshot time (for example
@@ -198,18 +302,23 @@ pub fn blob_file(key: &str) -> String {
     format!("{BLOBS_DIR}/{}/{key}", key.get(..2).unwrap_or("00"))
 }
 
+/// Relative path of a chunk file keyed by its validated UUID.
+#[must_use]
+pub fn chunk_file(id: &str) -> String {
+    format!("{CHUNKS_DIR}/{id}")
+}
+
 fn format_error(message: impl Into<String>) -> BackupError {
     BackupError::new(ErrorKind::Format, message)
 }
 
 impl Manifest {
     /// Parses and checks the manifest text. `known_migrations` are the
-    /// migration versions of this build.
+    /// migration versions of this build. Versions 1 and 2 remain readable.
     ///
     /// # Errors
     ///
-    /// [`ErrorKind::Format`] for anything that is not exactly a manifest of
-    /// format version 1 with consistent entries.
+    /// [`ErrorKind::Format`] for an unsupported format or inconsistent entries.
     pub fn parse(bytes: &[u8], known_migrations: &[i64]) -> Result<Self, BackupError> {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
             return Err(format_error("the manifest is too large"));
@@ -224,15 +333,15 @@ impl Manifest {
         if self.format != FORMAT {
             return Err(format_error("this directory is not a CraftCloud backup"));
         }
-        if !matches!(self.format_version, 1 | FORMAT_VERSION) {
+        if !matches!(self.format_version, 1 | 2 | FORMAT_VERSION) {
             return Err(format_error(format!(
-                "unsupported backup format version {} (this build reads versions 1 and {FORMAT_VERSION})",
+                "unsupported backup format version {} (this build reads versions 1 through {FORMAT_VERSION})",
                 self.format_version
             )));
         }
         match (self.format_version, self.backup_id.as_deref()) {
             (1, None) => {}
-            (2, Some(id)) if uuid::Uuid::parse_str(id).is_ok() => {}
+            (2 | 3, Some(id)) if uuid::Uuid::parse_str(id).is_ok() => {}
             _ => return Err(format_error("the manifest backup id is invalid")),
         }
         if !known_migrations.contains(&self.migration_version) {
@@ -275,6 +384,29 @@ impl Manifest {
             return Err(format_error(
                 "the blob list entry of the manifest is malformed",
             ));
+        }
+        match (&self.chunks, self.format_version) {
+            (Some(chunks), 3)
+                if chunks.file == CHUNK_INDEX_FILE && is_sha256_hex(&chunks.sha256) => {}
+            (None, 1 | 2) => {}
+            _ => {
+                return Err(format_error(
+                    "the chunk list entry of the manifest is malformed",
+                ));
+            }
+        }
+        match (
+            &self.chunked_versions,
+            &self.version_chunks,
+            self.format_version,
+        ) {
+            (Some(versions), Some(mappings), 3)
+                if versions.file == CHUNKED_VERSION_INDEX_FILE
+                    && mappings.file == VERSION_CHUNK_INDEX_FILE
+                    && is_sha256_hex(&versions.sha256)
+                    && is_sha256_hex(&mappings.sha256) => {}
+            (None, None, 1 | 2) => {}
+            _ => return Err(format_error("the chunked version indexes are malformed")),
         }
         if self.store.store_id.len() > 64 {
             return Err(format_error("the manifest holds an oversized field"));
@@ -354,11 +486,91 @@ impl BlobEntry {
                 ));
             }
         }
-        if !entry.local_copy && entry.archive_object_key.is_none() {
+        if !matches!(entry.layout.as_str(), "whole" | "chunked") {
+            return Err(format_error("a blob has an invalid layout"));
+        }
+        if !entry.local_copy && entry.archive_object_key.is_none() && entry.layout != "chunked" {
             return Err(format_error(
                 "a blob without an archive reference has no backup bytes",
             ));
         }
+        Ok(entry)
+    }
+}
+
+impl ChunkEntry {
+    /// Parses one line of `chunks.jsonl`.
+    pub fn parse_line(line: &[u8]) -> Result<Self, BackupError> {
+        if line.len() > MAX_BLOB_LINE_BYTES {
+            return Err(format_error("a line of the chunk list is too long"));
+        }
+        let entry: Self = serde_json::from_slice(line)
+            .map_err(|_| format_error("a line of the chunk list is malformed"))?;
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), BackupError> {
+        if uuid::Uuid::parse_str(&self.id).is_err()
+            || uuid::Uuid::parse_str(&self.file_id).is_err()
+            || !is_key(&self.key)
+            || !is_sha256_hex(&self.sha256)
+            || !(1..=4 * 1024 * 1024).contains(&self.size)
+        {
+            return Err(format_error("a chunk entry has an invalid field"));
+        }
+        if !self.local_copy && self.archive_object_key.is_none() {
+            return Err(format_error(
+                "a chunk without local bytes has no archive reference",
+            ));
+        }
+        match (&self.archive_object_key, &self.archive_wrapped_key) {
+            (None, None) => {}
+            (Some(key), Some(wrapped))
+                if is_key(key) && wrapped.len() == 240 && is_lowercase_hex(wrapped) =>
+            {
+                let envelope =
+                    craftcloud_storage::WrappedDataKey::from_bytes(&decode_hex(wrapped)?)
+                        .map_err(|_| format_error("a chunk archive envelope is invalid"))?;
+                if envelope.blob_id().to_string() != self.id
+                    || envelope.plaintext_len() != self.size
+                {
+                    return Err(format_error("chunk archive metadata is inconsistent"));
+                }
+            }
+            _ => return Err(format_error("chunk archive metadata is incomplete")),
+        }
+        Ok(())
+    }
+}
+
+impl ChunkedVersionEntry {
+    pub fn parse_line(line: &[u8]) -> Result<Self, BackupError> {
+        if line.len() > MAX_BLOB_LINE_BYTES {
+            return Err(format_error("a chunked-version index line is too long"));
+        }
+        let entry: Self = serde_json::from_slice(line)
+            .map_err(|_| format_error("a chunked-version entry is malformed"))?;
+        if uuid::Uuid::parse_str(&entry.id).is_err() || !is_sha256_hex(&entry.sha256) {
+            return Err(format_error("a chunked-version entry has an invalid field"));
+        }
+        Ok(entry)
+    }
+}
+
+impl VersionChunkEntry {
+    pub fn parse_line(line: &[u8]) -> Result<Self, BackupError> {
+        if line.len() > MAX_BLOB_LINE_BYTES {
+            return Err(format_error("a version-chunk index line is too long"));
+        }
+        let entry: Self = serde_json::from_slice(line)
+            .map_err(|_| format_error("a version-chunk entry is malformed"))?;
+        if uuid::Uuid::parse_str(&entry.version_id).is_err() {
+            return Err(format_error(
+                "a version-chunk entry has an invalid version id",
+            ));
+        }
+        entry.chunk.validate()?;
         Ok(entry)
     }
 }
@@ -420,6 +632,24 @@ mod tests {
                 total_bytes: 0,
                 sha256: "0".repeat(64),
             },
+            chunks: Some(ChunkIndex {
+                file: CHUNK_INDEX_FILE.to_owned(),
+                count: 0,
+                total_bytes: 0,
+                sha256: "0".repeat(64),
+            }),
+            chunked_versions: Some(JsonlIndex {
+                file: CHUNKED_VERSION_INDEX_FILE.to_owned(),
+                count: 0,
+                total_bytes: 0,
+                sha256: "0".repeat(64),
+            }),
+            version_chunks: Some(JsonlIndex {
+                file: VERSION_CHUNK_INDEX_FILE.to_owned(),
+                count: 0,
+                total_bytes: 0,
+                sha256: "0".repeat(64),
+            }),
             excluded_tables: vec!["sessions".to_owned()],
             unavailable_version_blobs: 0,
             backup_id: Some("d7d6c52f-cb40-42ca-a6a8-7bf4e73db845".to_owned()),
@@ -448,8 +678,14 @@ mod tests {
                 .contains("not a CraftCloud backup")
         );
         let mut m = sample();
-        m.format_version = 3;
-        assert!(parse(&m).unwrap_err().message.contains("format version 3"));
+        m.format_version = 4;
+        assert!(parse(&m).unwrap_err().message.contains("format version 4"));
+        let mut legacy = sample();
+        legacy.format_version = 2;
+        legacy.chunks = None;
+        legacy.chunked_versions = None;
+        legacy.version_chunks = None;
+        assert!(parse(&legacy).is_ok());
         let mut m = sample();
         m.migration_version = 15;
         let error = parse(&m).unwrap_err();
@@ -536,6 +772,26 @@ b",
         ] {
             assert!(BlobEntry::parse_line(bad.as_bytes()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn chunked_blob_and_chunk_lines_are_validated() {
+        let blob = serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"key":"a".repeat(32),"size":5,"sha256":"b".repeat(64),"layout":"chunked","local_copy":false});
+        assert_eq!(
+            BlobEntry::parse_line(&serde_json::to_vec(&blob).unwrap())
+                .unwrap()
+                .layout,
+            "chunked"
+        );
+        let chunk = serde_json::json!({"id":uuid::Uuid::new_v4().to_string(),"file_id":uuid::Uuid::new_v4().to_string(),"key":"c".repeat(32),"size":5,"sha256":"d".repeat(64),"local_copy":true});
+        assert_eq!(
+            ChunkEntry::parse_line(&serde_json::to_vec(&chunk).unwrap())
+                .unwrap()
+                .size,
+            5
+        );
+        let invalid = serde_json::json!({"id":"x","file_id":"y","key":"z","size":5,"sha256":"bad","local_copy":true});
+        assert!(ChunkEntry::parse_line(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 
     #[test]

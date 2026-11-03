@@ -276,6 +276,22 @@ mod tests {
         /// Starts the HTTP server (maintenance loop off: tests run
         /// maintenance explicitly) and waits until it answers.
         fn serve(&self, abort_at: Option<&str>) -> Server {
+            self.serve_configured(abort_at, None)
+        }
+
+        fn serve_with_secret_key(
+            &self,
+            abort_at: Option<&str>,
+            secret_key_file: Option<&Path>,
+        ) -> Server {
+            self.serve_configured(abort_at, secret_key_file)
+        }
+
+        fn serve_configured(
+            &self,
+            abort_at: Option<&str>,
+            secret_key_file: Option<&Path>,
+        ) -> Server {
             let port = free_port();
             let bind = format!("127.0.0.1:{port}");
             let public = format!("http://127.0.0.1:{port}");
@@ -287,6 +303,15 @@ mod tests {
             ];
             if let Some(point) = abort_at {
                 env.push(("CC_FAULT_ABORT_AT", point));
+            }
+            let secret_key = secret_key_file.map(|path| {
+                (
+                    "CRAFTCLOUD_SECRET_KEY_FILE",
+                    path.to_str().expect("test secret path is UTF-8"),
+                )
+            });
+            if let Some(secret_key) = secret_key.as_ref() {
+                env.push(*secret_key);
             }
             let (mut cmd, log) = self.command(&[], &env);
             let child = cmd.spawn().unwrap();
@@ -584,6 +609,102 @@ mod tests {
             bytes
         });
         assert_eq!(actual, expected);
+    }
+
+    type ChunkCrashEntry = (
+        i32,
+        i64,
+        uuid::Uuid,
+        String,
+        i64,
+        Vec<u8>,
+        String,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
+
+    fn assert_chunked_version_bytes(
+        fixture: &Fixture,
+        version_id: &str,
+        archive_dir: &Path,
+        expected: &[u8],
+    ) {
+        let chunks: Vec<ChunkCrashEntry> = fixture
+            .rt
+            .block_on(async {
+                sqlx::query_as(
+                    "SELECT vc.ordinal,vc.byte_offset,c.id,c.object_key,c.size_bytes,c.sha256, \
+                            c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
+                     FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+                     WHERE vc.version_id=$1 ORDER BY vc.ordinal",
+                )
+                .bind(uuid::Uuid::parse_str(version_id).unwrap())
+                .fetch_all(&fixture.pool)
+                .await
+            })
+            .unwrap();
+        assert!(!chunks.is_empty());
+        let local = fixture
+            .rt
+            .block_on(LocalStore::open(&fixture.storage))
+            .unwrap();
+        let archive = fixture.rt.block_on(LocalStore::open(archive_dir)).unwrap();
+        let crypto = craftcloud_storage::ArchiveCrypto::from_server_key(&[0x42; 32]).unwrap();
+        let actual = fixture.rt.block_on(async {
+            let mut bytes = Vec::new();
+            let mut offset = 0_i64;
+            for (
+                index,
+                (
+                    ordinal,
+                    chunk_offset,
+                    chunk_id,
+                    local_text,
+                    size,
+                    raw_sha,
+                    tier,
+                    archive_text,
+                    wrapped,
+                ),
+            ) in chunks.into_iter().enumerate()
+            {
+                assert_eq!(usize::try_from(ordinal).unwrap(), index);
+                assert_eq!(chunk_offset, offset);
+                let size = u64::try_from(size).unwrap();
+                let expected_sha: [u8; 32] = raw_sha.as_slice().try_into().unwrap();
+                let mut chunk_bytes = Vec::new();
+                if tier == "local" {
+                    let key = ObjectKey::parse(&local_text).unwrap();
+                    let mut reader = local.open_read(&key, None).await.unwrap();
+                    assert_eq!(reader.remaining(), size);
+                    while let Some(block) = reader.next_chunk().await.unwrap() {
+                        chunk_bytes.extend_from_slice(&block);
+                    }
+                } else {
+                    assert_eq!(tier, "archive");
+                    let key = ObjectKey::parse(archive_text.as_deref().unwrap()).unwrap();
+                    let envelope = WrappedDataKey::from_bytes(wrapped.as_deref().unwrap()).unwrap();
+                    let mut reader = craftcloud_api::archive_transport::open_archive_range(
+                        &archive, &crypto, &key, &envelope, chunk_id, size, None,
+                    )
+                    .await
+                    .unwrap();
+                    while let Some(block) = reader.next_chunk().await.unwrap() {
+                        chunk_bytes.extend_from_slice(&block);
+                    }
+                }
+                assert_eq!(chunk_bytes.len() as u64, size);
+                assert_eq!(Sha256::digest(&chunk_bytes).as_slice(), expected_sha);
+                offset += i64::try_from(size).unwrap();
+                bytes.extend_from_slice(&chunk_bytes);
+            }
+            bytes
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(
+            Sha256::digest(&actual).as_slice(),
+            Sha256::digest(expected).as_slice()
+        );
     }
 
     // ---- minimal HTTP client -------------------------------------------------------
@@ -913,14 +1034,40 @@ mod tests {
         }
 
         fn new_with_first_size(first_size: usize, then: impl FnOnce(&Fixture, &Api, &str)) -> Self {
+            Self::new_with_options(first_size, false, then)
+        }
+
+        fn new_chunked_with_first_size(
+            first_size: usize,
+            then: impl FnOnce(&Fixture, &Api, &str),
+        ) -> Self {
+            Self::new_with_options(first_size, true, then)
+        }
+
+        fn new_with_options(
+            first_size: usize,
+            chunked: bool,
+            then: impl FnOnce(&Fixture, &Api, &str),
+        ) -> Self {
             let fx = Fixture::new();
-            let server = fx.serve(None);
+            let secret_key_file = if chunked {
+                let path = fx.root.join("test-server-key");
+                std::fs::write(
+                    &path,
+                    base64::engine::general_purpose::STANDARD.encode([0x42; 32]),
+                )
+                .unwrap();
+                Some(path)
+            } else {
+                None
+            };
+            let server = fx.serve_with_secret_key(None, secret_key_file.as_deref());
             let api = Api::login(server.port);
             let file = make_file(&api, &fx.op_id);
             let v1_data = pattern(first_size, 1);
             let v1 = api.publish(&file, &v1_data, ("If-None-Match", "*"));
             let baseline_objects = fx.objects();
-            assert_eq!(baseline_objects.len(), 1, "{baseline_objects:?}");
+            assert!(!baseline_objects.is_empty(), "{baseline_objects:?}");
             then(&fx, &api, &file);
             server.kill();
             Self {
@@ -1415,6 +1562,101 @@ mod tests {
             );
             assert_archive_bytes(fx, &world.v1, &archive_dir, &world.v1_data);
             assert_local_version_bytes(fx, &head_version, &pattern(1024 * 1024 + 7, 23));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    fn chunk_archive_process_crashes_resume_without_losing_version_bytes() {
+        for (point, local_survives) in [
+            ("archive-chunk-db-committed", true),
+            ("archive-chunk-local-deleted", false),
+        ] {
+            let world =
+                World::new_chunked_with_first_size(12 * 1024 * 1024, |fixture, api, file| {
+                    let version = tag(&fixture.text(&format!(
+                        "SELECT head_version_id::text FROM files WHERE id='{file}'"
+                    )));
+                    let mut data = pattern(12 * 1024 * 1024, 23);
+                    let start = data.len() / 2;
+                    let changed = data.len() / 100;
+                    data[start..start + changed].fill(0x6b);
+                    api.publish(file, &data, ("If-Match", version.as_str()));
+                });
+            let fx = &world.fx;
+            assert_eq!(
+                fx.text(&format!("SELECT layout FROM blobs WHERE id=(SELECT blob_id FROM file_versions WHERE id='{}')", world.v1)),
+                "chunked"
+            );
+            let archive_dir = fx.root.join(format!("chunk-archive-{}", unique()));
+            std::fs::create_dir_all(&archive_dir).unwrap();
+            let archive_key_file = fx.root.join(format!("chunk-archive-key-{}", unique()));
+            write_archive_test_key(&archive_key_file);
+            let old_only: (String, String) = fx.rt.block_on(async {
+                sqlx::query_as(
+                    "SELECT c.id::text,c.object_key FROM chunks c \
+                     JOIN version_chunks old ON old.chunk_id=c.id \
+                     WHERE old.version_id=$1 AND NOT EXISTS ( \
+                       SELECT 1 FROM version_chunks head JOIN files f ON f.head_version_id=head.version_id \
+                       WHERE head.chunk_id=c.id AND f.id=old.file_id) \
+                     ORDER BY old.ordinal LIMIT 1",
+                )
+                .bind(uuid::Uuid::parse_str(&world.v1).unwrap())
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap()
+            });
+
+            let child = archive_worker_child(fx, &archive_dir, &archive_key_file, Some(point));
+            assert_aborted(child.status, &String::from_utf8_lossy(&child.stderr));
+            let state: (String, bool, Option<String>) = fx.rt.block_on(async {
+                sqlx::query_as(
+                    "SELECT storage_tier,archive_local_delete_pending,archive_object_key FROM chunks WHERE id=$1",
+                )
+                .bind(uuid::Uuid::parse_str(&old_only.0).unwrap())
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap()
+            });
+            assert_eq!(state.0, "archive", "{point}");
+            assert!(state.1, "durable local-delete retry missing at {point}");
+            assert!(
+                state.2.is_some(),
+                "archive object intent missing at {point}"
+            );
+            let local = fx.rt.block_on(LocalStore::open(&fx.storage)).unwrap();
+            let local_key = ObjectKey::parse(&old_only.1).unwrap();
+            assert_eq!(
+                fx.rt.block_on(local.head(&local_key)).is_ok(),
+                local_survives,
+                "wrong local copy state at {point}"
+            );
+
+            let resumed = archive_worker_child(fx, &archive_dir, &archive_key_file, None);
+            assert!(
+                resumed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&resumed.stderr)
+            );
+            let pending: i64 = fx.rt.block_on(async {
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM chunks WHERE storage_tier='archive' AND archive_local_delete_pending",
+                )
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap()
+            });
+            assert_eq!(pending, 0);
+            let mut expected = pattern(12 * 1024 * 1024, 23);
+            let start = expected.len() / 2;
+            let changed = expected.len() / 100;
+            expected[start..start + changed].fill(0x6b);
+            let head_version = fx.text(&format!(
+                "SELECT head_version_id::text FROM files WHERE id='{}'",
+                world.file
+            ));
+            assert_chunked_version_bytes(fx, &world.v1, &archive_dir, &world.v1_data);
+            assert_chunked_version_bytes(fx, &head_version, &archive_dir, &expected);
         }
     }
 

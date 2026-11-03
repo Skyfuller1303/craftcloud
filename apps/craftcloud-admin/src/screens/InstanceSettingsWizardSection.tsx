@@ -13,7 +13,8 @@ import type { Translate } from "../i18n/index.tsx";
 type FieldName =
   | "mail.transport" | "mail.host" | "mail.port" | "mail.tls" | "mail.username" | "mail.from"
   | "mail.tenant_id" | "mail.client_id" | "mail.sender" | "mail.save_to_sent"
-  | "retention.version_days" | "retention.trash_days" | "retention.audit_days" | "retention.quarantine_days";
+  | "retention.version_days" | "retention.trash_days" | "retention.audit_days" | "retention.quarantine_days"
+  | "versions.keep_all_hours" | "versions.daily_days" | "versions.weekly_weeks" | "versions.max_per_file";
 type SecretName = "mail.password" | "mail.client_secret" | "mail.certificate" | "mail.private_key" | "mail.service_account";
 type NormalField = { name: FieldName; label: string; kind: "text" | "number" | "select" | "checkbox"; choices?: string[]; min?: number; max?: number };
 const MAIL_FIELDS: NormalField[] = [
@@ -42,6 +43,10 @@ const RETENTION_FIELDS: NormalField[] = [
   { name: "retention.trash_days", label: "Trash retention (days)", kind: "number", min: 1, max: 3650 },
   { name: "retention.audit_days", label: "Audit retention (days)", kind: "number", min: 30, max: 3650 },
   { name: "retention.quarantine_days", label: "Quarantine retention (days)", kind: "number", min: 1, max: 3650 },
+  { name: "versions.keep_all_hours", label: "Keep all versions (hours)", kind: "number", min: 0, max: 168 },
+  { name: "versions.daily_days", label: "Daily version samples (days)", kind: "number", min: 0, max: 90 },
+  { name: "versions.weekly_weeks", label: "Weekly version samples (weeks)", kind: "number", min: 0, max: 52 },
+  { name: "versions.max_per_file", label: "Maximum unpinned versions per file", kind: "number", min: 0, max: 10000 },
 ];
 
 /** Settings that decide where stored credentials are sent; changing one removes them server-side. */
@@ -77,6 +82,10 @@ function translateFieldLabel(t: Translate, label: string): string {
     case "Trash retention (days)": return t("Trash retention (days)");
     case "Audit retention (days)": return t("Audit retention (days)");
     case "Quarantine retention (days)": return t("Quarantine retention (days)");
+    case "Keep all versions (hours)": return t("Keep all versions (hours)");
+    case "Daily version samples (days)": return t("Daily version samples (days)");
+    case "Weekly version samples (weeks)": return t("Weekly version samples (weeks)");
+    case "Maximum unpinned versions per file": return t("Maximum unpinned versions per file");
     default: return label;
   }
 }
@@ -132,7 +141,10 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
           setError(new Error(t("Enter a whole number from {min} to {max}.", { min: String(min), max: String(max) })));
           return;
         }
-        if (field.name.startsWith("retention.") && before !== "" && numeric < Number(before)) {
+        const maxChangesFromUnlimited = field.name === "versions.max_per_file" && Number(before) === 0 && numeric > 0;
+        const finiteMaxShortened = field.name === "versions.max_per_file" && Number(before) > 0 && numeric > 0 && numeric < Number(before);
+        if ((field.name.startsWith("retention.") || field.name.startsWith("versions."))
+          && before !== "" && (numeric < Number(before) || maxChangesFromUnlimited) && (field.name !== "versions.max_per_file" || finiteMaxShortened || maxChangesFromUnlimited)) {
           shortened.push(`${translateFieldLabel(t, field.label)}: ${before} → ${next}`);
         }
       }
@@ -251,7 +263,10 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
       {(dirtyFields || dirtySecrets) && <p className="field__hint">{t("Save settings before sending a test e-mail.")}</p>}
       {mailTest === "sent" && <p role="status" className="muted">{t("Test e-mail queued for delivery.")}</p>}
     </>}
-    {section === "retention" && <p>{t("These values control instance maintenance and retention.")}</p>}
+    {section === "retention" && <>
+      <p>{t("These values control instance maintenance and retention.")}</p>
+      <p className="field__hint">{t("With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.")}</p>
+    </>}
     {section === "retention" && fields.map((field) => {
       const item = settings.settings[field.name];
       if (item === undefined || isSecret(item)) return null;

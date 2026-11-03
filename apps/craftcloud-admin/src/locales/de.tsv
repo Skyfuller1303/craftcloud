@@ -948,3 +948,14 @@
 	Shorten retention period?	Aufbewahrungsfrist verkürzen?
 	Maintenance may permanently delete data older than the new period: {periods}. For 24 hours the previous, longer period still applies; afterwards the new period takes effect and deleted data cannot be recovered.	Die Wartung kann Daten, die älter als die neue Frist sind, endgültig löschen: {periods}. Für 24 Stunden gilt noch die bisherige, längere Frist; danach gilt die neue Frist und gelöschte Daten lassen sich nicht wiederherstellen.
 	Shorten retention	Frist verkürzen
+	Keep all versions (hours)	Alle Versionen behalten (Stunden)
+	Daily version samples (days)	Tägliche Versionen (Tage)
+	Weekly version samples (weeks)	Wöchentliche Versionen (Wochen)
+	Maximum unpinned versions per file	Maximale ungepinnte Versionen je Datei
+	With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.	Mit dem Standardraster bleiben bei 10 Speichervorgängen pro Tag etwa 36 Versionen je Datei sowie alle angehefteten Versionen. Die Kopfversion bleibt immer erhalten.
+	Keep	Behalten
+	Unpin	Nicht mehr behalten
+	Pin version {number}	Version {number} behalten
+	Unpin version {number}	Version {number} nicht mehr behalten
+	Version {number} will be kept.	Version {number} bleibt erhalten.
+	Version {number} will no longer be kept.	Version {number} bleibt nicht mehr erhalten.

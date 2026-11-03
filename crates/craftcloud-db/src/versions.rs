@@ -58,17 +58,23 @@ pub struct FileVersion {
     pub actor_kind: String,
     /// Informational storage tier (`archive` only after publication commits).
     pub storage_tier: String,
+    /// Protected from automatic thinning.
+    pub pinned: bool,
     /// When.
     pub created_at: OffsetDateTime,
 }
 
 const COLUMNS: &str = "id, org_id, workspace_id, project_id, file_id, number, blob_id, size_bytes, \
      sha256, base_version_id, restored_from_version_id, upload_session_id, created_by_user_id, \
-     created_at, actor_kind";
+     created_at, actor_kind, pinned";
 const SELECT_COLUMNS: &str = "v.id, v.org_id, v.workspace_id, v.project_id, v.file_id, v.number, \
      v.blob_id, v.size_bytes, v.sha256, v.base_version_id, v.restored_from_version_id, \
      v.upload_session_id, v.created_by_user_id, v.created_at, v.actor_kind, \
-     CASE WHEN b.tier_state IN ('archived', 'recalling') THEN 'archive' ELSE 'local' END AS storage_tier";
+     CASE WHEN b.tier_state IN ('archived', 'recalling') OR EXISTS (\
+         SELECT 1 FROM version_chunks vc JOIN chunks c ON c.id = vc.chunk_id \
+         WHERE vc.version_id = v.id AND c.storage_tier = 'archive'\
+     ) THEN 'archive' ELSE 'local' END AS storage_tier, \
+     v.pinned";
 type DownloadRow = (
     Uuid,
     Uuid,
@@ -79,6 +85,7 @@ type DownloadRow = (
     String,
     Option<String>,
     Option<Vec<u8>>,
+    String,
 );
 type RestoreSourceRow = (
     Uuid,
@@ -90,6 +97,7 @@ type RestoreSourceRow = (
     String,
     Option<String>,
     Option<Vec<u8>>,
+    String,
     String,
 );
 
@@ -199,6 +207,8 @@ pub struct DownloadInfo {
     pub blob_id: Uuid,
     /// The storage key.
     pub object_key: String,
+    /// Storage layout (`whole` or `chunked`).
+    pub layout: String,
     /// Recorded size.
     pub size_bytes: i64,
     /// Recorded SHA-256.
@@ -213,6 +223,54 @@ pub struct DownloadInfo {
     pub archive_wrapped_key: Option<Vec<u8>>,
     /// Display name of the file (untrusted).
     pub file_name: String,
+}
+
+/// One verified manifest entry required to read a chunked version.
+#[derive(Debug, Clone, FromRow)]
+pub struct DownloadChunk {
+    /// Stable object identity and archive-encryption AAD.
+    pub chunk_id: Uuid,
+    /// Zero-based position.
+    pub ordinal: i32,
+    /// Byte offset in the logical version.
+    pub byte_offset: i64,
+    /// Server-generated object key.
+    pub object_key: String,
+    /// Number of bytes.
+    pub size_bytes: i64,
+    /// File-scoped HMAC digest.
+    pub digest: Vec<u8>,
+    /// Plain SHA-256 used to verify the object while reading.
+    pub sha256: Vec<u8>,
+    /// File that scopes the chunk identity.
+    pub file_id: Uuid,
+    /// Local or archive; archiving keeps local bytes readable.
+    pub storage_tier: String,
+    /// Archive object key when the local chunk was removed.
+    pub archive_object_key: Option<String>,
+    /// Wrapped per-chunk archive data key.
+    pub archive_wrapped_key: Option<Vec<u8>>,
+}
+
+/// Loads a chunk manifest under the caller's organization and file scope.
+pub async fn download_chunks(
+    pool: &PgPool,
+    scope: &OrgScope,
+    file_id: Uuid,
+    version_id: Uuid,
+) -> Result<Vec<DownloadChunk>, DbError> {
+    Ok(sqlx::query_as::<_, DownloadChunk>(
+        "SELECT c.id AS chunk_id, vc.ordinal, vc.byte_offset, c.object_key, c.size_bytes, c.digest, c.sha256, vc.file_id, \
+                c.storage_tier, c.archive_object_key, c.archive_wrapped_key \
+         FROM version_chunks vc JOIN chunks c ON c.id = vc.chunk_id \
+         JOIN file_versions v ON v.id = vc.version_id AND v.file_id = vc.file_id \
+         WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3 ORDER BY vc.ordinal",
+    )
+    .bind(scope.org_id())
+    .bind(file_id)
+    .bind(version_id)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Fetches one version of a file in the scoped organization.
@@ -321,7 +379,7 @@ pub async fn download_target(
     let row: Option<DownloadRow> = sqlx::query_as(
         "SELECT v.id, b.id, b.object_key, v.size_bytes, v.sha256, b.state, \
                 CASE WHEN b.tier_state IN ('archived', 'recalling') THEN 'archive' ELSE 'local' END, \
-                b.archive_object_key, b.archive_wrapped_key \
+                b.archive_object_key, b.archive_wrapped_key, b.layout \
          FROM file_versions v JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
          WHERE v.org_id = $1 AND v.file_id = $2 AND v.id = $3",
     )
@@ -341,10 +399,12 @@ pub async fn download_target(
             storage_tier,
             archive_object_key,
             archive_wrapped_key,
+            layout,
         )) => DownloadTarget::Ready(Box::new(DownloadInfo {
             version_id,
             blob_id,
             object_key,
+            layout,
             size_bytes,
             sha256,
             blob_state,
@@ -372,6 +432,54 @@ pub async fn mark_blob_corrupt(pool: &PgPool, blob_id: Uuid) -> Result<(), DbErr
 }
 
 impl OrgTx {
+    /// Changes the protection marker and records its transition atomically.
+    pub async fn version_pin(
+        &mut self,
+        scope: &OrgScope,
+        file_id: Uuid,
+        version_id: Uuid,
+        pinned: bool,
+        audit: &crate::audit::AuditCtx,
+    ) -> Result<Option<bool>, DbError> {
+        self.check(scope, Action::VersionPin)?;
+        let changed = sqlx::query(
+            "UPDATE file_versions v SET pinned=$4 FROM files f JOIN projects p ON p.id=f.project_id \
+             WHERE v.file_id=$1 AND v.org_id=$2 AND v.id=$3 AND f.id=v.file_id AND f.org_id=v.org_id \
+               AND f.deleted_at IS NULL AND p.deleted_at IS NULL AND v.pinned IS DISTINCT FROM $4",
+        )
+        .bind(file_id)
+        .bind(self.org_id)
+        .bind(version_id)
+        .bind(pinned)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        let current: Option<bool> = sqlx::query_scalar(
+            "SELECT v.pinned FROM file_versions v JOIN files f ON f.id=v.file_id AND f.org_id=v.org_id \
+             JOIN projects p ON p.id=f.project_id WHERE v.file_id=$1 AND v.org_id=$2 AND v.id=$3 \
+               AND f.deleted_at IS NULL AND p.deleted_at IS NULL",
+        )
+        .bind(file_id)
+        .bind(self.org_id)
+        .bind(version_id)
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        if changed > 0 {
+            self.audit(
+                audit,
+                crate::audit::NewEvent::new(if pinned {
+                    "version.pin"
+                } else {
+                    "version.unpin"
+                })
+                .target("version", version_id)
+                .detail("file_id", crate::audit::Detail::Id(file_id)),
+            )
+            .await?;
+        }
+        Ok(current)
+    }
+
     /// Marks a version produced by a FigCraft Live export while retaining the authenticated uploader as creator provenance.
     pub async fn mark_figcraft_live_snapshot(&mut self, version_id: Uuid) -> Result<(), DbError> {
         sqlx::query(
@@ -570,6 +678,15 @@ impl OrgTx {
                 now,
             )
             .await?;
+        sqlx::query(
+            "INSERT INTO version_chunks (version_id, file_id, ordinal, chunk_id, byte_offset) \
+             SELECT $1, file_id, ordinal, chunk_id, byte_offset FROM upload_chunks \
+             WHERE upload_id = $2 ORDER BY ordinal",
+        )
+        .bind(version.id)
+        .bind(upload_id)
+        .execute(&mut *self.tx)
+        .await?;
         sqlx::query("UPDATE blobs SET state = 'committed' WHERE id = $1 AND org_id = $2")
             .bind(blob_id)
             .bind(self.org_id)
@@ -596,6 +713,30 @@ impl OrgTx {
     /// # Errors
     ///
     /// Database failures; scope mismatches are internal errors.
+    pub async fn chunk_restore_local(
+        &mut self,
+        scope: &OrgScope,
+        file_id: Uuid,
+        chunk_id: Uuid,
+        object_key: &str,
+    ) -> Result<bool, DbError> {
+        self.check(scope, Action::VersionRestore)?;
+        let updated = sqlx::query(
+            "UPDATE chunks SET object_key=$4, storage_tier='local', \
+                 archive_local_delete_pending=false, archive_claim_token=NULL, \
+                 archive_claimed_at=NULL, archive_next_attempt_at=NULL \
+             WHERE id=$1 AND org_id=$2 AND file_id=$3 AND state='committed' \
+               AND storage_tier IN ('local','archiving','archive')",
+        )
+        .bind(chunk_id)
+        .bind(self.org_id)
+        .bind(file_id)
+        .bind(object_key)
+        .execute(&mut *self.tx)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     pub async fn version_restore(
         &mut self,
         scope: &OrgScope,
@@ -656,6 +797,15 @@ impl OrgTx {
                 now,
             )
             .await?;
+        sqlx::query(
+            "INSERT INTO version_chunks (version_id, file_id, ordinal, chunk_id, byte_offset) \
+             SELECT $1, file_id, ordinal, chunk_id, byte_offset FROM version_chunks \
+             WHERE version_id = $2 ORDER BY ordinal",
+        )
+        .bind(version.id)
+        .bind(version_id)
+        .execute(&mut *self.tx)
+        .await?;
         Ok(RestoreOutcome::Restored(Box::new(version)))
     }
 
@@ -681,7 +831,7 @@ impl OrgTx {
         let row: Option<RestoreSourceRow> = sqlx::query_as(
             "SELECT v.id, b.id, b.object_key, v.size_bytes, v.sha256, b.state, \
                     CASE WHEN b.tier_state IN ('archived', 'recalling') THEN 'archive' ELSE 'local' END, \
-                    b.archive_object_key, b.archive_wrapped_key, f.name \
+                    b.archive_object_key, b.archive_wrapped_key, f.name, b.layout \
              FROM file_versions v JOIN blobs b ON b.id = v.blob_id AND b.org_id = v.org_id \
              JOIN files f ON f.org_id = v.org_id AND f.id = v.file_id \
              WHERE v.org_id=$1 AND v.file_id=$2 AND v.id=$3 FOR SHARE OF b",
@@ -703,10 +853,12 @@ impl OrgTx {
                 archive_object_key,
                 archive_wrapped_key,
                 file_name,
+                layout,
             )) => DownloadTarget::Ready(Box::new(DownloadInfo {
                 version_id,
                 blob_id,
                 object_key,
+                layout,
                 size_bytes,
                 sha256,
                 blob_state,
