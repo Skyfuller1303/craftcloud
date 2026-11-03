@@ -6,6 +6,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and ver
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-11-03
+
+Second local test release. Adds AC-14 (version thinning), AC-15 (per-file chunk deduplication and delta upload) and AC-16 (zstd chunk compression). Migrations 0024 to 0027 run on upgrade.
+
+### Added
+
+- Version thinning: overwritten versions are kept on a UTC grid (all of the last 24 hours, one per day for 7 days, one per ISO week for 4 weeks) before the existing age limit applies; `versions.keep_all_hours`, `versions.daily_days`, `versions.weekly_weeks` and the optional cap `versions.max_per_file` are instance settings with environment overrides. Versions can be pinned ("keep") in the admin console, via `PATCH /api/v1/files/{file_id}/versions/{version_id}` and with the SDK's `pin_version`; the head, pinned and published versions are never thinned (ADR-0031).
+- Per-file chunk deduplication: new versions are stored as content-defined chunks (FastCDC, 1 MiB target) and only chunks new to that file are stored; nothing is shared across files. A second version of a 300 MiB file with a 1 % change used 1.46 % additional storage in the acceptance test. Admin usage reports `physical_bytes` next to the unchanged logical quota. `craftcloud-server admin storage rechunk --file <id>|--all [--dry-run]` converts existing whole versions (ADR-0032).
+- Optional delta upload: when `/api/v1/info` reports `chunked_upload`, the SDK sends a chunk manifest and uploads only missing chunks; older clients keep using the full upload.
+- Chunk compression: new chunks are stored zstd-compressed when that saves at least 5 %, otherwise raw. Level 3 by default, `storage.compression_level` 0 to 19 (`CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL` takes precedence, `0` turns compression off for new chunks). Downloads, `Range`, `ETag` and `Repr-Digest` are byte-for-byte unchanged (ADR-0033).
+
+### Changed
+
+- Backups use format v4 (chunk mappings and encoding metadata); v1 to v3 backups stay readable.
+
+### Upgrade notes
+
+- Take a backup with the current version before upgrading. Once chunks are stored compressed, an older server cannot read them and cannot restore a v4 backup; rolling back requires the pre-upgrade backup.
+- Existing versions stay whole and uncompressed until `admin storage rechunk` converts them. Setting the compression level to `0` does not decompress existing chunks.
+
 ## [0.1.0-alpha.1] - 2026-11-02
 
 First local test release (prototype, not production-ready). Includes AC-01 to AC-13 and OPS-01/OPS-02; archive storage remains locked until AC-12c.
