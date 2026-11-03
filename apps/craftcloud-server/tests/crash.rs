@@ -619,6 +619,8 @@ mod tests {
         i64,
         Vec<u8>,
         String,
+        i64,
+        String,
         Option<String>,
         Option<Vec<u8>>,
     );
@@ -633,7 +635,7 @@ mod tests {
             .rt
             .block_on(async {
                 sqlx::query_as(
-                    "SELECT vc.ordinal,vc.byte_offset,c.id,c.object_key,c.size_bytes,c.sha256, \
+                    "SELECT vc.ordinal,vc.byte_offset,c.id,c.object_key,c.size_bytes,c.sha256,c.encoding,c.stored_bytes, \
                             c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
                      FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
                      WHERE vc.version_id=$1 ORDER BY vc.ordinal",
@@ -662,6 +664,8 @@ mod tests {
                     local_text,
                     size,
                     raw_sha,
+                    encoding,
+                    stored_size,
                     tier,
                     archive_text,
                     wrapped,
@@ -671,12 +675,13 @@ mod tests {
                 assert_eq!(usize::try_from(ordinal).unwrap(), index);
                 assert_eq!(chunk_offset, offset);
                 let size = u64::try_from(size).unwrap();
+                let stored_size = u64::try_from(stored_size).unwrap();
                 let expected_sha: [u8; 32] = raw_sha.as_slice().try_into().unwrap();
                 let mut chunk_bytes = Vec::new();
                 if tier == "local" {
                     let key = ObjectKey::parse(&local_text).unwrap();
                     let mut reader = local.open_read(&key, None).await.unwrap();
-                    assert_eq!(reader.remaining(), size);
+                    assert_eq!(reader.remaining(), stored_size);
                     while let Some(block) = reader.next_chunk().await.unwrap() {
                         chunk_bytes.extend_from_slice(&block);
                     }
@@ -685,7 +690,13 @@ mod tests {
                     let key = ObjectKey::parse(archive_text.as_deref().unwrap()).unwrap();
                     let envelope = WrappedDataKey::from_bytes(wrapped.as_deref().unwrap()).unwrap();
                     let mut reader = craftcloud_api::archive_transport::open_archive_range(
-                        &archive, &crypto, &key, &envelope, chunk_id, size, None,
+                        &archive,
+                        &crypto,
+                        &key,
+                        &envelope,
+                        chunk_id,
+                        stored_size,
+                        None,
                     )
                     .await
                     .unwrap();
@@ -693,6 +704,14 @@ mod tests {
                         chunk_bytes.extend_from_slice(&block);
                     }
                 }
+                assert_eq!(chunk_bytes.len() as u64, stored_size);
+                let chunk_bytes = craftcloud_storage::compression::decode_chunk(
+                    &encoding,
+                    &chunk_bytes,
+                    size,
+                    &expected_sha,
+                )
+                .unwrap();
                 assert_eq!(chunk_bytes.len() as u64, size);
                 assert_eq!(Sha256::digest(&chunk_bytes).as_slice(), expected_sha);
                 offset += i64::try_from(size).unwrap();

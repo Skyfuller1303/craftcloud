@@ -1853,6 +1853,111 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn migration_0027_backfills_raw_chunks_and_enforces_physical_metadata() {
+        let db = TestDb::new().await;
+        migrate::run_with(&db.pool, &migrator_up_to(26))
+            .await
+            .unwrap();
+
+        let chunk_id = Uuid::new_v4();
+        let file_id = Uuid::new_v4();
+        let digest = vec![0x31; 32];
+        let sha256 = vec![0x42; 32];
+        let object_key = Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,storage_tier,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,120,'committed','local',now())",
+        )
+        .bind(chunk_id)
+        .bind(file_id)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(&digest)
+        .bind(&sha256)
+        .bind(&object_key)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        migrate::run_with(&db.pool, &migrator_up_to(27))
+            .await
+            .unwrap();
+        let old: (String, i64, Vec<u8>, Vec<u8>, String, i64) = sqlx::query_as(
+            "SELECT encoding,stored_bytes,digest,sha256,object_key,size_bytes FROM chunks WHERE id=$1",
+        )
+        .bind(chunk_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(old.0, "raw");
+        assert_eq!(old.1, old.5);
+        assert_eq!(old.2, digest);
+        assert_eq!(old.3, sha256);
+        assert_eq!(old.4, object_key);
+
+        let compressed_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,encoding,stored_bytes,state,storage_tier,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,400,'zstd',123,'committed','local',now())",
+        )
+        .bind(compressed_id)
+        .bind(file_id)
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(vec![0x53_u8; 32])
+        .bind(vec![0x64_u8; 32])
+        .bind(Uuid::new_v4().simple().to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let physical: i64 = sqlx::query_scalar(
+            "SELECT physical_bytes::bigint FROM chunked_version_physical_usage WHERE file_id=$1",
+        )
+        .bind(file_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(physical, 243);
+
+        let invalid_encoding = sqlx::query(
+            "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,encoding,stored_bytes,state,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,10,'brotli',10,'committed',now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(vec![0x75; 32])
+        .bind(vec![0x86; 32])
+        .bind(Uuid::new_v4().simple().to_string())
+        .execute(&db.pool)
+        .await;
+        assert!(invalid_encoding.is_err());
+
+        let raw_length_mismatch = sqlx::query(
+            "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,encoding,stored_bytes,state,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,10,'raw',9,'committed',now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(vec![0x97; 32])
+        .bind(vec![0xa8; 32])
+        .bind(Uuid::new_v4().simple().to_string())
+        .execute(&db.pool)
+        .await;
+        assert!(raw_length_mismatch.is_err());
+
+        let zero_stored = sqlx::query("UPDATE chunks SET stored_bytes=0 WHERE id=$1")
+            .bind(compressed_id)
+            .execute(&db.pool)
+            .await;
+        assert!(zero_stored.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn concurrent_migrators_apply_once() {
         let db = TestDb::new().await;
         let other = db.extra_pool().await;

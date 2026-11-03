@@ -223,12 +223,13 @@ export function AdminOverview({ organization, workspaces }: { organization: Orga
         {usage.items.length > 0 && (
           <div className="table-wrap">
             <table className="table">
-              <thead><tr><th>{t("Workspace")}</th><th>{t("Used")}</th><th>{t("Quota")}</th></tr></thead>
+              <thead><tr><th>{t("Workspace")}</th><th>{t("Used")}</th><th>{t("Physical storage")}</th><th>{t("Quota")}</th></tr></thead>
               <tbody>
                 {usage.items.map((item) => (
                   <tr key={item.workspace_id}>
                     <th>{workspaceNames.get(item.workspace_id) ?? item.workspace_id.slice(0, 8)}</th>
                     <td data-label={t("Used")}>{formatBytes(language, item.committed_bytes + item.reserved_bytes)}</td>
+                    <td data-label={t("Physical storage")}>{item.physical_bytes === undefined ? t("Unavailable") : formatBytes(language, item.physical_bytes)}</td>
                     <td data-label={t("Quota")}>{item.effective_limit_bytes === null ? t("Unlimited") : formatBytes(language, item.effective_limit_bytes)}</td>
                   </tr>
                 ))}

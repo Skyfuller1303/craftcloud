@@ -64,6 +64,7 @@ const instanceSettings = {
     "retention.trash_days": { value: 30, source: "default", locked: false },
     "retention.audit_days": { value: 90, source: "default", locked: false },
     "retention.quarantine_days": { value: 7, source: "default", locked: false },
+    "storage.compression_level": { value: 3, source: "default", locked: false },
   },
 };
 
@@ -284,6 +285,33 @@ describe.each(languages)("setup wizard (%s)", (language, wizardTitle, systemTitl
     const confirm = await screen.findByRole("dialog");
     await user.click(within(confirm).getByRole("button", { name: language === "en" ? "Shorten retention" : "Frist verkürzen" }));
     await waitFor(() => expect(patched).toEqual([{ settings: { "retention.trash_days": { value: 7 } } }]));
+  });
+
+  it("saves the instance compression level from the organization settings step", async () => {
+    window.history.replaceState(null, "", "/admin/setup");
+    let patchBody: unknown;
+    const organizationRow = {
+      id: ORG_A.id, slug: ORG_A.slug, name: ORG_A.name, member_count: 1,
+      created_at: "2026-10-01T10:00:00Z", committed_bytes: 0, reserved_bytes: 0,
+      quota_bytes: null, seat_limit: null,
+    };
+    const { fetch } = mockFetch(viewRoutes({
+      "GET /admin/setup": { body: setup() },
+      "GET /admin/setup/system-check": { body: systemCheck },
+      "GET /admin/organizations": { body: { items: [organizationRow], next_cursor: null } },
+      [`GET /organizations/${ORG_A.id}/apps`]: { status: 503, body: { error: "unavailable" } },
+      "GET /admin/instance-settings": { body: instanceSettings },
+      "PATCH /admin/instance-settings": (call) => { patchBody = call.body; return { body: instanceSettings }; },
+    }));
+    const user = userEvent.setup();
+    renderApp(fetch);
+    const nav = await screen.findByRole("navigation", { name: "Setup steps" });
+    await user.click(within(nav).getByRole("button", { name: /Organization basics/ }));
+    const level = await screen.findByLabelText("Storage compression level");
+    await user.clear(level);
+    await user.type(level, "0");
+    await user.click(screen.getAllByRole("button", { name: "Save settings" })[1]!);
+    await waitFor(() => expect(patchBody).toEqual({ settings: { "storage.compression_level": { value: 0 } } }));
   });
 
   it("asks before changing the unlimited per-file version cap", async () => {

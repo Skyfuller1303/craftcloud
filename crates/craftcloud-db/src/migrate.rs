@@ -399,16 +399,17 @@ mod tests {
     fn embedded_migrations_are_ordered_and_complete() {
         // Migration 19 adds email delivery state, 20 adds app access, 22 adds
         // archive tiers, 23 adds instance setup/settings, 25 adds per-file chunks,
-        // and 26 adds temporary chunked-upload manifests.
+        // 26 adds temporary chunked-upload manifests, and 27 adds chunk encoding metadata.
         let versions = embedded_versions();
         assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(versions.first(), Some(&1));
-        assert_eq!(versions.last(), Some(&26));
+        assert_eq!(versions.last(), Some(&27));
         assert!((1..=23).all(|version| versions.contains(&version)));
         // Migration 24 belongs to AC-14 and may be absent in this standalone
         // worktree; the integrated branch contains both allocated migrations.
         assert!(versions.contains(&25));
         assert!(versions.contains(&26));
+        assert!(versions.contains(&27));
     }
 
     #[test]
@@ -425,7 +426,7 @@ mod tests {
         assert_eq!(migrator_up_to(22).iter().count(), 22);
         assert_eq!(migrator_up_to(23).iter().count(), 23);
         let latest_count = embedded_versions().len();
-        assert_eq!(migrator_up_to(26).iter().count(), latest_count);
+        assert_eq!(migrator_up_to(27).iter().count(), latest_count);
         assert_eq!(migrator_up_to(99).iter().count(), latest_count);
     }
 }

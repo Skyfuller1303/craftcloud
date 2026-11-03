@@ -748,7 +748,15 @@ pub struct ArchiveClaim {
 }
 
 type ArchiveClaimRow = (String, Option<String>, Option<Vec<u8>>, i64, Vec<u8>);
-type ChunkArchiveClaimRow = (String, Option<String>, Option<Vec<u8>>, i64, Vec<u8>);
+type ChunkArchiveClaimRow = (
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    i64,
+    Vec<u8>,
+    i64,
+    String,
+);
 type ArchiveRecallRow = (
     String,
     Option<String>,
@@ -792,6 +800,10 @@ pub struct ChunkArchiveClaim {
     pub size_bytes: i64,
     /// Plaintext SHA-256.
     pub sha256: Vec<u8>,
+    /// Physical stored length.
+    pub stored_bytes: i64,
+    /// Physical encoding.
+    pub encoding: String,
     /// Claim token fencing other workers.
     pub claim_token: Uuid,
 }
@@ -1273,6 +1285,80 @@ pub async fn archive_gc_mark_inventory_complete(
     Ok(true)
 }
 
+/// A retired remote archive object eligible for cleanup after the stale-writer grace.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RetiredArchiveObject {
+    /// Tenant that originally owned the object.
+    pub org_id: Uuid,
+    /// Provider key; never derived from user input.
+    pub archive_object_key: String,
+    /// Stored physical bytes retained for operator accounting.
+    pub physical_bytes: i64,
+}
+
+const ARCHIVE_OBJECT_REFERENCED: &str = "EXISTS (SELECT 1 FROM blobs WHERE archive_object_key={key}) \
+    OR EXISTS (SELECT 1 FROM chunks WHERE archive_object_key={key}) \
+    OR EXISTS (SELECT 1 FROM archive_backup_refs WHERE archive_object_key={key}) \
+    OR EXISTS (SELECT 1 FROM archive_chunk_backup_refs WHERE archive_object_key={key})";
+
+/// Lists unreferenced archive keys only after inventory is complete and both
+/// the stale-writer grace and retry delay have elapsed.
+pub async fn retired_archive_objects_due(
+    pool: &PgPool,
+    stale_before: OffsetDateTime,
+    now: OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<RetiredArchiveObject>, DbError> {
+    let references = ARCHIVE_OBJECT_REFERENCED.replace("{key}", "r.archive_object_key");
+    Ok(sqlx::query_as(&format!(
+        "SELECT r.org_id, r.archive_object_key, r.physical_bytes \
+         FROM retired_archive_objects r CROSS JOIN archive_gc_state s \
+         WHERE s.id AND s.inventory_complete AND r.retired_at <= $1 AND r.next_attempt_at <= $2 \
+           AND NOT ({references}) \
+         ORDER BY r.next_attempt_at, r.retired_at, r.archive_object_key LIMIT $3"
+    ))
+    .bind(stale_before)
+    .bind(now)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Records a retry without dropping durable cleanup ownership.
+pub async fn retired_archive_object_failed(
+    pool: &PgPool,
+    archive_object_key: &str,
+    retry_at: OffsetDateTime,
+    code: &str,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        "UPDATE retired_archive_objects SET attempts=attempts+1, next_attempt_at=$2, last_error_code=$3 \
+         WHERE archive_object_key=$1",
+    )
+    .bind(archive_object_key)
+    .bind(retry_at)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Drops the tombstone only after the provider delete succeeded (or returned
+/// NotFound) and the object remains unreferenced.
+pub async fn retired_archive_object_finish(
+    pool: &PgPool,
+    archive_object_key: &str,
+) -> Result<bool, DbError> {
+    let references = ARCHIVE_OBJECT_REFERENCED.replace("{key}", "$1");
+    let result = sqlx::query(&format!(
+        "DELETE FROM retired_archive_objects WHERE archive_object_key=$1 AND NOT ({references})"
+    ))
+    .bind(archive_object_key)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Reads archive health counters for the instance operator view.
 pub async fn archive_status(
     pool: &PgPool,
@@ -1287,10 +1373,13 @@ pub async fn archive_status(
         "SELECT \
            (COALESCE(sum(size_bytes) FILTER (WHERE layout = 'whole' AND state <> 'deleting' AND \
              (tier_state IN ('local', 'archiving', 'recalling') OR archive_local_delete_pending)), 0) + \
-             COALESCE((SELECT sum(size_bytes) FROM chunks WHERE state <> 'deleting' AND (storage_tier IN ('local','archiving') OR archive_local_delete_pending)), 0))::bigint AS local_bytes, \
+             COALESCE((SELECT sum(stored_bytes) FROM chunks WHERE state <> 'deleting' AND (storage_tier IN ('local','archiving') OR archive_local_delete_pending)), 0))::bigint AS local_bytes, \
            (COALESCE(sum(size_bytes) FILTER (WHERE layout = 'whole' AND state <> 'deleting' AND archive_object_key IS NOT NULL \
              AND archive_verified_at IS NOT NULL AND tier_state IN ('local', 'archiving', 'archived', 'recalling')), 0) + \
-             COALESCE((SELECT sum(size_bytes) FROM chunks WHERE state <> 'deleting' AND archive_object_key IS NOT NULL AND archive_verified_at IS NOT NULL AND storage_tier IN ('archiving','archive')), 0))::bigint AS archive_bytes, \
+             COALESCE((SELECT sum(stored_bytes) FROM chunks WHERE state <> 'deleting' AND archive_object_key IS NOT NULL AND archive_verified_at IS NOT NULL AND storage_tier IN ('archiving','archive')), 0) + \
+             COALESCE((SELECT sum(r.physical_bytes) FROM retired_archive_objects r WHERE \
+               NOT EXISTS (SELECT 1 FROM blobs b WHERE b.archive_object_key=r.archive_object_key) AND \
+               NOT EXISTS (SELECT 1 FROM chunks c WHERE c.archive_object_key=r.archive_object_key)), 0))::bigint AS archive_bytes, \
            count(*) FILTER (WHERE layout = 'whole' AND state = 'committed' AND tier_state IN ('local', 'archiving') \
              AND (archive_next_attempt_at IS NULL OR archive_next_attempt_at <= $2) AND {ARCHIVE_DUE}) + \
            (SELECT count(*) FROM chunks c WHERE c.state = 'committed' AND c.storage_tier IN ('local','archiving') \
@@ -1528,7 +1617,7 @@ impl OrgTx {
     ) -> Result<Option<ChunkArchiveClaim>, DbError> {
         let due = CHUNK_ARCHIVE_DUE.replace("$1", "$5");
         let row: Option<ChunkArchiveClaimRow> = sqlx::query_as(&format!(
-            "SELECT c.object_key, c.archive_object_key, c.archive_wrapped_key, c.size_bytes, c.sha256 \
+            "SELECT c.object_key, c.archive_object_key, c.archive_wrapped_key, c.size_bytes, c.sha256, c.stored_bytes, c.encoding \
              FROM chunks c WHERE c.id=$1 AND c.org_id=$2 AND c.state='committed' \
                AND c.storage_tier IN ('local','archiving') \
                AND (c.archive_next_attempt_at IS NULL OR c.archive_next_attempt_at <= $3) \
@@ -1537,7 +1626,15 @@ impl OrgTx {
         ))
         .bind(chunk_id).bind(self.org_id).bind(now).bind(stale_before).bind(cutoff)
         .fetch_optional(&mut *self.tx).await?;
-        let Some((object_key, archive_object_key, archive_wrapped_key, size_bytes, sha256)) = row
+        let Some((
+            object_key,
+            archive_object_key,
+            archive_wrapped_key,
+            size_bytes,
+            sha256,
+            stored_bytes,
+            encoding,
+        )) = row
         else {
             return Ok(None);
         };
@@ -1551,6 +1648,8 @@ impl OrgTx {
             archive_wrapped_key,
             size_bytes,
             sha256,
+            stored_bytes,
+            encoding,
             claim_token,
         }))
     }
@@ -2331,7 +2430,7 @@ pub async fn verify_candidate_chunks(
     version_id: Uuid,
 ) -> Result<Vec<crate::versions::DownloadChunk>, DbError> {
     Ok(sqlx::query_as(
-        "SELECT c.id AS chunk_id, vc.ordinal, vc.byte_offset, c.object_key, c.size_bytes, \
+        "SELECT c.id AS chunk_id, vc.ordinal, vc.byte_offset, c.object_key, c.size_bytes, c.stored_bytes, c.encoding, \
                 c.digest, c.sha256, vc.file_id, c.storage_tier, c.archive_object_key, \
                 c.archive_wrapped_key \
          FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \

@@ -61,6 +61,7 @@ const DEVICE_ABSOLUTE_DAYS_RANGE: (u64, u64) = (1, 365);
 const DEFAULT_VERIFY_BYTES_PER_RUN: u64 = 1024 * 1024 * 1024;
 const VERIFY_BYTES_PER_RUN_RANGE: (u64, u64) = (1024 * 1024, 1024 * 1024 * 1024 * 1024);
 const DEFAULT_ARCHIVE_AFTER: Duration = Duration::from_secs(24 * 3600);
+const DEFAULT_STORAGE_COMPRESSION_LEVEL: u64 = 3;
 const DEFAULT_ARCHIVE_VERIFY_BYTES_PER_RUN: u64 = 4 * 1024 * 1024;
 const DEFAULT_ARCHIVE_VERIFY_SECONDS_PER_RUN: u64 = 5;
 const DEFAULT_ARCHIVE_SFTP_PORT: u64 = 23;
@@ -88,6 +89,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "SESSION_ABSOLUTE_TIMEOUT_HOURS",
     "TRASH_RETENTION_DAYS",
     "STORAGE_DIR",
+    "STORAGE_COMPRESSION_LEVEL",
     "MAX_FILE_SIZE_BYTES",
     "UPLOAD_TTL_HOURS",
     "DATABASE_URL_FILE",
@@ -366,6 +368,8 @@ pub struct Config {
     /// Directory of the local object store, if configured. Validated when the
     /// server starts (exists, writable, no links, same file system).
     pub storage_dir: Option<PathBuf>,
+    /// Default compression level for stored chunks (0 disables compression).
+    pub storage_compression_level: i32,
     /// Largest accepted file size in bytes (ADR-0014: 5 GiB by default).
     pub max_file_size_bytes: u64,
     /// How long an upload session stays open.
@@ -582,6 +586,11 @@ impl Config {
         let secret_key_old_file =
             field(&mut errors, env, "SECRET_KEY_OLD_FILE", parse_absolute_path);
         let archive_requested = env.contains_key(&format!("{PREFIX}ARCHIVE_STORE"));
+        let storage_compression_level =
+            field(&mut errors, env, "STORAGE_COMPRESSION_LEVEL", |key, raw| {
+                parse_ranged(key, raw, (0, 19))
+            })
+            .unwrap_or(DEFAULT_STORAGE_COMPRESSION_LEVEL);
         let archive = parse_archive(env, &mut errors);
         let archive_after = field(&mut errors, env, "ARCHIVE_AFTER", parse_archive_after)
             .unwrap_or(DEFAULT_ARCHIVE_AFTER);
@@ -894,6 +903,7 @@ impl Config {
                 device_absolute_timeout: Duration::from_secs(device_absolute_days * 24 * 3600),
                 trash_retention: Duration::from_secs(trash_retention_days * 24 * 3600),
                 storage_dir,
+                storage_compression_level: i32::try_from(storage_compression_level).unwrap_or(3),
                 max_file_size_bytes,
                 upload_ttl: Duration::from_secs(upload_ttl_hours * 3600),
                 maintenance_interval: Duration::from_secs(maintenance_interval_secs),
@@ -2339,6 +2349,7 @@ mod tests {
             assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
         }
         assert_eq!(defaults.storage_dir, None);
+        assert_eq!(defaults.storage_compression_level, 3);
         assert_eq!(defaults.max_file_size_bytes, 5 * 1024 * 1024 * 1024);
         let storage = Config::from_env_map(&env(&[
             (
@@ -2350,16 +2361,21 @@ mod tests {
                 },
             ),
             ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "1048576"),
+            ("CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL", "19"),
         ]))
         .unwrap();
         assert!(storage.storage_dir.is_some());
         assert_eq!(storage.max_file_size_bytes, 1_048_576);
+        assert_eq!(storage.storage_compression_level, 19);
         for (key, bad) in [
             ("CRAFTCLOUD_STORAGE_DIR", "relative/dir"),
             ("CRAFTCLOUD_STORAGE_DIR", ""),
             ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "1048575"),
             ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "1099511627777"),
             ("CRAFTCLOUD_MAX_FILE_SIZE_BYTES", "5GiB"),
+            ("CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL", "20"),
+            ("CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL", "-1"),
+            ("CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL", "3x"),
         ] {
             assert_eq!(keys(&errors_of(&[(key, bad)])), [key], "{key}={bad}");
         }

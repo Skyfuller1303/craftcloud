@@ -218,6 +218,7 @@ async fn stage_and_publish(
     identity_keys: &[[u8; 32]],
 ) -> Result<Option<(u64, u64)>, String> {
     let (manifest, candidate_keys) = stage_chunk_manifest(
+        pool,
         local,
         source_key,
         size,

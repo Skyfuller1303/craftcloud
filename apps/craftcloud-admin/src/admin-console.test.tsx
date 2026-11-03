@@ -5,6 +5,7 @@ import type { Handler } from "./test/helpers.tsx";
 import { ORG_A, ORG_B, WS_1 } from "./test/helpers.tsx";
 import { apiError, expectNoAxeViolations, loggedInRoutes, mockFetch, renderApp } from "./test/helpers.tsx";
 import { BOB, CARA, member, page } from "./test/fixtures.ts";
+import { formatBytes } from "./format.ts";
 
 const MEMBERS = [
   { ...member(BOB, "Bob Example", "admin"), status: "active", account_disabled: false, two_factor_enabled: true },
@@ -308,6 +309,28 @@ it("discards a delayed device page after closing and switching accounts", async 
 
 describe.each([["en", "Overview"], ["de", "Übersicht"]] as const)("admin screen coverage (%s)", (language, overviewTitle) => {
   const org = `/admin/organizations/${ORG_A.id}`;
+  it("shows physical workspace storage separately and handles older usage responses", async () => {
+    window.history.replaceState(null, "", `${org}/overview`);
+    const { fetch } = mockFetch(adminRoutes({
+      [`GET /organizations/${ORG_A.id}/usage`]: { body: {
+        organization: { quota_bytes: null, committed_bytes: 1536, reserved_bytes: 0, physical_bytes: 900 },
+        workspaces: [
+          { workspace_id: WS_1.id, effective_limit_bytes: 4096, quota_bytes: 4096, committed_bytes: 1024, reserved_bytes: 512, physical_bytes: 333 },
+          { workspace_id: "00000000-0000-4000-8000-000000000042", effective_limit_bytes: null, quota_bytes: null, committed_bytes: 2048, reserved_bytes: 0 },
+        ],
+        next_cursor: null,
+      } },
+    }));
+    renderApp(fetch, { language });
+    await screen.findByRole("heading", { level: 1, name: overviewTitle });
+    await screen.findByRole("columnheader", { name: language === "en" ? "Physical storage" : "Physischer Speicher" });
+    const workspaceRow = screen.getByRole("row", { name: /333 B/ });
+    expect(within(workspaceRow).getByText(formatBytes(language, 1536))).toBeTruthy();
+    expect(within(workspaceRow).getByText(formatBytes(language, 333))).toBeTruthy();
+    const oldResponseRow = screen.getByRole("row", { name: /Unavailable|Nicht verfügbar/ });
+    expect(within(oldResponseRow).getByText(language === "en" ? "Unavailable" : "Nicht verfügbar")).toBeTruthy();
+  });
+
   const cases = [
     [`${org}/overview`, overviewTitle, {}],
     [`${org}/workspaces`, language === "en" ? "Workspaces" : "Workspaces", {}],

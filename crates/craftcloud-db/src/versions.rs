@@ -238,6 +238,10 @@ pub struct DownloadChunk {
     pub object_key: String,
     /// Number of bytes.
     pub size_bytes: i64,
+    /// Physical byte length.
+    pub stored_bytes: i64,
+    /// Physical chunk encoding.
+    pub encoding: String,
     /// File-scoped HMAC digest.
     pub digest: Vec<u8>,
     /// Plain SHA-256 used to verify the object while reading.
@@ -260,7 +264,7 @@ pub async fn download_chunks(
     version_id: Uuid,
 ) -> Result<Vec<DownloadChunk>, DbError> {
     Ok(sqlx::query_as::<_, DownloadChunk>(
-        "SELECT c.id AS chunk_id, vc.ordinal, vc.byte_offset, c.object_key, c.size_bytes, c.digest, c.sha256, vc.file_id, \
+        "SELECT c.id AS chunk_id, vc.ordinal, vc.byte_offset, c.object_key, c.size_bytes, c.stored_bytes, c.encoding, c.digest, c.sha256, vc.file_id, \
                 c.storage_tier, c.archive_object_key, c.archive_wrapped_key \
          FROM version_chunks vc JOIN chunks c ON c.id = vc.chunk_id \
          JOIN file_versions v ON v.id = vc.version_id AND v.file_id = vc.file_id \

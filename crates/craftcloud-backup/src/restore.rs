@@ -704,41 +704,50 @@ async fn write_chunks_into(
         let entry = crate::manifest::ChunkEntry::parse_line(&line)?;
         listed_count += 1;
         listed_total = listed_total
-            .checked_add(entry.size)
+            .checked_add(entry.stored_len())
             .ok_or_else(|| BackupError::new(ErrorKind::Integrity, "chunk size total overflow"))?;
         if !entry.local_copy {
             continue;
         }
         let key = ObjectKey::parse(&entry.key)
             .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk key is invalid"))?;
-        let digest = parse_sha256(&entry.sha256)
-            .ok_or_else(|| BackupError::new(ErrorKind::Format, "a chunk checksum is invalid"))?;
         let mut src = tokio::fs::File::open(dir.join(crate::manifest::chunk_file(&entry.id)))
             .await
             .map_err(|error| BackupError::io("cannot open a chunk file", &error))?;
-        let mut temp = store.begin_write(entry.size).await?;
-        let mut buf = vec![0_u8; BLOCK];
-        loop {
-            let got = src
-                .read(&mut buf)
-                .await
-                .map_err(|error| BackupError::io("cannot read a chunk file", &error))?;
-            if got == 0 {
-                break;
-            }
-            let block = buf.get(..got).ok_or_else(|| {
-                BackupError::new(ErrorKind::Integrity, "chunk read exceeded its buffer")
-            })?;
-            temp.write(block).await?;
+        let capacity = usize::try_from(entry.stored_len())
+            .map_err(|_| BackupError::new(ErrorKind::Integrity, "a chunk size is invalid"))?;
+        let mut stored = vec![0_u8; capacity];
+        src.read_exact(&mut stored)
+            .await
+            .map_err(|error| BackupError::io("cannot read a chunk file", &error))?;
+        let mut extra = [0_u8; 1];
+        if src
+            .read(&mut extra)
+            .await
+            .map_err(|error| BackupError::io("cannot read a chunk file", &error))?
+            != 0
+        {
+            return Err(BackupError::new(
+                ErrorKind::Integrity,
+                "a chunk grew after verification",
+            ));
         }
-        store.finalize_as(temp, key, entry.size, &digest).await?;
+        // The backup may change after preflight. Recheck the indexed plaintext
+        // digest before publishing the original encoded representation.
+        crate::archive::verify_chunk_payload(&entry, &stored)?;
+        let stored_digest: [u8; 32] = Sha256::digest(&stored).into();
+        let mut temp = store.begin_write(entry.stored_len()).await?;
+        temp.write(&stored).await?;
+        store
+            .finalize_as(temp, key, entry.stored_len(), &stored_digest)
+            .await?;
         written.keys.push(
             u128::from_str_radix(&entry.key, 16)
                 .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk key is invalid"))?,
         );
         written.bytes = written
             .bytes
-            .checked_add(entry.size)
+            .checked_add(entry.stored_len())
             .ok_or_else(|| BackupError::new(ErrorKind::Integrity, "chunk byte total overflow"))?;
     }
     if listed_count != index.count

@@ -1590,6 +1590,208 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn compressed_and_raw_chunks_keep_range_digest_and_cross_level_dedup() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let mut data = vec![b'A'; 4 * 1024 * 1024];
+        let mut state = 0x16ac_0033_u32;
+        data.extend((0..4 * 1024 * 1024).map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        }));
+        data.extend(vec![b'B'; 4 * 1024 * 1024]);
+        let first = w.push(&c.editor.1, c.file, &data).await;
+        let encodings: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT encoding, size_bytes, stored_bytes FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id WHERE vc.version_id=$1 ORDER BY vc.ordinal",
+        )
+        .bind(first)
+        .fetch_all(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(encodings.iter().any(|(encoding, _, _)| encoding == "raw"));
+        assert!(encodings.iter().any(|(encoding, _, _)| encoding == "zstd"));
+        assert!(
+            encodings
+                .iter()
+                .any(|(_, logical, physical)| physical < logical)
+        );
+
+        let (status, headers, downloaded) = w
+            .download_large(
+                &c.viewer.1,
+                &format!("/api/v1/files/{}/versions/{first}/content", c.file),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(downloaded, data);
+        assert_eq!(
+            headers.get("repr-digest").unwrap(),
+            &format!(
+                "sha-256=:{}:",
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&downloaded))
+            )
+        );
+        let boundary: i64 = sqlx::query_scalar(
+            "WITH ordered AS (SELECT vc.byte_offset, c.encoding, lag(c.encoding) OVER (ORDER BY vc.ordinal) AS previous FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id WHERE vc.version_id=$1) SELECT byte_offset FROM ordered WHERE previous IS NOT NULL AND previous <> encoding ORDER BY byte_offset LIMIT 1",
+        )
+        .bind(first)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let start = usize::try_from(boundary - 2).unwrap();
+        let end = usize::try_from(boundary + 2).unwrap();
+        let range = w
+            .download(
+                &c.viewer.1,
+                &format!("/api/v1/files/{}/content", c.file),
+                Some(&format!("bytes={}-{}", start, end)),
+            )
+            .await;
+        assert_eq!(range.status, StatusCode::PARTIAL_CONTENT, "{}", range.text);
+        assert_eq!(range.bytes, data[start..=end]);
+
+        sqlx::query(
+            "INSERT INTO instance_settings(key,value) VALUES('storage.compression_level', '{\"value\":0}') ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",
+        )
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        let second = w.push(&c.editor.1, c.file, &data).await;
+        let reused: bool = sqlx::query_scalar(
+            "SELECT (SELECT array_agg(chunk_id ORDER BY ordinal) FROM version_chunks WHERE version_id=$1) = (SELECT array_agg(chunk_id ORDER BY ordinal) FROM version_chunks WHERE version_id=$2)",
+        )
+        .bind(first)
+        .bind(second)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(
+            reused,
+            "switching compression level must preserve chunk identities"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn corrupt_compressed_chunk_fails_download_and_marks_version_corrupt() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let data = vec![b'Z'; 3 * 1024 * 1024];
+        let version = w.push(&c.editor.1, c.file, &data).await;
+        let key: String = sqlx::query_scalar(
+            "SELECT object_key FROM chunks WHERE file_id=$1 AND encoding='zstd' LIMIT 1",
+        )
+        .bind(c.file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        let path = w.object_path(&key);
+        let mut stored = std::fs::read(&path).unwrap();
+        let last = stored.len() - 1;
+        stored[last] ^= 0xff;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::write(&path, stored).unwrap();
+        let (status, _, mut body) = call_stream(
+            &w.env.app,
+            Req::new("GET", &format!("/api/v1/files/{}/content", c.file)).cookie_only(&c.viewer.1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut failed = false;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(_) => {}
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            failed,
+            "a corrupted zstd frame must terminate the response body"
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT b.state FROM blobs b JOIN file_versions v ON v.blob_id=b.id WHERE v.id=$1",
+        )
+        .bind(version)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "corrupt");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn restore_rejects_same_length_corrupt_local_compressed_chunk() {
+        let mut w = W::new().await;
+        let _archive = w.env.configure_archive().await;
+        let c = cast(&w).await;
+        let old_data = vec![b'Q'; 12 * 1024 * 1024];
+        let old = w.push(&c.editor.1, c.file, &old_data).await;
+        let mut head_data = old_data.clone();
+        let changed_at = head_data.len() / 2;
+        head_data[changed_at] = b'R';
+        let head = w.push(&c.editor.1, c.file, &head_data).await;
+        let (object_key, encoding): (String, String) = sqlx::query_as(
+            "SELECT c.object_key,c.encoding FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id \
+             WHERE vc.version_id=$1 ORDER BY vc.ordinal LIMIT 1",
+        )
+        .bind(old)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            encoding, "zstd",
+            "fixture must exercise compressed local bytes"
+        );
+        let path = w.object_path(&object_key);
+        let mut stored = std::fs::read(&path).unwrap();
+        let stored_len = stored.len();
+        let last = stored.len() - 1;
+        stored[last] ^= 0xff;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::write(&path, stored).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), stored_len as u64);
+
+        let failed = w
+            .send(
+                Req::new(
+                    "POST",
+                    &format!("/api/v1/files/{}/versions/{old}/restore", c.file),
+                )
+                .session(&c.editor.1)
+                .header("If-Match", &tag(head)),
+            )
+            .await;
+        assert_status(&failed, StatusCode::INTERNAL_SERVER_ERROR, "BLOB_CORRUPT");
+        let state: String = sqlx::query_scalar(
+            "SELECT b.state FROM blobs b JOIN file_versions v ON v.blob_id=b.id WHERE v.id=$1",
+        )
+        .bind(old)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "corrupt");
+        let created = w
+            .file(&c.owner.1, c.project, "after-compressed-integrity.fig")
+            .await;
+        assert!(
+            !created.is_nil(),
+            "restore must release locks before marking corruption"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
     async fn phase_b_chunk_upload_verifies_replay_reuse_scope_and_expiry() {
         let mut w = W::new().await;
         let _archive = w.env.configure_archive().await;
@@ -1730,6 +1932,14 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(downloaded, data);
+        let compressed_chunks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id WHERE vc.version_id=$1 AND c.encoding='zstd' AND c.stored_bytes<c.size_bytes",
+        )
+        .bind(version_id)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        assert!(compressed_chunks > 0, "Phase B writes compressed chunks");
         let after_commit = w.counters().await;
         let mapped_after_commit = w
             .count(&format!(

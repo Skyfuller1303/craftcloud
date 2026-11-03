@@ -19,8 +19,8 @@ use crate::error::{BackupError, ErrorKind};
 
 /// Value of [`Manifest::format`].
 pub const FORMAT: &str = "craftcloud-backup";
-/// The current format version. Versions 1 and 2 remain readable.
-pub const FORMAT_VERSION: u32 = 3;
+/// The current format version. Versions 1 through 3 remain readable.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// File name of the manifest.
 pub const MANIFEST_FILE: &str = "manifest.json";
@@ -155,6 +155,12 @@ pub struct ChunkEntry {
     pub key: String,
     /// Byte size.
     pub size: u64,
+    /// Number of bytes stored in the object. Missing in format v3 (raw).
+    #[serde(default)]
+    pub stored_bytes: u64,
+    /// Stored representation. Missing in format v3 (raw).
+    #[serde(default = "raw_encoding")]
+    pub encoding: String,
     /// Plaintext SHA-256.
     pub sha256: String,
     /// Whether plaintext bytes are included locally.
@@ -165,6 +171,10 @@ pub struct ChunkEntry {
     /// Wrapped per-chunk key envelope as lowercase hex.
     #[serde(default)]
     pub archive_wrapped_key: Option<String>,
+}
+
+fn raw_encoding() -> String {
+    "raw".to_owned()
 }
 
 /// One line of `blobs.jsonl`: a committed blob and its bytes.
@@ -333,7 +343,7 @@ impl Manifest {
         if self.format != FORMAT {
             return Err(format_error("this directory is not a CraftCloud backup"));
         }
-        if !matches!(self.format_version, 1 | 2 | FORMAT_VERSION) {
+        if !matches!(self.format_version, 1 | 2 | 3 | FORMAT_VERSION) {
             return Err(format_error(format!(
                 "unsupported backup format version {} (this build reads versions 1 through {FORMAT_VERSION})",
                 self.format_version
@@ -341,7 +351,7 @@ impl Manifest {
         }
         match (self.format_version, self.backup_id.as_deref()) {
             (1, None) => {}
-            (2 | 3, Some(id)) if uuid::Uuid::parse_str(id).is_ok() => {}
+            (2..=4, Some(id)) if uuid::Uuid::parse_str(id).is_ok() => {}
             _ => return Err(format_error("the manifest backup id is invalid")),
         }
         if !known_migrations.contains(&self.migration_version) {
@@ -386,7 +396,7 @@ impl Manifest {
             ));
         }
         match (&self.chunks, self.format_version) {
-            (Some(chunks), 3)
+            (Some(chunks), 3 | 4)
                 if chunks.file == CHUNK_INDEX_FILE && is_sha256_hex(&chunks.sha256) => {}
             (None, 1 | 2) => {}
             _ => {
@@ -400,7 +410,7 @@ impl Manifest {
             &self.version_chunks,
             self.format_version,
         ) {
-            (Some(versions), Some(mappings), 3)
+            (Some(versions), Some(mappings), 3 | 4)
                 if versions.file == CHUNKED_VERSION_INDEX_FILE
                     && mappings.file == VERSION_CHUNK_INDEX_FILE
                     && is_sha256_hex(&versions.sha256)
@@ -499,6 +509,14 @@ impl BlobEntry {
 }
 
 impl ChunkEntry {
+    pub(crate) fn stored_len(&self) -> u64 {
+        if self.stored_bytes == 0 {
+            self.size
+        } else {
+            self.stored_bytes
+        }
+    }
+
     /// Parses one line of `chunks.jsonl`.
     pub fn parse_line(line: &[u8]) -> Result<Self, BackupError> {
         if line.len() > MAX_BLOB_LINE_BYTES {
@@ -516,6 +534,10 @@ impl ChunkEntry {
             || !is_key(&self.key)
             || !is_sha256_hex(&self.sha256)
             || !(1..=4 * 1024 * 1024).contains(&self.size)
+            || (self.stored_bytes != 0 && !(1..=4 * 1024 * 1024).contains(&self.stored_bytes))
+            || !matches!(self.encoding.as_str(), "raw" | "zstd")
+            || (self.encoding == "raw" && self.stored_bytes != 0 && self.stored_bytes != self.size)
+            || (self.encoding == "zstd" && self.stored_bytes == 0)
         {
             return Err(format_error("a chunk entry has an invalid field"));
         }
@@ -533,7 +555,7 @@ impl ChunkEntry {
                     craftcloud_storage::WrappedDataKey::from_bytes(&decode_hex(wrapped)?)
                         .map_err(|_| format_error("a chunk archive envelope is invalid"))?;
                 if envelope.blob_id().to_string() != self.id
-                    || envelope.plaintext_len() != self.size
+                    || envelope.plaintext_len() != self.stored_len()
                 {
                     return Err(format_error("chunk archive metadata is inconsistent"));
                 }
@@ -678,14 +700,17 @@ mod tests {
                 .contains("not a CraftCloud backup")
         );
         let mut m = sample();
-        m.format_version = 4;
-        assert!(parse(&m).unwrap_err().message.contains("format version 4"));
+        m.format_version = 5;
+        assert!(parse(&m).unwrap_err().message.contains("format version 5"));
         let mut legacy = sample();
         legacy.format_version = 2;
         legacy.chunks = None;
         legacy.chunked_versions = None;
         legacy.version_chunks = None;
         assert!(parse(&legacy).is_ok());
+        let mut chunked_v3 = sample();
+        chunked_v3.format_version = 3;
+        assert!(parse(&chunked_v3).is_ok());
         let mut m = sample();
         m.migration_version = 15;
         let error = parse(&m).unwrap_err();
@@ -698,6 +723,18 @@ mod tests {
         let mut m = sample();
         m.migration_version = 10;
         assert!(parse(&m).unwrap_err().message.contains("backup support"));
+    }
+
+    #[test]
+    fn v3_chunk_records_default_to_raw_and_v4_rejects_hostile_encoding_metadata() {
+        let legacy = br#"{"id":"d7d6c52f-cb40-42ca-a6a8-7bf4e73db845","file_id":"d7d6c52f-cb40-42ca-a6a8-7bf4e73db846","key":"00000000000000000000000000000001","size":4,"sha256":"9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a","local_copy":true,"archive_object_key":null,"archive_wrapped_key":null}"#;
+        let chunk = ChunkEntry::parse_line(legacy).unwrap();
+        assert_eq!(chunk.encoding, "raw");
+        assert_eq!(chunk.stored_len(), 4);
+        let mut hostile: serde_json::Value = serde_json::from_slice(legacy).unwrap();
+        hostile["encoding"] = serde_json::json!("gzip");
+        hostile["stored_bytes"] = serde_json::json!(4);
+        assert!(ChunkEntry::parse_line(&serde_json::to_vec(&hostile).unwrap()).is_err());
     }
 
     #[test]

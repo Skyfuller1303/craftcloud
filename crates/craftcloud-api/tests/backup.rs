@@ -86,7 +86,10 @@ mod tests {
         }
         let manifest: Value =
             serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["format_version"], 3);
+        assert_eq!(
+            manifest["format_version"],
+            craftcloud_backup::manifest::FORMAT_VERSION
+        );
         assert_eq!(manifest["chunks"]["count"], 0);
         for index in ["chunked_versions", "version_chunks"] {
             assert_eq!(manifest[index]["count"], 0);

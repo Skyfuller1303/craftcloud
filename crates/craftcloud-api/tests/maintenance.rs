@@ -22,7 +22,7 @@ mod tests {
     };
     use craftcloud_db::maintenance as dbm;
     use craftcloud_db::members::OrgTx;
-    use craftcloud_storage::{LocalStore, ObjectStore, WriteSink};
+    use craftcloud_storage::{ArchiveStore, LocalStore, ObjectKey, ObjectStore, WriteSink};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use tokio::sync::watch;
@@ -75,6 +75,16 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    async fn write_archive_object(store: &ArchiveStore, bytes: &[u8]) -> ObjectKey {
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let mut temp = store.begin_write(bytes.len() as u64).await.unwrap();
+        temp.write(bytes).await.unwrap();
+        store
+            .finalize(temp, bytes.len() as u64, &digest)
+            .await
+            .unwrap()
     }
 
     /// Settings for tests with a manual clock that jumps by days: the clock
@@ -1419,7 +1429,7 @@ mod tests {
         let text = logs.text();
         let line = text
             .lines()
-            .find(|l| l.contains("usage counters differed"))
+            .find(|l| l.contains("usage counters differed") && l.contains(&w.org.to_string()))
             .expect("a drift warning");
         assert!(line.contains(&w.org.to_string()), "{line}");
         assert!(line.contains("reserved_delta=-3"), "{line}");
@@ -1845,6 +1855,165 @@ mod tests {
             archive.head(&copy.object_key).await,
             Err(craftcloud_storage::StorageError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+    async fn retired_archive_objects_wait_for_pins_and_retry_failed_deletes() {
+        let mut w = W::new().await;
+        let (archive, _) = w.env.configure_archive().await;
+
+        let pinned_key = write_archive_object(archive.as_ref(), b"pinned retired object").await;
+        let failed_key = write_archive_object(archive.as_ref(), b"failed retired object").await;
+        let active_key = write_archive_object(archive.as_ref(), b"still referenced object").await;
+        let young_key = write_archive_object(archive.as_ref(), b"young retired object").await;
+
+        let backup_id = Uuid::new_v4();
+        let pinned_blob_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO archive_backups(backup_id,manifest_sha256) VALUES($1,$2)")
+            .bind(backup_id)
+            .bind("a".repeat(64))
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO archive_backup_refs(backup_id,blob_id,archive_object_key) VALUES($1,$2,$3)",
+        )
+        .bind(backup_id)
+        .bind(pinned_blob_id)
+        .bind(pinned_key.as_str())
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+
+        let project = w.project("Retired archive").await;
+        let file = w.file(project, "current.fig").await;
+        w.push(file, b"a current archived version").await;
+        let current_blob_id: Uuid = sqlx::query_scalar(
+            "SELECT blob_id FROM file_versions WHERE file_id=$1 ORDER BY number DESC LIMIT 1",
+        )
+        .bind(file)
+        .fetch_one(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE blobs SET archive_object_key=$2,archive_wrapped_key=$3,tier_state='archived' WHERE id=$1",
+        )
+        .bind(current_blob_id)
+        .bind(pinned_key.as_str())
+        .bind([1_u8])
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE blobs SET archive_object_key=$2 WHERE id=$1")
+            .bind(current_blob_id)
+            .bind(active_key.as_str())
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO retired_archive_objects(archive_object_key,org_id,workspace_id,physical_bytes,retired_at,next_attempt_at) \
+             VALUES($1,$4,$5,20,now()-interval '2 hours',now()-interval '2 hours'), \
+                   ($2,$4,$5,27,now()-interval '2 hours',now()-interval '2 hours'), \
+                   ($3,$4,$5,19,now(),now())",
+        )
+        .bind(failed_key.as_str())
+        .bind(active_key.as_str())
+        .bind(young_key.as_str())
+        .bind(w.org)
+        .bind(w.ws)
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE retired_archive_objects SET retired_at=now()-interval '2 hours',next_attempt_at=now()-interval '2 hours' WHERE archive_object_key<>$1",
+        )
+        .bind(young_key.as_str())
+        .execute(&w.env.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE archive_gc_state SET inventory_complete=true WHERE id=true")
+            .execute(&w.env.pool)
+            .await
+            .unwrap();
+
+        // Replace the object file by a directory at the same provider path.
+        // The provider returns an I/O failure; the retry row must survive.
+        let failed_path = w
+            .env
+            .storage_dir
+            .join("archive")
+            .join("objects")
+            .join(&failed_key.as_str()[0..2])
+            .join(&failed_key.as_str()[2..4])
+            .join(failed_key.as_str());
+        std::fs::remove_file(&failed_path).unwrap();
+        std::fs::create_dir(&failed_path).unwrap();
+
+        let mut policy = settings(1024 * 1024);
+        policy.upload_ttl = Duration::ZERO;
+        let job = w.job_with(policy).await.with_archive(archive.clone());
+        let dry = run_with(&job, true).await;
+        assert_eq!(dry.count("collect_blobs", "retired_archive_candidates"), 1);
+        assert!(archive.head(&young_key).await.is_ok());
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM retired_archive_objects WHERE archive_object_key=$1",
+            )
+            .bind(young_key.as_str())
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let first = run(&job).await;
+        assert_eq!(first.count("collect_blobs", "retired_archive_errors"), 1);
+        assert_eq!(
+            first.count("collect_blobs", "retired_archive_objects_deleted"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM retired_archive_objects WHERE archive_object_key=$1",
+            )
+            .bind(failed_key.as_str())
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(archive.head(&pinned_key).await.is_ok());
+        assert!(archive.head(&active_key).await.is_ok());
+
+        // Releasing the only backup pin makes the retired object eligible.
+        assert_eq!(
+            dbm::archive_backup_release(&w.env.pool, backup_id, &"a".repeat(64))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let second = run(&job).await;
+        assert_eq!(
+            second.count("collect_blobs", "retired_archive_objects_deleted"),
+            1
+        );
+        assert!(matches!(
+            archive.head(&pinned_key).await,
+            Err(craftcloud_storage::StorageError::NotFound)
+        ));
+        assert!(archive.head(&active_key).await.is_ok());
+        assert!(archive.head(&failed_key).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM retired_archive_objects WHERE archive_object_key=$1",
+            )
+            .bind(failed_key.as_str())
+            .fetch_one(&w.env.pool)
+            .await
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

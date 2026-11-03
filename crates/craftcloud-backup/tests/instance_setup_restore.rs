@@ -9,10 +9,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use craftcloud_auth::{decrypt_secret_for, encrypt_secret_for};
 use craftcloud_backup::{
-    ArchiveAccess, CreateOptions, RestoreOptions, create_with_archive, restore_with_archive,
-    verify, verify_with_archive,
+    ArchiveAccess, CreateOptions, RestoreOptions, RestorePhase, create_with_archive,
+    restore_with_archive, verify, verify_with_archive,
 };
 use craftcloud_db::{maintenance, migrate, setup};
+use craftcloud_storage::compression::{decode_chunk, encode_chunk};
 use craftcloud_storage::{
     ArchiveCrypto, ArchiveStore, LocalStore, ObjectKey, ObjectStore, ReadSource, WriteSink,
 };
@@ -195,17 +196,17 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
     let chunk_one = Uuid::new_v4();
     let chunk_two = Uuid::new_v4();
     let chunk_three = Uuid::new_v4();
-    let first = b"shared prefix ";
-    let second = b"shared suffix";
+    let first = vec![b'a'; 4096];
+    let second = vec![b'b'; 4096];
     let head_suffix = b"current suffix";
     let mut content = first.to_vec();
-    content.extend_from_slice(second);
+    content.extend_from_slice(&second);
     let mut head_content = first.to_vec();
     head_content.extend_from_slice(head_suffix);
     let full_sha: [u8; 32] = Sha256::digest(&content).into();
     let head_sha: [u8; 32] = Sha256::digest(&head_content).into();
-    let first_sha: [u8; 32] = Sha256::digest(first).into();
-    let second_sha: [u8; 32] = Sha256::digest(second).into();
+    let first_sha: [u8; 32] = Sha256::digest(&first).into();
+    let second_sha: [u8; 32] = Sha256::digest(&second).into();
     let third_sha: [u8; 32] = Sha256::digest(head_suffix).into();
     let first_key = ObjectKey::generate();
     let second_key = ObjectKey::generate();
@@ -213,13 +214,21 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
     let second_key_text = second_key.to_string();
     let third_key = ObjectKey::generate();
     let third_key_text = third_key.to_string();
+    let first_encoded = encode_chunk(&first, 3).unwrap();
+    assert_eq!(first_encoded.encoding, "zstd");
+    let first_stored_sha: [u8; 32] = Sha256::digest(&first_encoded.bytes).into();
     let mut temp = store
-        .begin_write_as(first_key.clone(), first.len() as u64)
+        .begin_write_as(first_key.clone(), first_encoded.bytes.len() as u64)
         .await
         .unwrap();
-    temp.write(first).await.unwrap();
+    temp.write(&first_encoded.bytes).await.unwrap();
     store
-        .finalize(temp, first.len() as u64, &first_sha)
+        .finalize_as(
+            temp,
+            first_key.clone(),
+            first_encoded.bytes.len() as u64,
+            &first_stored_sha,
+        )
         .await
         .unwrap();
     let mut temp = store
@@ -237,12 +246,14 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
         .expect("open local test archive");
     let archive_store = ArchiveStore::Local(archive_local);
     let archive_crypto = ArchiveCrypto::from_server_key(&[73; 32]).expect("archive test key");
+    let second_encoded = encode_chunk(&second, 3).unwrap();
+    assert_eq!(second_encoded.encoding, "zstd");
     let (archive_envelope, archive_data_key) = archive_crypto
-        .create_data_key(chunk_two, second.len() as u64)
+        .create_data_key(chunk_two, second_encoded.bytes.len() as u64)
         .expect("chunk archive envelope");
     let archive_object_key = ObjectKey::generate();
     let encrypted = archive_data_key
-        .encrypt_block(&archive_envelope, 0, second)
+        .encrypt_block(&archive_envelope, 0, &second_encoded.bytes)
         .expect("encrypt archived chunk");
     let mut archive_temp = archive_store
         .begin_write_as(archive_object_key.clone(), encrypted.len() as u64)
@@ -287,19 +298,12 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
         .execute(&source.pool)
         .await
         .expect("update head file metadata");
-    for (id, key, bytes, sha) in [(
-        chunk_one,
-        first_key_text.as_str(),
-        first.as_slice(),
-        first_sha,
-    )] {
-        sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged',now())")
-            .bind(id).bind(file_id).bind(operator.organization_id).bind(workspace_id).bind(sha.to_vec()).bind(sha.to_vec()).bind(key).bind(bytes.len() as i64).execute(&source.pool).await.expect("insert physical chunk");
-    }
+    sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,stored_bytes,encoding,state,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'staged',now())")
+        .bind(chunk_one).bind(file_id).bind(operator.organization_id).bind(workspace_id).bind(first_sha.to_vec()).bind(first_sha.to_vec()).bind(first_key_text.as_str()).bind(first.len() as i64).bind(first_encoded.bytes.len() as i64).bind(first_encoded.encoding).execute(&source.pool).await.expect("insert physical compressed chunk");
     sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged',now())")
         .bind(chunk_three).bind(file_id).bind(operator.organization_id).bind(workspace_id).bind(third_sha.to_vec()).bind(third_sha.to_vec()).bind(third_key_text.as_str()).bind(head_suffix.len() as i64).execute(&source.pool).await.expect("insert head-only chunk");
-    sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,storage_tier,archive_object_key,archive_wrapped_key,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged','archive',$9,$10,now())")
-        .bind(chunk_two).bind(file_id).bind(operator.organization_id).bind(workspace_id).bind(second_sha.to_vec()).bind(second_sha.to_vec()).bind(second_key_text.as_str()).bind(second.len() as i64).bind(archive_object_key.as_str()).bind(archive_envelope.to_bytes()).execute(&source.pool).await.expect("insert archived physical chunk");
+    sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,stored_bytes,encoding,state,storage_tier,archive_object_key,archive_wrapped_key,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'staged','archive',$11,$12,now())")
+        .bind(chunk_two).bind(file_id).bind(operator.organization_id).bind(workspace_id).bind(second_sha.to_vec()).bind(second_sha.to_vec()).bind(second_key_text.as_str()).bind(second.len() as i64).bind(second_encoded.bytes.len() as i64).bind(second_encoded.encoding).bind(archive_object_key.as_str()).bind(archive_envelope.to_bytes()).execute(&source.pool).await.expect("insert archived compressed chunk");
     sqlx::query("INSERT INTO version_chunks (version_id,file_id,ordinal,chunk_id,byte_offset) VALUES ($1,$2,0,$3,0),($1,$2,1,$4,$5),($6,$2,0,$3,0),($6,$2,1,$7,$5)")
         .bind(first_version).bind(file_id).bind(chunk_one).bind(chunk_two).bind(first.len() as i64).bind(second_version).bind(chunk_three).execute(&source.pool).await.expect("map shared, old-only archived, and head-only local chunks");
 
@@ -316,6 +320,7 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
     )
     .await
     .expect("create backup");
+    assert_eq!(report.manifest.format_version, 4);
     assert_eq!(
         report.manifest.migration_version,
         migrate::embedded_versions().last().copied().unwrap()
@@ -329,6 +334,23 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
             .count,
         3
     );
+    let chunk_index = std::fs::read_to_string(backup_dir.0.join("chunks.jsonl"))
+        .expect("read encoded chunk index");
+    let indexed_chunks: Vec<serde_json::Value> = chunk_index
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse encoded chunk index line"))
+        .collect();
+    for (id, encoding, stored_bytes) in [
+        (chunk_one, "zstd", first_encoded.bytes.len()),
+        (chunk_two, "zstd", second_encoded.bytes.len()),
+    ] {
+        let entry = indexed_chunks
+            .iter()
+            .find(|entry| entry["id"] == id.to_string())
+            .expect("compressed chunk index entry");
+        assert_eq!(entry["encoding"], encoding);
+        assert_eq!(entry["stored_bytes"], stored_bytes);
+    }
     let version_chunks = report
         .manifest
         .tables
@@ -377,6 +399,42 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
             .expect("read durable source chunk pins");
     assert_eq!(source_archive_pins, 1);
 
+    // Changing an encoded chunk after preflight must fail before publication.
+    let damaged_target = TestDatabase::new().await;
+    let damaged_root = TestDirectory::new("changed-after-verification");
+    let damaged_store = LocalStore::open(&damaged_root.0)
+        .await
+        .expect("open mutation target");
+    let mutable_chunk = backup_dir.0.join("chunks").join(chunk_one.to_string());
+    let original_stored = std::fs::read(&mutable_chunk).expect("read original backup chunk");
+    let hook_path = mutable_chunk.clone();
+    let rejected = restore_with_archive(
+        &damaged_target.pool,
+        &damaged_store,
+        &backup_dir.0,
+        &RestoreOptions {
+            expected_manifest_sha256: Some(&verified.manifest_sha256),
+            on_phase: Some(std::sync::Arc::new(move |phase| {
+                let path = hook_path.clone();
+                Box::pin(async move {
+                    if phase == RestorePhase::Verified {
+                        let mut bytes = std::fs::read(&path).expect("read mutable backup chunk");
+                        let last = bytes.last_mut().expect("nonempty compressed chunk");
+                        *last ^= 1;
+                        std::fs::write(path, bytes).expect("mutate backup after verification");
+                    }
+                })
+            })),
+            ..RestoreOptions::default()
+        },
+        Some(archive_access),
+    )
+    .await
+    .expect_err("restore must reject post-preflight chunk damage");
+    assert_eq!(rejected.kind, craftcloud_backup::ErrorKind::Integrity);
+    assert!(damaged_store.head(&first_key).await.is_err());
+    std::fs::write(&mutable_chunk, original_stored).expect("restore valid backup fixture");
+
     let target = TestDatabase::new().await;
     let target_root = TestDirectory::new("target-store");
     let target_store = LocalStore::open(&target_root.0)
@@ -404,7 +462,7 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
     assert_eq!(refs.get(&chunk_two), Some(&1));
     assert_eq!(refs.get(&chunk_three), Some(&1));
     for (key, expected) in [
-        (first_key_text.as_str(), first.as_slice()),
+        (first_key_text.as_str(), first_encoded.bytes.as_slice()),
         (third_key_text.as_str(), head_suffix.as_slice()),
     ] {
         let mut source = target_store
@@ -417,6 +475,60 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
         }
         assert_eq!(bytes, expected);
     }
+    assert_eq!(
+        decode_chunk("zstd", &first_encoded.bytes, first.len() as u64, &first_sha).unwrap(),
+        first
+    );
+    assert_eq!(
+        decode_chunk(
+            "zstd",
+            &second_encoded.bytes,
+            second.len() as u64,
+            &second_sha
+        )
+        .unwrap(),
+        second
+    );
+    let mut archived_after_restore = archive_store
+        .open_read(&archive_object_key, None)
+        .await
+        .expect("open archived compressed chunk after restore");
+    let mut archived_ciphertext_after_restore = Vec::new();
+    while let Some(block) = archived_after_restore.next_chunk().await.unwrap() {
+        archived_ciphertext_after_restore.extend_from_slice(&block);
+    }
+    assert_eq!(archived_ciphertext_after_restore, encrypted);
+    let archived_encoded_after_restore = archive_data_key
+        .decrypt_block(&archive_envelope, 0, &archived_ciphertext_after_restore)
+        .expect("decrypt archived compressed chunk after restore");
+    let mut restored_local = target_store
+        .open_read(&first_key, None)
+        .await
+        .expect("open restored local compressed chunk");
+    let mut restored_local_encoded = Vec::new();
+    while let Some(block) = restored_local.next_chunk().await.unwrap() {
+        restored_local_encoded.extend_from_slice(&block);
+    }
+    let mut restored_version = decode_chunk(
+        "zstd",
+        &restored_local_encoded,
+        first.len() as u64,
+        &first_sha,
+    )
+    .expect("decode restored local chunk");
+    restored_version.extend(
+        decode_chunk(
+            "zstd",
+            &archived_encoded_after_restore,
+            second.len() as u64,
+            &second_sha,
+        )
+        .expect("decode archived chunk after restore"),
+    );
+    assert_eq!(
+        restored_version, content,
+        "restored version plaintext matches source"
+    );
     let target_archive_pins: i64 =
         sqlx::query_scalar("SELECT count(*) FROM archive_chunk_backup_refs WHERE backup_id=$1")
             .bind(
@@ -439,7 +551,8 @@ async fn instance_settings_and_setup_steps_survive_backup_restore() {
             .kind,
         craftcloud_backup::ErrorKind::Integrity
     );
-    std::fs::write(&first_chunk_path, first).expect("restore original chunk bytes");
+    std::fs::write(&first_chunk_path, &first_encoded.bytes)
+        .expect("restore original encoded chunk bytes");
     let mapping_path = backup_dir.0.join("version_chunks.jsonl");
     let original_mappings = std::fs::read(&mapping_path).expect("read version chunk mappings");
     let mut lines = original_mappings.split_inclusive(|byte| *byte == b'\n');

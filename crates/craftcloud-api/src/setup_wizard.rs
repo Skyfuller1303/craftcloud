@@ -81,6 +81,7 @@ const SETTING_KEYS: &[&str] = &[
     "versions.daily_days",
     "versions.weekly_weeks",
     "versions.max_per_file",
+    "storage.compression_level",
 ];
 
 fn failed(error: &craftcloud_db::DbError, headers: &HeaderMap, action: &'static str) -> Response {
@@ -152,6 +153,7 @@ fn setting_code(key: &str) -> Option<&'static str> {
         "versions.daily_days" => Some("versions.daily_days"),
         "versions.weekly_weeks" => Some("versions.weekly_weeks"),
         "versions.max_per_file" => Some("versions.max_per_file"),
+        "storage.compression_level" => Some("storage.compression_level"),
         _ => None,
     }
 }
@@ -228,6 +230,7 @@ fn default_setting_value(key: &str) -> Value {
         "versions.daily_days" => json!(7),
         "versions.weekly_weeks" => json!(4),
         "versions.max_per_file" => json!(0),
+        "storage.compression_level" => json!(3),
         _ => Value::Null,
     }
 }
@@ -257,6 +260,7 @@ fn setting_value_valid(key: &str, value: &Value) -> bool {
         "versions.max_per_file" => value
             .as_u64()
             .is_some_and(|v| v == 0 || (2..=10_000).contains(&v)),
+        "storage.compression_level" => value.as_u64().is_some_and(|v| v <= 19),
         "mail.host" => value.as_str().is_some_and(valid_setting_host),
         "mail.username" | "mail.from" | "mail.tenant_id" | "mail.client_id" | "mail.sender" => {
             value.is_null() && key != "mail.host"
@@ -1063,6 +1067,24 @@ mod tests {
         assert!(setting_requires_fresh_auth("mail.transport"));
         assert!(setting_requires_fresh_auth("mail.password"));
         assert!(!setting_requires_fresh_auth("retention.trash_days"));
+    }
+
+    #[test]
+    fn compression_level_setting_accepts_only_integer_range_zero_through_nineteen() {
+        assert!(setting_value_valid("storage.compression_level", &json!(0)));
+        assert!(setting_value_valid("storage.compression_level", &json!(19)));
+        assert!(!setting_value_valid(
+            "storage.compression_level",
+            &json!(20)
+        ));
+        assert!(!setting_value_valid(
+            "storage.compression_level",
+            &json!(-1)
+        ));
+        assert!(!setting_value_valid(
+            "storage.compression_level",
+            &json!(3.5)
+        ));
     }
 
     #[tokio::test]

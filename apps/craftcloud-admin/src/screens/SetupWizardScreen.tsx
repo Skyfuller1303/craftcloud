@@ -285,6 +285,7 @@ function StepContent({
     <p>{t("Set organization seats, storage quota, app access, and instance retention periods.")}</p>
     {organization !== null && <OrganizationSetupControls organization={organization} />}
     <InstanceSettingsWizardSection section="retention" />
+    <InstanceSettingsWizardSection section="storage" />
   </>;
   if (step === "workspace_project") return <WorkspaceProjectSetup organization={organization} workspaces={workspaces} />;
   if (step === "invitations") return <>

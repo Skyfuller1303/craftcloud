@@ -2763,6 +2763,11 @@ fn instance_setting_environment_with(
             values.insert(key.to_owned(), value);
         }
     };
+    public(
+        "storage.compression_level",
+        &["STORAGE_COMPRESSION_LEVEL"],
+        json!(config.storage_compression_level),
+    );
     let transport = config
         .mail
         .as_ref()
@@ -3030,6 +3035,19 @@ mod tests {
             parse_args(&words(&["restore", "/backups/a"])),
             Ok(Command::BackupRestore { dir, digest: None }) if dir == "/backups/a"
         ));
+    }
+
+    #[test]
+    fn compression_environment_setting_is_exposed_as_locked_operator_setting() {
+        let config = Config::from_env_map(&BTreeMap::from([(
+            "CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL".to_owned(),
+            "0".to_owned(),
+        )]))
+        .unwrap();
+        let (values, locked) =
+            instance_setting_environment_with(&config, &|name| name == "STORAGE_COMPRESSION_LEVEL");
+        assert!(locked.contains("storage.compression_level"));
+        assert_eq!(values["storage.compression_level"], serde_json::json!(0));
     }
 
     #[test]

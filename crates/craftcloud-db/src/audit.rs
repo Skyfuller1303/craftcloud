@@ -305,6 +305,7 @@ pub(crate) fn valid_instance_setting_value(key: &str, value: &Value) -> bool {
         "versions.max_per_file" => value
             .as_u64()
             .is_some_and(|v| v == 0 || (2..=10_000).contains(&v)),
+        "storage.compression_level" => value.as_u64().is_some_and(|v| v <= 19),
         "mail.host" => value.as_str().is_some_and(valid_setting_host),
         "mail.username" | "mail.from" | "mail.tenant_id" | "mail.client_id" | "mail.sender" => {
             value
@@ -831,5 +832,21 @@ mod endpoint_host_tests {
             uppercase_host.details_json().unwrap(),
             r#"{"new":"Mail.Example.COM"}"#
         );
+        let compression = NewEvent::new("instance_setting.updated").detail(
+            "new",
+            Detail::InstanceSetting {
+                key: "storage.compression_level".into(),
+                value: Value::from(19),
+            },
+        );
+        assert_eq!(compression.details_json().unwrap(), r#"{"new":19}"#);
+        let invalid_compression = NewEvent::new("instance_setting.updated").detail(
+            "new",
+            Detail::InstanceSetting {
+                key: "storage.compression_level".into(),
+                value: Value::from(20),
+            },
+        );
+        assert!(invalid_compression.details_json().is_err());
     }
 }

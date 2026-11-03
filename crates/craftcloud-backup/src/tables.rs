@@ -66,6 +66,9 @@ pub const BACKUP_TABLES: &[TableSpec] = &[
     table("archive_backups", 22),
     table("archive_backup_refs", 22),
     table("archive_chunk_backup_refs", 25),
+    // Durable cleanup ownership must survive a DB restore; the restored
+    // archive inventory gate still prevents deletion until re-inventoried.
+    table("retired_archive_objects", 27),
     table("upload_sessions", 8),
     table("file_versions", 9),
     table("version_chunks", 25),

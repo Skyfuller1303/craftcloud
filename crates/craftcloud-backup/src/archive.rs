@@ -119,7 +119,7 @@ pub(crate) async fn verify_remote_chunks(
         };
         let key = ObjectKey::parse(archive_key)
             .map_err(|_| BackupError::new(ErrorKind::Format, "a chunk archive key is invalid"))?;
-        let expected = encrypted_len(entry.size).map_err(|_| {
+        let expected = encrypted_len(entry.stored_len()).map_err(|_| {
             BackupError::new(ErrorKind::Integrity, "chunk ciphertext length overflow")
         })?;
         let head = access.store.head(&key).await.map_err(|error| {
@@ -165,9 +165,20 @@ pub(crate) async fn verify_remote_chunks(
         return Err(error);
     }
     for (_, entry) in sample {
-        let _ = read_archive_chunk(access.store, access.crypto, &entry).await?;
+        let stored = read_archive_chunk(access.store, access.crypto, &entry).await?;
+        verify_chunk_payload(&entry, &stored)?;
     }
     Ok(())
+}
+
+pub(crate) fn verify_chunk_payload(
+    entry: &ChunkEntry,
+    stored: &[u8],
+) -> Result<Vec<u8>, BackupError> {
+    let digest = parse_sha256(&entry.sha256)
+        .ok_or_else(|| BackupError::new(ErrorKind::Format, "a chunk checksum is invalid"))?;
+    craftcloud_storage::compression::decode_chunk(&entry.encoding, stored, entry.size, &digest)
+        .map_err(|_| BackupError::new(ErrorKind::Integrity, "a stored chunk is damaged"))
 }
 
 pub(crate) async fn read_archive_chunk(
@@ -189,17 +200,15 @@ pub(crate) async fn read_archive_chunk(
     let envelope = WrappedDataKey::from_bytes(&parse_hex(wrapped)?).map_err(|_| {
         BackupError::new(ErrorKind::Integrity, "a chunk archive envelope is invalid")
     })?;
-    let digest = parse_sha256(&entry.sha256)
-        .ok_or_else(|| BackupError::new(ErrorKind::Format, "a chunk checksum is invalid"))?;
     let data_key = crypto
-        .unwrap_data_key(&envelope, chunk_id, entry.size)
+        .unwrap_data_key(&envelope, chunk_id, entry.stored_len())
         .map_err(|_| {
             BackupError::new(
                 ErrorKind::Integrity,
                 "a chunk archive key cannot be unwrapped",
             )
         })?;
-    let expected_len = encrypted_len(entry.size)
+    let expected_len = encrypted_len(entry.stored_len())
         .map_err(|_| BackupError::new(ErrorKind::Integrity, "chunk ciphertext length overflow"))?;
     let source = store.open_read(&key, None).await.map_err(|error| {
         if matches!(error, StorageError::NotFound) {
@@ -218,9 +227,8 @@ pub(crate) async fn read_archive_chunk(
         ));
     }
     let mut exact = ExactReader::new(source);
-    let mut hasher = Sha256::new();
-    let mut plaintext = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0));
-    let mut remaining = entry.size;
+    let mut plaintext = Vec::with_capacity(usize::try_from(entry.stored_len()).unwrap_or(0));
+    let mut remaining = entry.stored_len();
     let mut index = 0_u64;
     loop {
         let plain_len = usize::try_from(remaining.min(CHUNK_BYTES as u64))
@@ -234,7 +242,6 @@ pub(crate) async fn read_archive_chunk(
                     "an archive chunk block failed authentication",
                 )
             })?;
-        hasher.update(&plain);
         plaintext.extend_from_slice(&plain);
         remaining -= plain_len as u64;
         if remaining == 0 {
@@ -245,12 +252,6 @@ pub(crate) async fn read_archive_chunk(
         })?;
     }
     exact.finish().await?;
-    if <[u8; 32]>::from(hasher.finalize()) != digest {
-        return Err(BackupError::new(
-            ErrorKind::Integrity,
-            format!("archive chunk {archive_key} does not match its checksum"),
-        ));
-    }
     Ok(plaintext)
 }
 

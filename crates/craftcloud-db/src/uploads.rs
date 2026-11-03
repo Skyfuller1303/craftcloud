@@ -38,6 +38,7 @@ use crate::{DbError, OrgScope};
 /// Session states that still hold a quota reservation.
 pub(crate) const HOLDING: &str = "('created', 'receiving', 'stored')";
 const MAX_MANIFEST_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
+type ExistingChunkRow = (Uuid, i64, Vec<u8>, String, String, String, String, i64);
 
 /// A stored upload session.
 #[derive(Debug, Clone, FromRow)]
@@ -116,6 +117,10 @@ pub struct NewChunk {
     pub object_key: String,
     /// Chunk size.
     pub size_bytes: i64,
+    /// Stored byte length after optional compression.
+    pub stored_bytes: i64,
+    /// Physical storage encoding.
+    pub encoding: String,
     /// Byte offset in the whole file.
     pub byte_offset: i64,
 }
@@ -134,6 +139,14 @@ pub struct ChunkReuseCandidate {
     pub sha256: [u8; 32],
     /// Expected object size.
     pub size_bytes: i64,
+    /// Stored byte length.
+    pub stored_bytes: i64,
+    /// Existing object's encoding.
+    pub encoding: String,
+    /// Candidate's encoding.
+    pub candidate_encoding: String,
+    /// Candidate's stored byte length.
+    pub candidate_stored_bytes: i64,
 }
 
 /// One validated ordinal in a client-provided chunk manifest.
@@ -170,6 +183,10 @@ pub struct ChunkManifestRow {
     pub object_key: Option<String>,
     /// Chunk tier.
     pub storage_tier: Option<String>,
+    /// Stored byte length.
+    pub stored_bytes: Option<i64>,
+    /// Stored encoding.
+    pub encoding: Option<String>,
 }
 
 /// A same-file candidate selected while the organization transaction is held.
@@ -189,6 +206,10 @@ pub struct ManifestChunkCandidate {
     pub state: String,
     /// Storage tier.
     pub storage_tier: String,
+    /// Stored byte length.
+    pub stored_bytes: i64,
+    /// Stored encoding.
+    pub encoding: String,
 }
 
 /// Ordered manifest snapshot for verification outside a write transaction.
@@ -251,10 +272,14 @@ pub async fn physical_usage(
     scope: &OrgScope,
 ) -> Result<(i64, Vec<PhysicalWorkspaceUsage>), DbError> {
     let rows = sqlx::query_as::<_, PhysicalWorkspaceUsage>(
-        "SELECT workspace_id, SUM(size_bytes)::bigint AS physical_bytes FROM ( \
-           SELECT workspace_id, size_bytes FROM blobs WHERE org_id = $1 AND layout = 'whole' \
+        "SELECT workspace_id, SUM(stored_bytes)::bigint AS physical_bytes FROM ( \
+           SELECT workspace_id, size_bytes AS stored_bytes FROM blobs WHERE org_id = $1 AND layout = 'whole' \
            UNION ALL \
-           SELECT workspace_id, size_bytes FROM chunks WHERE org_id = $1 \
+           SELECT workspace_id, stored_bytes FROM chunks WHERE org_id = $1 \
+           UNION ALL \
+           SELECT r.workspace_id, r.physical_bytes FROM retired_archive_objects r WHERE r.org_id=$1 \
+             AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.archive_object_key=r.archive_object_key) \
+             AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.archive_object_key=r.archive_object_key) \
          ) physical GROUP BY workspace_id ORDER BY workspace_id",
     )
     .bind(scope.org_id())
@@ -661,7 +686,7 @@ impl OrgTx {
         }
         for digest in digests {
             let candidate = sqlx::query_as::<_, ManifestChunkCandidate>(
-                "SELECT id, digest, sha256, size_bytes, object_key, state, storage_tier FROM chunks \
+                "SELECT id, digest, sha256, size_bytes, object_key, state, storage_tier, stored_bytes, encoding FROM chunks \
                  WHERE file_id=$1 AND digest=$2 AND state <> 'deleting' FOR UPDATE",
             )
             .bind(session.file_id)
@@ -782,7 +807,7 @@ impl OrgTx {
             return Ok(None);
         }
         Ok(Some(sqlx::query_as::<_, ChunkManifestRow>(
-            "SELECT m.ordinal,m.byte_offset,m.size_bytes,m.sha256,m.digest,u.chunk_id,c.object_key,c.storage_tier \
+            "SELECT m.ordinal,m.byte_offset,m.size_bytes,m.sha256,m.digest,u.chunk_id,c.object_key,c.storage_tier,c.stored_bytes,c.encoding \
              FROM upload_chunk_manifest_entries m LEFT JOIN upload_chunks u ON u.upload_id=m.upload_id AND u.ordinal=m.ordinal \
              LEFT JOIN chunks c ON c.id=u.chunk_id AND c.file_id=(SELECT file_id FROM upload_chunk_manifests WHERE upload_id=m.upload_id) \
              WHERE m.upload_id=$1 ORDER BY m.ordinal",
@@ -804,6 +829,8 @@ impl OrgTx {
         digest: &[u8; 32],
         sha256: &[u8; 32],
         size_bytes: i64,
+        stored_bytes: i64,
+        encoding: &str,
         object_key: &str,
         now: OffsetDateTime,
     ) -> Result<Option<Option<String>>, DbError> {
@@ -853,7 +880,7 @@ impl OrgTx {
                 return Err(DbError::Internal);
             }
             sqlx::query(
-                "UPDATE chunks SET object_key=$3,state=CASE WHEN refcount>0 THEN 'committed' ELSE 'staged' END,storage_tier='local', \
+            "UPDATE chunks SET object_key=$3,stored_bytes=$4,encoding=$5,state=CASE WHEN refcount>0 THEN 'committed' ELSE 'staged' END,storage_tier='local',archive_object_key=NULL,archive_wrapped_key=NULL,archive_verified_at=NULL, \
                  archive_claim_token=NULL,archive_claimed_at=NULL,archive_next_attempt_at=NULL, \
                  archive_error_code=NULL,archive_local_delete_pending=false \
                  WHERE id=$1 AND file_id=$2",
@@ -861,6 +888,8 @@ impl OrgTx {
             .bind(chunk_id)
             .bind(session.file_id)
             .bind(object_key)
+            .bind(stored_bytes)
+            .bind(encoding)
             .execute(&mut *self.tx)
             .await?;
             (
@@ -870,8 +899,8 @@ impl OrgTx {
         } else {
             let chunk_id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,created_at) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged',$9)",
+                "INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,stored_bytes,encoding,state,created_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'staged',$11)",
             )
             .bind(chunk_id)
             .bind(session.file_id)
@@ -881,6 +910,8 @@ impl OrgTx {
             .bind(sha256.as_slice())
             .bind(object_key)
             .bind(size_bytes)
+            .bind(stored_bytes)
+            .bind(encoding)
             .bind(now)
             .execute(&mut *self.tx)
             .await?;
@@ -1569,10 +1600,10 @@ impl OrgTx {
                 previous_offset = previous_offset
                     .checked_add(chunk.size_bytes)
                     .ok_or(DbError::Internal)?;
-                let mut existing_chunk: Option<(Uuid, i64, Vec<u8>, String, String, String)> = None;
+                let mut existing_chunk: Option<ExistingChunkRow> = None;
                 for digest in &chunk.digest_candidates {
                     existing_chunk = sqlx::query_as(
-                        "SELECT id, size_bytes, sha256, state, storage_tier, object_key FROM chunks WHERE file_id = $1 AND digest = $2 FOR UPDATE",
+                        "SELECT id, size_bytes, sha256, state, storage_tier, object_key, encoding, stored_bytes FROM chunks WHERE file_id = $1 AND digest = $2 FOR UPDATE",
                     )
                     .bind(session.file_id)
                     .bind(digest.as_slice())
@@ -1589,6 +1620,8 @@ impl OrgTx {
                     existing_state,
                     existing_tier,
                     existing_key,
+                    existing_encoding,
+                    existing_stored_bytes,
                 )) = existing_chunk
                 {
                     if existing_size != chunk.size_bytes
@@ -1610,6 +1643,10 @@ impl OrgTx {
                                 candidate_object_key: chunk.object_key.clone(),
                                 sha256: chunk.sha256,
                                 size_bytes: chunk.size_bytes,
+                                stored_bytes: existing_stored_bytes,
+                                encoding: existing_encoding,
+                                candidate_encoding: chunk.encoding.clone(),
+                                candidate_stored_bytes: chunk.stored_bytes,
                             });
                         }
                     } else {
@@ -1617,7 +1654,7 @@ impl OrgTx {
                         // archive worker before commit prevents a later delete from removing
                         // a chunk used by the new head.
                         sqlx::query(
-                            "UPDATE chunks SET object_key=$2, storage_tier='local', \
+                            "UPDATE chunks SET object_key=$2, encoding=$4, stored_bytes=$5, storage_tier='local', archive_object_key=NULL,archive_wrapped_key=NULL,archive_verified_at=NULL,archive_error_code=NULL, \
                                  archive_local_delete_pending=false, archive_claim_token=NULL, \
                                  archive_claimed_at=NULL, archive_next_attempt_at=NULL \
                              WHERE id=$1 AND file_id=$3",
@@ -1625,6 +1662,8 @@ impl OrgTx {
                         .bind(existing_id)
                         .bind(&chunk.object_key)
                         .bind(session.file_id)
+                        .bind(&chunk.encoding)
+                        .bind(chunk.stored_bytes)
                         .execute(&mut *self.tx)
                         .await?;
                         unused_keys.push(existing_key);
@@ -1633,8 +1672,8 @@ impl OrgTx {
                 } else {
                     let candidate_id = Uuid::new_v4();
                     let inserted: Option<Uuid> = sqlx::query_scalar(
-                        "INSERT INTO chunks (id, file_id, org_id, workspace_id, digest, sha256, object_key, size_bytes, state, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'staged', $9) \
+                        "INSERT INTO chunks (id, file_id, org_id, workspace_id, digest, sha256, object_key, size_bytes, encoding, stored_bytes, state, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'staged', $11) \
                      ON CONFLICT (file_id, digest) DO NOTHING RETURNING id",
                     )
                     .bind(candidate_id)
@@ -1645,14 +1684,16 @@ impl OrgTx {
                     .bind(chunk.sha256.as_slice())
                     .bind(&chunk.object_key)
                     .bind(chunk.size_bytes)
+                    .bind(&chunk.encoding)
+                    .bind(chunk.stored_bytes)
                     .bind(now)
                     .fetch_optional(&mut *self.tx)
                     .await?;
                     if let Some(inserted) = inserted {
                         inserted
                     } else {
-                        let existing: Option<(Uuid, i64, Vec<u8>, String, String, String)> = sqlx::query_as(
-                            "SELECT id, size_bytes, sha256, state, storage_tier, object_key FROM chunks WHERE file_id = $1 AND digest = $2 FOR UPDATE",
+                        let existing: Option<ExistingChunkRow> = sqlx::query_as(
+                            "SELECT id, size_bytes, sha256, state, storage_tier, object_key, encoding, stored_bytes FROM chunks WHERE file_id = $1 AND digest = $2 FOR UPDATE",
                         )
                         .bind(session.file_id)
                         .bind(chunk.digest.as_slice())
@@ -1665,6 +1706,8 @@ impl OrgTx {
                             existing_state,
                             existing_tier,
                             existing_key,
+                            existing_encoding,
+                            existing_stored_bytes,
                         )) = existing
                         else {
                             return Err(DbError::Internal);
@@ -1688,11 +1731,15 @@ impl OrgTx {
                                     candidate_object_key: chunk.object_key.clone(),
                                     sha256: chunk.sha256,
                                     size_bytes: chunk.size_bytes,
+                                    stored_bytes: existing_stored_bytes,
+                                    encoding: existing_encoding,
+                                    candidate_encoding: chunk.encoding.clone(),
+                                    candidate_stored_bytes: chunk.stored_bytes,
                                 });
                             }
                         } else {
                             sqlx::query(
-                                "UPDATE chunks SET object_key=$2, storage_tier='local', \
+                                "UPDATE chunks SET object_key=$2, encoding=$4, stored_bytes=$5, storage_tier='local', archive_object_key=NULL,archive_wrapped_key=NULL,archive_verified_at=NULL,archive_error_code=NULL, \
                                      archive_local_delete_pending=false, archive_claim_token=NULL, \
                                      archive_claimed_at=NULL, archive_next_attempt_at=NULL \
                                  WHERE id=$1 AND file_id=$3",
@@ -1700,6 +1747,8 @@ impl OrgTx {
                             .bind(existing_id)
                             .bind(&chunk.object_key)
                             .bind(session.file_id)
+                            .bind(&chunk.encoding)
+                            .bind(chunk.stored_bytes)
                             .execute(&mut *self.tx)
                             .await?;
                             unused_keys.push(existing_key);
@@ -1752,7 +1801,7 @@ impl OrgTx {
     ) -> Result<bool, DbError> {
         self.check(scope, Action::UploadWrite)?;
         let done = sqlx::query(
-            "UPDATE chunks SET object_key=$4 WHERE id=$1 AND org_id=$2 \
+            "UPDATE chunks SET object_key=$4, encoding=$8, stored_bytes=$9, archive_object_key=NULL, archive_wrapped_key=NULL, archive_verified_at=NULL, archive_claim_token=NULL, archive_claimed_at=NULL, archive_next_attempt_at=NULL, archive_error_code=NULL, archive_local_delete_pending=false WHERE id=$1 AND org_id=$2 \
              AND object_key=$3 AND storage_tier='local' AND state <> 'deleting' \
              AND size_bytes=$6 AND sha256=$7 \
              AND EXISTS (SELECT 1 FROM upload_chunks u WHERE u.upload_id=$5 AND u.chunk_id=chunks.id)",
@@ -1764,6 +1813,8 @@ impl OrgTx {
         .bind(upload_id)
         .bind(reuse.size_bytes)
         .bind(reuse.sha256.as_slice())
+        .bind(&reuse.candidate_encoding)
+        .bind(reuse.candidate_stored_bytes)
         .execute(&mut *self.tx)
         .await?;
         Ok(done.rows_affected() == 1)

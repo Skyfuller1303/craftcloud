@@ -243,12 +243,12 @@ async fn verify_archived_version_assemblies(
                 "version chunk mappings have a discontinuous ordinal or offset",
             ));
         }
-        let bytes = if entry.chunk.local_copy {
-            std::fs::read(dir.join(crate::manifest::chunk_file(&entry.chunk.id)))
-                .map_err(|e| BackupError::io("cannot read mapped chunk", &e))?
+        let stored = if entry.chunk.local_copy {
+            read_stored_chunk(dir, &entry.chunk)?
         } else {
             crate::archive::read_archive_chunk(access.store, access.crypto, &entry.chunk).await?
         };
+        let bytes = crate::archive::verify_chunk_payload(&entry.chunk, &stored)?;
         hasher.update(&bytes);
         size = size
             .checked_add(bytes.len() as u64)
@@ -351,6 +351,42 @@ fn read_bounded(dir: &Path, relative: &str, limit: u64) -> Result<Vec<u8>, Backu
     File::open(dir.join(relative))
         .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
         .map_err(|error| BackupError::io(&format!("cannot read {relative}"), &error))?;
+    if bytes.len() as u64 > limit {
+        return Err(BackupError::new(
+            ErrorKind::Format,
+            format!("{relative} grew beyond its size limit while being read"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_stored_chunk(
+    dir: &Path,
+    entry: &crate::manifest::ChunkEntry,
+) -> Result<Vec<u8>, BackupError> {
+    let relative = crate::manifest::chunk_file(&entry.id);
+    let meta = require_file(dir, &relative)?;
+    let limit = entry.stored_len();
+    if meta.len() != limit {
+        return Err(integrity(format!(
+            "chunk {} has an unexpected stored size",
+            entry.id
+        )));
+    }
+    let capacity = usize::try_from(limit)
+        .map_err(|_| integrity("a stored chunk size exceeds addressable memory"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(dir.join(&relative))
+        .map_err(|error| BackupError::io("cannot open a chunk file", &error))?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BackupError::io("cannot read a chunk file", &error))?;
+    if bytes.len() != capacity {
+        return Err(integrity(format!(
+            "chunk {} changed while being read",
+            entry.id
+        )));
+    }
     Ok(bytes)
 }
 
@@ -606,6 +642,12 @@ pub fn verify(
         let mut total_chunks = 0_u64;
         let mut local_chunks = 0_u64;
         for_each_chunk(dir, |entry| {
+            if manifest.format_version >= 4 && entry.stored_bytes == 0 {
+                return Err(BackupError::new(
+                    ErrorKind::Format,
+                    "a version-4 chunk entry omits its stored size",
+                ));
+            }
             if entry.id <= previous {
                 return Err(integrity("chunks.jsonl is not sorted or repeats an id"));
             }
@@ -613,17 +655,12 @@ pub fn verify(
             if entry.local_copy {
                 let relative = crate::manifest::chunk_file(&entry.id);
                 require_file(dir, &relative)?;
-                let sum = sum_file(dir, &relative)?;
-                if sum.len != entry.size || hex(&sum.sha256) != entry.sha256 {
-                    return Err(integrity(format!(
-                        "chunk {} does not match its recorded checksum",
-                        entry.id
-                    )));
-                }
+                let stored = read_stored_chunk(dir, entry)?;
+                crate::archive::verify_chunk_payload(entry, &stored)?;
                 local_chunks += 1;
             }
             total_chunks = total_chunks
-                .checked_add(entry.size)
+                .checked_add(entry.stored_len())
                 .ok_or_else(|| integrity("chunk sizes overflow"))?;
             chunk_count += 1;
             Ok(())
@@ -648,7 +685,7 @@ pub fn verify(
                 return Err(integrity(format!("{name} does not match its manifest")));
             }
         }
-        verify_chunked_index_contents(dir)?;
+        verify_chunked_index_contents(dir, manifest.format_version)?;
     }
 
     check_no_extra_files(dir, &manifest, local_count)?;
@@ -689,7 +726,7 @@ where
     }
 }
 
-fn verify_chunked_index_contents(dir: &Path) -> Result<(), BackupError> {
+fn verify_chunked_index_contents(dir: &Path, format_version: u32) -> Result<(), BackupError> {
     use crate::manifest::{ChunkedVersionEntry, VersionChunkEntry};
     let versions = File::open(dir.join(CHUNKED_VERSION_INDEX_FILE))
         .map_err(|e| BackupError::io("cannot open chunked version list", &e))?;
@@ -714,6 +751,12 @@ fn verify_chunked_index_contents(dir: &Path) -> Result<(), BackupError> {
     let mut line = Vec::new();
     while read_jsonl_line(&mut mappings_reader, &mut line, "version chunk list")? {
         let entry = VersionChunkEntry::parse_line(&line)?;
+        if format_version >= 4 && entry.chunk.stored_bytes == 0 {
+            return Err(BackupError::new(
+                ErrorKind::Format,
+                "a version-4 mapping omits its chunk stored size",
+            ));
+        }
         let key = (entry.version_id.clone(), entry.ordinal);
         if previous.as_ref().is_some_and(|last| last >= &key) {
             return Err(integrity(
@@ -739,29 +782,9 @@ fn verify_chunked_index_contents(dir: &Path) -> Result<(), BackupError> {
             ));
         }
         if entry.chunk.local_copy {
-            let path = dir.join(crate::manifest::chunk_file(&entry.chunk.id));
-            let mut file =
-                File::open(path).map_err(|e| BackupError::io("cannot open mapped chunk", &e))?;
-            let mut chunk_hash = Sha256::new();
-            let mut buf = vec![0; BLOCK];
-            let mut chunk_len = 0_u64;
-            loop {
-                let n = file
-                    .read(&mut buf)
-                    .map_err(|e| BackupError::io("cannot read mapped chunk", &e))?;
-                if n == 0 {
-                    break;
-                }
-                chunk_len += n as u64;
-                let block = buf
-                    .get(..n)
-                    .ok_or_else(|| integrity("mapped chunk read exceeded its buffer"))?;
-                chunk_hash.update(block);
-                digest.update(block);
-            }
-            if chunk_len != entry.chunk.size || hex(&chunk_hash.finalize()) != entry.chunk.sha256 {
-                return Err(integrity("mapped chunk bytes do not match their digest"));
-            }
+            let stored = read_stored_chunk(dir, &entry.chunk)?;
+            let plain = crate::archive::verify_chunk_payload(&entry.chunk, &stored)?;
+            digest.update(&plain);
         } else {
             *archived = true;
         }
@@ -966,6 +989,34 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::Format);
         assert!(line.len() <= MAX_BLOB_LINE_BYTES + 2);
         assert!(reader.position() <= (MAX_BLOB_LINE_BYTES + 2) as u64);
+    }
+
+    #[test]
+    fn oversized_chunk_file_is_rejected_from_metadata_before_reading_contents() {
+        let dir = Dir::new();
+        fs::create_dir_all(dir.0.join(CHUNKS_DIR)).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let entry = ChunkEntry {
+            id: id.clone(),
+            file_id: uuid::Uuid::new_v4().to_string(),
+            key: "00000000000000000000000000000001".to_owned(),
+            size: 4096,
+            stored_bytes: 4096,
+            encoding: "raw".to_owned(),
+            sha256: sha(&vec![0; 4096]),
+            local_copy: true,
+            archive_object_key: None,
+            archive_wrapped_key: None,
+        };
+        fs::write(
+            dir.0.join(crate::manifest::chunk_file(&id)),
+            vec![b'x'; 8 * 1024 * 1024],
+        )
+        .unwrap();
+        assert_eq!(
+            read_stored_chunk(&dir.0, &entry).unwrap_err().kind,
+            ErrorKind::Integrity
+        );
     }
 
     /// Writes a complete, valid backup of empty tables and the given blobs

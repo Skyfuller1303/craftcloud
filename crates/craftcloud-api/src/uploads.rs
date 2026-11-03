@@ -653,16 +653,20 @@ pub(crate) async fn create_upload(
                 {
                     continue;
                 }
-                let key = match ObjectKey::parse(&candidate.object_key) {
-                    Ok(key) => key,
-                    Err(_) => continue,
-                };
                 let size = u64::try_from(entry.size_bytes).unwrap_or(0);
                 let verified = if let Some(verified) = verified_candidates.get(&candidate.id) {
                     *verified
                 } else {
-                    let verified = matches!(store.head(&key).await, Ok(head) if head.len == size)
-                        && store.verify(&key, &entry.sha256).await.is_ok();
+                    let stored_size = u64::try_from(candidate.stored_bytes).unwrap_or(0);
+                    let verified = key_matches(
+                        store,
+                        &candidate.object_key,
+                        size,
+                        stored_size,
+                        &candidate.encoding,
+                        &entry.sha256,
+                    )
+                    .await;
                     verified_candidates.insert(candidate.id, verified);
                     verified
                 };
@@ -976,11 +980,34 @@ pub(crate) async fn local_chunk_matches(
     let Ok(key) = ObjectKey::parse(&reuse.existing_object_key) else {
         return false;
     };
-    let Ok(size) = u64::try_from(reuse.size_bytes) else {
+    let (Ok(size), Ok(stored_size), Ok(expected_sha)) = (
+        u64::try_from(reuse.size_bytes),
+        u64::try_from(reuse.stored_bytes),
+        <[u8; 32]>::try_from(reuse.sha256.as_slice()),
+    ) else {
         return false;
     };
-    matches!(store.head(&key).await, Ok(head) if head.len == size)
-        && store.verify(&key, &reuse.sha256).await.is_ok()
+    if !matches!(store.head(&key).await, Ok(head) if head.len == stored_size) {
+        return false;
+    }
+    let Ok(mut reader) = store.open_read(&key, None).await else {
+        return false;
+    };
+    let Ok(capacity) = usize::try_from(stored_size) else {
+        return false;
+    };
+    if capacity > craftcloud_storage::MAX_CHUNK_BYTES as usize {
+        return false;
+    }
+    let mut stored = Vec::with_capacity(capacity);
+    while let Ok(Some(bytes)) = reader.next_chunk().await {
+        if stored.len().saturating_add(bytes.len()) > capacity {
+            return false;
+        }
+        stored.extend_from_slice(&bytes);
+    }
+    craftcloud_storage::compression::decode_chunk(&reuse.encoding, &stored, size, &expected_sha)
+        .is_ok()
 }
 
 /// After this long a receiving upload must have shown the minimum average
@@ -989,8 +1016,8 @@ pub(crate) async fn local_chunk_matches(
 pub(crate) const RATE_GRACE_SECS: i64 = 300;
 /// Minimum average rate in bytes per second once the grace period is over.
 pub(crate) const MIN_RATE_BYTES_PER_SEC: u64 = 16 * 1024;
-
 pub(crate) async fn stage_chunk_manifest(
+    pool: &craftcloud_db::PgPool,
     store: &craftcloud_storage::LocalStore,
     source_key: &ObjectKey,
     size: u64,
@@ -1000,6 +1027,14 @@ pub(crate) async fn stage_chunk_manifest(
 ) -> Result<(Vec<NewChunk>, Vec<ObjectKey>), StorageError> {
     let mut manifest = Vec::new();
     let mut keys = Vec::new();
+    let settings = craftcloud_db::instance_settings::settings(pool)
+        .await
+        .map_err(|_| StorageError::ChecksumMismatch)?;
+    let environment_level = std::env::var("CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL").ok();
+    let level = craftcloud_db::instance_settings::compression_level_from_rows(
+        &settings,
+        environment_level.as_deref(),
+    );
     let result = async {
         store.verify(source_key, &expected).await?;
         let mut reader = store.open_read(source_key, None).await?;
@@ -1012,6 +1047,7 @@ pub(crate) async fn stage_chunk_manifest(
         while let Some(bytes) = reader.next_chunk().await? {
             buffer.extend_from_slice(&bytes);
             write_ready_chunks(
+                level,
                 store,
                 file_id,
                 identity_keys,
@@ -1024,6 +1060,7 @@ pub(crate) async fn stage_chunk_manifest(
             .await?;
         }
         write_ready_chunks(
+            level,
             store,
             file_id,
             identity_keys,
@@ -1057,6 +1094,7 @@ async fn delete_object_key(store: &craftcloud_storage::LocalStore, key: &ObjectK
 
 #[allow(clippy::too_many_arguments)]
 async fn write_ready_chunks(
+    level: i32,
     store: &craftcloud_storage::LocalStore,
     file_id: Uuid,
     identity_keys: &[[u8; 32]],
@@ -1091,15 +1129,21 @@ async fn write_ready_chunks(
                 digest_candidates.push(candidate);
             }
         }
+        let encoded =
+            craftcloud_storage::compression::encode_chunk_bounded(content.to_vec(), level)
+                .await
+                .map_err(|_| StorageError::ChecksumMismatch)?;
         let object_key = ObjectKey::generate();
         let chunk_len = u64::try_from(content.len()).map_err(|_| StorageError::TooLarge)?;
-        let mut temp = store.begin_write_as(object_key.clone(), chunk_len).await?;
-        if let Err(error) = temp.write(content).await {
+        let stored_len = u64::try_from(encoded.bytes.len()).map_err(|_| StorageError::TooLarge)?;
+        let mut temp = store.begin_write_as(object_key.clone(), stored_len).await?;
+        if let Err(error) = temp.write(&encoded.bytes).await {
             store.abort(temp).await;
             return Err(error);
         }
         let chunk_sha: Sha256Digest = Sha256::digest(content).into();
-        let published = store.finalize(temp, chunk_len, &chunk_sha).await?;
+        let stored_sha: Sha256Digest = Sha256::digest(&encoded.bytes).into();
+        let published = store.finalize(temp, stored_len, &stored_sha).await?;
         if published != object_key {
             return Err(StorageError::ChecksumMismatch);
         }
@@ -1112,6 +1156,8 @@ async fn write_ready_chunks(
             sha256: chunk_sha,
             object_key: object_key.as_str().to_owned(),
             size_bytes,
+            stored_bytes: i64::try_from(stored_len).map_err(|_| StorageError::TooLarge)?,
+            encoding: encoded.encoding.to_owned(),
             byte_offset,
         });
         *offset = offset
@@ -1259,7 +1305,17 @@ async fn finish_upload(finish: Finish) -> Response {
     let (chunk_manifest, chunk_keys) = if identity_keys.is_empty() {
         (None, Vec::new())
     } else {
-        match stage_chunk_manifest(store, &key, size, expected, file_id, &identity_keys).await {
+        match stage_chunk_manifest(
+            &services.pool,
+            store,
+            &key,
+            size,
+            expected,
+            file_id,
+            &identity_keys,
+        )
+        .await
+        {
             Ok((manifest, keys)) => (Some(manifest), keys),
             Err(error) => {
                 delete_object(&services, &key).await;
@@ -1949,7 +2005,7 @@ pub(crate) async fn put_chunk(
             }
         }
     }
-    let candidate_key = match store.finalize(temp, size, &expected_sha).await {
+    let mut candidate_key = match store.finalize(temp, size, &expected_sha).await {
         Ok(key) if key == candidate_key => key,
         Ok(key) => {
             delete_object(&services, &key).await;
@@ -1957,6 +2013,97 @@ pub(crate) async fn put_chunk(
         }
         Err(error) => return storage_error(&error, &headers),
     };
+    let mut source = match store.open_read(&candidate_key, None).await {
+        Ok(source) if source.remaining() == size => source,
+        Ok(_) => {
+            delete_object(&services, &candidate_key).await;
+            return internal(&headers);
+        }
+        Err(error) => {
+            delete_object(&services, &candidate_key).await;
+            return storage_error(&error, &headers);
+        }
+    };
+    let capacity = usize::try_from(size).unwrap_or(0);
+    let mut plaintext = Vec::with_capacity(capacity);
+    while let Some(bytes) = match source.next_chunk().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            delete_object(&services, &candidate_key).await;
+            return storage_error(&error, &headers);
+        }
+    } {
+        if plaintext.len().saturating_add(bytes.len()) > capacity {
+            delete_object(&services, &candidate_key).await;
+            return storage_error(&StorageError::TooLarge, &headers);
+        }
+        plaintext.extend_from_slice(&bytes);
+    }
+    if plaintext.len() != capacity {
+        delete_object(&services, &candidate_key).await;
+        return storage_error(&StorageError::LengthMismatch, &headers);
+    }
+    let settings = match craftcloud_db::instance_settings::settings(&services.pool).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            delete_object(&services, &candidate_key).await;
+            return db_failure(&error, &headers, "compression setting lookup failed");
+        }
+    };
+    let environment_level = std::env::var("CRAFTCLOUD_STORAGE_COMPRESSION_LEVEL").ok();
+    let level = craftcloud_db::instance_settings::compression_level_from_rows(
+        &settings,
+        environment_level.as_deref(),
+    );
+    let encoded =
+        match craftcloud_storage::compression::encode_chunk_bounded(plaintext, level).await {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                delete_object(&services, &candidate_key).await;
+                return internal(&headers);
+            }
+        };
+    let mut stored_bytes = i64::try_from(size).unwrap_or(-1);
+    let mut encoding = "raw";
+    if encoded.encoding == "zstd" {
+        let source_key = candidate_key.clone();
+        let compressed_key = ObjectKey::generate();
+        let compressed_len = u64::try_from(encoded.bytes.len()).unwrap_or(u64::MAX);
+        let mut compressed_temp = match store
+            .begin_write_as(compressed_key.clone(), compressed_len)
+            .await
+        {
+            Ok(temp) => temp,
+            Err(error) => {
+                delete_object(&services, &source_key).await;
+                return storage_error(&error, &headers);
+            }
+        };
+        if let Err(error) = compressed_temp.write(&encoded.bytes).await {
+            store.abort(compressed_temp).await;
+            delete_object(&services, &source_key).await;
+            return storage_error(&error, &headers);
+        }
+        let compressed_sha: Sha256Digest = Sha256::digest(&encoded.bytes).into();
+        candidate_key = match store
+            .finalize(compressed_temp, compressed_len, &compressed_sha)
+            .await
+        {
+            Ok(key) if key == compressed_key => key,
+            Ok(key) => {
+                delete_object(&services, &key).await;
+                delete_object(&services, &source_key).await;
+                return internal(&headers);
+            }
+            Err(error) => {
+                delete_object(&services, &source_key).await;
+                return storage_error(&error, &headers);
+            }
+        };
+        delete_object(&services, &source_key).await;
+        stored_bytes = i64::try_from(compressed_len).unwrap_or(-1);
+        encoding = "zstd";
+    }
     let mut guard = ChunkObjectGuard {
         services: Arc::clone(&services),
         key: Some(candidate_key.clone()),
@@ -2037,7 +2184,15 @@ pub(crate) async fn put_chunk(
     }
     let already_good = if current.storage_tier.as_deref() == Some("local") {
         if let Some(key) = current.object_key.as_deref() {
-            key_matches(store, key, size, &expected_sha).await
+            key_matches(
+                store,
+                key,
+                size,
+                u64::try_from(current.stored_bytes.unwrap_or(-1)).unwrap_or(0),
+                current.encoding.as_deref().unwrap_or("raw"),
+                &expected_sha,
+            )
+            .await
         } else {
             false
         }
@@ -2083,7 +2238,15 @@ pub(crate) async fn put_chunk(
             candidate.sha256.as_slice() == expected_sha
                 && candidate.size_bytes == i64::try_from(size).unwrap_or(-1)
                 && candidate.storage_tier == "local"
-                && key_matches(store, &candidate.object_key, size, &expected_sha).await
+                && key_matches(
+                    store,
+                    &candidate.object_key,
+                    size,
+                    u64::try_from(candidate.stored_bytes).unwrap_or(0),
+                    &candidate.encoding,
+                    &expected_sha,
+                )
+                .await
         } else {
             false
         };
@@ -2114,6 +2277,8 @@ pub(crate) async fn put_chunk(
                     &expected_digest,
                     &expected_sha,
                     i64::try_from(size).unwrap_or(-1),
+                    stored_bytes,
+                    encoding,
                     candidate_key.as_str(),
                     now,
                 )
@@ -2159,13 +2324,43 @@ async fn key_matches(
     store: &craftcloud_storage::LocalStore,
     key: &str,
     size: u64,
+    stored_size: u64,
+    encoding: &str,
     expected: &Sha256Digest,
 ) -> bool {
     let Ok(key) = ObjectKey::parse(key) else {
         return false;
     };
-    matches!(store.head(&key).await, Ok(head) if head.len == size)
-        && store.verify(&key, expected).await.is_ok()
+    if !matches!(store.head(&key).await, Ok(head) if head.len == stored_size) {
+        return false;
+    }
+    let Ok(mut reader) = store.open_read(&key, None).await else {
+        return false;
+    };
+    let Ok(capacity) = usize::try_from(stored_size) else {
+        return false;
+    };
+    if capacity > craftcloud_storage::MAX_CHUNK_BYTES as usize {
+        return false;
+    }
+    let mut stored = Vec::with_capacity(capacity);
+    while let Ok(Some(bytes)) = reader.next_chunk().await {
+        if stored.len().saturating_add(bytes.len()) > capacity {
+            return false;
+        }
+        stored.extend_from_slice(&bytes);
+    }
+    let Ok(expected) = <[u8; 32]>::try_from(expected.as_slice()) else {
+        return false;
+    };
+    craftcloud_storage::compression::decode_chunk_bounded(
+        encoding.to_owned(),
+        stored,
+        size,
+        expected,
+    )
+    .await
+    .is_ok()
 }
 
 fn slow_error(headers: &HeaderMap) -> Response {

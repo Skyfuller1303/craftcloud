@@ -14,7 +14,8 @@ type FieldName =
   | "mail.transport" | "mail.host" | "mail.port" | "mail.tls" | "mail.username" | "mail.from"
   | "mail.tenant_id" | "mail.client_id" | "mail.sender" | "mail.save_to_sent"
   | "retention.version_days" | "retention.trash_days" | "retention.audit_days" | "retention.quarantine_days"
-  | "versions.keep_all_hours" | "versions.daily_days" | "versions.weekly_weeks" | "versions.max_per_file";
+  | "versions.keep_all_hours" | "versions.daily_days" | "versions.weekly_weeks" | "versions.max_per_file"
+  | "storage.compression_level";
 type SecretName = "mail.password" | "mail.client_secret" | "mail.certificate" | "mail.private_key" | "mail.service_account";
 type NormalField = { name: FieldName; label: string; kind: "text" | "number" | "select" | "checkbox"; choices?: string[]; min?: number; max?: number };
 const MAIL_FIELDS: NormalField[] = [
@@ -47,6 +48,9 @@ const RETENTION_FIELDS: NormalField[] = [
   { name: "versions.daily_days", label: "Daily version samples (days)", kind: "number", min: 0, max: 90 },
   { name: "versions.weekly_weeks", label: "Weekly version samples (weeks)", kind: "number", min: 0, max: 52 },
   { name: "versions.max_per_file", label: "Maximum unpinned versions per file", kind: "number", min: 0, max: 10000 },
+];
+const STORAGE_FIELDS: NormalField[] = [
+  { name: "storage.compression_level", label: "Storage compression level", kind: "number", min: 0, max: 19 },
 ];
 
 /** Settings that decide where stored credentials are sent; changing one removes them server-side. */
@@ -86,11 +90,12 @@ function translateFieldLabel(t: Translate, label: string): string {
     case "Daily version samples (days)": return t("Daily version samples (days)");
     case "Weekly version samples (weeks)": return t("Weekly version samples (weeks)");
     case "Maximum unpinned versions per file": return t("Maximum unpinned versions per file");
+    case "Storage compression level": return t("Storage compression level");
     default: return label;
   }
 }
 
-export function InstanceSettingsWizardSection({ section, onEmailTest }: { section: "mail" | "retention"; onEmailTest?: () => void }) {
+export function InstanceSettingsWizardSection({ section, onEmailTest }: { section: "mail" | "retention" | "storage"; onEmailTest?: () => void }) {
   const { t } = useI18n();
   const { api } = useAuth();
   const [settings, setSettings] = useState<InstanceSettings | null>(null);
@@ -109,7 +114,7 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
     try {
       const result = await api.getAdminInstanceSettings();
       setSettings(result);
-      const values = Object.fromEntries([...MAIL_FIELDS, ...RETENTION_FIELDS].map((field) => [field.name, stringValue(result.settings[field.name])]));
+      const values = Object.fromEntries([...MAIL_FIELDS, ...RETENTION_FIELDS, ...STORAGE_FIELDS].map((field) => [field.name, stringValue(result.settings[field.name])]));
       setDraft(values);
       setSecrets({});
       setRemoveSecrets(new Set());
@@ -126,7 +131,7 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
     setCleared(false);
     const changes: InstanceSettingsPatch["settings"] = {};
     const shortened: string[] = [];
-    const fields = section === "mail" ? MAIL_FIELDS : RETENTION_FIELDS;
+    const fields = section === "mail" ? MAIL_FIELDS : section === "retention" ? RETENTION_FIELDS : STORAGE_FIELDS;
     for (const field of fields) {
       const existing = settings.settings[field.name];
       if (existing === undefined || isSecret(existing) || existing.locked) continue;
@@ -197,7 +202,7 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
     ? <p role="status" className="muted">{t("Loading instance settings…")}</p>
     : <ErrorNotice error={error} onRetry={() => void load()} onReload={() => void load()} />;
 
-  const fields = section === "mail" ? MAIL_FIELDS : RETENTION_FIELDS;
+  const fields = section === "mail" ? MAIL_FIELDS : section === "retention" ? RETENTION_FIELDS : STORAGE_FIELDS;
   const dirtyFields = fields.some((field) => {
     const item = settings.settings[field.name];
     return item !== undefined && !isSecret(item) && !item.locked && (draft[field.name] ?? "") !== stringValue(item);
@@ -267,7 +272,8 @@ export function InstanceSettingsWizardSection({ section, onEmailTest }: { sectio
       <p>{t("These values control instance maintenance and retention.")}</p>
       <p className="field__hint">{t("With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.")}</p>
     </>}
-    {section === "retention" && fields.map((field) => {
+    {section === "storage" && <p>{t("Choose a zstd compression level from 0 to 19. Level 0 stores chunks without compression; the environment setting takes precedence.")}</p>}
+    {section !== "mail" && fields.map((field) => {
       const item = settings.settings[field.name];
       if (item === undefined || isSecret(item)) return null;
       return <label className="field" key={field.name}>

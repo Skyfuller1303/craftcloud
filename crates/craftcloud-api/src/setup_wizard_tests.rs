@@ -21,6 +21,97 @@ fn services(env: &TestEnv, key: Option<[u8; 32]>) -> Services {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL: cargo xtask db-test"]
+async fn compression_level_setting_round_trips_with_audit_and_environment_lock() {
+    let env = TestEnv::new().await;
+    let owner = env.login_ok("op").await;
+    let app = env.router_with_services(services(&env, None));
+    let initial = call(
+        &app,
+        Req::new("GET", "/api/v1/admin/instance-settings").session(&owner),
+    )
+    .await;
+    assert_eq!(
+        initial.status,
+        axum::http::StatusCode::OK,
+        "{}",
+        initial.text
+    );
+    assert_eq!(
+        initial.body["settings"]["storage.compression_level"]["value"],
+        3
+    );
+
+    let saved = call(
+        &app,
+        Req::new("PATCH", "/api/v1/admin/instance-settings")
+            .json(json!({"settings":{"storage.compression_level":{"value":0}}}))
+            .session(&owner),
+    )
+    .await;
+    assert_eq!(saved.status, axum::http::StatusCode::OK, "{}", saved.text);
+    assert_eq!(
+        saved.body["settings"]["storage.compression_level"]["value"],
+        0
+    );
+    let stored: Value = sqlx::query_scalar(
+        "SELECT value FROM instance_settings WHERE key='storage.compression_level'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, json!({"value":0}));
+    let audit: Value = sqlx::query_scalar(
+        "SELECT details FROM audit_events WHERE action='instance_setting.updated' AND details->>'key'='storage.compression_level' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit["new"], 0);
+
+    let locked_services = services(&env, None).with_instance_setting_environment(
+        BTreeMap::from([("storage.compression_level".to_owned(), json!(19))]),
+        BTreeSet::from(["storage.compression_level".to_owned()]),
+    );
+    let locked_app = env.router_with_services(locked_services);
+    let locked = call(
+        &locked_app,
+        Req::new("GET", "/api/v1/admin/instance-settings").session(&owner),
+    )
+    .await;
+    assert_eq!(
+        locked.body["settings"]["storage.compression_level"]["value"],
+        19
+    );
+    assert_eq!(
+        locked.body["settings"]["storage.compression_level"]["source"],
+        "environment"
+    );
+    assert_eq!(
+        locked.body["settings"]["storage.compression_level"]["locked"],
+        true
+    );
+    let rejected = call(
+        &locked_app,
+        Req::new("PATCH", "/api/v1/admin/instance-settings")
+            .json(json!({"settings":{"storage.compression_level":{"value":18}}}))
+            .session(&owner),
+    )
+    .await;
+    assert_eq!(rejected.status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(rejected.code(), "SETTING_LOCKED");
+
+    let invalid = call(
+        &app,
+        Req::new("PATCH", "/api/v1/admin/instance-settings")
+            .json(json!({"settings":{"storage.compression_level":{"value":20}}}))
+            .session(&owner),
+    )
+    .await;
+    assert_eq!(invalid.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: cargo xtask db-test"]
 async fn setup_progress_authorization_environment_priority_and_secret_storage() {
     let env = TestEnv::new().await;
     let owner = env.login_ok("op").await;

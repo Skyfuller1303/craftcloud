@@ -215,6 +215,42 @@ pub struct InstanceSetting {
     pub updated_by: Option<Uuid>,
 }
 
+/// Resolves compression level using environment, stored instance setting, then default 3.
+#[must_use]
+pub fn compression_level_from_rows(rows: &[InstanceSetting], environment: Option<&str>) -> i32 {
+    if let Some(level) = environment
+        .and_then(|raw| raw.trim().parse::<i32>().ok())
+        .filter(|v| (0..=19).contains(v))
+    {
+        return level;
+    }
+    let row = rows
+        .iter()
+        .find(|row| row.key == "storage.compression_level");
+    let stored = row
+        .and_then(|row| row.value.get("value"))
+        .and_then(Value::as_i64)
+        .filter(|v| (0..=19).contains(v))
+        .and_then(|v| i32::try_from(v).ok());
+    if stored.is_none() && row.is_some() {
+        tracing::warn!(
+            setting = "storage.compression_level",
+            "ignoring invalid stored compression setting"
+        );
+    }
+    stored.unwrap_or(3)
+}
+
+/// Resolves the active compression level. The application supplies its
+/// validated environment value; invalid persisted values fall back safely.
+pub async fn effective_compression_level(
+    pool: &PgPool,
+    environment: Option<&str>,
+) -> Result<i32, DbError> {
+    let rows = settings(pool).await?;
+    Ok(compression_level_from_rows(&rows, environment))
+}
+
 pub async fn setup_steps(pool: &PgPool) -> Result<Vec<SetupStep>, DbError> {
     let rows = sqlx::query(
         "SELECT step, status, updated_at, updated_by FROM instance_setup_steps ORDER BY step",
@@ -498,6 +534,35 @@ pub async fn update_settings_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_level_prefers_environment_then_database_then_default() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let row = InstanceSetting {
+            key: "storage.compression_level".to_owned(),
+            value: serde_json::json!({"value": 7}),
+            updated_at: now,
+            updated_by: None,
+        };
+        let rows = std::slice::from_ref(&row);
+        assert_eq!(compression_level_from_rows(&[], None), 3);
+        assert_eq!(compression_level_from_rows(rows, None), 7);
+        assert_eq!(compression_level_from_rows(rows, Some("0")), 0);
+        assert_eq!(compression_level_from_rows(rows, Some(" 0 ")), 0);
+        assert_eq!(compression_level_from_rows(rows, Some("19")), 19);
+        assert_eq!(compression_level_from_rows(rows, Some("20")), 7);
+    }
+
+    #[test]
+    fn invalid_stored_compression_level_falls_back_to_default() {
+        let row = InstanceSetting {
+            key: "storage.compression_level".to_owned(),
+            value: serde_json::json!({"value": 20}),
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            updated_by: None,
+        };
+        assert_eq!(compression_level_from_rows(&[row], None), 3);
+    }
 
     #[test]
     fn setup_cannot_finish_until_every_required_step_is_resolved() {

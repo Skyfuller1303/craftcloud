@@ -1436,8 +1436,19 @@ impl Maintenance {
             report.add("candidates", count_of(candidates.len()));
             report.add("chunk_would_resume", count_of(deleting_chunks.len()));
             report.add("chunk_candidates", count_of(chunk_candidates.len()));
+            let retired = db::retired_archive_objects_due(
+                &self.pool,
+                minus(ctx.now, ctx.settings.grace()),
+                ctx.now,
+                batch,
+            )
+            .await?;
+            report.add("retired_archive_candidates", count_of(retired.len()));
             return Ok(());
         }
+        // Let one retired key advance before potentially long local GC batches;
+        // the bounded tail drain below handles the rest when time remains.
+        self.collect_retired_archive_objects(ctx, report, 1).await?;
         for target in deleting_chunks {
             if !ctx.go() {
                 break;
@@ -1552,6 +1563,76 @@ impl Maintenance {
                 report,
             })
             .await;
+        }
+        self.collect_retired_archive_objects(ctx, report, batch)
+            .await?;
+        Ok(())
+    }
+
+    async fn collect_retired_archive_objects(
+        &self,
+        ctx: &Ctx<'_>,
+        report: &mut StepReport,
+        limit: i64,
+    ) -> Result<(), DbError> {
+        let Some(archive) = &self.archive_store else {
+            report.add("retired_archive_skipped_no_provider", 1);
+            return Ok(());
+        };
+        // Inventory is checked in the DB query. The shared maintenance lock
+        // serializes this drain with backup pin registration and release.
+        let candidates = db::retired_archive_objects_due(
+            &self.pool,
+            minus(ctx.now, ctx.settings.grace()),
+            ctx.now,
+            limit,
+        )
+        .await?;
+        for item in candidates {
+            if !ctx.go() {
+                break;
+            }
+            let Ok(key) = ObjectKey::parse(&item.archive_object_key) else {
+                db::retired_archive_object_failed(
+                    &self.pool,
+                    &item.archive_object_key,
+                    ctx.now
+                        .checked_add(time::Duration::minutes(5))
+                        .unwrap_or(ctx.now),
+                    "INVALID_OBJECT_KEY",
+                )
+                .await?;
+                report.add("retired_archive_errors", 1);
+                continue;
+            };
+            match archive.delete(&key).await {
+                Ok(()) | Err(StorageError::NotFound) => {}
+                Err(error) => {
+                    tracing::warn!(target: "craftcloud::maintenance", org = %item.org_id, %error, "retired archive object deletion failed; cleanup ownership retained");
+                    db::retired_archive_object_failed(
+                        &self.pool,
+                        &item.archive_object_key,
+                        ctx.now
+                            .checked_add(time::Duration::minutes(5))
+                            .unwrap_or(ctx.now),
+                        "REMOTE_DELETE_FAILED",
+                    )
+                    .await?;
+                    report.add("retired_archive_errors", 1);
+                    continue;
+                }
+            }
+            if db::retired_archive_object_finish(&self.pool, &item.archive_object_key).await? {
+                report.add("retired_archive_objects_deleted", 1);
+                report.add(
+                    "retired_archive_bytes_deleted",
+                    u64::try_from(item.physical_bytes).unwrap_or(0),
+                );
+            } else {
+                // A defensive reference recheck keeps the queue row if a
+                // reference appeared after candidate selection.
+                report.add("retired_archive_referenced", 1);
+            }
         }
         Ok(())
     }

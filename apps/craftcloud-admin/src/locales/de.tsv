@@ -503,6 +503,8 @@
 	Active locks	Aktive Sperren
 	Two-factor coverage	Abdeckung der Zwei-Faktor-Anmeldung
 	Workspace storage	Workspace-Speicher
+	Physical storage	Physischer Speicher
+	Unavailable	Nicht verfügbar
 	Used	Belegt
 	Recent activity	Letzte Aktivität
 	No recent activity.	Keine aktuelle Aktivität.
@@ -953,6 +955,8 @@
 	Weekly version samples (weeks)	Wöchentliche Versionen (Wochen)
 	Maximum unpinned versions per file	Maximale ungepinnte Versionen je Datei
 	With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.	Mit dem Standardraster bleiben bei 10 Speichervorgängen pro Tag etwa 36 Versionen je Datei sowie alle angehefteten Versionen. Die Kopfversion bleibt immer erhalten.
+	Storage compression level	Speicherkomprimierungsstufe
+	Choose a zstd compression level from 0 to 19. Level 0 stores chunks without compression; the environment setting takes precedence.	Lege eine zstd-Komprimierungsstufe von 0 bis 19 fest. Stufe 0 speichert Blöcke ohne Komprimierung; die Umgebungsvariable hat Vorrang.
 	Keep	Behalten
 	Unpin	Nicht mehr behalten
 	Pin version {number}	Version {number} behalten

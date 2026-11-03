@@ -505,6 +505,8 @@
 	Active locks	Active locks
 	Two-factor coverage	Two-factor coverage
 	Workspace storage	Workspace storage
+	Physical storage	Physical storage
+	Unavailable	Unavailable
 	Used	Used
 	Recent activity	Recent activity
 	No recent activity.	No recent activity.
@@ -956,6 +958,8 @@
 	Weekly version samples (weeks)	Weekly version samples (weeks)
 	Maximum unpinned versions per file	Maximum unpinned versions per file
 	With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.	With the default thinning grid, 10 saves per day leave about 36 versions per file, plus pinned versions. The head always stays.
+	Storage compression level	Storage compression level
+	Choose a zstd compression level from 0 to 19. Level 0 stores chunks without compression; the environment setting takes precedence.	Choose a zstd compression level from 0 to 19. Level 0 stores chunks without compression; the environment setting takes precedence.
 	Keep	Keep
 	Unpin	Unpin
 	Pin version {number}	Pin version {number}

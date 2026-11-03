@@ -192,27 +192,43 @@ async fn verify_chunked_manifest(
             .as_slice()
             .try_into()
             .map_err(|_| StorageError::ChecksumMismatch)?;
+        let stored_size = u64::try_from(row.stored_bytes.ok_or(StorageError::LengthMismatch)?)
+            .map_err(|_| StorageError::LengthMismatch)?;
+        let encoding = row
+            .encoding
+            .as_deref()
+            .ok_or(StorageError::LengthMismatch)?;
+        if stored_size == 0 || stored_size > craftcloud_storage::MAX_CHUNK_BYTES as u64 {
+            return Ok(false);
+        }
         let head = store.head(&key).await?;
-        if head.len != size {
+        if head.len != stored_size {
             return Ok(false);
         }
         let mut reader = store.open_read(&key, None).await?;
-        if reader.remaining() != size {
+        if reader.remaining() != stored_size {
             return Ok(false);
         }
-        let mut chunk_hash = Sha256::new();
-        let mut chunk_size = 0u64;
+        let stored_capacity = usize::try_from(stored_size).map_err(|_| StorageError::TooLarge)?;
+        let mut stored = Vec::with_capacity(stored_capacity);
         while let Some(bytes) = reader.next_chunk().await? {
-            chunk_size = chunk_size
-                .checked_add(u64::try_from(bytes.len()).map_err(|_| StorageError::TooLarge)?)
-                .ok_or(StorageError::TooLarge)?;
-            chunk_hash.update(&bytes);
-            whole.update(&bytes);
+            if stored.len().saturating_add(bytes.len()) > stored_capacity {
+                return Ok(false);
+            }
+            stored.extend_from_slice(&bytes);
         }
-        let actual_chunk_sha: [u8; 32] = chunk_hash.finalize().into();
-        if chunk_size != size || actual_chunk_sha != expected_chunk_sha {
+        if stored.len() != stored_capacity {
             return Ok(false);
         }
+        let plaintext = craftcloud_storage::compression::decode_chunk_bounded(
+            encoding.to_owned(),
+            stored,
+            size,
+            expected_chunk_sha,
+        )
+        .await
+        .map_err(|_| StorageError::ChecksumMismatch)?;
+        whole.update(&plaintext);
         total = total
             .checked_add(row.size_bytes)
             .ok_or(StorageError::TooLarge)?;
@@ -917,10 +933,51 @@ async fn restore_archived_chunks_to_local(
         .map_err(ChunkRestoreError::Db)?;
     for chunk in chunks {
         let size = u64::try_from(chunk.size_bytes).map_err(|_| ChunkRestoreError::Integrity)?;
+        let stored_size =
+            u64::try_from(chunk.stored_bytes).map_err(|_| ChunkRestoreError::Integrity)?;
         let local_key =
             ObjectKey::parse(&chunk.object_key).map_err(|_| ChunkRestoreError::Integrity)?;
+        let expected_sha: [u8; 32] = chunk
+            .sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| ChunkRestoreError::Integrity)?;
         match local.head(&local_key).await {
-            Ok(head) if head.len == size => {
+            Ok(head) if head.len == stored_size => {
+                let capacity =
+                    usize::try_from(stored_size).map_err(|_| ChunkRestoreError::Integrity)?;
+                if capacity > craftcloud_storage::MAX_CHUNK_BYTES as usize {
+                    return Err(ChunkRestoreError::Integrity);
+                }
+                let mut reader = local
+                    .open_read(&local_key, None)
+                    .await
+                    .map_err(ChunkRestoreError::Local)?;
+                if reader.remaining() != stored_size {
+                    return Err(ChunkRestoreError::Integrity);
+                }
+                let mut stored = Vec::with_capacity(capacity);
+                while let Some(bytes) = reader
+                    .next_chunk()
+                    .await
+                    .map_err(ChunkRestoreError::Local)?
+                {
+                    if stored.len().saturating_add(bytes.len()) > capacity {
+                        return Err(ChunkRestoreError::Integrity);
+                    }
+                    stored.extend_from_slice(&bytes);
+                }
+                if stored.len() != capacity {
+                    return Err(ChunkRestoreError::Integrity);
+                }
+                craftcloud_storage::compression::decode_chunk_bounded(
+                    chunk.encoding.clone(),
+                    stored,
+                    size,
+                    expected_sha,
+                )
+                .await
+                .map_err(|_| ChunkRestoreError::Integrity)?;
                 if chunk.storage_tier == "archive" {
                     let _ = tx
                         .chunk_restore_local(scope, file_id, chunk.chunk_id, local_key.as_str())
@@ -944,18 +1001,13 @@ async fn restore_archived_chunks_to_local(
         let key = ObjectKey::parse(raw_key).map_err(|_| ChunkRestoreError::Integrity)?;
         let envelope = craftcloud_storage::WrappedDataKey::from_bytes(raw_envelope)
             .map_err(|_| ChunkRestoreError::Integrity)?;
-        let expected_sha: [u8; 32] = chunk
-            .sha256
-            .as_slice()
-            .try_into()
-            .map_err(|_| ChunkRestoreError::Integrity)?;
         let mut reader = crate::archive_transport::open_archive_range(
             archive,
             crypto,
             &key,
             &envelope,
             chunk.chunk_id,
-            size,
+            stored_size,
             None,
         )
         .await
@@ -965,15 +1017,14 @@ async fn restore_archived_chunks_to_local(
             }
             _ => ChunkRestoreError::Integrity,
         })?;
-        if reader.remaining() != size {
+        if reader.remaining() != stored_size {
             return Err(ChunkRestoreError::Integrity);
         }
-        let capacity = usize::try_from(size).map_err(|_| ChunkRestoreError::Integrity)?;
+        let capacity = usize::try_from(stored_size).map_err(|_| ChunkRestoreError::Integrity)?;
         if capacity > craftcloud_storage::MAX_CHUNK_BYTES as usize {
             return Err(ChunkRestoreError::Integrity);
         }
         let mut content = Vec::with_capacity(capacity);
-        let mut hasher = Sha256::new();
         while let Some(bytes) = match reader.next_chunk().await {
             Ok(bytes) => bytes,
             Err(crate::archive_transport::ArchiveTransportError::Storage(_)) => {
@@ -984,15 +1035,22 @@ async fn restore_archived_chunks_to_local(
             if content.len().saturating_add(bytes.len()) > capacity {
                 return Err(ChunkRestoreError::Integrity);
             }
-            hasher.update(&bytes);
             content.extend_from_slice(&bytes);
         }
-        let actual: [u8; 32] = hasher.finalize().into();
-        if content.len() != capacity || actual != expected_sha {
+        if content.len() != capacity {
             return Err(ChunkRestoreError::Integrity);
         }
+        craftcloud_storage::compression::decode_chunk_bounded(
+            chunk.encoding.clone(),
+            content.clone(),
+            size,
+            expected_sha,
+        )
+        .await
+        .map_err(|_| ChunkRestoreError::Integrity)?;
+        let stored_sha: [u8; 32] = Sha256::digest(&content).into();
         let mut temp = local
-            .begin_write(size)
+            .begin_write(stored_size)
             .await
             .map_err(ChunkRestoreError::Local)?;
         if let Err(error) = temp.write(&content).await {
@@ -1000,7 +1058,7 @@ async fn restore_archived_chunks_to_local(
             return Err(ChunkRestoreError::Local(error));
         }
         let local_key = local
-            .finalize(temp, size, &expected_sha)
+            .finalize(temp, stored_size, &stored_sha)
             .await
             .map_err(ChunkRestoreError::Local)?;
         if !tx
@@ -1285,20 +1343,27 @@ impl ChunkedReader {
         let mut offset = 0u64;
         let mut local_available = Vec::with_capacity(chunks.len());
         for (ordinal, chunk) in chunks.iter().enumerate() {
-            let (Ok(index), Ok(chunk_offset), Ok(chunk_len)) = (
+            let (Ok(index), Ok(chunk_offset), Ok(chunk_len), Ok(stored_len)) = (
                 i32::try_from(ordinal),
                 u64::try_from(chunk.byte_offset),
                 u64::try_from(chunk.size_bytes),
+                u64::try_from(chunk.stored_bytes),
             ) else {
                 return Err(ChunkOpenError::Integrity);
             };
-            if chunk.ordinal != index || chunk_offset != offset || chunk_len == 0 {
+            if chunk.ordinal != index
+                || chunk_offset != offset
+                || chunk_len == 0
+                || chunk_len > craftcloud_storage::MAX_CHUNK_BYTES as u64
+                || stored_len == 0
+                || stored_len > craftcloud_storage::MAX_CHUNK_BYTES as u64
+            {
                 return Err(ChunkOpenError::Integrity);
             }
             let key = ObjectKey::parse(&chunk.object_key).map_err(|_| ChunkOpenError::Integrity)?;
             let local = match store.head(&key).await {
                 Ok(head) => {
-                    if head.len != chunk_len {
+                    if head.len != stored_len {
                         return Err(ChunkOpenError::Integrity);
                     }
                     true
@@ -1325,9 +1390,9 @@ impl ChunkedReader {
                     .head(&archive_key)
                     .await
                     .map_err(|_| ChunkOpenError::ArchiveUnavailable)?;
-                if craftcloud_storage::verify_ciphertext_len(chunk_len, archive_head.len).is_err()
+                if craftcloud_storage::verify_ciphertext_len(stored_len, archive_head.len).is_err()
                     || crypto
-                        .unwrap_data_key(&envelope, chunk.chunk_id, chunk_len)
+                        .unwrap_data_key(&envelope, chunk.chunk_id, stored_len)
                         .is_err()
                 {
                     return Err(ChunkOpenError::Integrity);
@@ -1372,6 +1437,8 @@ impl ChunkedReader {
             }
             let expected_len = usize::try_from(chunk.size_bytes)
                 .map_err(|_| DownloadReadError::Chunked(StorageError::TooLarge))?;
+            let stored_len = u64::try_from(chunk.stored_bytes)
+                .map_err(|_| DownloadReadError::Chunked(StorageError::TooLarge))?;
             let mut content = Vec::with_capacity(expected_len);
             if self
                 .local_available
@@ -1386,7 +1453,7 @@ impl ChunkedReader {
                     .open_read(&key, None)
                     .await
                     .map_err(DownloadReadError::Chunked)?;
-                if reader.remaining() != length {
+                if reader.remaining() != stored_len {
                     return Err(DownloadReadError::Chunked(StorageError::LengthMismatch));
                 }
                 while let Some(bytes) = reader
@@ -1415,7 +1482,7 @@ impl ChunkedReader {
                     &archive_key,
                     &envelope,
                     chunk.chunk_id,
-                    length,
+                    stored_len,
                     None,
                 )
                 .await
@@ -1428,12 +1495,20 @@ impl ChunkedReader {
                     content.extend_from_slice(&bytes);
                 }
             }
-            let digest: [u8; 32] = Sha256::digest(&content).into();
-            if content.len() != expected_len
-                || <[u8; 32]>::try_from(chunk.sha256.as_slice()).ok() != Some(digest)
-            {
-                return Err(DownloadReadError::Chunked(StorageError::ChecksumMismatch));
-            }
+            let digest: [u8; 32] = chunk
+                .sha256
+                .as_slice()
+                .try_into()
+                .map_err(|_| DownloadReadError::Chunked(StorageError::ChecksumMismatch))?;
+            let decoded = craftcloud_storage::compression::decode_chunk_bounded(
+                chunk.encoding.clone(),
+                content,
+                length,
+                digest,
+            )
+            .await
+            .map_err(|_| DownloadReadError::Chunked(StorageError::ChecksumMismatch))?;
+            let content = decoded;
             let start = usize::try_from(selected_start - offset)
                 .map_err(|_| DownloadReadError::Chunked(StorageError::TooLarge))?;
             let stop = usize::try_from(selected_end - offset)

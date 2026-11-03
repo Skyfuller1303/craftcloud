@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use craftcloud_db::{DbError, maintenance as db_maintenance, members::OrgTx};
 use craftcloud_storage::{
-    ArchiveCrypto, LocalStore, ObjectKey, ObjectStore, StorageError, WrappedDataKey,
+    ArchiveCrypto, LocalStore, ObjectKey, ObjectStore, ReadSource, StorageError, WrappedDataKey,
 };
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -743,14 +744,61 @@ async fn archive_chunk_one<S: ObjectStore>(
         return Ok(WorkResult::Skipped);
     };
     tx.commit().await?;
-    let (Ok(local_key), Ok(size), Ok(expected_sha)) = (
+    let (Ok(local_key), Ok(size), Ok(expected_sha), Ok(logical_size)) = (
         ObjectKey::parse(&claim.object_key),
-        u64::try_from(claim.size_bytes),
+        u64::try_from(claim.stored_bytes),
         <[u8; 32]>::try_from(claim.sha256.as_slice()),
+        u64::try_from(claim.size_bytes),
     ) else {
         retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_CHUNK").await?;
         return Ok(WorkResult::Retried);
     };
+    let mut source = match local.open_read(&local_key, None).await {
+        Ok(source) if source.remaining() == size => source,
+        _ => {
+            retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_LOCAL_OBJECT").await?;
+            return Ok(WorkResult::Retried);
+        }
+    };
+    let Ok(capacity) = usize::try_from(size) else {
+        retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_LOCAL_SIZE").await?;
+        return Ok(WorkResult::Retried);
+    };
+    if capacity > craftcloud_storage::MAX_CHUNK_BYTES as usize {
+        retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_LOCAL_SIZE").await?;
+        return Ok(WorkResult::Retried);
+    }
+    let mut stored = Vec::with_capacity(capacity);
+    let mut stored_hash = Sha256::new();
+    loop {
+        let bytes = match source.next_chunk().await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
+            Err(_) => {
+                retry_chunk(pool, org_id, chunk_id, token, now, "STORAGE_FAILED").await?;
+                return Ok(WorkResult::Retried);
+            }
+        };
+        if stored.len().saturating_add(bytes.len()) > capacity {
+            retry_chunk(pool, org_id, chunk_id, token, now, "INVALID_LOCAL_SIZE").await?;
+            return Ok(WorkResult::Retried);
+        }
+        stored_hash.update(&bytes);
+        stored.extend_from_slice(&bytes);
+    }
+    let stored_sha: [u8; 32] = stored_hash.finalize().into();
+    if craftcloud_storage::compression::decode_chunk_bounded(
+        claim.encoding.clone(),
+        stored,
+        logical_size,
+        expected_sha,
+    )
+    .await
+    .is_err()
+    {
+        retry_chunk(pool, org_id, chunk_id, token, now, "INTEGRITY_FAILED").await?;
+        return Ok(WorkResult::Retried);
+    }
     let intent = match (&claim.archive_object_key, &claim.archive_wrapped_key) {
         (None, None) => {
             let key = ObjectKey::generate();
@@ -797,7 +845,7 @@ async fn archive_chunk_one<S: ObjectStore>(
         &archive_key,
         &envelope,
         size,
-        &expected_sha,
+        &stored_sha,
     )
     .await;
     let copy = match uploaded {

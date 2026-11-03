@@ -20,6 +20,7 @@
 mod archive_crypto;
 mod archive_store;
 mod chunking;
+pub mod compression;
 mod crash;
 mod error;
 mod faults;

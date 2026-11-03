@@ -71,6 +71,8 @@ type ChunkRow = (
     Uuid,
     String,
     i64,
+    i64,
+    String,
     Vec<u8>,
     String,
     Option<String>,
@@ -655,7 +657,7 @@ pub(crate) async fn register_archive_pins(
             }
             let entry = crate::manifest::ChunkEntry::parse_line(&line)?;
             entries += 1;
-            total = total.checked_add(entry.size).ok_or_else(|| {
+            total = total.checked_add(entry.stored_len()).ok_or_else(|| {
                 BackupError::new(ErrorKind::Integrity, "chunk size total overflow")
             })?;
             if let Some(key) = entry.archive_object_key {
@@ -806,15 +808,29 @@ async fn snapshot(
     if migration_version >= 25 {
         loop {
             let rows: Vec<ChunkRow> = sqlx::query_as(
-            "SELECT c.id,c.file_id,c.object_key,c.size_bytes,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
+            if migration_version >= 27 { "SELECT c.id,c.file_id,c.object_key,c.size_bytes,c.stored_bytes,c.encoding,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
              FROM chunks c WHERE EXISTS (SELECT 1 FROM version_chunks vc WHERE vc.chunk_id=c.id) AND c.id::text > $1 \
-             ORDER BY c.id::text LIMIT $2",
+             ORDER BY c.id::text LIMIT $2" } else { "SELECT c.id,c.file_id,c.object_key,c.size_bytes,c.size_bytes,'raw'::text,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
+             FROM chunks c WHERE EXISTS (SELECT 1 FROM version_chunks vc WHERE vc.chunk_id=c.id) AND c.id::text > $1 \
+             ORDER BY c.id::text LIMIT $2" },
         ).bind(&chunk_last).bind(BLOB_PAGE).fetch_all(&mut *tx).await?;
-            let Some((last_id, _, _, _, _, _, _, _)) = rows.last() else {
+            let Some((last_id, _, _, _, _, _, _, _, _, _)) = rows.last() else {
                 break;
             };
             chunk_last = last_id.to_string();
-            for (id, file_id, key, size, sha256, tier, archive_key, wrapped) in rows {
+            for (
+                id,
+                file_id,
+                key,
+                size,
+                stored_bytes,
+                encoding,
+                sha256,
+                tier,
+                archive_key,
+                wrapped,
+            ) in rows
+            {
                 let size = u64::try_from(size).map_err(|_| {
                     BackupError::new(ErrorKind::SourceDamaged, "a chunk has a negative size")
                 })?;
@@ -846,6 +862,13 @@ async fn snapshot(
                     file_id: file_id.to_string(),
                     key,
                     size,
+                    stored_bytes: u64::try_from(stored_bytes).map_err(|_| {
+                        BackupError::new(
+                            ErrorKind::SourceDamaged,
+                            "a chunk has an invalid stored size",
+                        )
+                    })?,
+                    encoding,
                     sha256: hex(&sha256),
                     local_copy,
                     archive_object_key,
@@ -863,9 +886,14 @@ async fn snapshot(
                     local_chunk_count = local_chunk_count.checked_add(1).ok_or_else(|| {
                         BackupError::new(ErrorKind::Integrity, "local chunk count overflow")
                     })?;
-                    local_chunk_bytes = local_chunk_bytes.checked_add(size).ok_or_else(|| {
-                        BackupError::new(ErrorKind::Integrity, "local chunk byte count overflow")
-                    })?;
+                    local_chunk_bytes = local_chunk_bytes
+                        .checked_add(entry.stored_len())
+                        .ok_or_else(|| {
+                            BackupError::new(
+                                ErrorKind::Integrity,
+                                "local chunk byte count overflow",
+                            )
+                        })?;
                 }
                 let mut line = serde_json::to_vec(&entry).map_err(|_| {
                     BackupError::new(ErrorKind::Format, "a chunk entry cannot be written")
@@ -878,7 +906,7 @@ async fn snapshot(
                 chunk_count = chunk_count.checked_add(1).ok_or_else(|| {
                     BackupError::new(ErrorKind::Integrity, "chunk count overflow")
                 })?;
-                chunk_total = chunk_total.checked_add(size).ok_or_else(|| {
+                chunk_total = chunk_total.checked_add(entry.stored_len()).ok_or_else(|| {
                     BackupError::new(ErrorKind::Integrity, "chunk sizes overflow")
                 })?;
             }
@@ -948,15 +976,17 @@ async fn snapshot(
                 Uuid,
                 String,
                 i64,
+                i64,
+                String,
                 Vec<u8>,
                 String,
                 Option<String>,
                 Option<Vec<u8>>,
             );
             let rows: Vec<MappingRow> = sqlx::query_as(
-                "SELECT vc.version_id,vc.ordinal,vc.byte_offset,c.id,vc.file_id,c.object_key,c.size_bytes,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id AND c.file_id=vc.file_id JOIN file_versions v ON v.id=vc.version_id JOIN blobs b ON b.org_id=v.org_id AND b.id=v.blob_id WHERE b.layout='chunked' AND b.state='committed' AND (vc.version_id::text,vc.ordinal) > ($1, $2) ORDER BY vc.version_id::text,vc.ordinal LIMIT $3",
+                if migration_version >= 27 { "SELECT vc.version_id,vc.ordinal,vc.byte_offset,c.id,vc.file_id,c.object_key,c.size_bytes,c.stored_bytes,c.encoding,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id AND c.file_id=vc.file_id JOIN file_versions v ON v.id=vc.version_id JOIN blobs b ON b.org_id=v.org_id AND b.id=v.blob_id WHERE b.layout='chunked' AND b.state='committed' AND (vc.version_id::text,vc.ordinal) > ($1, $2) ORDER BY vc.version_id::text,vc.ordinal LIMIT $3" } else { "SELECT vc.version_id,vc.ordinal,vc.byte_offset,c.id,vc.file_id,c.object_key,c.size_bytes,c.size_bytes,'raw'::text,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id AND c.file_id=vc.file_id JOIN file_versions v ON v.id=vc.version_id JOIN blobs b ON b.org_id=v.org_id AND b.id=v.blob_id WHERE b.layout='chunked' AND b.state='committed' AND (vc.version_id::text,vc.ordinal) > ($1, $2) ORDER BY vc.version_id::text,vc.ordinal LIMIT $3" },
             ).bind(&mapping_cursor).bind(mapping_ordinal).bind(BLOB_PAGE).fetch_all(&mut *tx).await?;
-            let Some((last, last_ordinal, _, _, _, _, _, _, _, _, _)) = rows.last() else {
+            let Some((last, last_ordinal, _, _, _, _, _, _, _, _, _, _, _)) = rows.last() else {
                 break;
             };
             mapping_cursor = last.to_string();
@@ -969,6 +999,8 @@ async fn snapshot(
                 file_id,
                 key,
                 size,
+                stored_bytes,
+                encoding,
                 sha256,
                 tier,
                 archive_key,
@@ -996,6 +1028,13 @@ async fn snapshot(
                         size: u64::try_from(size).map_err(|_| {
                             BackupError::new(ErrorKind::SourceDamaged, "a chunk size is invalid")
                         })?,
+                        stored_bytes: u64::try_from(stored_bytes).map_err(|_| {
+                            BackupError::new(
+                                ErrorKind::SourceDamaged,
+                                "a chunk stored size is invalid",
+                            )
+                        })?,
+                        encoding,
                         sha256: hex(&sha256),
                         local_copy,
                         archive_object_key,
@@ -1138,7 +1177,7 @@ async fn snapshot(
         })?;
     let written = list.finish().await?;
     if migration_version >= 25 {
-        verify_chunked_versions(&mut tx, store, archive).await?;
+        verify_chunked_versions(&mut tx, migration_version, store, archive).await?;
     }
     // The snapshot has served its purpose; do not hold it while copying files.
     tx.commit().await?;
@@ -1181,6 +1220,7 @@ async fn snapshot(
 
 async fn verify_chunked_versions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    migration_version: i64,
     store: &LocalStore,
     archive: Option<ArchiveAccess<'_>>,
 ) -> Result<(), BackupError> {
@@ -1213,15 +1253,19 @@ async fn verify_chunked_versions(
                     Uuid,
                     String,
                     i64,
+                    i64,
+                    String,
                     Vec<u8>,
                     String,
                     Option<String>,
                     Option<Vec<u8>>,
                 );
                 let rows:Vec<ChunkRow>=sqlx::query_as(
-                    "SELECT vc.ordinal,vc.byte_offset,c.id,vc.file_id,c.object_key,c.size_bytes,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
+                    if migration_version >= 27 { "SELECT vc.ordinal,vc.byte_offset,c.id,vc.file_id,c.object_key,c.size_bytes,c.stored_bytes,c.encoding,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
                      FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id AND c.file_id=vc.file_id \
-                     WHERE vc.version_id=$1 AND vc.ordinal >= $2 ORDER BY vc.ordinal LIMIT $3",
+                     WHERE vc.version_id=$1 AND vc.ordinal >= $2 ORDER BY vc.ordinal LIMIT $3" } else { "SELECT vc.ordinal,vc.byte_offset,c.id,vc.file_id,c.object_key,c.size_bytes,c.size_bytes,'raw'::text,c.sha256,c.storage_tier,c.archive_object_key,c.archive_wrapped_key \
+                     FROM version_chunks vc JOIN chunks c ON c.id=vc.chunk_id AND c.file_id=vc.file_id \
+                     WHERE vc.version_id=$1 AND vc.ordinal >= $2 ORDER BY vc.ordinal LIMIT $3" },
                 ).bind(version_id).bind(next_ordinal).bind(BLOB_PAGE).fetch_all(&mut **tx).await?;
                 if rows.is_empty() {
                     break;
@@ -1233,6 +1277,8 @@ async fn verify_chunked_versions(
                     file_id,
                     key,
                     chunk_size,
+                    stored_size,
+                    encoding,
                     chunk_sha,
                     tier,
                     archive_key,
@@ -1248,8 +1294,24 @@ async fn verify_chunked_versions(
                     let chunk_size = u64::try_from(chunk_size).map_err(|_| {
                         BackupError::new(ErrorKind::SourceDamaged, "a chunk has a negative size")
                     })?;
+                    let stored_size = u64::try_from(stored_size).map_err(|_| {
+                        BackupError::new(
+                            ErrorKind::SourceDamaged,
+                            "a chunk has an invalid stored size",
+                        )
+                    })?;
+                    if chunk_size == 0
+                        || chunk_size > craftcloud_storage::MAX_CHUNK_BYTES as u64
+                        || stored_size == 0
+                        || stored_size > craftcloud_storage::MAX_CHUNK_BYTES as u64
+                    {
+                        return Err(BackupError::new(
+                            ErrorKind::SourceDamaged,
+                            "a chunk exceeds the supported stored or plaintext size",
+                        ));
+                    }
                     let mut chunk_digest = Sha256::new();
-                    let mut chunk_actual = 0_u64;
+                    let chunk_actual;
                     match tier.as_str() {
                         "local" | "archiving" => {
                             let key = ObjectKey::parse(&key).map_err(|_| {
@@ -1269,24 +1331,33 @@ async fn verify_chunked_versions(
                                         error.into()
                                     }
                                 })?;
-                            if source.remaining() != chunk_size {
+                            if source.remaining() != stored_size {
                                 return Err(BackupError::new(
                                     ErrorKind::SourceDamaged,
                                     format!("chunk {chunk_id} has an unexpected size"),
                                 ));
                             }
+                            let mut stored =
+                                Vec::with_capacity(usize::try_from(stored_size).unwrap_or(0));
                             while let Some(block) = source.next_chunk().await? {
-                                chunk_actual = chunk_actual
-                                    .checked_add(block.len() as u64)
-                                    .ok_or_else(|| {
-                                        BackupError::new(
-                                            ErrorKind::Integrity,
-                                            "chunk length overflow",
-                                        )
-                                    })?;
-                                chunk_digest.update(&block);
-                                digest.update(&block);
+                                stored.extend_from_slice(&block);
                             }
+                            let entry = crate::manifest::ChunkEntry {
+                                id: chunk_id.to_string(),
+                                file_id: file_id.to_string(),
+                                key: key.to_string(),
+                                size: chunk_size,
+                                stored_bytes: stored_size,
+                                encoding: encoding.clone(),
+                                sha256: hex(&chunk_sha),
+                                local_copy: true,
+                                archive_object_key: None,
+                                archive_wrapped_key: None,
+                            };
+                            let plain = crate::archive::verify_chunk_payload(&entry, &stored)?;
+                            chunk_actual = plain.len() as u64;
+                            chunk_digest.update(&plain);
+                            digest.update(&plain);
                         }
                         "archive" => {
                             let access=archive.ok_or_else(||BackupError::new(ErrorKind::SourceDamaged,"chunked archive versions require the configured archive provider and server key"))?;
@@ -1295,17 +1366,20 @@ async fn verify_chunked_versions(
                                 file_id: file_id.to_string(),
                                 key,
                                 size: chunk_size,
+                                stored_bytes: stored_size,
+                                encoding,
                                 sha256: hex(&chunk_sha),
                                 local_copy: false,
                                 archive_object_key: archive_key,
                                 archive_wrapped_key: wrapped.map(|bytes| hex(&bytes)),
                             };
-                            let plain = crate::archive::read_archive_chunk(
+                            let stored = crate::archive::read_archive_chunk(
                                 access.store,
                                 access.crypto,
                                 &entry,
                             )
                             .await?;
+                            let plain = crate::archive::verify_chunk_payload(&entry, &stored)?;
                             chunk_actual = plain.len() as u64;
                             chunk_digest.update(&plain);
                             digest.update(&plain);
@@ -1419,7 +1493,7 @@ async fn copy_chunks(store: &LocalStore, out: &Path) -> Result<(u64, u64), Backu
         if entry.local_copy {
             copy_chunk_one(store, out, &entry).await?;
             count += 1;
-            total = total.checked_add(entry.size).ok_or_else(|| {
+            total = total.checked_add(entry.stored_len()).ok_or_else(|| {
                 BackupError::new(ErrorKind::Integrity, "chunk byte count overflow")
             })?;
         }
@@ -1443,19 +1517,34 @@ async fn copy_chunk_one(
             error.into()
         }
     })?;
-    if source.remaining() != entry.size {
+    if source.remaining() != entry.stored_len() {
         return Err(BackupError::new(
             ErrorKind::SourceDamaged,
             format!("chunk {} has a different size", entry.id),
         ));
     }
     let relative = crate::manifest::chunk_file(&entry.id);
-    let mut file = Out::create(&out.join(&relative), &relative)?;
+    let capacity = usize::try_from(entry.stored_len()).map_err(|_| {
+        BackupError::new(
+            ErrorKind::SourceDamaged,
+            "chunk stored size exceeds addressable memory",
+        )
+    })?;
+    let mut stored = Vec::with_capacity(capacity);
     while let Some(block) = source.next_chunk().await? {
-        file.write(&block).await?;
+        if stored.len().saturating_add(block.len()) > capacity {
+            return Err(BackupError::new(
+                ErrorKind::SourceDamaged,
+                "chunk stream exceeds its recorded stored size",
+            ));
+        }
+        stored.extend_from_slice(&block);
     }
+    let _ = crate::archive::verify_chunk_payload(entry, &stored)?;
+    let mut file = Out::create(&out.join(&relative), &relative)?;
+    file.write(&stored).await?;
     let sum = file.finish().await?;
-    if sum.len != entry.size || hex(&sum.sha256) != entry.sha256 {
+    if sum.len != entry.stored_len() {
         return Err(BackupError::new(
             ErrorKind::SourceDamaged,
             format!("chunk {} does not match its recorded checksum", entry.id),

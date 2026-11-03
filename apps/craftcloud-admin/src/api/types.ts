@@ -222,9 +222,9 @@ export interface OrganizationLock {
 }
 export interface WorkspaceUsage {
   workspace_id: Uuid; effective_limit_bytes: number | null; quota_bytes: number | null;
-  reserved_bytes: number; committed_bytes: number;
+  reserved_bytes: number; committed_bytes: number; physical_bytes?: number;
 }
-export interface UsageEntry { quota_bytes: number | null; reserved_bytes: number; committed_bytes: number; }
+export interface UsageEntry { quota_bytes: number | null; reserved_bytes: number; committed_bytes: number; physical_bytes?: number; }
 export interface OrganizationOverview {
   seats?: { used: number; limit: number | null };
   members: {

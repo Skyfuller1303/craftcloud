@@ -184,8 +184,8 @@ impl OrgTx {
         for chunk in chunks {
             let mut existing = None;
             for digest in &chunk.digest_candidates {
-                existing = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, String, String, String)>(
-                    "SELECT id,size_bytes,sha256,state,storage_tier,object_key FROM chunks WHERE file_id=$1 AND digest=$2 FOR UPDATE",
+                existing = sqlx::query_as::<_, (Uuid, i64, Vec<u8>, String, String, String, String, i64)>(
+                    "SELECT id,size_bytes,sha256,state,storage_tier,object_key,encoding,stored_bytes FROM chunks WHERE file_id=$1 AND digest=$2 FOR UPDATE",
                 )
                 .bind(file_id)
                 .bind(digest.as_slice())
@@ -202,6 +202,8 @@ impl OrgTx {
                 existing_state,
                 tier,
                 key,
+                encoding,
+                stored_bytes,
             )) = existing
             {
                 if existing_size != chunk.size_bytes
@@ -222,19 +224,23 @@ impl OrgTx {
                             candidate_object_key: chunk.object_key.clone(),
                             sha256: chunk.sha256,
                             size_bytes: chunk.size_bytes,
+                            stored_bytes,
+                            encoding,
+                            candidate_encoding: chunk.encoding.clone(),
+                            candidate_stored_bytes: chunk.stored_bytes,
                         });
                     }
                     selected_object_keys.insert(key);
                 } else {
-                    sqlx::query("UPDATE chunks SET object_key=$2,storage_tier='local',archive_local_delete_pending=false,archive_claim_token=NULL,archive_claimed_at=NULL,archive_next_attempt_at=NULL WHERE id=$1 AND file_id=$3")
-                        .bind(id).bind(&chunk.object_key).bind(file_id).execute(&mut *self.tx).await?;
+                    sqlx::query("UPDATE chunks SET object_key=$2,encoding=$4,stored_bytes=$5,storage_tier='local',archive_object_key=NULL,archive_wrapped_key=NULL,archive_verified_at=NULL,archive_local_delete_pending=false,archive_claim_token=NULL,archive_claimed_at=NULL,archive_next_attempt_at=NULL,archive_error_code=NULL WHERE id=$1 AND file_id=$3")
+                        .bind(id).bind(&chunk.object_key).bind(file_id).bind(&chunk.encoding).bind(chunk.stored_bytes).execute(&mut *self.tx).await?;
                     selected_object_keys.insert(chunk.object_key.clone());
                 }
                 id
             } else {
                 let id = Uuid::new_v4();
-                sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,state,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'orphaned',$9)")
-                    .bind(id).bind(file_id).bind(self.org_id).bind(workspace_id).bind(chunk.digest.as_slice()).bind(chunk.sha256.as_slice()).bind(&chunk.object_key).bind(chunk.size_bytes).bind(now).execute(&mut *self.tx).await?;
+                sqlx::query("INSERT INTO chunks (id,file_id,org_id,workspace_id,digest,sha256,object_key,size_bytes,encoding,stored_bytes,state,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'orphaned',$11)")
+                    .bind(id).bind(file_id).bind(self.org_id).bind(workspace_id).bind(chunk.digest.as_slice()).bind(chunk.sha256.as_slice()).bind(&chunk.object_key).bind(chunk.size_bytes).bind(&chunk.encoding).bind(chunk.stored_bytes).bind(now).execute(&mut *self.tx).await?;
                 selected_object_keys.insert(chunk.object_key.clone());
                 id
             };
@@ -265,8 +271,8 @@ impl OrgTx {
         prepared: &mut Prepared,
         reuse: &ChunkReuseCandidate,
     ) -> Result<bool, DbError> {
-        let changed = sqlx::query("UPDATE chunks SET object_key=$4,storage_tier='local',archive_local_delete_pending=false,archive_claim_token=NULL,archive_claimed_at=NULL,archive_next_attempt_at=NULL WHERE id=$1 AND org_id=$2 AND file_id=$3 AND object_key=$5 AND size_bytes=$6 AND sha256=$7 AND storage_tier='local' AND state <> 'deleting'")
-            .bind(reuse.chunk_id).bind(self.org_id).bind(prepared.file_id).bind(&reuse.candidate_object_key).bind(&reuse.existing_object_key).bind(reuse.size_bytes).bind(reuse.sha256.as_slice()).execute(&mut *self.tx).await?.rows_affected() == 1;
+        let changed = sqlx::query("UPDATE chunks SET object_key=$4,encoding=$8,stored_bytes=$9,storage_tier='local',archive_object_key=NULL,archive_wrapped_key=NULL,archive_verified_at=NULL,archive_local_delete_pending=false,archive_claim_token=NULL,archive_claimed_at=NULL,archive_next_attempt_at=NULL,archive_error_code=NULL WHERE id=$1 AND org_id=$2 AND file_id=$3 AND object_key=$5 AND size_bytes=$6 AND sha256=$7 AND storage_tier='local' AND state <> 'deleting'")
+            .bind(reuse.chunk_id).bind(self.org_id).bind(prepared.file_id).bind(&reuse.candidate_object_key).bind(&reuse.existing_object_key).bind(reuse.size_bytes).bind(reuse.sha256.as_slice()).bind(&reuse.candidate_encoding).bind(reuse.candidate_stored_bytes).execute(&mut *self.tx).await?.rows_affected() == 1;
         if changed {
             prepared
                 .selected_object_keys
