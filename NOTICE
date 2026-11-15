@@ -6,6 +6,11 @@ Licensed under the MIT License or the Apache License, Version 2.0, at your optio
 Craft Cloud is an independent project built for the Craft App Suite. It is not made, sponsored or
 endorsed by the ArtCraft Team, and it contains none of the ArtCraft name, logo or marks as branding.
 
+This copy is a maintained fork of the original Craft Cloud by Fabio Lussi
+(https://github.com/itrycodinganditsbad/craft-cloud), maintained by Skyfuller1303
+(https://github.com/Skyfuller1303/craft-cloud). The copyright line above is unchanged and covers the original
+author and every later contributor.
+
 Third-party material
 
 The packages of the Craft Cloud app carry LICENSES.txt: these licences, then every third-party crate compiled into
