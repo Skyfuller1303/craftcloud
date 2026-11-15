@@ -1,5 +1,7 @@
 # Later phases: libraries, links, comments and locks
 
+> Design draft. This is a proposal, not a description of the code; [the architecture](../architecture.md) says what exists.
+
 This document expands P3 to P6 from [collaboration.md](collaboration.md). It is a proposal for later pull requests. P1 and P2 remain prerequisites where stated. Names and routes explicitly called proposed are not present in the current code. Existing HTTP routes are under `/api/v1`; agents access their local service on `/v1`.
 
 ## Metadata backends

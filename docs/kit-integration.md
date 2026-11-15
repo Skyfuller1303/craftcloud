@@ -26,12 +26,12 @@ The collaboration features described below need a release that includes them: `p
 
 ```toml
 [dependencies]
-craft-cloud-app = { git = "https://github.com/itrycodinganditsbad/craft-cloud", tag = "vX.Y.Z" }
-craft-cloud-kit = { git = "https://github.com/itrycodinganditsbad/craft-cloud", tag = "vX.Y.Z" }
-craft-cloud-egui = { git = "https://github.com/itrycodinganditsbad/craft-cloud", tag = "vX.Y.Z" }
+craft-cloud-app = { git = "https://github.com/Skyfuller1303/craftcloud", tag = "vX.Y.Z" }
+craft-cloud-kit = { git = "https://github.com/Skyfuller1303/craftcloud", tag = "vX.Y.Z" }
+craft-cloud-egui = { git = "https://github.com/Skyfuller1303/craftcloud", tag = "vX.Y.Z" }
 
 [dev-dependencies]
-craft-cloud-kit = { git = "https://github.com/itrycodinganditsbad/craft-cloud", tag = "vX.Y.Z", features = ["fake"] }
+craft-cloud-kit = { git = "https://github.com/Skyfuller1303/craftcloud", tag = "vX.Y.Z", features = ["fake"] }
 ```
 
 The app-facing crates depend on `craft-cloud-api`, never on `craft-cloud-proto`. Do not add `proto` to an app.

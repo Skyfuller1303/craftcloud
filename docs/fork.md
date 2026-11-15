@@ -1,6 +1,6 @@
 # About this fork
 
-This repository is a maintained fork of [itrycodinganditsbad/craft-cloud](https://github.com/itrycodinganditsbad/craft-cloud). This page says where the code comes from, how the fork relates to the original, which rules it follows, and what would have to change if it were ever proposed to the organisation that maintains the Craft apps.
+This repository, [Skyfuller1303/craftcloud](https://github.com/Skyfuller1303/craftcloud), is a maintained fork of [itrycodinganditsbad/craft-cloud](https://github.com/itrycodinganditsbad/craft-cloud). This page says where the code comes from, how the fork relates to the original, which rules it follows, and what would have to change if it were ever proposed to the organisation that maintains the Craft apps.
 
 ## Where the code comes from
 
@@ -15,6 +15,23 @@ The history of the original is kept. The fork's main line is built by merging on
 - The original stays a remote of this repository. Changes are still proposed there as pull requests, so that the original can take them whenever its maintainer wishes.
 - The fork does not claim to be the original and makes no statement on its maintainer's behalf.
 - The licence is unchanged: MIT or Apache-2.0, at your option. The copyright lines in `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE` are kept as they are; `NOTICE` adds one line that names the fork.
+
+## The predecessor in this repository
+
+Before the fork line was imported, this repository held an earlier prototype with the same aim and a different design: one server image beside PostgreSQL instead of the sync engine, agent and app described here. It is kept unchanged under the tag [`archive/prototype-2026-11-03`](https://github.com/Skyfuller1303/craftcloud/tree/archive/prototype-2026-11-03), and its commits remain in the history of `main`, because the import was a merge.
+
+The prototype had parts that the current code does not have. They are listed here so that nobody assumes they still exist:
+
+- organisations and roles within them
+- single sign-on and SCIM provisioning
+- e-mail (invitations and notifications sent by the server)
+- shares and file locks
+- seats
+- storage tiers
+- the setup wizard
+- the admin interface written in React
+
+The current code covers some of the same ground differently: accounts with member and admin roles, team spaces with owner, editor and viewer roles, invitations as join strings, and server-rendered admin pages. See [the architecture](architecture.md) for what exists now.
 
 ## Independence and names
 
