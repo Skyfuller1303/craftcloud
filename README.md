@@ -6,6 +6,10 @@ all your machines, and the folder `~/Craft Cloud` stays in sync, with version hi
 
 There is no hosted service and no account with anyone but you. Nothing phones home.
 
+This repository is a maintained fork of [itrycodinganditsbad/craft-cloud](https://github.com/itrycodinganditsbad/craft-cloud),
+the original Craft Cloud by Fabio Lussi. It keeps the original's history and adds the work that was proposed to it
+since. See [Credits](#credits) and [About this fork](docs/fork.md).
+
 > **Status: early development.** File sync, shared recent files and the Craft Cloud app work. Team spaces
 > (a synced folder shared between accounts, with viewer, editor and owner roles) work in the server, the agent and the
 > app. Live documents (an edit shows on your other machines as you type) work in the agent and the server, and the app
@@ -70,12 +74,32 @@ The Craft Cloud app, from a test setup with a made-up account. The overview show
 - [Running the server](docs/server.md): reverse proxy, Postgres, S3 and SFTP, accounts, invites, team spaces, backups, Docker
 - [The admin pages in the browser](docs/web-admin.md): what each page does, with screenshots
 - [The agent on the command line](docs/agent.md): `login`, `run`, `sync`, `join`, start at login
+- [Using Craft Cloud](docs/user/overview.md): the user guide, with [getting started](docs/user/getting-started.md),
+  [installing and updating](docs/user/install-update.md), [everyday tasks](docs/user/workflows.md) and
+  [troubleshooting](docs/user/troubleshooting.md)
+- [Architecture](docs/architecture.md): the parts and how a file or an edit travels between them
+- [Integrating an app](docs/integration.md): the interfaces for saving to the cloud, sharing files and working together
+- [Screenshots](docs/screenshots.md) of the app, drawn by its tests
+- [Security model](docs/security.md) and [operating a server](docs/operations.md): backups, restore, upgrades
 - [Development](docs/development.md): how it fits together, building, testing, the sync engine's rules
 - [The app kit](docs/kit.md): how a Craft app makes its documents live
 - [Rust app kit integration guide](docs/kit-integration.md): adding the kit to a Rust app
 - [Local API protocol reference](docs/protocol-reference.md): the agent's local API, for apps in other languages
 - Design: [`sync.md`](docs/design/sync.md) and [`live.md`](docs/design/live.md). Contributors and AI agents
-  start with [`AGENTS.md`](AGENTS.md).
+  start with [`AGENTS.md`](AGENTS.md). [`CONTRIBUTING.md`](CONTRIBUTING.md) says how to propose a change, and
+  [`SECURITY.md`](SECURITY.md) how to report a vulnerability.
+
+## Credits
+
+Craft Cloud was created by **Fabio Lussi** ([itrycodinganditsbad](https://github.com/itrycodinganditsbad)). The original
+repository is [itrycodinganditsbad/craft-cloud](https://github.com/itrycodinganditsbad/craft-cloud). The design and the
+first implementation are his: the sync engine, the server, the agent, the Craft Cloud app and the app kit.
+
+The co-working feature is his work in particular: live documents, presence and the app kit that lets an app keep its
+document live. Team spaces and live documents in team spaces, added in this fork, are built on that foundation.
+
+This fork is maintained by [Skyfuller1303](https://github.com/Skyfuller1303). It is built by merging onto the original
+`main`, so the original commits keep their author. [About this fork](docs/fork.md) says more.
 
 ## License
 

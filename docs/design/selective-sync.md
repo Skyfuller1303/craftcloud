@@ -1,5 +1,7 @@
 # Selective sync and bandwidth limits
 
+> Design draft. This is a proposal, not a description of the code; [the architecture](../architecture.md) says what exists.
+
 This document expands selective sync and per-agent bandwidth controls left for later in [sync.md](sync.md). It describes proposed behavior and APIs; these features are not present in the current agent or desktop app. Selection is per configured space root, so it applies independently to personal and team spaces.
 
 ## Decisions
