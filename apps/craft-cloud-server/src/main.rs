@@ -1,0 +1,95 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+use std::process::ExitCode;
+
+use clap::Parser;
+use craft_cloud_server::cli::{Cli, Command, open};
+use craft_cloud_server::config::Config;
+use craft_cloud_server::web::WebSettings;
+use craft_cloud_server::{AppState, serve};
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
+        .init();
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Serve { config } => run_server(&config).await,
+        command => craft_cloud_server::cli::run(command, &mut std::io::stdin().lock(), &mut std::io::stdout()).await.map_err(|e| e.to_string()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_server(config_path: &std::path::Path) -> Result<(), String> {
+    let config = Config::load(config_path).map_err(|e| e.to_string())?;
+    // `Config::load` refuses `behind_proxy` without `trusted_proxies` unless `ignore_forwarded_for` says it is meant,
+    // and refuses `ignore_forwarded_for` anywhere else.
+    if config.ignore_forwarded_for {
+        tracing::warn!("ignore_forwarded_for is set: every client shares one address for sign-in rate limits");
+    }
+    let (meta, store) = open(&config).await.map_err(|e| e.to_string())?;
+    // Fail closed: a database that holds two-factor secrets the key can't open is not served. The server never makes the key.
+    let keys = craft_cloud_server::two_factor::load_keys(&config).map_err(|e| e.to_string())?;
+    let secrets = craft_cloud_server::two_factor::check_startup(&meta, keys, &config, craft_cloud_server::state::now_ms()).await?;
+    // `Config::load` has checked the setup the pages need (an https public_url, a proxy in front).
+    let web = match (config.web_admin.enabled, &config.public_url) {
+        (true, Some(public_url)) => Some(WebSettings::new(public_url, config.web_admin.idle_ms(), config.web_admin.absolute_ms())?),
+        _ => None,
+    };
+    let storage_info = craft_cloud_server::storage_info::StorageInfo::from_config(&config);
+    let state = AppState::new(meta, store, config.trusted_proxies.clone())
+        .map_err(|e| e.message)?
+        .with_public_url(config.public_url.clone())
+        .with_web_admin(web)
+        .with_updates(craft_cloud_server::updates::UpdateSettings::from_config(&config.updates))
+        .with_two_factor(secrets)
+        .with_trash_days(config.retention.trash_days)
+        .with_storage_info(storage_info.clone())
+        .with_full_guard(config.storage.full_policy().map(|policy| craft_cloud_server::full::FullGuard::new(policy, &storage_info)));
+    let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|e| format!("can't listen on {}: {e}", config.listen))?;
+    state.load_compression_level().await.map_err(|e| e.to_string())?;
+    tracing::info!(listen = %config.listen, behind_proxy = config.behind_proxy, web_admin = config.web_admin.enabled, "Craft Cloud server running");
+    let shutdown = async {
+        wait_for_stop_signal().await;
+        tracing::info!("shutting down");
+    };
+    serve(state, listener, shutdown).await.map_err(|e| e.to_string())
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM (what service managers send) on Unix. A service has no console, so
+/// Ctrl-C can't always be watched; that is not a reason to stop: the server then waits for SIGTERM alone
+/// (or forever, where there is no SIGTERM).
+async fn wait_for_stop_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("can't watch for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("can't watch for SIGTERM, only Ctrl-C will stop the server: {e}");
+                ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}

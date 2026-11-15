@@ -1,0 +1,325 @@
+# Craft Cloud — Live documents: protocols
+
+> The protocol section of the live documents design, kept word for word in step with it (as `sync.md` is with the
+> original design). The wire types are in `craft-cloud-proto` (`live` for the server endpoint, `local` for the local
+> API).
+
+## Protocols
+
+**Local API** (agent ↔ apps): the loopback design from the original design ("Agent and launcher API": `127.0.0.1`,
+random port, per-start token in an owner-only file `local-api.json {schema, port, token, pid}` in the agent's data
+dir, exact `Host: 127.0.0.1:<port>`, any `Origin` refused, token only in `Authorization: Bearer`), plus one WebSocket
+per app connection for live sessions. `run` serves it while signed out too. Calls:
+- `POST /v1/login {server, user, password, folder?, device_name?, adopt?}` / `POST /v1/logout {local}` (a sign-in
+  with a password, as `craft-cloud-agent login` makes; the password goes to the agent, never to an app or a file;
+  the Craft Cloud app joins with a code instead, and signs out with `logout`);
+- `POST /v1/join {join, folder?, device_name?, adopt, password?}` → status: parses the join string
+  (`cloud.example.com/K7M4-Q9TX` or the link `https://cloud.example.com/join/K7M4-Q9TX`), checks what it can before
+  the code is spent (the folder, the device name, the server's `/info`), redeems it and signs in as `login` does.
+  Refused while signed in. A setup that fails after the code is spent (the folder is set up for another space)
+  revokes the new device and says to make a new code. `password` only for an invite to a new account, which is
+  answered `password_required` without it. A folder with files in it, without `adopt`, is answered
+  `folder_has_files` before anything reaches the server (as `login` is), so the app can ask and send it again;
+- `POST /v1/pairings` → `{id, join, link, expires_ms}` (a new add-a-computer code, replacing this device's open
+  one), `GET /v1/pairings/{id}` → `{state: waiting|used|expired, device_name?}`, `DELETE /v1/pairings/{id}` → 204;
+- `GET /v1/devices` → the account's devices (`current` marks this one); `DELETE /v1/devices/{id}` revokes another one
+  and answers the list after (this one is refused with `cannot_remove_self`: that is `logout`);
+- `GET`, `POST`, `PATCH` and `DELETE` `/v1/admin/…`, and `GET /v1/account` and `/v1/account/activity`: the server's admin API
+  and the account's own audit events passed on for the Craft Cloud app's admin pages, with the server's status and error codes (listed in [`../agent.md`](../agent.md), "The local API's admin
+  calls");
+- `POST /v1/pause` / `POST /v1/resume` → status: while paused no sync pass starts (one under way finishes), and the
+  long-poll, the folder watcher and the live connection hold; the local API and the apps' recents keep working (adds
+  reach the server after resume). Kept in `state.json`, so a paused agent starts paused; `run_state` is
+  `paused_by_user`, apart from `paused`, which needs someone;
+- `POST /v1/quit` → status: the agent finishes the pass under way and exits (the answer goes out first);
+- `POST /v1/autostart {on}` → status: the agent registers or removes its own start-at-login entry (the Windows `Run`
+  value for the background build, a macOS launch agent, a systemd user unit or an XDG autostart entry), and
+  `status.autostart` says whether it is on (absent where the agent doesn't handle it). Signing out turns it off. The
+  entry belongs to the agent with the default data folder only; an agent with a data folder of its own is refused
+  (`autostart_failed`), reports nothing and leaves the entry alone when it signs out;
+- `GET /v1/status` → `{api, signed_in, account, server, folder, machine, online, run_state, autostart?,
+  last_sync_ms?, removed}` (`last_sync_ms`: when the last pass that didn't fail finished; `removed`: the server
+  refused this device at the last pass, so it was removed from the account and must sign out and join again). Something only a person can put
+  right found as `run` starts (a damaged or newer `account.json`, a damaged token) keeps the agent up, signed out with
+  `run_state` `paused` and the reason; every call but `logout` (which forgets the account here) and `quit` is answered
+  `needs_you` until then;
+- `GET /v1/recents` (WebSocket: subscribe per app, add an entry `{path, title?, saved}`, receive the list on change).
+  In team spaces (protocol 3, below) `subscribe {app, space?}` names a team space that syncs on this computer and gets that
+  space's own list (`entries` then names the `space`; a space that does not sync here is answered `error {not_found}`);
+  without `space` it is the personal list as before. An `add` whose `path` is an absolute path inside a synced team folder
+  goes to that space's list (kept relative to the folder); any other path is the personal list's;
+- `GET /v1/docs` (WebSocket: live documents). Control messages are JSON text frames, document bytes binary frames of
+  `[u8 kind][u64 id, big-endian][bytes]` (kinds: 1 state, 2 update, 3 presence, 4 import, 5 presence with identity, 6 held update), so
+  nothing is base64; `id`
+  is the number the app gave the document in its `open`, and one connection may open many documents:
+  - `open {id, path, app, identity?}` (`path` relative to the synced folder, or absolute inside it; `app` a lowercase app name)
+    → `opened {id, doc, state: {online, waiting, bytes}, read_only?, space?}` followed by the binary state (a Loro snapshot) and then, as
+    binary updates, the updates still waiting for their history and this machine's own not yet acked; or
+    `needs_import {id}` (the file has never been live: the app sends a binary import, a Loro snapshot, and then gets
+    `opened`; the state is the import the server kept, which may be another machine's); or `not_live {id, reason,
+    message?}`, with `reason` one of `offline` (never live here and no server with live documents to ask),
+    `not_synced` (the file isn't uploaded yet: the agent starts a sync pass for it and waits up to 5 s for its
+    node), `not_signed_in`, `too_large` (the file, or its import, is over the snapshot limit), `not_in_folder` (no
+    such file in the synced folder) and `resetting` (the admin reset the server's document and no machine has sent it
+    back yet: an app here would get an empty document). The app then opens and saves the file as always. A document
+    that has been live on this machine opens offline from the agent's copy;
+  - a binary update from the app (its own change, at most 1 MiB) → `ack {id, seq}` once it is on the agent's disk
+    (`seq` counts the app's updates of that document on this connection, from 1), or `error {id, seq, code,
+    message}` when the agent refused it (`invalid`: Loro doesn't take it; `too_large`; `read_only`: the account may not
+    change the document); the agent's copy is as it was;
+  - **team spaces**: an absolute `path` inside a synced team folder is routed to that space's own live link, any other path
+    to the personal space's. `opened` names the `space` (every document, the personal space's too) and says
+    `read_only: true` for a viewer, or in an archived space, as of the open (an agent from before team spaces says neither).
+    An update an app sends to a read-only document is refused with `error {id, seq, code: "read_only"}`, nothing of it is
+    kept, and nothing is sent to the server. A space that stops syncing on this computer answers a later `open` of its
+    files with `not_live {offline}`; the app's other documents go on. `role {doc, read_only}` follows `opened`: the agent
+    tells every app with a document of the space open when the account's right to change it changes, both ways, whether
+    or not the app asked for identity. An app that ends holding changes it made as a viewer and kept sends them as binary
+    kind 6 (`[u8 6][u64 id][a Loro update]`, in order, numbered and acked like updates): the agent journals them like an update, but they go
+    to the server only once the account may write (no app needs to be open then). An app that opens with `identity: true` gets other
+    accounts' presence (and the account's own other machines') as binary kind 5
+    `[u8 5][u64 id][16 bytes account ID][the app's bytes]` instead of kind 3, the account being the server's word whatever
+    the bytes say, and a text message `members {id, members: [{user, name, colour, self}]}` after `opened` and whenever the
+    list changes (the space's active members; `colour` is the palette index 0 to 11 of `craft-cloud-api`'s `colour`
+    module; in a personal space the list is the account alone; it is read from `GET /spaces/{id}/members`, and again when
+    presence names an account not in it). An app that does not ask gets kind 3 only and no `members`;
+  - from the agent: remote changes as binary updates, other machines' and apps' presence as binary presence (as
+    sent), and `status {doc, online, waiting, deleted, stopped}` when that changes (`deleted`: the file was deleted,
+    here or on another machine; the document still works, and a later open of the path is a new node and a new
+    document; a rename or move keeps the document, which belongs to the node; `stopped`: Loro failed on the
+    document twice in this run, and the agent follows it again only once it restarts; changes made meanwhile are
+    kept);
+  - a binary presence from the app (at most 4 KiB, at most 20 a second per document) goes to the document's other
+    machines and apps; `close {doc}`: the app is done with it (the agent keeps it);
+  - `saved {doc, hash, frontiers, version}` (appended): the app saved the document's file; `hash` is the BLAKE3 hash
+    of the bytes it wrote (hex), `frontiers` Loro's (hex, kept for the app's own use) and `version` the document's
+    version vector as `[peer, end counter]` pairs, at most 4,096. The agent keeps the newest 512 in
+    `live/<space>/saves.json` (atomically) and answers nothing; an `error` only when it doesn't look like a save. An
+    agent from before save records answers `error` (not a request it knows) and nothing else changes: the file syncs
+    as any file;
+  - a binary frame without a header, or of a kind an app doesn't send, ends the connection; a text message that
+    isn't a request is answered `error`. An app that doesn't take a message within 10 s is dropped (so is one whose
+    messages queue up past 1,024 in the agent); its documents stay with the agent. An app that goes away mid-import
+    leaves nothing on the server (the import goes up only once whole); the next app to open the file is asked.
+
+- `PUT /v1/blobs[?for=<path>]` (the body: 1 byte to 64 MiB of binary content an app keeps out of a live document) → `{hash, len}`
+  once the bytes are on the agent's disk (`live/<space>/blobs/<hash>`, with a `<hash>.pending` mark written first);
+  `hash` is the BLAKE3 hash of the manifest the bytes cut into with `fastcdc-v1`, so the same bytes have the same
+  name everywhere. The bytes go up through the chunk API (the chunks the server lacks, then the manifest, the
+  account's storage cap applying) at once when the server can be reached, and otherwise with the next put or every
+  30 s; the mark goes once they are up. `GET /v1/blobs/{hash}` → the bytes: from the agent's disk (checked against
+  the name on every read; a damaged copy is dropped and fetched again), or downloaded (every chunk checked, the whole
+  against the manifest) and kept. `blob_not_found` when the account has no such blob, `offline` when it isn't here
+  and the server can't be reached. With `?for=<absolute path of the document's file>`, on `PUT` and on `GET` alike, the
+  blob belongs to the space of the synced folder that holds the path: a team space's blob is kept in
+  `live/<team space>/blobs/`, goes up through that space's chunk API (charged to the space), and every member's agent reads
+  it with the same `for` (a path in no synced folder is `400 invalid`; a `PUT` for a space the account may not change is
+  `403 read_only`). Without `for`, or with a relative path or one in the personal folder, the personal space as before; an
+  agent from before team spaces ignores `for`. An agent from before blobs answers both with the local API's `not_found` for an
+  unknown call, which `craft-cloud-app` reports as `agent_too_old` (blob calls only: everything else works as
+  before).
+
+Errors use stable codes (`forbidden`, `wrong_password`, `already_signed_in`, `not_signed_in`, `offline`,
+`needs_you`, and for joining `invalid_code`, `password_required`, `weak_password`, `untrusted_certificate`,
+`cannot_remove_self`, `autostart_failed`, `folder_has_files`, and for blobs `blob_not_found`). Every call has the same `Host`, `Origin` and token checks. Each request is answered before the next is read; a client that doesn't take a message within 10 s is
+disconnected, and the crate reconnects.
+
+**Server live endpoint** (agent ↔ server): `GET /api/v1/live` upgraded to a WebSocket, signed in with the device
+token like every call (at most 4 connections per device and space, 32 per device in all). Binary frames encoded with postcard (compact, no base64
+for opaque updates; variants are only ever appended, anything new is negotiated at `hello`), types in
+`craft-cloud-proto`:
+- `hello {min, max}` → `welcome {protocol, epoch}` (the space's epoch), or `error protocol_mismatch`. The agent says
+  `hello {1, 3}`: a server that knows 2 at most answers protocol 2 and the agent goes on as it did; one that knows 3
+  answers `welcome_space` (also for the personal space, with role `owner`). Protocol 2 adds
+  documents of files, snapshots, compaction and presence; a connection on protocol 1 (an agent from before them, or
+  a new agent and an older server) carries recents only, and is sent a compacted log whole. A new agent with an older
+  server keeps recents and says live documents need a newer server; a document live on it already keeps its changes
+  on the machine until then. Protocol 3 adds team spaces (`docs/design/collaboration.md`): the connection's space is
+  named by the `craft-space` header of the upgrade, and the server answers `welcome_space {protocol, epoch, space,
+  role}` instead of `welcome` and relays presence as `presence_from {doc, bytes, user}` instead of `presence`, `user`
+  being the sending account, stamped by the server. Both are appended to the server's frames; every frame of
+  protocol 2 keeps its bytes (golden tests pin them), and a connection that negotiates 2 sees exactly the old frames.
+- **Team spaces** (protocol 3, `docs/design/collaboration.md`). The upgrade names the space with the `craft-space`
+  header; a non-member is refused with `404` before the upgrade, and a team space is served to a connection that
+  reaches protocol 3 only (one that negotiates 2 is answered `protocol_mismatch`). The role is read at the upgrade and
+  again at `hello`, and sent in `welcome_space`. Per frame: `create`, `update` and `snapshot` need an editor and are
+  answered `error {read_only}` (naming the document, and the update) from a viewer, whose connection stays;
+  `subscribe` and `subscribe_log` need a viewer, `presence` and `unsubscribe` only the membership. The two kinds of
+  write are checked against the database when the frame arrives, so a change made by another process is respected at
+  once; a connection whose account is no longer a member, or whose role is not the one it was opened with, is closed
+  with `error {access_changed}` and a WebSocket close with code 4403 and reason `access_changed`. In this process that
+  happens at once (a membership, role, archive, disable or removal signal; within a second in the tests), for a change
+  made elsewhere at the next ping (30 s) at the latest. An archived space is read-only (every member is a viewer).
+  A viewer is never asked to `compact`. The writes are guarded again inside their transaction (a role lowered,
+  a member removed or a space archived between the frame's check and its commit stores and announces nothing). A
+  connection trusts its last look at the account (and its device) for 5 s: before it relays updates or presence, or
+  accepts presence, it looks again, so a member removed by another process stops receiving and sending within that
+  time; a device signed out by another process cannot write after it either. A change of a space's members makes each
+  of its connections look at once, then at most once a second. A look that fails (the database cannot be read) confirms
+  nothing: the last confirmation stays, so past the 5 s the connection relays no update or presence and accepts no
+  presence, the look is repeated every second, and a connection whose look failed three times in a row (or 15 s after
+  the first failure) ends with `error {internal}` and a plain close (not 4403: nothing is known about the access); the
+  agent connects again. A page that is being sent is the exception: it cannot be paused (the log position counts as
+  sent once read), so it ends the connection on the first look that cannot be confirmed (`error {internal}`, a plain
+  close), and the agent connects again and catches up from what it has. A look asked for by a signal that cannot be
+  made withdraws the 5 s of trust at once. The device and the access are trusted separately: a write that read only the
+  access does not extend the trust in the device. A catch-up page is sent frame by frame while the connection also
+  listens to the signals above (a revoked member, a revoked device, shutdown) and reads the access again between frames
+  once the 5 s have passed, and the frames of one page must all be out within two minutes: a reader that does not read cannot hold a revoked
+  connection. An answer to a `compact` that finds the access gone inside its transaction ends the connection like any
+  other loss of access (`error {access_changed}`, close 4403). A device may follow 256 documents in one space and 1024
+  in all. **The agent** keeps one link per synced team space, each with the `craft-space`
+  header of its own and its own hub, documents and journals (`live/<space>/`), next to the personal link. A team link takes
+  `welcome_space` for its own space only: a plain `welcome` (a server that does not serve the space) or another space ends
+  it as a mismatch, and so does a `404` for the upgrade (not a member now, or a server whose live service has no team
+  spaces): it is asked again after ten minutes, and the agent's list of spaces is looked at at once. Its role comes from
+  `welcome_space` and from the agent's list (a viewer, or an archived space): while the account may not change the space the
+  agent refuses the apps' changes and sends nothing that writes (`create`, `update`, `snapshot`); what was unacked stays in
+  the journals. `error {access_changed}`, or the close code 4403, ends the connection and the agent asks again at once, once:
+  the answer is the new role in `welcome_space`, or `404`. If the role allows writing again, the journals' updates go up on
+  that connection; if the account is a viewer, they stay and the agent says so once (a count, no names; the document opens
+  with them in `waiting`). A removed account's link stops with the space's sync, and nothing in `live/<space>/` is deleted.
+  When the agent's list of spaces lifts the read-only mark on a link that is up, the updates the gate held back are sent
+  again at once. A repeated `access_changed` is answered with longer and longer pauses (the first is 200 ms, each next one
+  doubles) unless the link had stayed up for a minute.
+  The caps are per space: the live bytes of a team space are
+  `[spaces] team_live_bytes` (4 GiB by default; a personal space keeps `live_bytes_per_user`), the documents and rows
+  counts are the ones of a personal space, per space.
+- `create {doc, kind}` → `created {doc}`; idempotent. Kinds: `recents:<app>`, whose ID is derived from the account and
+  the app, so two machines that create it offline make the same one; and `document {node, app}`, a file of the synced
+  folder, whose ID is `node_doc(space, node)` (BLAKE3 of both with a domain of its own, as a UUIDv8), so two machines
+  that import the same file make one document. A document of a file is only made by import: `create {doc, node, app,
+  snapshot}` (the snapshot's manifest appended to the frame) → `created {doc, kept}` (`kept` appended): the server
+  checks the ID is the node's, the node a file of the space and the manifest one the account uploaded, and keeps the
+  first one it sees; an agent whose import wasn't kept drops it and catches up from 0, and its app is told the
+  document is live only once that is settled, so an app never edits a losing import. A recents `create` and `created`
+  are byte for byte what they were. A joined document the server lost (a restore from before it was made) is made
+  again from the agent's copy.
+- **Snapshots never travel in frames.** A snapshot (a Loro snapshot of a whole document, at most 36 MiB) goes up as a
+  file's content does: cut into chunks named by a manifest, uploaded through the chunk API (with its body limits,
+  hash checks and the account's storage cap, `stored_bytes_per_user`) before the frame that names its manifest; the
+  agent's other frames for that document wait behind the upload. Down, a frame names the manifest and the agent
+  downloads it the same way, every chunk checked against its ID and the whole against the manifest; the catch-up's
+  updates wait for it. One the agent can't upload isn't named (an import's open then answers `offline`); one it can't
+  download, it follows the whole log instead. So no message on the live connection is over an update and its envelope
+  (about 1 MiB), on any protocol.
+- `subscribe {doc, after, at}` → the log above `after`, then `subscribed {doc, head}`, then live updates. **Catch-up is
+  by sequence number**, not by Loro version, so the server never parses Loro: per-document numbers have no gaps,
+  `after` is the highest number up to which the agent holds every update (an own ack that arrives before the updates
+  below it isn't counted until they do, and its update is sent again on the next connection; the server's retry rule
+  makes that free), and `at` is the BLAKE3 hash of the update at `after`. Whether one of the agent's own updates is
+  stored is known by version, not by acks: an unacked update all of whose operations are in the rows (and the
+  snapshot) the agent has taken is stored, whatever its ack does; an ack that came for it is kept until the rows
+  below it are there.
+- A restored or reset server is recognised by the epoch `welcome` names (checked again at every ping; the space's
+  epoch hashed with its live generation), by an `at` that doesn't match its log (`error {resync_required, doc}`), or by
+  a head behind the agent's, even when the log has grown back to the same length. The agent then catches up from 0
+  and sends only the operations the log lacks: parts of at most 64 KiB, built from the missing changes in Lamport
+  order (a change too big for one part goes in pieces, and a part never spans a gap), so each part applies once the
+  earlier ones are in; each part is worked out when the last is acked. Its own operations (its apps' among them) go
+  without a wait, and a change an app makes meanwhile goes at once as a plain update; others' go only
+  after a random wait of 1–8 ticks, after which what the log lacks is worked out again; any update that comes in
+  meanwhile restarts the wait (9–16 ticks), so pushers queue behind whoever is pushing. Duplicates arise only when two
+  waits run out before either's part arrives (at the start, or when a pusher goes quiet): expected at most
+  (k−1)(d+1)/8 extra parts each time, for k machines and d ticks of delay. Unacked adds travel inside the parts. Restore steps run `reset-epoch` before
+  `serve`.
+- A second `subscribe` to a document whose catch-up is still running is refused (`invalid`); catch-up is paged by
+  bytes.
+- **Snapshots and compaction**: when a document's log above its snapshot passes 1,000 updates or 1 MiB, the server
+  sends `compact {doc, upto}` to one subscribed device that holds every update up to `upto` (the one that sent the
+  update that crossed, or one that just caught up); one request per document at a time. That agent answers `snapshot
+  {doc, upto, manifest}`, naming a Loro snapshot of exactly the updates 1..=`upto` (exported at the version those
+  updates make as the agent took them, never including later ones: the agent tracks what the log holds, as a version
+  per update), once it holds them and nothing waits for its history; otherwise it doesn't answer. An agent that
+  dropped a row at or below `upto` (Loro failed on it, or it never applies) never answers, and says so. The server
+  takes only the snapshot it asked that session for, and only a manifest the account uploaded: it records `base =
+  upto` and the manifest in one metadata transaction, only past the current base (a second snapshot for an older or
+  equal `upto` is ignored). The rows at or below the base are kept (compacted: no longer counted against the 16 MiB
+  cap, and not sent to a protocol 2 agent that reads the snapshot) until the retention rules come; the retention
+  rules must count `snapshot` and `import_snapshot` as references to their manifests. A device that doesn't answer
+  within 30 s is skipped for 10 minutes and another is asked when it next appends or catches up. Recents documents
+  compact the same way.
+- **Catch-up with a snapshot**: a `subscribe {after}` with `after < base` (or `after` 0, for a document made by
+  import) is sent `snapshot {doc, base, manifest}`, then the log from `base` on (the row at `base` too, so the agent
+  learns its hash for the next `at`). The `at` check for `after < base` is against the stored hash of row `after`;
+  an `after` the server can't check means `resync_required`. An agent that can't read the snapshot, or finds updates
+  waiting after it for history the snapshot should have held, follows the whole log instead: `subscribe_log {doc,
+  after, at}` is a `subscribe` that never gets a snapshot, but from 0 gets the document's import first (the log
+  doesn't hold it; the server keeps it beside the snapshot).
+- `update {doc, client_seq, bytes}` → `ack {doc, client_seq, seq}` once committed; a retry with the same
+  `(device, client_seq, bytes)` is acked with its first `seq` and stored once. The server sends
+  `update {doc, seq, bytes, device}` to every other subscriber.
+- `presence {doc, bytes}` both ways, at most 4 KiB, at most 20 a second per document per device (more are dropped),
+  relayed to the document's other subscribers and never stored. The agent forwards it to the apps as it is.
+- `unsubscribe {doc}`; `error {code, message, doc?, client_seq?}`. A refused `create` or `subscribe` is retried with
+  backoff.
+- Another account's document gets the same `not_found` as a missing one. A revoked device's sockets are closed.
+- Limits: one update 1 B to 1 MiB, one message at most an update and its envelope, one snapshot at most 36 MiB (an
+  upload), at most 256 subscribed documents per
+  device, 400 updates, creates and subscribes per connection refilled at 200/s; over them, `too_large` /
+  `rate_limited` like the HTTP API.
+- Quota: once a document's log holds 16 MiB (about 30,000 recents adds), every later append is refused with
+  `quota_exceeded` (one-way: the update that crosses the cap is the last one stored). The agent keeps every unacked
+  update, retries with a pause growing to about 64 s, and says the document is full.
+  `craft-cloud-server live reset-doc <user> <app>` (or, for a document of a file, `<user> <document ID>`; with
+  `--space <ID or name>`, the team space's document, `<user>` being one of its members; it writes a
+  `cli.live_reset` audit event and refuses an archived space unless `--force` is given) empties the
+  log, drops the snapshot and the import, and raises the space's live generation in the same transaction, so every
+  live connection ends at its next ping and every agent starts over and pushes what the log lacks. The file sync's
+  epoch is untouched, so it never sees a reset. Nothing a machine holds is lost. Only the log above the snapshot
+  counts against the cap, so compaction keeps a document from filling up.
+- Account caps: at most 64 of an account's recents documents may hold updates; the first update to one more is
+  refused with `quota_exceeded`, and the agent handles it like a full document. Recents documents with no updates
+  (made by following a list) are at most 1,024 per account; a create over that is refused with `quota_exceeded`, and
+  that list stays on the machine and is tried again after a growing pause. Documents of files are counted apart (each
+  needs a file of the space): at most 65,536 per account, at most 10,000 of them holding updates (the first update to
+  one more is refused with `quota_exceeded`, handled like a full document), and their snapshots count against the
+  account's storage (they are uploads). Every row of every live document of an account, compacted ones too, counts
+  towards its live bytes, at most `live_bytes_per_user` (1 GiB by default); over it, every append is refused with
+  `quota_exceeded`. A live document can't be deleted yet: `reset-doc` empties one (and gives its bytes back), but
+  machines that hold its updates send them up again.
+- The agent follows at most 256 documents (the server's cap) and keeps at most 256 documents of files in memory:
+  past that, the least recently used document no app has open and with nothing to send or waiting is unfollowed, and
+  written and let go of (it stays on disk, and is loaded and followed again when opened). At start only the documents
+  with something to send or waiting are loaded. Its copy of each document is a file of its own beside a journal of
+  the apps' changes since it was written (on disk before an app hears its change is kept; every record with its
+  length and a checksum, read up to the first that doesn't read and cut there; an append that fails is cut back and
+  refused, and the document written whole before its journal takes another); an older agent leaves those files
+  alone.
+- Loro failing on a row of a catch-up taken as a batch: the catch-up is taken again one row at a time, so only the
+  row at fault is dropped (and said). A second failure in a run stops the document (`status.stopped`) until the agent
+  restarts. A batch goes to Loro in groups of at most 16 KiB of updates (Loro's batch import of much text at once
+  takes time growing with its square).
+
+**Save records** (the file sync and live documents): each file version a Craft app saves records the live
+document's version it was made from.
+- The app tells its agent (`saved`, above); the sync engine's new version of a file whose content an app saved
+  carries the record, `NewVersion.save = {doc, version}` (appended: an older agent sends none, an older server ignores
+  it). The server keeps it with the version as the JSON it came as (`versions.save`, migration 0006; a record of more
+  than 4,096 entries is kept as none) and lists it as `FileState.save` (an older agent ignores it). The server never
+  reads what it means, and never parses Loro.
+- When a file changed here and on the server, and this content and the server's version both carry a record of the
+  same live document, the engine makes no conflict copy: the server's version wins if its record's version includes
+  this one's (it was saved later from a document that had everything this one had: it is downloaded over the file);
+  otherwise this one goes up over it (the newer upload; the live document holds both sides' edits, so the next save
+  writes them all). A version without a record (edited outside Craft), or records of two documents, is a conflict as
+  always, with its copy.
+- A file whose bytes are no save (or the import) of its document is reported by the app kit on open
+  (`changed_outside`): the app may bring the file in as an ordinary local change, or keep the live content. The kit
+  keeps the newest 32 saves' hashes in the document's `$saves` map for that.
+
+**The app kit** (`craft-cloud-kit`, what apps link; see `docs/kit.md`): the content's layout in Loro.
+- The root map `root` holds `schema: {app, version}`, written at import. A document whose app differs, whose version
+  is newer than the app's, or that has none opens read-only.
+- Each part of an app's model has a key: a tree `k` (`LoroTree`, fractional index on, each node's meta map holding
+  the element's ID under `$id` and its properties), a rich text `k` (`LoroText`: character attributes as marks
+  expanding after, paragraph attributes as marks `¶<name>` on each paragraph's `\n` never expanding, the last
+  paragraph's in the root map `k.last`), a table (`k.rows`, `k.cols`: movable lists of IDs; `k.cells`: a map from
+  `row:column` to a value), a timeline (`k.tracks`: a movable list; `k.track`: track properties; `k.items`: item ID
+  to `{$track, $start, $len, …}`; `k.keys`: keyframe ID to `{$item, $at, $value}`), an opaque value (the root map
+  `$opaque`, key `k`, bytes). IDs are 16 bytes (little-endian `u128`), or 32 hex digits as map keys. Binary content
+  is never in Loro: it is a `{$chunk, $len}` value naming a blob.
+- A local change is written as commits of at most 512 KiB each (estimated: payload and 32 bytes per operation), each
+  exported at once; an export still over 512 KiB is cut by counter range. One change is one undo step.
+- Presence an app sets is sent as `[u64 peer, big-endian][the app's bytes]`, again every 3 s, and dropped 10 s after
+  its peer goes quiet.

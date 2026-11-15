@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Line tables keep file:line in backtraces; full debug info only makes the ~40 test binaries slower to link.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+# A newer push to a PR branch cancels its older run. Runs on main are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The server targets Linux; the sync agent and the Craft Cloud app also run on Windows and macOS (whose
+        # start-at-login code only compiles there). Linux stays on 24.04: on 26.04 the window's snapshot tests crashed
+        # once in three runs (SIGSEGV under wgpu on lavapipe, Mesa 26).
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Craft Cloud app's window (egui on winit and wgpu) needs these headers on Linux, and its snapshot tests a
+      # CPU renderer (Mesa's lavapipe). Its tray and folder picker talk D-Bus in pure Rust: no GTK or libdbus; the
+      # tray's tests run a private bus of their own (dbus-daemon).
+      - name: Install Linux system dependencies (egui/winit, lavapipe, dbus-daemon)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev mesa-vulkan-drivers dbus
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # rust-lld ships with the toolchain and links the test binaries much faster than link.exe. Set before the cache
+      # step so the linker is part of the cache key.
+      - name: Link with rust-lld (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $lld = Join-Path (rustc --print sysroot) 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
+          if (-not (Test-Path $lld)) { throw "rust-lld not found at $lld" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Only main saves the cache: PR caches are seen by no other branch, and their saves (up to 5 min on Windows) would
+      # evict main's from the repository's 10 GB.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      # Every dependency's licence, for every target, against the allow-list in AGENTS.md.
+      - name: Licences
+        if: runner.os == 'Linux'
+        run: cargo xtask licenses
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # The tray's D-Bus tests again, required: without dbus-daemon they would skip, and pass, above. `--workspace` keeps
+      # the features of the step above, so nothing is built again (`-p craft-cloud-desktop` alone rebuilt every
+      # dependency).
+      - name: Test the Linux tray on D-Bus (required)
+        if: runner.os == 'Linux'
+        env:
+          CRAFT_CLOUD_REQUIRE_BACKENDS: "1"
+        run: cargo test --workspace --lib --locked tray::linux
+
+      # The app bundle is built only on macOS: CI checks it builds (unsigned, not published).
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        run: cargo xtask package
+
+  backends:
+    name: Postgres, S3 and SFTP backends
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ccpw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      CRAFT_CLOUD_REQUIRE_BACKENDS: "1"
+      CRAFT_CLOUD_TEST_PG: postgres://postgres:ccpw@127.0.0.1:5432/postgres
+      CRAFT_CLOUD_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      CRAFT_CLOUD_TEST_S3_BUCKET: cc-test
+      CRAFT_CLOUD_TEST_S3_ACCESS_KEY: test
+      CRAFT_CLOUD_TEST_S3_SECRET_KEY: test
+      # The SFTP server below; the key file and the pinned host key (a fingerprint) are named by its step (the runner context is not available in a job's env).
+      CRAFT_CLOUD_TEST_SFTP_HOST: 127.0.0.1
+      CRAFT_CLOUD_TEST_SFTP_PORT: "2222"
+      CRAFT_CLOUD_TEST_SFTP_USER: craft
+      CRAFT_CLOUD_TEST_SFTP_ROOT: /config/cc-test
+    steps:
+      - uses: actions/checkout@v7
+
+      # SeaweedFS (Apache-2.0) is the S3-compatible test server. It runs as a container and is never linked.
+      - name: Start the S3 test server
+        run: |
+          docker run -d --name s3 -p 8333:8333 chrislusf/seaweedfs:4.48 server -s3
+          for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:8333/ && break; sleep 2; done
+          curl -sf -o /dev/null http://127.0.0.1:8333/ || { echo "SeaweedFS did not start"; docker logs s3; exit 1; }
+          curl -sf -X PUT http://127.0.0.1:8333/cc-test
+
+      # OpenSSH's own SFTP server (BSD-2-Clause, run as a container and never linked), with a key made here. The test
+      # pins its host key by fingerprint, as an operator would.
+      - name: Start the SFTP test server
+        run: |
+          ssh-keygen -q -t ed25519 -N "" -f "$RUNNER_TEMP/sftp-key"
+          echo "CRAFT_CLOUD_TEST_SFTP_KEY_FILE=$RUNNER_TEMP/sftp-key" >> "$GITHUB_ENV"
+          docker run -d --name sftp -p 127.0.0.1:2222:2222 -e PUID=1001 -e PGID=1001 -e USER_NAME=craft             -e PUBLIC_KEY="$(cat "$RUNNER_TEMP/sftp-key.pub")" -e PASSWORD_ACCESS=false             linuxserver/openssh-server:10.3_p1-r2-ls243
+          for i in $(seq 1 60); do ssh-keyscan -T 2 -p 2222 -t ed25519 127.0.0.1 2>/dev/null | grep -q ssh-ed25519 && break; sleep 2; done
+          ssh-keyscan -T 2 -p 2222 -t ed25519 127.0.0.1 2>/dev/null | grep -q ssh-ed25519 || { echo "the SFTP server did not start"; docker logs sftp; exit 1; }
+          docker exec sftp cat /config/ssh_host_keys/ssh_host_ed25519_key.pub > "$RUNNER_TEMP/sftp-host.pub"
+          echo "CRAFT_CLOUD_TEST_SFTP_HOST_KEY=$(ssh-keygen -lf "$RUNNER_TEMP/sftp-host.pub" | cut -d' ' -f2)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Test storage, metadata and the server on every backend
+        run: cargo test -p craft-cloud-store -p craft-cloud-meta -p craft-cloud-server --locked
+
+  # The other jobs build with the newest stable Rust, so code or a dependency that needs a newer compiler than the
+  # `rust-version` in Cargo.toml would go unnoticed. Keep the toolchain here equal to that `rust-version`.
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies (egui/winit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@1.95
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
+  # The Docker deployment's shell tests (no Docker needed): the rendered config and the refusal of values that could break
+  # the TOML, the two-factor key files, the Caddyfile and compose file (no management API, no client address in the error
+  # log, a health check that does not need the management API) and the version script.
+  docker-files:
+    name: Docker deployment files
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell tests of packaging/docker
+        run: |
+          set -eu
+          for test in packaging/docker/tests/*.sh; do
+            echo "== $test"
+            sh "$test"
+          done

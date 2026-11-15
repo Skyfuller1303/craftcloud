@@ -1,0 +1,1370 @@
+//! A fake agent for tests (feature `fake`): it serves the local API's `/v1/status`, `/v1/docs` and `/v1/blobs` on a
+//! loopback port of this process, from memory, so an app (or the app kit) is tested through the real client code with
+//! no agent and no server.
+//!
+//! Every [`Fake`] is one machine. Fakes made from one [`Hub`] are machines of one account: the hub stands in for the
+//! server, holding each document (its import and every update after it, in order) and the blobs. A machine keeps its
+//! own copy of each document it opened (as the agent's journal does): an app's update goes into that copy and is acked
+//! at once, and goes to the hub while the machine is online ([`Fake::set_online`]); offline it waits there and goes up
+//! when the machine is back, and the other machines' updates come down then. What the bytes mean is never read: the
+//! state an app opens is the import followed by the updates as `update` frames (the local API allows that).
+//!
+//! [`Fake::restart`] drops every app connection and refuses new ones until [`Fake::start`] (an agent that stopped):
+//! what the machine held stays, as the agent's files do. [`Fake::too_old`] makes a machine answer the blob calls as an
+//! agent from before blobs (`not_found` for the call). [`Hub::set_live`] holds live updates back between machines while
+//! saved files' records still go (a proxy that blocks WebSockets).
+//!
+//! Team spaces: [`Hub::machine_as`] makes a machine of another account on the same hub, and [`Hub::team`] makes the hub's
+//! space a team space whose folder is [`Hub::team_folder`]. As in the agent, a document is routed by its path (an absolute
+//! path inside the team folder is the team space's, any other is its account's personal space, and the personal spaces of
+//! two accounts are apart), and `?for=<path>` routes a blob the same way (a relative path is personal, an absolute path in
+//! no synced folder is `400 invalid`, a viewer's put to the team space `403 read_only`). Every document says its `space`.
+//! An app that opens a document with `identity` hears the space's accounts as `members` and the other accounts'
+//! presence as kind 5. [`Hub::set_read_only`] makes an account a viewer of the team space (its updates are refused with
+//! `read_only`, the documents it opens say so, apps are told with `role` when it changes, and changes an app hands over with
+//! [`HELD`] are kept until the account may write again), [`Hub::remove_member`] takes it out of the member list, and
+//! [`Hub::stop_team`] is the team space ceasing to sync on the machine (open documents say `stopped`, updates are answered
+//! `not_found`).
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use craft_cloud_api::api::SpaceRole;
+use craft_cloud_api::limits::{MAX_BLOB_BYTES, MAX_PRESENCE_BYTES, MAX_UPDATE_BYTES};
+use craft_cloud_api::local::blobs::{Stored, hex, parse_hex};
+use craft_cloud_api::local::docs::{HELD, IMPORT, MAX_BINARY_BYTES, PRESENCE, PRESENCE_FROM, STATE, UPDATE, decode_binary, encode_binary};
+use craft_cloud_api::local::{
+    DocMember, DocState, DocsEvent, DocsRequest, LOCAL_API_MAX, MAX_LOCAL_JSON_BYTES, NotLiveReason, RunState, SpaceInfo, SpaceList, SpaceSync,
+    Status, paths,
+};
+use craft_cloud_api::{DocId, SpaceId, member_colour};
+use tungstenite::protocol::{Role, WebSocketConfig};
+use tungstenite::{Message, WebSocket};
+use uuid::Uuid;
+
+use crate::Client;
+
+/// The account the fakes of one hub share: the server's part.
+#[derive(Clone, Default)]
+pub struct Hub {
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl std::fmt::Debug for Hub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hub").finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    docs: HashMap<String, HubDoc>,
+    blobs: HashMap<(BlobSpace, [u8; 32]), Vec<u8>>,
+    machines: HashMap<usize, Machine>,
+    next_machine: usize,
+    next_conn: u64,
+    /// The record of each path's file on the server (as if every save were written and synced at once: the newest
+    /// upload wins); `None` for one edited outside Craft ([`Hub::edit_outside`]).
+    files: HashMap<String, Option<Version>>,
+    /// The live relay is down while the file sync goes on ([`Hub::set_live`]).
+    live_down: bool,
+    /// The hub's space is a team space ([`Hub::team`]).
+    team: Option<SpaceId>,
+    /// Accounts that are viewers ([`Hub::set_read_only`]).
+    read_only: HashSet<Uuid>,
+    /// Accounts taken out of the team space's member list ([`Hub::remove_member`]).
+    gone: HashSet<Uuid>,
+    /// The team space doesn't sync on the machines any more ([`Hub::stop_team`]).
+    team_stopped: bool,
+}
+
+/// Whose blobs: an account's personal space, or the team space.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum BlobSpace {
+    Personal(Uuid),
+    Team,
+}
+
+/// The account a machine is signed in as.
+#[derive(Clone)]
+struct Account {
+    user: Uuid,
+    name: String,
+}
+
+struct HubDoc {
+    id: DocId,
+    import: Vec<u8>,
+    /// Every update after the import, with the machine it came from.
+    log: Vec<(usize, Vec<u8>)>,
+}
+
+/// Where an update in a machine's copy came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// An app connection of this machine.
+    Conn(u64),
+    /// Another machine.
+    Remote,
+}
+
+/// A machine's copy of a document.
+struct MachineDoc {
+    path: String,
+    import: Vec<u8>,
+    log: Vec<(Origin, Vec<u8>)>,
+    /// How much of the hub's log this copy has taken.
+    hub_seen: usize,
+    /// Positions in `log` of this machine's updates the hub doesn't have yet.
+    pending: VecDeque<usize>,
+    /// Changes an app handed over as a viewer ([`HELD`]): kept here, sent when the account may write.
+    held: Vec<Vec<u8>>,
+}
+
+struct Machine {
+    name: String,
+    token: String,
+    online: bool,
+    running: bool,
+    too_old: bool,
+    docs: HashMap<DocId, MachineDoc>,
+    blobs: HashMap<(BlobSpace, [u8; 32]), Vec<u8>>,
+    pending_blobs: Vec<(BlobSpace, [u8; 32])>,
+    conns: HashMap<u64, Conn>,
+    /// The save records apps sent: document, content hash (hex), frontiers.
+    saves: Vec<(DocId, String, Version)>,
+    /// Codes the next updates are refused with ([`Fake::refuse_next`]).
+    refuse: VecDeque<String>,
+    /// Saves made here that haven't gone up yet (offline): each path's file record on this machine until they do.
+    file_pending: HashMap<String, Version>,
+    account: Account,
+    /// The update frames apps sent to this machine, kept or not ([`Fake::update_frames`]).
+    update_frames: usize,
+}
+
+/// A live document's frontiers: `(peer, counter)` heads.
+type Version = Vec<(u64, u32)>;
+
+/// One app connection to the docs socket.
+struct Conn {
+    writer: Arc<Mutex<WebSocket<TcpStream>>>,
+    stream: TcpStream,
+    /// Each document number opened: the document, how much of the machine's copy went out, and the app's updates.
+    open: HashMap<u64, Opened>,
+    /// A `needs_import` waiting for its import, by number: the path, and the document it will be.
+    importing: HashMap<u64, (String, DocId)>,
+    /// The hash (hex) of the file each open read, by number.
+    apps: HashMap<u64, Option<String>>,
+    told: HashMap<DocId, (bool, u64)>,
+    /// The file record each document's apps were last told.
+    told_file: HashMap<DocId, Option<Version>>,
+    /// The numbers opened with `identity`.
+    identity: HashSet<u64>,
+}
+
+struct Opened {
+    doc: DocId,
+    sent: usize,
+    seq: u64,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Hub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A new machine of this account, signed in and online, its local API listening on a loopback port.
+    pub fn machine(&self, name: &str) -> std::io::Result<Fake> {
+        self.machine_as(name, "fake")
+    }
+
+    /// A new machine signed in as the account `account` (the same name, the same account). Machines of one account share
+    /// its personal space; those of several are the members of the hub's team space ([`Hub::team`]).
+    pub fn machine_as(&self, name: &str, account: &str) -> std::io::Result<Fake> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let addr = listener.local_addr()?;
+        let token = format!("fake-{}-{}", name, addr.port());
+        let id = {
+            let mut inner = lock(&self.inner);
+            let id = inner.next_machine;
+            inner.next_machine += 1;
+            inner.machines.insert(
+                id,
+                Machine {
+                    name: name.to_owned(),
+                    token: token.clone(),
+                    online: true,
+                    running: true,
+                    too_old: false,
+                    docs: HashMap::new(),
+                    blobs: HashMap::new(),
+                    pending_blobs: Vec::new(),
+                    conns: HashMap::new(),
+                    saves: Vec::new(),
+                    refuse: VecDeque::new(),
+                    file_pending: HashMap::new(),
+                    account: Account { user: account_user(account), name: account.to_owned() },
+                    update_frames: 0,
+                },
+            );
+            members_changed(&inner);
+            id
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (hub, stopping) = (self.clone(), stop.clone());
+        std::thread::Builder::new().name(format!("fake-agent-{name}")).spawn(move || {
+            for stream in listener.incoming() {
+                if stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(stream) = stream else { continue };
+                let hub = hub.clone();
+                let _ = std::thread::Builder::new().name("fake-agent-conn".into()).spawn(move || hub.serve(id, stream));
+            }
+        })?;
+        Ok(Fake { hub: self.clone(), id, addr, token, stop })
+    }
+
+    /// Another file takes `path`'s place (the old one renamed away while agents were down): with `Some(import)`, a
+    /// live document of its own (a new ID); with `None`, one that was never live. Every machine forgets its copy of
+    /// the old one there.
+    pub fn replace(&self, path: &str, import: Option<Vec<u8>>) {
+        let mut inner = lock(&self.inner);
+        let mut keys: Vec<String> = inner.docs.keys().filter(|k| key_path(k) == path).cloned().collect();
+        if keys.is_empty() {
+            keys.push(format!("{}\0{path}", account_user("fake")));
+        }
+        for key in keys {
+            match &import {
+                Some(import) => {
+                    inner.docs.insert(key, HubDoc { id: DocId::generate(), import: import.clone(), log: Vec::new() });
+                }
+                None => {
+                    inner.docs.remove(&key);
+                }
+            }
+        }
+        for m in inner.machines.values_mut() {
+            m.docs.retain(|_, d| key_path(&d.path) != path);
+        }
+    }
+
+    /// The hub's space is a team space from now on: its documents name their `space`, and the accounts of its machines are
+    /// its members (the ones not removed, [`Hub::remove_member`]).
+    pub fn team(&self) -> SpaceId {
+        let mut inner = lock(&self.inner);
+        let space = *inner.team.get_or_insert_with(SpaceId::generate);
+        members_changed(&inner);
+        space
+    }
+
+    /// The team space's folder on every machine: an absolute path. A document opened by a path inside it is the team space's;
+    /// any other path (a relative one) is the account's personal space's.
+    pub fn team_folder(&self) -> String {
+        team_folder()
+    }
+
+    /// The personal space's folder on every machine: an absolute path. A document or blob path inside it is the account's personal
+    /// space's, as a relative path is.
+    pub fn personal_folder(&self) -> String {
+        personal_folder()
+    }
+
+    /// The team space syncs again on every machine (after [`Hub::stop_team`]): opening its files works again.
+    pub fn start_team(&self) {
+        lock(&self.inner).team_stopped = false;
+    }
+
+    /// Makes `account` a viewer of the team space (or an editor again): its updates are refused with `read_only` from now
+    /// on, as the agent does when the role is too low, and the documents it opens say `read_only`. The apps with a team
+    /// document open hear it as `role`. When the account may write again, the changes apps handed over ([`HELD`]) go up.
+    pub fn set_read_only(&self, account: &str, on: bool) {
+        let user = account_user(account);
+        let mut inner = lock(&self.inner);
+        let changed = if on { inner.read_only.insert(user) } else { inner.read_only.remove(&user) };
+        if !changed {
+            return;
+        }
+        let mut told = Vec::new();
+        for (mid, m) in &mut inner.machines {
+            if m.account.user != user {
+                continue;
+            }
+            for (cid, c) in &m.conns {
+                let mut docs: Vec<DocId> = c.open.values().map(|o| o.doc).collect();
+                docs.sort_unstable();
+                docs.dedup();
+                for doc in docs {
+                    if m.docs.get(&doc).is_some_and(|d| is_team_key(&d.path)) {
+                        told.push((*mid, *cid, doc));
+                    }
+                }
+            }
+            if !on {
+                for d in m.docs.values_mut().filter(|d| is_team_key(&d.path)) {
+                    for held in std::mem::take(&mut d.held) {
+                        d.log.push((Origin::Remote, held));
+                        d.pending.push_back(d.log.len() - 1);
+                    }
+                }
+            }
+        }
+        for (mid, cid, doc) in told {
+            tell(&inner, mid, cid, &DocsEvent::Role { doc, read_only: on });
+        }
+        sync(&mut inner);
+    }
+
+    /// The team space stops syncing on every machine (turned off, the folder moved, access lost): the apps with one of its
+    /// documents open are told `stopped`, a later update is answered `not_found` and nothing is kept, and opening one of its
+    /// files says `not_live`.
+    pub fn stop_team(&self) {
+        let mut inner = lock(&self.inner);
+        inner.team_stopped = true;
+        for (mid, m) in &inner.machines {
+            for (cid, c) in &m.conns {
+                let mut docs: Vec<DocId> = c.open.values().map(|o| o.doc).collect();
+                docs.sort_unstable();
+                docs.dedup();
+                for doc in docs {
+                    if let Some(d) = m.docs.get(&doc).filter(|d| is_team_key(&d.path)) {
+                        let status = DocsEvent::Status { doc, online: false, waiting: d.pending.len() as u64, deleted: false, stopped: true };
+                        tell(&inner, *mid, *cid, &status);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes `account` out of the team space's members (it left, or was removed); the apps that asked hear the new list.
+    pub fn remove_member(&self, account: &str) {
+        let mut inner = lock(&self.inner);
+        inner.gone.insert(account_user(account));
+        members_changed(&inner);
+    }
+
+    /// `account` is a member of the team space again.
+    pub fn add_member(&self, account: &str) {
+        let mut inner = lock(&self.inner);
+        inner.gone.remove(&account_user(account));
+        members_changed(&inner);
+    }
+
+    /// Whether live updates go between machines (`false`: a proxy that blocks WebSockets, the relay out) while the
+    /// file sync goes on (saved files' records still reach every machine).
+    pub fn set_live(&self, on: bool) {
+        let mut inner = lock(&self.inner);
+        inner.live_down = !on;
+        sync(&mut inner);
+    }
+
+    /// Another program writes `path`'s file (no save record): every machine's apps hear it has none.
+    pub fn edit_outside(&self, path: &str) {
+        let mut inner = lock(&self.inner);
+        let mut keys: Vec<String> = inner.docs.keys().filter(|k| key_path(k) == path).cloned().collect();
+        if keys.is_empty() {
+            keys.push(format!("{}\0{path}", account_user("fake")));
+        }
+        for key in keys {
+            inner.files.insert(key, None);
+        }
+        sync(&mut inner);
+    }
+
+    /// The record of `path`'s file on the server: the live document's version a Craft app saved it from.
+    pub fn file(&self, path: &str) -> Option<Vec<(u64, u32)>> {
+        lock(&self.inner).files.iter().find(|(k, _)| key_path(k) == path).and_then(|(_, v)| v.clone())
+    }
+
+    /// How many changes apps handed over as viewers ([`HELD`]) the machines hold for the document at `path`, not sent yet.
+    pub fn held(&self, path: &str) -> usize {
+        let inner = lock(&self.inner);
+        inner.machines.values().flat_map(|m| m.docs.values()).filter(|d| key_path(&d.path) == path).map(|d| d.held.len()).sum()
+    }
+
+    /// How many updates the hub holds of the document at `path` (0 when it has none).
+    pub fn updates(&self, path: &str) -> usize {
+        lock(&self.inner).docs.iter().filter(|(k, _)| key_path(k) == path).map(|(_, d)| d.log.len()).sum()
+    }
+
+    fn serve(&self, machine: usize, mut stream: TcpStream) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let (token, running, too_old, name, account) = {
+            let inner = lock(&self.inner);
+            let Some(m) = inner.machines.get(&machine) else { return };
+            (m.token.clone(), m.running, m.too_old, m.name.clone(), m.account.clone())
+        };
+        // An agent from before blobs answers an unknown call from its fallback without reading the body.
+        let Ok(Some(mut request)) = read_request(&mut stream, !too_old) else { return };
+        // `?for=<path>` on a blob call: the call is for that file's space.
+        let for_path = match request.path.split_once('?') {
+            Some((route, query)) => {
+                let bound = query.split('&').find_map(|pair| pair.strip_prefix("for=")).map(percent_decode);
+                request.path = route.to_owned();
+                bound
+            }
+            None => None,
+        };
+        if too_old && request.path.starts_with(paths::BLOBS) {
+            respond_error(&mut stream, 404, "not_found", "no such call");
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+        if !running {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+        if request.auth.as_deref() != Some(&format!("Bearer {token}")) {
+            return respond_error(&mut stream, 401, "unauthorized", "the token is wrong");
+        }
+        let blob_get = request.path.strip_prefix(paths::BLOBS).and_then(|p| p.strip_prefix('/')).map(str::to_owned);
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", paths::STATUS) => {
+                let online = lock(&self.inner).machines.get(&machine).is_some_and(|m| m.online);
+                let status = Status {
+                    api: LOCAL_API_MAX,
+                    signed_in: true,
+                    account: Some(account.name.clone()),
+                    server: Some("https://fake.invalid".into()),
+                    folder: None,
+                    machine: Some(name),
+                    online,
+                    run_state: RunState::Idle,
+                    autostart: None,
+                    last_sync_ms: None,
+                    removed: false,
+                    spaces: Vec::new(),
+                    from_folder: None,
+                };
+                respond_json(&mut stream, 200, &status);
+            }
+            ("GET", paths::DOCS) => self.docs_socket(machine, stream, &request),
+            ("GET", paths::SPACES) => respond_json(&mut stream, 200, &self.spaces(&account)),
+            ("PUT", paths::BLOBS) | ("GET", _) if too_old && (request.path == paths::BLOBS || blob_get.is_some()) => {
+                respond_error(&mut stream, 404, "not_found", "no such call");
+            }
+            ("PUT", paths::BLOBS) => match self.put_blob(machine, &request.body, for_path.as_deref()) {
+                Ok(stored) => respond_json(&mut stream, 200, &stored),
+                Err((status, code, message)) => respond_error(&mut stream, status, code, &message),
+            },
+            ("GET", _) if blob_get.is_some() => {
+                let hash = blob_get.as_deref().and_then(parse_hex);
+                match hash.map(|h| self.get_blob(machine, &h, for_path.as_deref())) {
+                    Some(Ok(bytes)) => respond(&mut stream, 200, "application/octet-stream", &bytes),
+                    Some(Err((status, code, message))) => respond_error(&mut stream, status, code, &message),
+                    None => respond_error(&mut stream, 400, "invalid", "not a blob's name"),
+                }
+            }
+            _ => respond_error(&mut stream, 404, "not_found", "no such call"),
+        }
+    }
+
+    /// `GET /v1/spaces` for `account`: its personal space, and the team space if the hub has one and it is a member.
+    fn spaces(&self, account: &Account) -> SpaceList {
+        let inner = lock(&self.inner);
+        let info = |space: SpaceId, kind: &str, role: SpaceRole| SpaceInfo {
+            space,
+            kind: kind.to_owned(),
+            name: (kind == "team").then(|| "Team".to_owned()),
+            role,
+            state: "active".to_owned(),
+            archived: false,
+            folder: None,
+            sync: SpaceSync::On,
+            run_state: None,
+            last_sync_ms: None,
+            read_only: role == SpaceRole::Viewer,
+        };
+        let mut spaces = vec![info(SpaceId::from_uuid(account.user), "personal", SpaceRole::Owner)];
+        if let Some(team) = inner.team
+            && !inner.gone.contains(&account.user)
+        {
+            let role = if inner.read_only.contains(&account.user) { SpaceRole::Viewer } else { SpaceRole::Editor };
+            spaces.push(info(team, "team", role));
+        }
+        SpaceList { spaces }
+    }
+
+    fn put_blob(&self, machine: usize, bytes: &[u8], for_path: Option<&str>) -> Result<Stored, (u16, &'static str, String)> {
+        if bytes.is_empty() || bytes.len() > MAX_BLOB_BYTES {
+            return Err((413, "too_large", format!("a blob is 1 byte to {MAX_BLOB_BYTES} bytes")));
+        }
+        let hash = fake_hash(bytes);
+        let mut inner = lock(&self.inner);
+        let space = blob_route(&inner, machine, for_path)?;
+        // A viewer may not put into the team space.
+        if space == BlobSpace::Team && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user)) {
+            return Err((403, "read_only", "this space is read-only for you".into()));
+        }
+        let Some(m) = inner.machines.get_mut(&machine) else { return Err((500, "internal", "no machine".into())) };
+        let key = (space, hash);
+        m.blobs.insert(key, bytes.to_vec());
+        m.pending_blobs.push(key);
+        sync(&mut inner);
+        Ok(Stored { hash, len: bytes.len() as u64 })
+    }
+
+    fn get_blob(&self, machine: usize, hash: &[u8; 32], for_path: Option<&str>) -> Result<Vec<u8>, (u16, &'static str, String)> {
+        let mut inner = lock(&self.inner);
+        let space = blob_route(&inner, machine, for_path)?;
+        let key = (space, *hash);
+        let hub_copy = inner.blobs.get(&key).cloned();
+        let Some(m) = inner.machines.get_mut(&machine) else { return Err((500, "internal", "no machine".into())) };
+        if let Some(bytes) = m.blobs.get(&key) {
+            return Ok(bytes.clone());
+        }
+        if !m.online {
+            return Err((503, "offline", "the server can't be reached to fetch the blob".into()));
+        }
+        match hub_copy {
+            Some(bytes) => {
+                m.blobs.insert(key, bytes.clone());
+                Ok(bytes)
+            }
+            None => Err((404, "blob_not_found", "no such blob".into())),
+        }
+    }
+
+    /// The docs WebSocket: the handshake by hand, then a reader here and writes from wherever state changes.
+    fn docs_socket(&self, machine: usize, mut stream: TcpStream, request: &Request) {
+        let Some(key) = request.ws_key.as_deref() else {
+            return respond_error(&mut stream, 400, "invalid", "not a WebSocket request");
+        };
+        let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let head = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let limit = MAX_BINARY_BYTES.max(MAX_LOCAL_JSON_BYTES);
+        let config = WebSocketConfig::default().max_message_size(Some(limit)).max_frame_size(Some(limit));
+        let (Ok(write_side), Ok(shut)) = (stream.try_clone(), stream.try_clone()) else { return };
+        let mut reader = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
+        let writer = Arc::new(Mutex::new(WebSocket::from_raw_socket(write_side, Role::Server, Some(config))));
+        let conn = {
+            let mut inner = lock(&self.inner);
+            let conn = inner.next_conn;
+            inner.next_conn += 1;
+            let Some(m) = inner.machines.get_mut(&machine) else { return };
+            m.conns.insert(
+                conn,
+                Conn {
+                    writer,
+                    stream: shut,
+                    open: HashMap::new(),
+                    importing: HashMap::new(),
+                    apps: HashMap::new(),
+                    told: HashMap::new(),
+                    told_file: HashMap::new(),
+                    identity: HashSet::new(),
+                },
+            );
+            conn
+        };
+        loop {
+            match reader.read() {
+                Ok(Message::Text(text)) => {
+                    if let Ok(request) = serde_json::from_str::<DocsRequest>(text.as_str()) {
+                        self.on_request(machine, conn, request);
+                    }
+                }
+                Ok(Message::Binary(bytes)) => {
+                    if let Some((kind, id, body)) = decode_binary(&bytes) {
+                        self.on_binary(machine, conn, kind, id, body);
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let mut inner = lock(&self.inner);
+        if let Some(m) = inner.machines.get_mut(&machine) {
+            m.conns.remove(&conn);
+        }
+    }
+
+    fn on_request(&self, machine: usize, conn: u64, request: DocsRequest) {
+        let mut inner = lock(&self.inner);
+        match request {
+            DocsRequest::Open { id, path, app: _, file_hash, identity } => {
+                if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
+                    c.apps.insert(id, file_hash);
+                    if identity {
+                        c.identity.insert(id);
+                    }
+                }
+                let key = doc_key(&inner, machine, &path);
+                open(&mut inner, machine, conn, id, &key);
+            }
+            DocsRequest::Close { doc } => {
+                if let Some(c) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)) {
+                    c.open.retain(|_, o| o.doc != doc);
+                }
+            }
+            DocsRequest::Saved { doc, hash, frontiers } => {
+                let stopped = inner.team_stopped && inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
+                if stopped {
+                    return tell(
+                        &inner,
+                        machine,
+                        conn,
+                        &DocsEvent::Error {
+                            id: None,
+                            seq: None,
+                            code: "not_found".into(),
+                            message: "the space stopped syncing on this computer".into(),
+                        },
+                    );
+                }
+                let Some(m) = inner.machines.get_mut(&machine) else { return };
+                m.saves.push((doc, hash, frontiers.clone()));
+                // The file is written and goes up at once (offline: once the machine is back). (The fake reads no
+                // Loro: the record comes after the changes it covers on the app's stream, which the copy took first.)
+                let Some(path) = m.docs.get(&doc).map(|d| d.path.clone()) else { return };
+                m.file_pending.insert(path, frontiers);
+                sync(&mut inner);
+            }
+            // (The fake's file sync is the records themselves: nothing waits for a save on its way.)
+            DocsRequest::Saving { .. } => {}
+        }
+    }
+
+    fn on_binary(&self, machine: usize, conn: u64, kind: u8, id: u64, body: &[u8]) {
+        let mut inner = lock(&self.inner);
+        match kind {
+            IMPORT => {
+                let Some((path, new_id)) =
+                    inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)).and_then(|c| c.importing.remove(&id))
+                else {
+                    return;
+                };
+                let online = inner.machines.get(&machine).is_some_and(|m| m.online);
+                if !online {
+                    return tell(&inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None });
+                }
+                // The first import is kept; a later one joins it.
+                inner.docs.entry(path.clone()).or_insert_with(|| HubDoc { id: new_id, import: body.to_vec(), log: Vec::new() });
+                open(&mut inner, machine, conn, id, &path);
+            }
+            HELD => {
+                // What an app that ends hands over (it made it as a viewer and kept it): the account's changes, acked once kept.
+                let Some(opened) = inner.machines.get_mut(&machine).and_then(|m| m.conns.get_mut(&conn)).and_then(|c| c.open.get_mut(&id)) else {
+                    return;
+                };
+                opened.seq += 1;
+                let (seq, doc) = (opened.seq, opened.doc);
+                let team_doc = inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
+                let viewer = team_doc && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user));
+                if team_doc && inner.team_stopped {
+                    let message = "the space stopped syncing on this computer: nothing was kept".to_owned();
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "not_found".into(), message });
+                }
+                if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
+                    let message = format!("a held change is 1 byte to {MAX_UPDATE_BYTES} bytes");
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
+                }
+                let Some(d) = inner.machines.get_mut(&machine).and_then(|m| m.docs.get_mut(&doc)) else { return };
+                if viewer {
+                    d.held.push(body.to_vec());
+                } else {
+                    d.log.push((Origin::Conn(conn), body.to_vec()));
+                    d.pending.push_back(d.log.len() - 1);
+                }
+                tell(&inner, machine, conn, &DocsEvent::Ack { id, seq });
+                sync(&mut inner);
+            }
+            UPDATE => {
+                let team_doc = inner
+                    .machines
+                    .get(&machine)
+                    .and_then(|m| m.conns.get(&conn).and_then(|c| c.open.get(&id)).and_then(|o| m.docs.get(&o.doc)))
+                    .is_some_and(|d| is_team_key(&d.path));
+                let viewer = team_doc && inner.machines.get(&machine).is_some_and(|m| inner.read_only.contains(&m.account.user));
+                let stopped = team_doc && inner.team_stopped;
+                let Some(m) = inner.machines.get_mut(&machine) else { return };
+                m.update_frames += 1;
+                let Some(c) = m.conns.get_mut(&conn) else { return };
+                let Some(opened) = c.open.get_mut(&id) else { return };
+                opened.seq += 1;
+                let (seq, doc) = (opened.seq, opened.doc);
+                if body.is_empty() || body.len() > MAX_UPDATE_BYTES {
+                    let message = format!("an update is 1 byte to {MAX_UPDATE_BYTES} bytes");
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "too_large".into(), message });
+                }
+                // The space stopped syncing here: nothing is kept.
+                if stopped {
+                    let message = "the space stopped syncing on this computer: nothing was kept".to_owned();
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "not_found".into(), message });
+                }
+                // A viewer's update is refused, and kept nowhere.
+                if viewer {
+                    let message = "your role in this space does not let you change documents".to_owned();
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code: "read_only".into(), message });
+                }
+                // A refusal asked for ([`Fake::refuse_next`]): the update isn't kept.
+                if let Some(code) = m.refuse.pop_front() {
+                    let message = format!("refused as asked ({code})");
+                    return tell(&inner, machine, conn, &DocsEvent::Error { id: Some(id), seq: Some(seq), code, message });
+                }
+                if let Some(d) = m.docs.get_mut(&doc) {
+                    d.log.push((Origin::Conn(conn), body.to_vec()));
+                    d.pending.push_back(d.log.len() - 1);
+                }
+                tell(&inner, machine, conn, &DocsEvent::Ack { id, seq });
+                sync(&mut inner);
+            }
+            PRESENCE => {
+                if body.len() > MAX_PRESENCE_BYTES {
+                    return;
+                }
+                let Some(doc) = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.open.get(&id)).map(|o| o.doc) else {
+                    return;
+                };
+                let from_online = inner.machines.get(&machine).is_some_and(|m| m.online);
+                let Some(sender) = inner.machines.get(&machine).map(|m| m.account.user) else { return };
+                let team_doc = inner.machines.get(&machine).and_then(|m| m.docs.get(&doc)).is_some_and(|d| is_team_key(&d.path));
+                if team_doc && inner.team_stopped {
+                    return;
+                }
+                // The account's frame for apps that asked who sent it: `[16 bytes account ID][the app's bytes]`.
+                let stamped = [sender.as_bytes().as_slice(), body].concat();
+                for (mid, m) in &inner.machines {
+                    if *mid != machine && !(m.online && from_online) {
+                        continue;
+                    }
+                    // (A member taken out of the space neither sends nor hears.)
+                    if team_doc && (inner.gone.contains(&sender) || inner.gone.contains(&m.account.user)) {
+                        continue;
+                    }
+                    for (cid, c) in &m.conns {
+                        if (*mid, *cid) == (machine, conn) {
+                            continue;
+                        }
+                        for (number, o) in &c.open {
+                            if o.doc == doc {
+                                let frame = if c.identity.contains(number) {
+                                    encode_binary(PRESENCE_FROM, *number, &stamped)
+                                } else {
+                                    encode_binary(PRESENCE, *number, body)
+                                };
+                                let _ = lock(&c.writer).send(Message::Binary(frame.into()));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Opens the document at `path` on `machine` for `conn` under `id` (the machine takes the hub's copy if it has none).
+fn open(inner: &mut Inner, machine: usize, conn: u64, id: u64, path: &str) {
+    if inner.team_stopped && is_team_key(path) {
+        return tell(inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None });
+    }
+    let hub_doc = inner.docs.get(path).map(|d| (d.id, d.import.clone()));
+    let Some(m) = inner.machines.get_mut(&machine) else { return };
+    let known = m.docs.iter().find(|(_, d)| d.path == path).map(|(doc, _)| *doc);
+    let doc = match (known, hub_doc) {
+        (Some(doc), _) => doc,
+        (None, Some((doc, import))) if m.online => {
+            m.docs
+                .insert(doc, MachineDoc { path: path.to_owned(), import, log: Vec::new(), hub_seen: 0, pending: VecDeque::new(), held: Vec::new() });
+            doc
+        }
+        (None, None) if m.online => {
+            let new_id = DocId::generate();
+            if let Some(c) = m.conns.get_mut(&conn) {
+                c.importing.insert(id, (path.to_owned(), new_id));
+            }
+            return tell(inner, machine, conn, &DocsEvent::NeedsImport { id });
+        }
+        (None, _) => return tell(inner, machine, conn, &DocsEvent::NotLive { id, reason: NotLiveReason::Offline, message: None }),
+    };
+    // Take what the hub has first (when online), so the state is as fresh as it can be.
+    sync(inner);
+    // Edited outside Craft unless some machine's app saved that content (the server's versions keep every record).
+    let file_hash = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).and_then(|c| c.apps.get(&id)).and_then(Clone::clone);
+    let changed_outside = file_hash.map(|h| !inner.machines.values().any(|m| m.saves.iter().any(|(d, saved, _)| *d == doc && *saved == h)));
+    let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
+    let team_doc = is_team_key(path);
+    let space = Some(if team_doc { inner.team.unwrap_or_else(|| SpaceId::from_uuid(user)) } else { SpaceId::from_uuid(user) });
+    let read_only = team_doc && inner.read_only.contains(&user);
+    let Some(m) = inner.machines.get_mut(&machine) else { return };
+    let online = m.online;
+    let Some(d) = m.docs.get(&doc) else { return };
+    let state = DocState { online, waiting: d.pending.len() as u64, bytes: d.import.len() as u64, updates: d.log.len() as u64 };
+    let (import, log): (Vec<u8>, Vec<Vec<u8>>) = (d.import.clone(), d.log.iter().map(|(_, b)| b.clone()).collect());
+    let Some(c) = m.conns.get_mut(&conn) else { return };
+    c.open.insert(id, Opened { doc, sent: log.len(), seq: 0 });
+    c.told.insert(doc, (online, state.waiting));
+    let mut w = lock(&c.writer);
+    let opened = DocsEvent::Opened { id, doc, state, changed_outside, read_only, space };
+    if let Ok(text) = serde_json::to_string(&opened) {
+        let _ = w.send(Message::Text(text.into()));
+    }
+    let _ = w.send(Message::Binary(encode_binary(STATE, id, &import).into()));
+    for bytes in log {
+        let _ = w.send(Message::Binary(encode_binary(UPDATE, id, &bytes).into()));
+    }
+    drop(w);
+    // The file's record, after the state.
+    sync(inner);
+    // Who is there, for an app that asked.
+    if inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)).is_some_and(|c| c.identity.contains(&id)) {
+        send_members(inner, machine, conn, id);
+    }
+}
+
+/// The name an account of the fake has, as a UUID (the same name, the same ID).
+fn account_user(name: &str) -> Uuid {
+    let hash = fake_hash(name.as_bytes());
+    let mut bytes = [0u8; 16];
+    for (to, from) in bytes.iter_mut().zip(hash.iter()) {
+        *to = *from;
+    }
+    Uuid::from_bytes(bytes)
+}
+
+/// The team space's folder, the same on every machine (an absolute path).
+fn team_folder() -> String {
+    std::env::temp_dir().join("craft-cloud-fake-team").to_string_lossy().into_owned()
+}
+
+/// The personal space's folder, the same on every machine (an absolute path).
+fn personal_folder() -> String {
+    std::env::temp_dir().join("craft-cloud-fake-personal").to_string_lossy().into_owned()
+}
+
+/// The rest of `path` below the personal folder, when it is an absolute path inside it.
+fn in_personal_folder(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return None;
+    }
+    let parts = segments(path)?;
+    let folder = segments(&personal_folder())?;
+    Some(parts.strip_prefix(folder.as_slice())?.join("/"))
+}
+
+/// A path's parts, with `.` and `..` taken out; none when it climbs above its root.
+fn segments(path: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other.to_owned()),
+        }
+    }
+    Some(parts)
+}
+
+/// The rest of `path` below the team folder, when it is an absolute path inside it (`.` and `..` taken out first).
+fn in_team_folder(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return None;
+    }
+    let parts = segments(path)?;
+    let folder = segments(&team_folder())?;
+    let rest = parts.strip_prefix(folder.as_slice())?;
+    Some(rest.join("/"))
+}
+
+/// The key a document of `path` is kept under on the hub: the team space's, or the account's personal space's (the
+/// personal spaces of two accounts are apart).
+fn doc_key(inner: &Inner, machine: usize, path: &str) -> String {
+    if inner.team.is_some()
+        && let Some(rest) = in_team_folder(path)
+    {
+        return format!("team\0{rest}");
+    }
+    let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
+    // (A path inside the personal folder is the same file as the relative path below it.)
+    format!("{user}\0{}", in_personal_folder(path).as_deref().unwrap_or(path))
+}
+
+/// Whether a document key is the team space's.
+fn is_team_key(key: &str) -> bool {
+    key.starts_with("team\0")
+}
+
+/// The path part of a document key.
+fn key_path(key: &str) -> &str {
+    key.split_once('\0').map_or(key, |(_, path)| path)
+}
+
+/// The space a blob call of `machine` is for, from its `for` path as the agent routes it: none is the account's personal space,
+/// as is a relative path; an absolute path inside the team folder is the team space's; any other is `400 invalid` (it is in no
+/// synced folder, or it climbs out of one).
+fn blob_route(inner: &Inner, machine: usize, for_path: Option<&str>) -> Result<BlobSpace, (u16, &'static str, String)> {
+    let user = inner.machines.get(&machine).map(|m| m.account.user).unwrap_or_default();
+    let Some(path) = for_path else { return Ok(BlobSpace::Personal(user)) };
+    if !std::path::Path::new(path).is_absolute() {
+        return Ok(BlobSpace::Personal(user));
+    }
+    if inner.team.is_some() && !inner.gone.contains(&user) && in_team_folder(path).is_some() {
+        return Ok(BlobSpace::Team);
+    }
+    if in_personal_folder(path).is_some() {
+        return Ok(BlobSpace::Personal(user));
+    }
+    Err((400, "invalid", "that path is in no synced folder".into()))
+}
+
+/// `%XX` escapes undone (the value of a query's `for=`).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = |at: usize| bytes.get(at).and_then(|c| (*c as char).to_digit(16));
+        if b == b'%'
+            && let (Some(hi), Some(lo)) = (hex(i + 1), hex(i + 2))
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The members of the space of a document, for the account `for_user`: in a team space the accounts of the hub's
+/// machines that were not removed, else the account alone.
+fn members_of(inner: &Inner, for_user: Uuid, team_doc: bool) -> Vec<DocMember> {
+    let mut users: Vec<(Uuid, String)> = Vec::new();
+    for m in inner.machines.values() {
+        let counts = if team_doc { !inner.gone.contains(&m.account.user) } else { m.account.user == for_user };
+        if counts && !users.iter().any(|(u, _)| *u == m.account.user) {
+            users.push((m.account.user, m.account.name.clone()));
+        }
+    }
+    users.sort_by(|a, b| a.1.cmp(&b.1));
+    users.into_iter().map(|(user, name)| DocMember { user, name, colour: member_colour(user), is_self: user == for_user }).collect()
+}
+
+/// Sends the members to the document opened as `id` on `conn`.
+fn send_members(inner: &Inner, machine: usize, conn: u64, id: u64) {
+    let Some(m) = inner.machines.get(&machine) else { return };
+    let team_doc = m.conns.get(&conn).and_then(|c| c.open.get(&id)).and_then(|o| m.docs.get(&o.doc)).is_some_and(|d| is_team_key(&d.path));
+    tell(inner, machine, conn, &DocsEvent::Members { id, members: members_of(inner, m.account.user, team_doc) });
+}
+
+/// The member list changed: every document opened with `identity` hears it.
+fn members_changed(inner: &Inner) {
+    for (mid, m) in &inner.machines {
+        for (cid, c) in &m.conns {
+            for number in &c.identity {
+                send_members(inner, *mid, *cid, *number);
+            }
+        }
+    }
+}
+
+/// Sends one control message to one connection.
+fn tell(inner: &Inner, machine: usize, conn: u64, event: &DocsEvent) {
+    let Some(c) = inner.machines.get(&machine).and_then(|m| m.conns.get(&conn)) else { return };
+    if let Ok(text) = serde_json::to_string(event) {
+        let _ = lock(&c.writer).send(Message::Text(text.into()));
+    }
+}
+
+/// Moves updates and blobs between the online machines and the hub, then sends every connection what it lacks.
+fn sync(inner: &mut Inner) {
+    let live_down = inner.live_down;
+    let Inner { docs, blobs, machines, files, .. } = inner;
+    // Up: every online machine's waiting updates, blobs and saved files.
+    let mut ids: Vec<usize> = machines.keys().copied().collect();
+    ids.sort_unstable();
+    for mid in &ids {
+        let Some(m) = machines.get_mut(mid) else { continue };
+        if !m.online {
+            continue;
+        }
+        for (path, version) in m.file_pending.drain() {
+            files.insert(path, Some(version));
+        }
+        for key in m.pending_blobs.drain(..) {
+            if let Some(bytes) = m.blobs.get(&key) {
+                blobs.insert(key, bytes.clone());
+            }
+        }
+        for d in m.docs.values_mut() {
+            let Some(hub) = docs.get_mut(&d.path) else { continue };
+            if live_down {
+                continue;
+            }
+            while let Some(at) = d.pending.pop_front() {
+                if let Some((_, bytes)) = d.log.get(at) {
+                    hub.log.push((*mid, bytes.clone()));
+                }
+            }
+        }
+    }
+    // Down: what the others sent.
+    for mid in &ids {
+        let Some(m) = machines.get_mut(mid) else { continue };
+        if !m.online {
+            continue;
+        }
+        for d in m.docs.values_mut() {
+            let Some(hub) = docs.get(&d.path) else { continue };
+            if live_down {
+                continue;
+            }
+            for (from, bytes) in hub.log.iter().skip(d.hub_seen) {
+                if from != mid {
+                    d.log.push((Origin::Remote, bytes.clone()));
+                }
+            }
+            d.hub_seen = hub.log.len();
+        }
+    }
+    // Out to the apps: the copy's new updates (an app's own not back to it), and status when it changed.
+    for m in machines.values_mut() {
+        let online = m.online;
+        for (cid, c) in m.conns.iter_mut() {
+            let mut w = lock(&c.writer);
+            for (number, o) in c.open.iter_mut() {
+                let Some(d) = m.docs.get(&o.doc) else { continue };
+                for (origin, bytes) in d.log.iter().skip(o.sent) {
+                    if *origin != Origin::Conn(*cid) {
+                        let _ = w.send(Message::Binary(encode_binary(UPDATE, *number, bytes).into()));
+                    }
+                }
+                o.sent = d.log.len();
+                let now = (online, d.pending.len() as u64);
+                if c.told.get(&o.doc) != Some(&now) {
+                    c.told.insert(o.doc, now);
+                    let status = DocsEvent::Status { doc: o.doc, online, waiting: now.1, deleted: false, stopped: false };
+                    if let Ok(text) = serde_json::to_string(&status) {
+                        let _ = w.send(Message::Text(text.into()));
+                    }
+                }
+                // The file here: this machine's save not up yet, else the server's (offline: as it was).
+                let file = match m.file_pending.get(&d.path) {
+                    Some(v) => Some(v.clone()),
+                    None if online => files.get(&d.path).cloned().flatten(),
+                    None => c.told_file.get(&o.doc).cloned().flatten(),
+                };
+                if c.told_file.get(&o.doc) != Some(&file) {
+                    c.told_file.insert(o.doc, file.clone());
+                    if let Ok(text) = serde_json::to_string(&DocsEvent::File { doc: o.doc, frontiers: file }) {
+                        let _ = w.send(Message::Text(text.into()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One machine of a [`Hub`]. Dropping it stops its local API (its app connections end).
+pub struct Fake {
+    hub: Hub,
+    id: usize,
+    addr: SocketAddr,
+    token: String,
+    stop: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for Fake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fake").field("addr", &self.addr).finish_non_exhaustive()
+    }
+}
+
+impl Fake {
+    /// A client of this machine's agent, as [`Client::connect`] gives one.
+    pub fn client(&self) -> Client {
+        Client::at(self.addr, self.token.clone(), std::env::temp_dir())
+    }
+
+    /// The machine reaches the hub (`true`) or not: offline, its updates and blobs wait, and others' don't come.
+    pub fn set_online(&self, online: bool) {
+        let mut inner = lock(&self.hub.inner);
+        if let Some(m) = inner.machines.get_mut(&self.id) {
+            m.online = online;
+        }
+        sync(&mut inner);
+    }
+
+    /// How many update frames apps sent to this machine in all, kept or refused (to tell a change sent again from one sent once).
+    pub fn update_frames(&self) -> usize {
+        lock(&self.hub.inner).machines.get(&self.id).map_or(0, |m| m.update_frames)
+    }
+
+    /// The account this machine is signed in as.
+    pub fn account(&self) -> String {
+        lock(&self.hub.inner).machines.get(&self.id).map(|m| m.account.name.clone()).unwrap_or_default()
+    }
+
+    /// Whether this machine answers the local API ([`Fake::restart`] stops it until [`Fake::start`]).
+    pub fn running(&self) -> bool {
+        lock(&self.hub.inner).machines.get(&self.id).is_some_and(|m| m.running)
+    }
+
+    /// The agent stops: every app connection ends, and new ones are refused until [`Fake::start`]. What the machine
+    /// holds (its copies, its waiting updates) stays, as the agent's files do.
+    pub fn restart(&self) {
+        let mut inner = lock(&self.hub.inner);
+        if let Some(m) = inner.machines.get_mut(&self.id) {
+            m.running = false;
+            for (_, c) in m.conns.drain() {
+                let _ = c.stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    /// The agent runs again.
+    pub fn start(&self) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.running = true;
+        }
+    }
+
+    /// Every app connection ends (the agent dropped them), but the agent keeps running.
+    pub fn drop_connections(&self) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            for (_, c) in m.conns.drain() {
+                let _ = c.stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    /// Refuses the next `count` updates any app of this machine sends with `code`, as the agent does: `internal` when
+    /// it can't write a change to disk (worth sending again), `invalid` when Loro doesn't take it (never).
+    pub fn refuse_next(&self, code: &str, count: usize) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.refuse.extend(std::iter::repeat_n(code.to_owned(), count));
+        }
+    }
+
+    /// Answer the blob calls as an agent from before blobs.
+    pub fn too_old(&self) {
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.too_old = true;
+        }
+    }
+
+    /// The save records this machine's apps sent: content hash (hex) and frontiers, in order.
+    pub fn saves(&self) -> Vec<(String, Vec<(u64, u32)>)> {
+        lock(&self.hub.inner).machines.get(&self.id).map(|m| m.saves.iter().map(|(_, h, v)| (h.clone(), v.clone())).collect()).unwrap_or_default()
+    }
+
+    /// How many of this machine's updates of the document at `path` the hub doesn't have yet.
+    pub fn waiting(&self, path: &str) -> usize {
+        let inner = lock(&self.hub.inner);
+        inner.machines.get(&self.id).map_or(0, |m| m.docs.values().filter(|d| key_path(&d.path) == path).map(|d| d.pending.len()).sum())
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(m) = lock(&self.hub.inner).machines.get_mut(&self.id) {
+            m.running = false;
+            for (_, c) in m.conns.drain() {
+                let _ = c.stream.shutdown(Shutdown::Both);
+            }
+        }
+        // Wake the accept loop so it sees the stop.
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(200));
+    }
+}
+
+/// A content name for the fake's blobs: 32 bytes, the same for the same bytes (not a cryptographic hash; the real
+/// agent names blobs by their manifest's BLAKE3 hash).
+fn fake_hash(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (lane, slot) in out.chunks_mut(8).enumerate() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (lane as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3 ^ ((lane as u64) << 40));
+        }
+        h ^= bytes.len() as u64;
+        slot.copy_from_slice(&h.to_le_bytes());
+    }
+    out
+}
+
+struct Request {
+    method: String,
+    path: String,
+    auth: Option<String>,
+    ws_key: Option<String>,
+    body: Vec<u8>,
+}
+
+/// One HTTP request: its head (at most 16 KiB) and, with `body`, its body (by `Content-Length`, at most the blob
+/// limit).
+fn read_request(stream: &mut TcpStream, body: bool) -> std::io::Result<Option<Request>> {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut parsed = httparse::Request::new(&mut headers);
+        match parsed.parse(&buf) {
+            Ok(httparse::Status::Complete(head)) => {
+                let header = |name: &str| {
+                    parsed
+                        .headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case(name))
+                        .and_then(|h| std::str::from_utf8(h.value).ok())
+                        .map(str::to_owned)
+                };
+                let length = header("content-length").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                if length > MAX_BLOB_BYTES {
+                    return Ok(None);
+                }
+                let mut request = Request {
+                    method: parsed.method.unwrap_or_default().to_owned(),
+                    path: parsed.path.unwrap_or_default().to_owned(),
+                    auth: header("authorization"),
+                    ws_key: header("sec-websocket-key"),
+                    body: buf.split_off(head.min(buf.len())),
+                };
+                if !body {
+                    return Ok(Some(request));
+                }
+                while request.body.len() < length {
+                    let n = stream.read(&mut chunk)?;
+                    if n == 0 {
+                        return Ok(None);
+                    }
+                    request.body.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                }
+                request.body.truncate(length);
+                return Ok(Some(request));
+            }
+            Ok(httparse::Status::Partial) if buf.len() <= 16 * 1024 => {}
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    let head = format!("HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+fn respond_json(stream: &mut TcpStream, status: u16, value: &impl serde::Serialize) {
+    let body = serde_json::to_vec(value).unwrap_or_default();
+    respond(stream, status, "application/json", &body);
+}
+
+fn respond_error(stream: &mut TcpStream, status: u16, code: &str, message: &str) {
+    respond_json(stream, status, &serde_json::json!({ "error": code, "message": message }));
+}
+
+/// The blob name a fake gives `bytes`, for tests that compare.
+pub fn blob_name(bytes: &[u8]) -> String {
+    hex(&fake_hash(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::{Event, Opened};
+
+    fn next_update(doc: &crate::live::Document) -> Vec<u8> {
+        for _ in 0..200 {
+            if let Some(Event::Update(bytes)) = doc.recv_timeout(Duration::from_millis(25)) {
+                return bytes;
+            }
+        }
+        panic!("no update came");
+    }
+
+    fn acked(doc: &crate::live::Document, seq: u64) {
+        for _ in 0..200 {
+            if let Some(Event::Acked(s)) = doc.recv_timeout(Duration::from_millis(25))
+                && s == seq
+            {
+                return;
+            }
+        }
+        panic!("no ack came");
+    }
+
+    /// Two machines of one hub: an import on one is live on the other; updates go both ways, and wait while a machine
+    /// is offline; a restarted machine keeps what it held; blobs go up and come down; an old agent's blob calls are
+    /// `agent_too_old`.
+    #[test]
+    fn two_fakes_share_documents_and_blobs() {
+        let hub = Hub::new();
+        let (a, b) = (hub.machine("a").unwrap(), hub.machine("b").unwrap());
+        let docs_a = a.client().documents().unwrap();
+        let Opened::NeedsImport(importer) = docs_a.open("x.txt", "test").unwrap() else { panic!("not new") };
+        let doc_a = importer.import(b"snapshot").unwrap();
+        assert_eq!(doc_a.state(), b"snapshot");
+        let docs_b = b.client().documents().unwrap();
+        let Opened::Live(doc_b) = docs_b.open("x.txt", "test").unwrap() else { panic!("not live on b") };
+        assert_eq!(doc_b.state(), b"snapshot");
+        doc_a.send(b"u1").unwrap();
+        assert_eq!(next_update(&doc_b), b"u1");
+        b.set_online(false);
+        acked(&doc_b, doc_b.send(b"u2").unwrap());
+        acked(&doc_a, doc_a.send(b"u3").unwrap());
+        assert_eq!(b.waiting("x.txt"), 1);
+        b.set_online(true);
+        assert_eq!(next_update(&doc_a), b"u2");
+        assert_eq!(next_update(&doc_b), b"u3");
+        assert_eq!(hub.updates("x.txt"), 3);
+        // A restart: b's connections end; it keeps its copy.
+        b.set_online(false);
+        acked(&doc_b, doc_b.send(b"u4").unwrap());
+        b.restart();
+        assert!(b.client().documents().is_err() || !b.running());
+        b.start();
+        let docs_b = b.client().documents().unwrap();
+        let Opened::Live(again) = docs_b.open("x.txt", "test").unwrap() else { panic!("not live after the restart") };
+        assert_eq!(again.opened_state().waiting, 1);
+        // Blobs.
+        let stored = a.client().blobs().put(b"blob bytes").unwrap();
+        assert_eq!(
+            b.client().blobs().get(&stored.hash, stored.len).unwrap_err(),
+            crate::Error::Refused { code: "offline".into(), message: "the server can't be reached to fetch the blob".into(), name_taken: None }
+        );
+        b.set_online(true);
+        assert_eq!(b.client().blobs().get(&stored.hash, stored.len).unwrap(), b"blob bytes");
+        assert!(matches!(b.client().blobs().get(&[1; 32], 3), Err(crate::Error::Refused { code, .. }) if code == "blob_not_found"));
+        b.too_old();
+        assert!(matches!(b.client().blobs().put(b"x"), Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"));
+        // A big put too: an old agent answers before reading the body, and the client asks before sending it.
+        let put = b.client().blobs().put(&vec![9u8; 8 * 1024 * 1024]);
+        assert!(matches!(&put, Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"), "{put:?}");
+        assert!(matches!(b.client().blobs().get(&stored.hash, stored.len), Err(crate::Error::Refused { code, .. }) if code == "agent_too_old"));
+        assert!(b.client().status().is_ok(), "the rest still works");
+        let big = vec![0u8; MAX_UPDATE_BYTES + 1];
+        let seq = doc_a.send(&big).unwrap();
+        let refused = (0..200).find_map(|_| match doc_a.recv_timeout(Duration::from_millis(25)) {
+            Some(Event::Refused { seq: s, .. }) => Some(s),
+            _ => None,
+        });
+        assert_eq!(refused, Some(seq), "an update over 1 MiB is refused");
+    }
+}

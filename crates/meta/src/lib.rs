@@ -1,0 +1,449 @@
+//! Server metadata for Craft Cloud: users, devices, spaces, the node tree, versions, which blobs each space
+//! may use, the batch commit that changes it all, live documents with their update logs, and join codes (invites and
+//! add-a-computer pairings). SQLite or Postgres, with the same behaviour.
+//!
+//! Every write goes through one transaction. On SQLite, writes are serialised by a single lock (SQLite has
+//! one writer anyway, and this avoids "database is locked" retries); on Postgres, a commit locks its space's
+//! row, so commits to one space run one at a time and commits to different spaces run in parallel.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+mod admin;
+mod audit;
+mod blobs;
+mod codec;
+mod commit;
+mod history;
+mod index;
+mod join;
+mod live;
+mod schema;
+mod spaces;
+mod storage;
+mod trash;
+mod tree;
+mod two_factor;
+mod usage;
+mod users;
+mod web;
+
+use std::str::FromStr;
+use std::sync::Arc;
+
+use craft_cloud_proto::{ChunkId, Conflict};
+use sqlx::any::{AnyConnectOptions, AnyPoolOptions};
+use sqlx::{AnyPool, ConnectOptions};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+pub use admin::{AdminActor, AdminUser, AdminVia, Issued, MAX_SEARCH_BYTES, MIN_QUOTA_BYTES, RESET_TTL_MS, ServerCounts, UserPage};
+pub use audit::{
+    ActionFilter, AuditAction, AuditCursor, AuditDetails, AuditEvent, AuditFailure, AuditOutcome, AuditQuery, ClientKind, Field, MAX_DETAILS_BYTES,
+    MAX_RETENTION_DAYS, MIN_RETENTION_DAYS, OPPORTUNISTIC_PRUNE_BATCHES, Origin, PRUNE_BATCH, PRUNE_EVERY_MS, Platform, Pruned, Step, TargetKind,
+};
+pub use blobs::Claim;
+pub use commit::{CommitOutcome, RestoreOutcome, TrashRestoreOutcome};
+pub use craft_cloud_proto::BlobKind;
+pub use history::HistoryPage;
+pub use index::{BlobRecord, EdgeCheck, EdgeProblem, EdgeProblemKind, Finding, INDEX_BATCH_ROWS, IndexAudit, IndexState, Validation};
+pub use join::{InviteFor, Redeemed};
+pub use live::{
+    Appended, DEFAULT_LIVE_BYTES_PER_SPACE, DEFAULT_TEAM_LIVE_BYTES, LiveDoc, LiveUpdate, MAX_LIVE_DOC_BYTES, MAX_LIVE_DOC_ROWS_PER_SPACE,
+    MAX_LIVE_DOCS_PER_SPACE, MAX_LIVE_DOCUMENTS_HOLDING_UPDATES, MAX_LIVE_DOCUMENTS_PER_SPACE, MAX_LIVE_PAGE, SnapshotRef,
+};
+pub use spaces::{Member, SpaceActor, SpaceOwner, SpacePage, SpaceSummary, UserSpace, WriteGuard};
+pub use storage::{BlobRow, StorageTotals};
+pub use trash::{TrashEntry, TrashPage};
+pub use tree::{MAX_PAGE_SAVE_BYTES, SpaceInfo};
+pub use two_factor::{
+    CHALLENGE_TTL_MS, Completed, DeviceActor, LOCK_AFTER_FAILURES, LOCK_BASE_MS, LOCK_MAX_MS, MAX_CHALLENGE_ATTEMPTS, MAX_OPEN_CHALLENGES,
+    MAX_SETUP_ATTEMPTS, NewChallenge, Proof, RECOVERY_CODES, SETUP_TTL_MS, SignIn, StoredSecrets, TotpVerifier, TwoFactorInfo, UnreadableSecret,
+    retry_after_secs,
+};
+pub use usage::{StorageAccount, StorageEstimate, StorageEstimateReason, StorageIndexCounts, StorageOverview};
+pub use users::{
+    AccountRecord, CLIENT_KINDS, DeviceAuth, DeviceClient, DeviceRecord, MAX_CLIENT_FIELD_BYTES, RevokeReason, Role, UserId, UserRecord,
+    valid_username,
+};
+pub use web::{NewWebSession, WebSession, WebSignIn};
+
+#[derive(Debug, thiserror::Error)]
+pub enum MetaError {
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+    #[error("unsupported database URL (use sqlite:… or postgres://…)")]
+    UnsupportedUrl,
+    #[error("the username is taken")]
+    UsernameTaken,
+    #[error("no such {0}")]
+    NotFound(&'static str),
+    #[error("the batch was refused: {} conflicting operation(s)", .0.len())]
+    Rejected(Vec<Conflict>),
+    #[error("{} chunk(s) of the manifest are not uploaded", .0.len())]
+    MissingChunks(Vec<ChunkId>),
+    #[error("the change feed no longer reaches that far back; list the whole tree")]
+    ResyncRequired,
+    /// A blob would take the space over its stored-bytes cap ([`Meta::with_stored_bytes_cap`]); nothing was
+    /// recorded. `used` is what the space stores without it.
+    #[error("the account's storage on the server is full: {used} of {limit} bytes used")]
+    QuotaExceeded { used: u64, limit: u64 },
+    /// An update would take a live document's log over its cap ([`Meta::with_live_doc_cap`]); nothing was stored.
+    /// `used` is what the log holds.
+    #[error("this live document is full on the server: its log holds {used} of {limit} bytes")]
+    DocFull { used: u64, limit: u64 },
+    /// An update would take the bytes all of a space's live documents hold (compacted rows too) over its cap
+    /// ([`Meta::with_live_bytes_cap`]); nothing was stored. `used` is what they hold.
+    #[error("the account's live documents hold {used} of {limit} bytes on the server, the most they may")]
+    LiveFull { used: u64, limit: u64 },
+    /// The first update to a live document would take its space over the most documents holding updates it may have
+    /// ([`MAX_LIVE_DOCS_PER_SPACE`] recents, [`MAX_LIVE_DOCUMENTS_HOLDING_UPDATES`] documents of files); nothing was
+    /// stored.
+    #[error("the account has {limit} live documents holding updates on the server, the most it may have")]
+    TooManyDocs { limit: u64 },
+    /// A new live document would take its space over the most rows it may have ([`MAX_LIVE_DOC_ROWS_PER_SPACE`]);
+    /// nothing was stored.
+    #[error("the account has {limit} live documents on the server, the most it may have")]
+    TooManyDocRows { limit: u64 },
+    /// A join code that is wrong, expired or used, never saying which.
+    #[error("this code doesn't work any more")]
+    InvalidCode,
+    /// An invite to an account without a password was redeemed without a new one; nothing was changed.
+    #[error("this invite needs a new password for the account")]
+    PasswordRequired,
+    /// The device that asked for a change was revoked while the request ran (it is no longer signed in); nothing was
+    /// changed.
+    #[error("this device is no longer signed in")]
+    DeviceRevoked,
+    /// What the request was based on changed while it ran (the password it checked is no longer the account's);
+    /// nothing was changed and the request may be made again.
+    #[error("{0}")]
+    Conflict(&'static str),
+    /// The admin who asked may not do this (their role changed while the request ran, or the rules about resetting
+    /// another admin); nothing was changed.
+    #[error("{0}")]
+    Forbidden(&'static str),
+    /// The change would leave the server without an administrator who can sign in; nothing was changed.
+    #[error("this would leave the server without an enabled administrator")]
+    LastAdmin,
+    /// The change would leave a team space without an accepted owner; nothing was changed.
+    #[error("this would leave the team space without an owner")]
+    LastOwner,
+    /// The account is a member of the team space but its role does not allow this write (it was lowered, or the space was
+    /// archived, after the request was let in); nothing was changed.
+    #[error("this space is read-only for your role")]
+    ReadOnly,
+    /// The account is disabled or marked for removal. Said only to someone who proved they hold its password or a
+    /// code of it, never to a guesser.
+    #[error("this account is disabled")]
+    AccountDisabled,
+    /// The account has two-factor sign-in and the request carried no second factor; nothing was changed (an invite or
+    /// reset code is not used up).
+    #[error("this account needs its second factor")]
+    TwoFactorRequired,
+    /// A code or recovery code was wrong, or a code that was used before; its counters were committed and nothing else
+    /// was changed.
+    #[error("the second factor is wrong")]
+    TwoFactorInvalid,
+    /// Too many wrong second factors: every check is refused until `retry_after_ms` have passed.
+    #[error("the second factor is locked after too many wrong codes")]
+    TwoFactorLocked { retry_after_ms: i64 },
+    /// A set-up of two-factor sign-in is open on another device.
+    #[error("two-factor set-up is open on another device")]
+    TwoFactorPending,
+    /// A sign-in challenge that is unknown, expired, used or no longer fit, never saying which.
+    #[error("this sign-in step doesn't work any more")]
+    ChallengeGone,
+    #[error("invalid input: {0}")]
+    Invalid(&'static str),
+    #[error("stored data is damaged: {0}")]
+    Corrupt(&'static str),
+    /// A database that was to exist already ([`Meta::open_existing`]) is not there or not ready; nothing was created.
+    #[error("{0}")]
+    Missing(&'static str),
+}
+
+/// How long a SQLite connection waits for a lock another connection or program holds before giving up.
+pub const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most deleted items below one folder that restoring or removing the folder from the trash takes with it in one
+/// call, shallowest first. What is beyond stays in the trash and, once its folder is live or removed from the trash,
+/// appears in the trash list on its own, to be restored or removed by a further call. The bound keeps the work done
+/// under the space's write lock by one call small.
+pub const MAX_TRASH_TREE_NODES: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+/// The metadata store. Cheap to clone.
+#[derive(Clone)]
+pub struct Meta {
+    pool: AnyPool,
+    dialect: Dialect,
+    /// Serialises write transactions on SQLite. Unused on Postgres.
+    write_lock: Arc<Mutex<()>>,
+    /// The most bytes one space may store ([`Meta::with_stored_bytes_cap`]); `None`: no cap.
+    stored_cap: Option<u64>,
+    /// The most bytes of updates one live document's log may hold ([`Meta::with_live_doc_cap`]).
+    live_doc_cap: u64,
+    /// The most live documents holding updates one space may have ([`Meta::with_live_docs_cap`]).
+    live_docs_cap: u64,
+    /// The most live document rows one space may have ([`Meta::with_live_doc_rows_cap`]).
+    live_doc_rows_cap: u64,
+    /// The most documents of files one space may have ([`Meta::with_live_documents_cap`]).
+    live_documents_cap: u64,
+    /// The most documents of files holding updates one space may have ([`Meta::with_live_held_documents_cap`]).
+    live_held_documents_cap: u64,
+    /// The most bytes all of one space's live documents may hold ([`Meta::with_live_bytes_cap`]).
+    live_bytes_cap: u64,
+    /// The same for a team space ([`Meta::with_team_live_bytes_cap`]).
+    team_live_bytes_cap: u64,
+    /// How long audit events are kept when a write prunes them ([`Meta::with_audit_retention_days`]); `None`: a write never prunes.
+    audit_retention_ms: Option<i64>,
+    /// When the last complete pruning ran, and whether one runs now; shared by the clones.
+    prune_state: Arc<audit::PruneState>,
+    /// Where the store reads the time of day for what it judges itself (a browser session's expiry inside an admin change);
+    /// `None`: the system clock ([`Meta::with_clock`]).
+    clock: Option<Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// Edges of the reference index one transaction writes ([`Meta::with_index_batch_rows`]).
+    index_rows: usize,
+    /// The most deleted items below one folder that restoring or removing the folder from the trash takes with it
+    /// ([`Meta::with_trash_tree_cap`]).
+    trash_tree_cap: u64,
+    /// Set on a handle made by [`Meta::guarded`]: the write transactions of the space's writes check the caller's role
+    /// again before they change anything.
+    guard: Option<WriteGuard>,
+}
+
+impl Meta {
+    /// The configured stored-bytes cap for one space, if any.
+    pub fn stored_bytes_cap(&self) -> Option<u64> {
+        self.stored_cap
+    }
+    /// Connects and brings the schema up to date. `url` is `sqlite:path/to/meta.db` (created if missing),
+    /// `sqlite::memory:`, or `postgres://user:pass@host/db`.
+    pub async fn open(url: &str) -> Result<Self, MetaError> {
+        Self::start(url, false).await
+    }
+
+    /// Connects to a database that already exists and creates nothing: a SQLite file that is not there is an error
+    /// (`mode=ro`, whatever options the URL had), not a new empty database, and a database whose schema is not the
+    /// current one is refused, not upgraded. For a command that only reads, so that a wrong path is reported instead of
+    /// being taken for an empty database that has no problems. `sqlite::memory:` has nothing to exist.
+    ///
+    /// A read-only SQLite connection never writes the database file or the WAL, and cannot checkpoint: closing the last
+    /// connection of a read-write one checkpoints the WAL of a crashed process into the database file and removes it,
+    /// which is a write a read-only command must not make. It still reads the WAL's committed data. Opening may leave
+    /// an empty `-wal` and a `-shm` file (SQLite's rebuilt index of the WAL, no data) when there were none.
+    pub async fn open_existing(url: &str) -> Result<Self, MetaError> {
+        Self::start(url, true).await
+    }
+
+    /// Writes a consistent copy of a SQLite database to the new file `dest` (`VACUUM INTO`): a snapshot of one
+    /// transaction, made while the server runs, with the write-ahead log folded in. The file must not exist. Other
+    /// databases are not copied this way (`pg_dump` is the tool for Postgres): they give [`MetaError::UnsupportedUrl`].
+    pub async fn dump_sqlite(&self, dest: &std::path::Path) -> Result<(), MetaError> {
+        if self.dialect != Dialect::Sqlite {
+            return Err(MetaError::UnsupportedUrl);
+        }
+        let Some(dest) = dest.to_str() else { return Err(MetaError::Db(sqlx::Error::Protocol("the backup path is not valid UTF-8".into()))) };
+        // The path is a string literal of the statement: quotes are doubled, and no other character ends it.
+        let sql = format!("VACUUM INTO '{}'", dest.replace('\'', "''"));
+        sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn start(url: &str, existing: bool) -> Result<Self, MetaError> {
+        sqlx::any::install_default_drivers();
+        let dialect = if url.starts_with("sqlite:") {
+            Dialect::Sqlite
+        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            Dialect::Postgres
+        } else {
+            return Err(MetaError::UnsupportedUrl);
+        };
+        let url = match dialect {
+            Dialect::Sqlite if existing && url.contains(":memory:") => return Err(MetaError::Missing("an in-memory database has no existing data")),
+            Dialect::Sqlite if existing => format!("{}?mode=ro", url.split_once('?').map_or(url, |(path, _)| path)),
+            Dialect::Sqlite if !url.contains('?') && !url.contains(":memory:") => format!("{url}?mode=rwc"),
+            _ => url.to_owned(),
+        };
+        let options = AnyConnectOptions::from_str(&url)?.disable_statement_logging();
+        let pool_options = match dialect {
+            // An in-memory SQLite database exists only as long as its one connection. sqlx closes idle and old
+            // connections by default, and a closed one takes the database with it: the next query would open
+            // a fresh, empty database. So keep exactly one connection, and never retire it.
+            Dialect::Sqlite if url.contains(":memory:") => {
+                AnyPoolOptions::new().max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None)
+            }
+            Dialect::Sqlite => AnyPoolOptions::new().max_connections(8),
+            Dialect::Postgres => AnyPoolOptions::new().max_connections(16),
+        };
+        // SQLite: a connection that finds the database locked (by another program: a backup, the admin CLI) waits
+        // up to this long for it rather than failing at once. Said here rather than left to sqlx's default.
+        let pool_options = match dialect {
+            Dialect::Sqlite => pool_options.after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA busy_timeout = {}", SQLITE_BUSY_TIMEOUT.as_millis()))).execute(conn).await?;
+                    Ok(())
+                })
+            }),
+            Dialect::Postgres => pool_options,
+        };
+        let pool = pool_options.connect_with(options).await?;
+        if existing {
+            schema::check_current(&pool, dialect).await?;
+        } else {
+            if dialect == Dialect::Sqlite && !url.contains(":memory:") {
+                sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+            }
+            schema::migrate(&pool, dialect).await?;
+        }
+        Ok(Self {
+            pool,
+            dialect,
+            write_lock: Arc::new(Mutex::new(())),
+            stored_cap: None,
+            live_doc_cap: MAX_LIVE_DOC_BYTES,
+            live_docs_cap: MAX_LIVE_DOCS_PER_SPACE,
+            live_doc_rows_cap: MAX_LIVE_DOC_ROWS_PER_SPACE,
+            live_documents_cap: MAX_LIVE_DOCUMENTS_PER_SPACE,
+            live_held_documents_cap: MAX_LIVE_DOCUMENTS_HOLDING_UPDATES,
+            live_bytes_cap: DEFAULT_LIVE_BYTES_PER_SPACE,
+            team_live_bytes_cap: DEFAULT_TEAM_LIVE_BYTES,
+            audit_retention_ms: None,
+            prune_state: Arc::new(audit::PruneState::new()),
+            clock: None,
+            index_rows: INDEX_BATCH_ROWS,
+            trash_tree_cap: MAX_TRASH_TREE_NODES,
+            guard: None,
+        })
+    }
+
+    /// The store with another clock, for what it judges by the time of day itself: whether a browser session is still inside its
+    /// lifetimes when an admin change runs (read after the change's locks are taken). The server gives it the clock it injects
+    /// for tests; without one the system clock is read. The clock belongs to this handle and its clones.
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Milliseconds since the Unix epoch, by the store's clock.
+    pub(crate) fn clock_ms(&self) -> i64 {
+        self.clock.as_ref().map_or_else(users::wall_clock_ms, |clock| clock())
+    }
+
+    /// The store with another cap on the deleted items below one folder that restoring or removing the folder from the
+    /// trash takes with it in one call (the default is [`MAX_TRASH_TREE_NODES`]); the rest stays in the trash. For tests.
+    pub fn with_trash_tree_cap(mut self, cap: u64) -> Self {
+        self.trash_tree_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the bytes of updates one live document's log may hold (the default is
+    /// [`MAX_LIVE_DOC_BYTES`]); an append over it is refused with [`MetaError::DocFull`]. For tests.
+    pub fn with_live_doc_cap(mut self, cap: u64) -> Self {
+        self.live_doc_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of live documents holding updates one space may have (the default is
+    /// [`MAX_LIVE_DOCS_PER_SPACE`]); the first update to one over it is refused with [`MetaError::TooManyDocs`]. For
+    /// tests.
+    pub fn with_live_docs_cap(mut self, cap: u64) -> Self {
+        self.live_docs_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of live documents (rows, held updates or not) one space may have (the
+    /// default is [`MAX_LIVE_DOC_ROWS_PER_SPACE`]); a create over it is refused with [`MetaError::TooManyDocRows`].
+    /// For tests.
+    pub fn with_live_doc_rows_cap(mut self, cap: u64) -> Self {
+        self.live_doc_rows_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of documents of files one space may have (the default is
+    /// [`MAX_LIVE_DOCUMENTS_PER_SPACE`]); a create over it is refused with [`MetaError::TooManyDocRows`]. For tests.
+    pub fn with_live_documents_cap(mut self, cap: u64) -> Self {
+        self.live_documents_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the number of documents of files holding updates one space may have (the default
+    /// is [`MAX_LIVE_DOCUMENTS_HOLDING_UPDATES`]); the first update to one over it is refused with
+    /// [`MetaError::TooManyDocs`]. For tests.
+    pub fn with_live_held_documents_cap(mut self, cap: u64) -> Self {
+        self.live_held_documents_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the bytes all of one space's live documents may hold, compacted rows too (the
+    /// default is [`DEFAULT_LIVE_BYTES_PER_SPACE`]; the server's `live_bytes_per_user` sets it); an append over it is
+    /// refused with [`MetaError::LiveFull`]. The cap belongs to this handle and its clones.
+    pub fn with_live_bytes_cap(mut self, cap: u64) -> Self {
+        self.live_bytes_cap = cap;
+        self
+    }
+
+    /// The store with another cap on the bytes all of one team space's live documents may hold (the default is
+    /// [`DEFAULT_TEAM_LIVE_BYTES`]; the server's `[spaces] team_live_bytes` sets it); an append over it is refused with
+    /// [`MetaError::LiveFull`]. Personal spaces keep [`Meta::with_live_bytes_cap`].
+    pub fn with_team_live_bytes_cap(mut self, cap: u64) -> Self {
+        self.team_live_bytes_cap = cap;
+        self
+    }
+
+    /// The store with a cap on the bytes one space (one user's) stores: the stored size of every chunk and manifest
+    /// it has, each counted once however many files use it. Recording a blob that would go over it is refused with
+    /// [`MetaError::QuotaExceeded`]. `None` (the default): no cap. The cap belongs to this handle and its clones.
+    pub fn with_stored_bytes_cap(mut self, cap: Option<u64>) -> Self {
+        self.stored_cap = cap;
+        self
+    }
+
+    /// `sqlite` or `postgres`, for the admin's server overview.
+    pub fn database_kind(&self) -> &'static str {
+        match self.dialect {
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
+        }
+    }
+
+    /// Whether a database connection is in use (a query under way, or a connection on its way back to the pool).
+    /// A simulation on a simulated clock (`turmoil`) keeps time still while it is, since SQLite answers from a
+    /// thread of its own, outside the simulation: otherwise how far simulated time got before an answer would depend
+    /// on the real machine's speed, and a seed wouldn't replay exactly.
+    #[cfg(feature = "test-support")]
+    pub fn busy(&self) -> bool {
+        self.pool.num_idle() < self.pool.size() as usize
+    }
+
+    /// Starts a write transaction. On SQLite it also holds the write lock until commit or drop.
+    async fn begin_write(&self) -> Result<WriteTx, MetaError> {
+        let guard = match self.dialect {
+            Dialect::Sqlite => Some(self.write_lock.clone().lock_owned().await),
+            Dialect::Postgres => None,
+        };
+        // SQLite: take the write lock up front, so a transaction never starts as a reader and then fails to
+        // upgrade ("database is locked") when another connection has written in between.
+        let tx = match self.dialect {
+            Dialect::Sqlite => self.pool.begin_with("BEGIN IMMEDIATE").await?,
+            Dialect::Postgres => self.pool.begin().await?,
+        };
+        Ok(WriteTx { tx, _guard: guard })
+    }
+}
+
+/// A write transaction; dropping it without [`WriteTx::commit`] rolls back.
+struct WriteTx {
+    tx: sqlx::Transaction<'static, sqlx::Any>,
+    _guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl WriteTx {
+    async fn commit(self) -> Result<(), MetaError> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+}

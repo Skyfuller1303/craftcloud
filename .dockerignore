@@ -1,25 +1,20 @@
-# Build context for deploy/compose/Dockerfile: sources only. Nothing here may
-# carry secrets, local build output or version-control data into an image layer.
+# The build context of packaging/docker/Dockerfile is the repository root, because Cargo needs the manifests of
+# every workspace member. Nothing here may reach the image: no history, no local data, no secrets.
 .git
-.cargo
 .github
+target
+**/target
+/dist
+/temp
+/data
+docs
+packaging
+**/*.md
 .env
 .env.*
 **/.env
 **/.env.*
-**/secrets
-**/*.pem
-**/*.key
-target
-**/target
-**/node_modules
-**/dist
-plan
-docs
-deploy
-output
-*.log
 *.sqlite
-*.sqlite3
-.coverage
-.DS_Store
+*.sqlite-wal
+*.sqlite-shm
+*~

@@ -1,180 +1,109 @@
-//! Local developer tasks. `cargo xtask ci` runs the same checks a CI job
-//! would run, sequentially and failing fast.
+//! Workspace tooling: `cargo xtask <command>`.
+//!
+//! Pure Rust (std, and serde_json for `cargo metadata`). External tools (`cargo`) are invoked through
+//! `std::process::Command`.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-mod compose;
-mod db_test;
-mod docs_check;
-mod release;
-mod web;
+mod icons;
+mod licenses;
+mod notices;
+mod package;
+mod suite_deps;
+mod version;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+const USAGE: &str = "\
+usage: cargo xtask <command>
+
+commands:
+  ci              fmt --check, licenses, icons --check, clippy -D warnings, test (stops at first failure)
+  licenses        check every dependency's licence against the allow-list in AGENTS.md
+  icons [--check] draw the Craft Cloud app's icons into apps/craft-cloud-desktop/assets (or check they are current)
+  package         release builds packed for this OS into <target>/package: the Windows setup, the macOS app
+                  (zipped) or the Linux tarball
+  version [set X.Y.Z[-pre]]
+                  print the workspace version, or set it (Cargo.toml + Cargo.lock)
+  suite-deps <Cargo.lock>...
+                  the crates craft-cloud-kit and craft-cloud-egui pull in that none of the given lock files (the
+                  Craft apps') has; fails if any but Loro's own (not part of ci)
+";
+
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("ci") => match (args.next().as_deref(), args.next()) {
-            (None, None) => ci(false),
-            (Some("--skip-web"), None) => ci(true),
-            _ => usage(),
-        },
-        Some("web") if args.next().is_none() => web::run(&repo_root()),
-        Some("db-test") => db_test::run(&repo_root(), &args.collect::<Vec<_>>()),
-        Some("release") => match args.next() {
-            Some(version) => release::run(&repo_root(), &version, &args.collect::<Vec<_>>()),
-            _ => usage(),
-        },
-        Some("compose-secrets") => compose::run(&repo_root(), &args.collect::<Vec<_>>()),
-        Some("openapi-snapshot") => match (args.next().as_deref(), args.next()) {
-            (None, None) => openapi_snapshot(false),
-            (Some("--update"), None) => openapi_snapshot(true),
-            _ => usage(),
-        },
-        _ => usage(),
-    }
-}
-
-fn usage() -> ExitCode {
-    eprintln!(
-        "usage: cargo xtask <ci [--skip-web]|web|db-test [--postgres 16|17|18]|release <version> [--no-image] [--image-arch amd64,arm64]|compose-secrets [<dir>] [--domain <name>] [--tls-internal] [--http-port <n>] [--https-port <n>]|openapi-snapshot [--update]>"
-    );
-    ExitCode::from(2)
-}
-
-/// Checks `contracts/openapi.snapshot` against `contracts/openapi.yaml`, or
-/// rewrites it with `--update`. The normalization lives in the contract test
-/// (`crates/craftcloud-api/tests/contract.rs`), so there is one implementation.
-fn openapi_snapshot(update: bool) -> ExitCode {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = Command::new(cargo);
-    command
-        .args([
-            "test",
-            "-p",
-            "craftcloud-api",
-            "--test",
-            "contract",
-            "openapi_matches_the_committed_snapshot",
-        ])
-        .current_dir(repo_root());
-    if update {
-        command.env("UPDATE_OPENAPI_SNAPSHOT", "1");
-    } else {
-        command.env_remove("UPDATE_OPENAPI_SNAPSHOT");
-    }
-    match command.status() {
-        Ok(status) if status.success() => {
-            println!(
-                "{}",
-                if update {
-                    "contracts/openapi.snapshot updated; review and commit the diff"
-                } else {
-                    "contracts/openapi.snapshot matches contracts/openapi.yaml"
-                }
-            );
-            ExitCode::SUCCESS
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let result = match args.first().map(String::as_str) {
+        Some("ci") => cmd_ci(),
+        Some("licenses") => licenses::run(),
+        Some("icons") => icons::run(&root(), &rest),
+        Some("package") => package::run(&root()),
+        Some("version") => version::run(&root(), &rest),
+        Some("suite-deps") => suite_deps::run(&rest),
+        Some("-h" | "--help" | "help") | None => {
+            print!("{USAGE}");
+            Ok(())
         }
-        Ok(status) => exit_code_from(status.code()),
-        Err(err) => {
-            eprintln!("cannot start cargo: {err}");
+        Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}")),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// The repository root: the parent of the `xtask` crate directory.
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+/// Workspace root (parent of the xtask crate).
+pub fn root() -> PathBuf {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
 }
 
-/// `skip_web` is only set by the explicit `--skip-web` flag; a missing Node.js
-/// never skips the web step silently.
-fn ci(skip_web: bool) -> ExitCode {
-    let root = repo_root();
-    let steps: [(&str, &[&str]); 4] = [
-        ("cargo fmt", &["fmt", "--all", "--", "--check"]),
-        (
-            "cargo clippy",
-            &[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ),
-        // The crash tests (CC-P02-08) are only built with the feature; lint them too.
-        (
-            "cargo clippy (fault-injection)",
-            &[
-                "clippy",
-                "-p",
-                "craftcloud-server",
-                "--all-targets",
-                "--features",
-                "fault-injection",
-                "--",
-                "-D",
-                "warnings",
-            ],
-        ),
-        ("cargo test", &["test", "--workspace"]),
+pub fn cargo() -> Command {
+    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    c.current_dir(root());
+    c
+}
+
+fn run(mut cmd: Command, what: &str) -> Result<(), String> {
+    eprintln!("$ {what}");
+    let status = cmd.status().map_err(|e| format!("{what}: failed to spawn: {e}"))?;
+    if status.success() { Ok(()) } else { Err(format!("{what}: exited with {status}")) }
+}
+
+fn cargo_step(args: &[&str]) -> Result<(), String> {
+    let mut c = cargo();
+    c.args(args);
+    run(c, &format!("cargo {}", args.join(" ")))
+}
+
+fn cmd_ci() -> Result<(), String> {
+    type Step = (&'static str, Box<dyn Fn() -> Result<(), String>>);
+    let steps: Vec<Step> = vec![
+        ("fmt", Box::new(|| cargo_step(&["fmt", "--all", "--", "--check"]))),
+        ("licenses", Box::new(licenses::run)),
+        ("icons", Box::new(|| icons::run(&root(), &["--check"]))),
+        ("clippy", Box::new(|| cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
+        ("test", Box::new(|| cargo_step(&["test", "--workspace"]))),
     ];
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-
-    for (name, args) in steps {
-        println!("==> {name}");
-        let status = Command::new(&cargo).args(args).current_dir(&root).status();
-        match status {
-            Ok(status) if status.success() => println!("<== {name}: PASS"),
-            Ok(status) => {
-                println!("<== {name}: FAIL ({status})");
-                return exit_code_from(status.code());
+    let mut done = Vec::new();
+    for (name, f) in &steps {
+        eprintln!("\n=== ci: {name} ===");
+        if let Err(e) = f() {
+            println!("\nCI summary:");
+            for d in &done {
+                println!("  ok    {d}");
             }
-            Err(err) => {
-                println!("<== {name}: FAIL (cannot start cargo: {err})");
-                return ExitCode::FAILURE;
+            println!("  FAIL  {name}: {e}");
+            for (n, _) in steps.iter().skip(done.len().saturating_add(1)) {
+                println!("  skip  {n}");
             }
+            return Err(format!("ci failed at `{name}`"));
         }
+        done.push(*name);
     }
-
-    if skip_web {
-        println!("==> web: SKIPPED by --skip-web (admin UI NOT checked)");
-    } else {
-        println!("==> web");
-        if let Err(message) = web::check(&root) {
-            println!("<== web: FAIL ({message})");
-            return ExitCode::FAILURE;
-        }
-        println!("<== web: PASS");
-    }
-
-    println!("==> docs links");
-    match docs_check::check_repository(&root) {
-        Ok(checked) => println!("<== docs links: PASS ({checked} relative links resolved)"),
-        Err(problems) => {
-            for problem in &problems {
-                println!("  {problem}");
-            }
-            println!("<== docs links: FAIL ({} broken)", problems.len());
-            return ExitCode::FAILURE;
-        }
-    }
-
-    if skip_web {
-        println!("ci: all steps passed EXCEPT the skipped web step (--skip-web)");
-    } else {
-        println!("ci: all steps passed");
-    }
-    ExitCode::SUCCESS
-}
-
-fn exit_code_from(code: Option<i32>) -> ExitCode {
-    match code.and_then(|c| u8::try_from(c).ok()) {
-        Some(c) if c != 0 => ExitCode::from(c),
-        _ => ExitCode::FAILURE,
-    }
+    println!("\nCI summary: all {} steps passed ({})", done.len(), done.join(", "));
+    Ok(())
 }
