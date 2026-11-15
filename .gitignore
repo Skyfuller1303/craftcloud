@@ -1,15 +1,17 @@
-# Proposal repository: private notes and implementation artifacts
-.env
-.env.*
-!.env.example
+*~
 plan/
-*.log
-*.sqlite
-*.sqlite3
-secrets/
+plans/
+/target
 target/
-node_modules/
-dist/
-.coverage/
-.DS_Store
-__pycache__/
+/dist
+/temp
+# local server data from dev runs
+/data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+# a snapshot test's own render when it doesn't match
+*.new.png
+# the Docker deployment's settings and secrets (written by packaging/docker/install.sh), and a custom TLS certificate
+/packaging/docker/.env
+/packaging/docker/tls/

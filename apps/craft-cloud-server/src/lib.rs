@@ -1,0 +1,59 @@
+//! The Craft Cloud server: an HTTP API over the metadata store (`craft-cloud-meta`) and the blob store
+//! (`craft-cloud-store`), the live service on a WebSocket ([`live`]), plus the admin command line.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+pub mod account;
+pub mod admin;
+pub mod api;
+pub mod audit;
+pub mod auth;
+#[cfg(feature = "sftp")]
+pub mod backup;
+#[cfg(feature = "sftp")]
+pub mod backup_auth;
+pub mod cli;
+pub mod config;
+pub mod error;
+pub mod full;
+pub mod gc;
+pub mod health;
+pub mod join;
+pub mod live;
+pub mod notify;
+pub mod ratelimit;
+pub mod secretbox;
+pub mod space;
+pub mod spaces;
+pub mod state;
+pub mod storage_info;
+pub mod storage_tools;
+pub mod totp;
+pub mod two_factor;
+pub mod updates;
+pub mod verify;
+pub mod web;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use tokio::net::TcpListener;
+
+pub use state::AppState;
+
+/// Serves the API on `listener` until `shutdown` resolves.
+pub async fn serve(state: AppState, listener: TcpListener, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> std::io::Result<()> {
+    let state = Arc::new(state);
+    let app = api::router(state.clone());
+    // Long-polls are told to answer before axum starts waiting for open requests to finish.
+    let shutdown = async move {
+        shutdown.await;
+        state.notifier.begin_shutdown();
+    };
+    // No Nagle delay: a live update is a few dozen bytes, and must go out at once (a keystroke reaches the other
+    // machines in well under 250 ms).
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown).await
+}
