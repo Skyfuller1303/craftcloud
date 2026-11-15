@@ -532,7 +532,7 @@ who can write to the database can change it; keep the database file and Postgres
 This release adds migrations (`0007`, device sessions, `0008`, the admin API: reset codes, per-account quotas, the
 removal mark, `0009`, the audit log, `0010`, two-factor sign-in: the secrets, recovery codes and sign-in challenges,
 `0011`, the admin pages' browser sessions, `0012`, the history index, `0013`, the trash, `0014`, the manifest reference
-index, and `0016`, team spaces: the kind, name and archive mark of a space, and its members; on SQLite it rebuilds the `spaces` table
+index, `0015`, what a blob takes on the backend and its compression level, and `0016`, team spaces: the kind, name and archive mark of a space, and its members; on SQLite it rebuilds the `spaces` table
 in one transaction with a foreign-key check). The server applies them when it starts. A database it
 has migrated cannot be opened by an older server: that one refuses to start ("the database was created by a newer Craft
 Cloud"). Rolling back therefore means restoring a backup taken before the upgrade, so take one first. Upgrade the
@@ -1084,4 +1084,5 @@ installation data. Do not grant an updater service root rights: the server must 
 ### Not covered
 
 Postgres over TLS, TLS in the server itself (Caddy terminates it), Kubernetes or Helm files, a registry image and
-release automation, and backup automation (copy the data as above until the server can create backups itself).
+release automation, and scheduled backups in the Compose files (the server's `backup` command exists, see
+[operations.md](operations.md), but nothing in the Docker setup runs it for you).
